@@ -42,8 +42,17 @@ test("createTaskSpec assigns a unique id and sensible defaults", () => {
   assert.notEqual(a.id, b.id);
   assert.match(a.id, /^task_/);
   assert.equal(a.retryCount, 0);
+  assert.equal(a.retryNotBefore, null);
   assert.deepEqual(a.checkpoints, []);
   assert.equal(a.priority, "normal");
+});
+
+test("createTaskSpec rejects malformed retry policies", () => {
+  assert.throws(() => createTaskSpec({ goal: "x", retryPolicy: null }), /retryPolicy must be an object/);
+  assert.throws(() => createTaskSpec({ goal: "x", retryPolicy: { maxRetries: -1 } }), /maxRetries/);
+  assert.throws(() => createTaskSpec({ goal: "x", retryPolicy: { maxRetries: 1.5 } }), /maxRetries/);
+  assert.throws(() => createTaskSpec({ goal: "x", retryPolicy: { backoffMs: -1 } }), /backoffMs/);
+  assert.throws(() => createTaskSpec({ goal: "x", retryPolicy: { backoffMs: "1000" } }), /backoffMs/);
 });
 
 test("task kinds distinguish research workers from generic queue work", () => {

@@ -235,6 +235,33 @@ test("FAILED_RETRYABLE re-queues the task until retries are exhausted, then FAIL
   assert.equal(reloaded.retryCount, 2);
 });
 
+test("retry backoff is durable and blocks redispatch until retryNotBefore", async () => {
+  const { dir, queue, deviceLease } = setup(["dev-1"]);
+  const task = queue.addTask({
+    goal: "x",
+    deviceSelector: { deviceId: "dev-1" },
+    retryPolicy: { maxRetries: 1, backoffMs: 1_000 },
+  });
+
+  await queue.reportResult(task.id, TASK_STATES.FAILED_RETRYABLE);
+  const waiting = queue.getTask(task.id);
+  const retryAt = new Date(waiting.retryNotBefore);
+  assert.equal(waiting.state, TASK_STATES.QUEUED);
+  assert.equal(waiting.retryCount, 1);
+  assert.equal(deviceLease.getMode("dev-1"), "AI_IDLE");
+  assert.ok(Number.isFinite(retryAt.getTime()));
+
+  const stored = JSON.parse(fs.readFileSync(path.join(dir, "tasks.json"), "utf8"));
+  assert.equal(stored[0].retryNotBefore, waiting.retryNotBefore);
+
+  queue.tick(new Date(retryAt.getTime() - 1));
+  assert.equal(queue.getTask(task.id).state, TASK_STATES.QUEUED);
+
+  queue.tick(retryAt);
+  assert.equal(queue.getTask(task.id).state, TASK_STATES.RUNNING);
+  assert.equal(queue.getTask(task.id).retryNotBefore, null);
+});
+
 test("NEEDS_HUMAN hands the device back via a real handoff, not just a status flag", async () => {
   const { queue, deviceLease } = setup(["dev-1"]);
   const task = queue.addTask({ goal: "x", deviceSelector: { deviceId: "dev-1" } });
@@ -390,6 +417,51 @@ test("restart recovery: a RUNNING task found on disk is retried or failed per it
   const exhausted = queue.getTask("task_interrupted_exhausted");
   assert.equal(exhausted.state, TASK_STATES.FAILED_FINAL);
   assert.equal(exhausted.retryCount, 1);
+});
+
+test("restart recovery preserves retry backoff before redispatch", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-retry-recovery-"));
+  const storePath = path.join(dir, "tasks.json");
+  try {
+    fs.writeFileSync(storePath, JSON.stringify([{
+      id: "task_interrupted_with_backoff",
+      goal: "x",
+      state: TASK_STATES.RUNNING,
+      deviceSelector: { deviceId: "dev-1" },
+      accountSelector: {},
+      criteria: {},
+      allowedActions: [],
+      requiredActions: [],
+      earliestStart: null,
+      latestEnd: null,
+      priority: "normal",
+      dependencies: [],
+      retryPolicy: { maxRetries: 1, backoffMs: 60_000 },
+      retryCount: 0,
+      allowOverrun: false,
+      createdBy: null,
+      createdAt: new Date().toISOString(),
+      checkpoints: [],
+      result: null,
+      updatedAt: new Date().toISOString(),
+    }]));
+
+    const queue = createTaskQueue({
+      devices: makeDevices(["dev-1"]),
+      deviceLease: createMockDeviceLease(),
+      auditLog: null,
+      storePath,
+    });
+    const recovered = queue.getTask("task_interrupted_with_backoff");
+    const retryAt = new Date(recovered.retryNotBefore);
+    assert.equal(recovered.state, TASK_STATES.QUEUED);
+    assert.equal(recovered.retryCount, 1);
+    assert.ok(retryAt.getTime() > Date.now());
+
+    queue.tick(retryAt);
+    assert.equal(queue.getTask(recovered.id).state, TASK_STATES.RUNNING);
+    assert.equal(queue.getTask(recovered.id).retryNotBefore, null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("startup dispatch can wait until workers subscribe, so recovered work is not missed", () => {

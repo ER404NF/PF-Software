@@ -12,7 +12,14 @@
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
-import { TASK_STATES, isTerminal, createTaskSpec, isWindowOpen, hasWindowExpired } from "./taskSpec.js";
+import {
+  TASK_STATES,
+  isTerminal,
+  createTaskSpec,
+  isWindowOpen,
+  hasWindowExpired,
+  normalizeRetryPolicy,
+} from "./taskSpec.js";
 
 const PRIORITY_ORDER = { urgent: 0, high: 1, normal: 2, low: 3 };
 const REPORTABLE_OUTCOMES = new Set([
@@ -47,8 +54,18 @@ function writeTasks(storePath, tasks) {
 function loadTasks(storePath) {
   if (!fs.existsSync(storePath)) return [];
   const tasks = JSON.parse(fs.readFileSync(storePath, "utf8"));
-  let recovered = false;
+  let changed = false;
   for (const task of tasks) {
+    // Migrate snapshots written before retry timing became durable. Keeping
+    // the normalized policy on every loaded task also prevents old files
+    // with an omitted policy from crashing during recovery/reporting.
+    const retryPolicy = normalizeRetryPolicy(task.retryPolicy ?? {});
+    if (JSON.stringify(task.retryPolicy) !== JSON.stringify(retryPolicy)) changed = true;
+    task.retryPolicy = retryPolicy;
+    if (!("retryNotBefore" in task)) {
+      task.retryNotBefore = null;
+      changed = true;
+    }
     // The process that was running this was killed or crashed — there is no
     // way to know whether the last action actually completed, so this is
     // never silently resumed or silently dropped. The 13 states in
@@ -56,14 +73,18 @@ function loadTasks(storePath) {
     // state, so retry accounting (§10) decides the outcome directly here,
     // the same as any other failure would.
     if (task.state === TASK_STATES.RUNNING || task.state === TASK_STATES.DISPATCHED) {
+      const recoveredAt = new Date();
       task.retryCount = (task.retryCount || 0) + 1;
       task.state = task.retryCount <= task.retryPolicy.maxRetries ? TASK_STATES.QUEUED : TASK_STATES.FAILED_FINAL;
-      task.result = { outcome: "interrupted_by_restart", at: new Date().toISOString() };
+      task.retryNotBefore = task.state === TASK_STATES.QUEUED && task.retryPolicy.backoffMs > 0
+        ? new Date(recoveredAt.getTime() + task.retryPolicy.backoffMs).toISOString()
+        : null;
+      task.result = { outcome: "interrupted_by_restart", at: recoveredAt.toISOString() };
       task.updatedAt = task.result.at;
-      recovered = true;
+      changed = true;
     }
   }
-  if (recovered) writeTasks(storePath, tasks);
+  if (changed) writeTasks(storePath, tasks);
   return tasks;
 }
 
@@ -313,6 +334,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
   function isEligible(task, now) {
     if (task.state !== TASK_STATES.QUEUED) return false;
     if (!isWindowOpen(task, now)) return false;
+    if (task.retryNotBefore && now.getTime() < new Date(task.retryNotBefore).getTime()) return false;
     return task.dependencies.every((depId) => getTask(depId)?.state === TASK_STATES.SUCCEEDED);
   }
 
@@ -348,6 +370,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     deviceLease.applyEvent(deviceId, "START_TASK"); // -> AI_RUNNING
     task.state = TASK_STATES.RUNNING;
     task.deviceSelector = { ...task.deviceSelector, deviceId };
+    task.retryNotBefore = null;
     task.dispatchedAt = now.toISOString();
     task.updatedAt = now.toISOString();
     persist();
@@ -437,11 +460,16 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     if (outcome === TASK_STATES.FAILED_RETRYABLE) {
       task.retryCount += 1;
       task.state = task.retryCount <= task.retryPolicy.maxRetries ? TASK_STATES.QUEUED : TASK_STATES.FAILED_FINAL;
+      task.retryNotBefore = task.state === TASK_STATES.QUEUED && task.retryPolicy.backoffMs > 0
+        ? new Date(now.getTime() + task.retryPolicy.backoffMs).toISOString()
+        : null;
     } else if (outcome === TASK_STATES.NEEDS_HUMAN) {
       task.state = TASK_STATES.NEEDS_HUMAN;
+      task.retryNotBefore = null;
       if (deviceId) await deviceLease.switchToHuman(deviceId); // a real handoff, not just a status flag
     } else {
       task.state = outcome; // SUCCEEDED | PARTIAL | FAILED_FINAL | CANCELLED
+      task.retryNotBefore = null;
     }
     task.result = { outcome, detail, at: now.toISOString() };
     task.updatedAt = now.toISOString();

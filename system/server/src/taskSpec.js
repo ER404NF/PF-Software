@@ -33,6 +33,20 @@ const TERMINAL_STATES = new Set([
 
 const PRIORITIES = Object.freeze(["low", "normal", "high", "urgent"]);
 
+function normalizeRetryPolicy(retryPolicy = {}) {
+  if (!retryPolicy || typeof retryPolicy !== "object" || Array.isArray(retryPolicy)) {
+    throw new Error("retryPolicy must be an object");
+  }
+  const normalized = { maxRetries: 0, backoffMs: 0, ...retryPolicy };
+  if (!Number.isSafeInteger(normalized.maxRetries) || normalized.maxRetries < 0) {
+    throw new Error("retryPolicy.maxRetries must be a non-negative integer");
+  }
+  if (!Number.isSafeInteger(normalized.backoffMs) || normalized.backoffMs < 0) {
+    throw new Error("retryPolicy.backoffMs must be a non-negative integer");
+  }
+  return normalized;
+}
+
 function isTerminal(state) {
   return TERMINAL_STATES.has(state);
 }
@@ -74,6 +88,8 @@ function createTaskSpec({
     throw new Error("earliestStart must be before latestEnd");
   }
 
+  const normalizedRetryPolicy = normalizeRetryPolicy(retryPolicy);
+
   const now = new Date().toISOString();
   return {
     id: `task_${crypto.randomUUID()}`,
@@ -89,8 +105,9 @@ function createTaskSpec({
     maxDurationSec,
     priority,
     dependencies,
-    retryPolicy: { maxRetries: 0, backoffMs: 0, ...retryPolicy },
+    retryPolicy: normalizedRetryPolicy,
     retryCount: 0,
+    retryNotBefore: null,
     allowOverrun,
     createdBy: createdBy ?? null,
     createdAt: now,
@@ -116,4 +133,4 @@ function hasWindowExpired(task, now) {
   return Boolean(task.latestEnd) && now.getTime() >= new Date(task.latestEnd).getTime();
 }
 
-export { TASK_STATES, PRIORITIES, isTerminal, createTaskSpec, isWindowOpen, hasWindowExpired };
+export { TASK_STATES, PRIORITIES, isTerminal, createTaskSpec, isWindowOpen, hasWindowExpired, normalizeRetryPolicy };
