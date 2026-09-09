@@ -133,8 +133,11 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
 
   function addTask(input, now = new Date()) {
     const task = createTaskSpec(input);
+    // Admit the task durably before exposing it to the live scheduler. If
+    // storage is unavailable, callers receive an error and no hidden task is
+    // left in memory to dispatch on a later tick.
+    writeQueueSnapshot(storePath, [...tasks, task], paused);
     tasks.push(task);
-    persist();
     auditLog?.logEvent({
       operator: task.createdBy,
       type: "task_added",
@@ -377,14 +380,42 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
   }
 
   function dispatchTaskToDevice(task, deviceId, now) {
-    if (deviceLease.getMode(deviceId) === "HUMAN") deviceLease.switchToAI(deviceId); // -> AI_IDLE
-    deviceLease.applyEvent(deviceId, "START_TASK"); // -> AI_RUNNING
-    task.state = TASK_STATES.RUNNING;
-    task.deviceSelector = { ...task.deviceSelector, deviceId };
-    task.retryNotBefore = null;
-    task.dispatchedAt = now.toISOString();
-    task.updatedAt = now.toISOString();
-    persist();
+    const previousMode = deviceLease.getMode(deviceId);
+    const previousTask = {
+      state: task.state,
+      deviceSelector: task.deviceSelector,
+      retryNotBefore: task.retryNotBefore,
+      dispatchedAt: task.dispatchedAt,
+      updatedAt: task.updatedAt,
+    };
+    try {
+      if (previousMode === "HUMAN") deviceLease.switchToAI(deviceId); // -> AI_IDLE
+      deviceLease.applyEvent(deviceId, "START_TASK"); // -> AI_RUNNING
+      task.state = TASK_STATES.RUNNING;
+      task.deviceSelector = { ...task.deviceSelector, deviceId };
+      task.retryNotBefore = null;
+      task.dispatchedAt = now.toISOString();
+      task.updatedAt = now.toISOString();
+      persist();
+    } catch (error) {
+      task.state = previousTask.state;
+      task.deviceSelector = previousTask.deviceSelector;
+      task.retryNotBefore = previousTask.retryNotBefore;
+      task.updatedAt = previousTask.updatedAt;
+      if (previousTask.dispatchedAt === undefined) delete task.dispatchedAt;
+      else task.dispatchedAt = previousTask.dispatchedAt;
+
+      const currentMode = deviceLease.getMode(deviceId);
+      if (previousMode === "AI_IDLE" && currentMode === "AI_RUNNING") {
+        deviceLease.applyEvent(deviceId, "TASK_FINISHED");
+      } else if (currentMode !== previousMode) {
+        // A failed dispatch must fail closed. HUMAN is the only synchronous
+        // safe fallback when a partially-completed lease transition cannot
+        // be restored exactly.
+        deviceLease.emergencyStop(deviceId);
+      }
+      return null;
+    }
     auditLog?.logEvent({
       operator: task.createdBy,
       type: "task_dispatched",
@@ -392,6 +423,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
       detail: { taskId: task.id, goal: task.goal },
     });
     emit("dispatched", { task, deviceId });
+    return task;
   }
 
   // Tries every currently-free device against the queue — not just one task
@@ -404,8 +436,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     for (const device of freeDevices()) {
       const task = pickTaskForDevice(device.id, now);
       if (!task) continue;
-      dispatchTaskToDevice(task, device.id, now);
-      dispatched.push(task);
+      if (dispatchTaskToDevice(task, device.id, now)) dispatched.push(task);
     }
     return dispatched;
   }

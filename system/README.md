@@ -412,7 +412,9 @@ across relay restarts; a task that reaches
 `NEEDS_HUMAN` triggers a real handoff (`deviceLease.switchToHuman`), not
 just a status flag; and a relay restart recovers any task that was `RUNNING`
 mid-crash per its retry policy, exactly like the persistence work above
-already proved for sessions and audit history.
+already proved for sessions and audit history. Task admission is write-first,
+and a failed dispatch write restores both the queued task and its prior device
+lease so a disk error cannot create hidden work or a workerless `RUNNING` task.
 
 A restricted admin cannot accidentally bypass device RBAC by creating a
 generic task: task specs carry the creator's allowed-device set, and scheduler
@@ -574,7 +576,7 @@ UI-role pass.
 admin-only APIs, admin access, direct VA AI-control rejection, normal VA device
 control, restricted-admin scheduler dispatch, research ownership/review, model
 adapters, observation fallback, policy enforcement and the bounded worker.
-Full suite: **352/352 passing** on 2026-09-09. A final visual pass in Chrome/Safari on the deployment
+Full suite: **354/354 passing** on 2026-09-09. A final visual pass in Chrome/Safari on the deployment
 Mac is still recommended because the repo does not run a full browser E2E
 harness.
 

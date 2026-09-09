@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
 import os from "os";
@@ -77,6 +77,47 @@ test("addTask with no window dispatches immediately to a free device", () => {
   assert.equal(task.state, TASK_STATES.RUNNING);
   assert.ok(["dev-1", "dev-2"].includes(task.deviceSelector.deviceId));
   assert.equal(deviceLease.getMode(task.deviceSelector.deviceId), "AI_RUNNING");
+});
+
+test("a task admission persistence failure leaves no hidden live task", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-task-admission-fail-"));
+  const storePath = path.join(dir, "tasks.json");
+  try {
+    const queue = createTaskQueue({
+      devices: makeDevices(["dev-1"]),
+      deviceLease: createMockDeviceLease(),
+      auditLog: null,
+      storePath,
+    });
+    fs.mkdirSync(storePath);
+    assert.throws(() => queue.addTask({ goal: "must not leak into memory" }));
+    assert.deepEqual(queue.listTasks(), []);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("a dispatch persistence failure restores the queued task and device lease", () => {
+  const { dir, queue, deviceLease } = setup(["dev-1"]);
+  const originalRename = fs.renameSync.bind(fs);
+  let renames = 0;
+  const rename = mock.method(fs, "renameSync", (from, to) => {
+    renames += 1;
+    if (renames === 2) throw new Error("injected dispatch write failure");
+    return originalRename(from, to);
+  });
+  let task;
+  try {
+    task = queue.addTask({ goal: "remain safely queued", deviceSelector: { deviceId: "dev-1" } });
+  } finally { rename.mock.restore(); }
+
+  assert.equal(task.state, TASK_STATES.QUEUED);
+  assert.equal(task.dispatchedAt, undefined);
+  assert.equal(deviceLease.getMode("dev-1"), "HUMAN");
+  const stored = JSON.parse(fs.readFileSync(path.join(dir, "tasks.json"), "utf8"));
+  assert.equal(stored.tasks[0].state, TASK_STATES.QUEUED);
+
+  queue.tick(new Date());
+  assert.equal(task.state, TASK_STATES.RUNNING);
+  assert.equal(deviceLease.getMode("dev-1"), "AI_RUNNING");
 });
 
 test("a task targeting a specific device only dispatches to that device", () => {

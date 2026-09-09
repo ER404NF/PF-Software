@@ -8,7 +8,7 @@ context. Admin status does not bypass the boundary. Legacy files remain untouche
 and are not served implicitly. Configuration and reviewed migration are documented
 in [RESEARCH_OWNERSHIP.md](RESEARCH_OWNERSHIP.md). No real customer mapping was assumed.
 
-Verification: **352/352 full-suite tests passed** with `npm test` (current count,
+Verification: **354/354 full-suite tests passed** with `npm test` (current count,
 up from the 215 recorded when this note was first written). Earlier
 sections describing MS3.3 as undecided are historical and superseded by this update.
 This completes the research-record boundary, not global queue/audit tenancy.
@@ -110,7 +110,7 @@ what the other docs say should exist.
 **Update:** the original version of this report (below, still accurate for
 MS5 and MS8 onward) found zero milestones complete. Since then, **MS1
 through MS4, MS6, and MS7 were implemented and verified**. The 2026-09-08
-current full automated suite is **352/352 passing**
+current full automated suite is **354/354 passing**
 (`npm test`). Earlier manual browser/curl passes still cover device control,
 login/logout, audit, AI-mode handoff, and the command console; this latest
 role-split pass adds automated DOM/authorization coverage and should still get
@@ -126,13 +126,13 @@ hardware to build or test.
 
 | MS | Name | Code status | Testing gate |
 |---|---|---|---|
-| 1 | Engineering foundations & test infra | ✅ Done | ✅ Passing (352-test full suite) |
-| 2 | Human VA core hardening | ✅ Done | ✅ Passing (part of the 352) |
-| 3 | Authentication & authorization | ✅ MS3.1/3.2, VA/admin roles and MS3.3 research-record ownership implemented; customer mappings/migration remain explicit setup | ✅ Passing (352-test full suite, 2026-09-09) |
-| 4 | Persistence, audit & health | ✅ Done (MS4.1 rescoped — see detail) | ✅ Passing (part of the 352) |
+| 1 | Engineering foundations & test infra | ✅ Done | ✅ Passing (354-test full suite) |
+| 2 | Human VA core hardening | ✅ Done | ✅ Passing (part of the 354) |
+| 3 | Authentication & authorization | ✅ MS3.1/3.2, VA/admin roles and MS3.3 research-record ownership implemented; customer mappings/migration remain explicit setup | ✅ Passing (354-test full suite, 2026-09-09) |
+| 4 | Persistence, audit & health | ✅ Done (MS4.1 rescoped — see detail) | ✅ Passing (part of the 354) |
 | 5 | Real-device validation & scaling | 🟡 Reusable N-device mock soak runner built; physical WDA validation remains | ✅ 5 mocks/60 actions short proof passed; 30-minute and real-device gates not run |
-| 6 | Controller mode & input-lease abstraction | ✅ Done (MS6.3 UI: see detail — STOP AI is now `admin`-only, a deliberate 2026-09-09 decision) | ✅ Passing (part of the 352) |
-| 7 | Command & queue scheduler | ✅ Done | ✅ Passing (part of the 352) |
+| 6 | Controller mode & input-lease abstraction | ✅ Done (MS6.3 UI: see detail — STOP AI is now `admin`-only, a deliberate 2026-09-09 decision) | ✅ Passing (part of the 354) |
+| 7 | Command & queue scheduler | ✅ Done | ✅ Passing (part of the 354) |
 | 8 | AI VA read-only research mode | 🟡 Software path complete locally: providers, model selection, three versioned accessibility profiles, production runner, candidate/evidence pipeline and handoff | ✅ Local unit/integration coverage passing; live provider/app/device gate not run |
 | 9 | Private research markers | ⬜ Not started, blocked on MS8 | ❌ Not run |
 | 10 | Configured account actions | ⬜ Not started, blocked on MS8-9 | ❌ Not run |
@@ -494,6 +494,9 @@ What's implemented:
   `FAILED_FINAL`'d per its own retry policy on load — COMMAND_QUEUE_SPEC.md
   §14 has no dedicated "interrupted" state among its 13, so this reuses the
   same accounting a normal failure would).
+- Queue admission now writes the task snapshot before adding it to the live
+  scheduler. If a dispatch write fails after taking a device lease, the task
+  and lease roll back to their prior states and a later tick can retry safely.
 - `/cresearch` formalized in `docs/COMMAND_QUEUE_SPEC.md` as its own
   documented section (MS7.1.4) — no longer just a code-comment convention.
 - `POST /api/queue/command` and `GET /api/queue`, both auth-gated;
@@ -730,7 +733,7 @@ rebuilt:
 **All three originally-requested priorities are now done**: #1 (fleet UI),
 #2 (VA/admin role split), and #3 (research review panel + full
 `ContentCandidate` schema, plus MS3.3's ownership-model decision that #3
-depended on) — all built, tested, and reflected above. 352/352 tests passing.
+depended on) — all built, tested, and reflected above. 354/354 tests passing.
 
 What's actually left, in rough priority order:
 
