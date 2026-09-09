@@ -32,11 +32,11 @@ const REPORTABLE_OUTCOMES = new Set([
 ]);
 
 const replaceWaitArray = new Int32Array(new SharedArrayBuffer(4));
-function writeTasks(storePath, tasks) {
+function writeQueueSnapshot(storePath, tasks, paused) {
   fs.mkdirSync(path.dirname(storePath), { recursive: true });
   const temporary = `${storePath}.${crypto.randomUUID()}.tmp`;
   try {
-    fs.writeFileSync(temporary, JSON.stringify(tasks, null, 2), { flag: "wx" });
+    fs.writeFileSync(temporary, JSON.stringify({ version: 1, paused, tasks }, null, 2), { flag: "wx" });
     for (let attempt = 0; ; attempt++) {
       try {
         fs.renameSync(temporary, storePath);
@@ -51,10 +51,16 @@ function writeTasks(storePath, tasks) {
   }
 }
 
-function loadTasks(storePath) {
-  if (!fs.existsSync(storePath)) return [];
-  const tasks = JSON.parse(fs.readFileSync(storePath, "utf8"));
-  let changed = false;
+function loadQueueSnapshot(storePath) {
+  if (!fs.existsSync(storePath)) return { tasks: [], paused: false };
+  const stored = JSON.parse(fs.readFileSync(storePath, "utf8"));
+  const isLegacyArray = Array.isArray(stored);
+  if (!isLegacyArray && (!stored || typeof stored !== "object" || !Array.isArray(stored.tasks))) {
+    throw new Error("invalid queue snapshot");
+  }
+  const tasks = isLegacyArray ? stored : stored.tasks;
+  const paused = isLegacyArray ? false : stored.paused === true;
+  let changed = isLegacyArray;
   for (const task of tasks) {
     // Migrate snapshots written before retry timing became durable. Keeping
     // the normalized policy on every loaded task also prevents old files
@@ -84,24 +90,25 @@ function loadTasks(storePath) {
       changed = true;
     }
   }
-  if (changed) writeTasks(storePath, tasks);
-  return tasks;
+  if (changed) writeQueueSnapshot(storePath, tasks, paused);
+  return { tasks, paused };
 }
 
 function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOnCreate = true }) {
   fs.mkdirSync(path.dirname(storePath), { recursive: true });
-  const tasks = loadTasks(storePath);
-  let paused = false;
+  const snapshot = loadQueueSnapshot(storePath);
+  const tasks = snapshot.tasks;
+  let paused = snapshot.paused;
   const listeners = { dispatched: [], completed: [] };
 
   function persist() {
     // A crash during a direct truncate/write can destroy the only durable
     // queue snapshot. Write a complete sibling file and atomically replace
     // the destination so restart recovery sees the old or new state only.
-    writeTasks(storePath, tasks);
+    writeQueueSnapshot(storePath, tasks, paused);
   }
 
-  // Restart recovery (COMMAND_QUEUE_SPEC.md §14): loadTasks() above already
+  // Restart recovery (COMMAND_QUEUE_SPEC.md §14): loadQueueSnapshot() above already
   // requeued or failed any interrupted task per its retry policy — this is
   // what actually lets a requeued one resume immediately on a fresh device
   // set (every device starts HUMAN/idle on a new process) rather than
@@ -300,10 +307,14 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
   }
 
   function pauseQueue() {
+    if (paused) return;
     paused = true;
+    persist();
   }
   function resumeQueue() {
+    if (!paused) return;
     paused = false;
+    persist();
   }
   function isPaused() {
     return paused;

@@ -404,7 +404,8 @@ What's real today: a task with no time window
 dispatches immediately to a free device; a task can target a specific device
 or take whichever frees up first; equal-priority tasks stay FIFO unless
 `/queue move` reorders them; a task's window opening/closing is enforced on
-a clock tick, not just at creation; `FAILED_RETRYABLE` re-queues up to its
+a clock tick, not just at creation; the global `/queue pause` state survives
+relay restarts; `FAILED_RETRYABLE` re-queues up to its
 `retryPolicy.maxRetries` before going `FAILED_FINAL`, and a configured
 `retryPolicy.backoffMs` now creates a durable retry deadline that is enforced
 across relay restarts; a task that reaches
@@ -573,7 +574,7 @@ UI-role pass.
 admin-only APIs, admin access, direct VA AI-control rejection, normal VA device
 control, restricted-admin scheduler dispatch, research ownership/review, model
 adapters, observation fallback, policy enforcement and the bounded worker.
-Full suite: **351/351 passing** on 2026-09-09. A final visual pass in Chrome/Safari on the deployment
+Full suite: **352/352 passing** on 2026-09-09. A final visual pass in Chrome/Safari on the deployment
 Mac is still recommended because the repo does not run a full browser E2E
 harness.
 

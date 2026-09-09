@@ -252,7 +252,7 @@ test("retry backoff is durable and blocks redispatch until retryNotBefore", asyn
   assert.ok(Number.isFinite(retryAt.getTime()));
 
   const stored = JSON.parse(fs.readFileSync(path.join(dir, "tasks.json"), "utf8"));
-  assert.equal(stored[0].retryNotBefore, waiting.retryNotBefore);
+  assert.equal(stored.tasks[0].retryNotBefore, waiting.retryNotBefore);
 
   queue.tick(new Date(retryAt.getTime() - 1));
   assert.equal(queue.getTask(task.id).state, TASK_STATES.QUEUED);
@@ -317,6 +317,36 @@ test("pauseQueue stops new dispatches; resumeQueue lets them resume", () => {
   queue.resumeQueue();
   queue.tick(new Date());
   assert.equal(queue.getTask(task.id).state, TASK_STATES.RUNNING);
+});
+
+test("queue pause state survives restart and resume is persisted", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-paused-queue-"));
+  const storePath = path.join(dir, "tasks.json");
+  try {
+    const devices = makeDevices(["dev-1"]);
+    const first = createTaskQueue({ devices, deviceLease: createMockDeviceLease(), auditLog: null, storePath });
+    first.pauseQueue();
+    first.addTask({ goal: "wait while paused" });
+
+    const restarted = createTaskQueue({
+      devices,
+      deviceLease: createMockDeviceLease(),
+      auditLog: null,
+      storePath,
+    });
+    assert.equal(restarted.isPaused(), true);
+    assert.equal(restarted.listTasks()[0].state, TASK_STATES.QUEUED);
+
+    restarted.resumeQueue();
+    const reloaded = createTaskQueue({
+      devices,
+      deviceLease: createMockDeviceLease(),
+      auditLog: null,
+      storePath,
+      dispatchOnCreate: false,
+    });
+    assert.equal(reloaded.isPaused(), false);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("reportResult throws for an unknown task id or a task that isn't RUNNING", async () => {
