@@ -265,6 +265,19 @@ export function appendCandidate(workspaceId, account, runId, input) {
   return recorded;
 }
 
+export function finalizeRun(workspaceId, account, runId, { overview, outcome = "SUCCEEDED" } = {}) {
+  if (!accountFile(workspaceId, account)) return null;
+  if (typeof overview !== "string" || !overview.trim()) return null;
+  const data = readAccount(workspaceId, account);
+  const run = data.runs.find((entry) => entry.id === runId);
+  if (!run) return null;
+  run.overview = overview.trim();
+  run.outcome = outcome;
+  run.completedAt = new Date().toISOString();
+  writeAccount(workspaceId, account, data);
+  return run;
+}
+
 // The VA's review action: confirm a good match, or remove one the AI got
 // wrong. Never anything platform-visible — this only touches our own record.
 export function setCandidateStatus(workspaceId, account, runId, candidateId, status) {

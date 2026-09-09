@@ -12,6 +12,7 @@ const getRun = (...args) => store.getRun("workspace-a", ...args);
 const listRuns = (...args) => store.listRuns("workspace-a", ...args);
 const setCandidateStatus = (...args) => store.setCandidateStatus("workspace-a", ...args);
 const appendCandidate = (...args) => store.appendCandidate("workspace-a", ...args);
+const finalizeRun = (...args) => store.finalizeRun("workspace-a", ...args);
 
 // Uses a dedicated, disposable account so this never touches a real
 // account's research history. Cleaned up in `after` regardless of outcome.
@@ -63,6 +64,17 @@ test("appendCandidate adds and merges durable discoveries into an existing run",
   assert.deepEqual(merged.tags, ["hook", "format"]);
   assert.equal(getRun("append", run.id).candidates.length, 1);
   assert.equal(appendCandidate("append", "missing-run", { platform_content_id: "x" }), null);
+});
+
+test("finalizeRun replaces the provisional overview and records completion", () => {
+  const run = createRun("finalize", { platform: "reddit", overview: "first finding", candidates: [] });
+  const finalized = finalizeRun("finalize", run.id, { overview: "Three useful themes found", outcome: "SUCCEEDED" });
+  assert.equal(finalized.overview, "Three useful themes found");
+  assert.equal(finalized.outcome, "SUCCEEDED");
+  assert.ok(Number.isFinite(new Date(finalized.completedAt).getTime()));
+  assert.deepEqual(getRun("finalize", run.id), finalized);
+  assert.equal(finalizeRun("finalize", "missing", { overview: "x" }), null);
+  assert.equal(finalizeRun("finalize", run.id, { overview: " " }), null);
 });
 
 test("createRun tolerates a malformed candidate instead of throwing", () => {

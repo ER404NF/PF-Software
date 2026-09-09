@@ -1,6 +1,6 @@
 import { runResearchStep } from "./researchWorker.js";
 import { TASK_STATES } from "./taskSpec.js";
-import { createRun, appendCandidate } from "./researchStore.js";
+import { createRun, appendCandidate, finalizeRun } from "./researchStore.js";
 import { saveResearchEvidence } from "./researchEvidenceStore.js";
 
 const COMPLETE_PROGRESS = new Set(["complete", "completed", "done", "goal complete", "goal completed"]);
@@ -24,6 +24,7 @@ export function createResearchTaskRunner({
   sleep = wait,
   createRunRecord = createRun,
   appendCandidateRecord = appendCandidate,
+  finalizeRunRecord = finalizeRun,
   saveEvidenceRecord = saveResearchEvidence,
 } = {}) {
   if (!taskQueue || !devices || !deviceLease) throw new Error("research task runner requires queue, devices and lease");
@@ -143,7 +144,13 @@ export function createResearchTaskRunner({
       }
       const progress = String(result.decision?.goal_progress ?? "").trim().toLowerCase();
       if (COMPLETE_PROGRESS.has(progress)) {
-        ensureRun(result.decision.reason);
+        const completedRunId = ensureRun(result.decision.reason);
+        const finalized = finalizeRunRecord(workspaceId, accountId, completedRunId, {
+          overview: result.decision.reason,
+          outcome: TASK_STATES.SUCCEEDED,
+        });
+        if (!finalized?.id) throw new Error("research run could not be finalized");
+        taskQueue.checkpoint(task.id, { researchRunId: completedRunId, recordType: "research_run_completed" });
         if (taskQueue.getTask(task.id)?.state === TASK_STATES.RUNNING) {
           await taskQueue.reportResult(task.id, TASK_STATES.SUCCEEDED, { detail: "research goal completed" });
         }

@@ -35,6 +35,11 @@ function setup({ provider = null, skill = createInstagramSkill({ appVersion: "fi
       const recorded = { id: `candidate-${run.candidates.length + 1}`, ...candidate };
       run.candidates.push(recorded); return recorded;
     },
+    finalizeRunRecord(workspaceId, accountId, runId, final) {
+      const run = runs.find((entry) => entry.id === runId);
+      Object.assign(run, final, { completedAt: "2026-09-09T00:00:00.000Z" });
+      return run;
+    },
     saveEvidenceRecord() { return { ref: "/api/research/account-a/evidence/evidence-fixture.png" }; } });
   runner.start();
   return { device, queue, runner, runs };
@@ -109,7 +114,10 @@ test("a verified candidate is written to the task's durable research run", async
   assert.equal(runs[0].candidates[0].task_id, task.id);
   assert.deepEqual(runs[0].candidates[0].evidence_refs,
     ["/api/research/account-a/evidence/evidence-fixture.png"]);
+  assert.equal(runs[0].overview, "done");
+  assert.equal(runs[0].outcome, TASK_STATES.SUCCEEDED);
   assert.equal(queue.getTask(task.id).checkpoints.some((entry) => entry.data?.recordType === "content_candidate"), true);
+  assert.equal(queue.getTask(task.id).checkpoints.some((entry) => entry.data?.recordType === "research_run_completed"), true);
 });
 
 test("the next decision uses a provider selected while the task is running", async () => {
@@ -132,7 +140,8 @@ test("the next decision uses a provider selected while the task is running", asy
     providerForTask: () => providerMap[selected], skillForPlatform: () => createInstagramSkill({ appVersion: "fixture-1" }),
     operatorForUsername: () => ({ username: "admin" }), workspaceForOperatorAccount: () => "client-a",
     stepDelayMs: 0, sleep: async () => { selected = "second"; },
-    createRunRecord: () => ({ id: "run-switch" }), appendCandidateRecord: () => ({ id: "unused" }) });
+    createRunRecord: () => ({ id: "run-switch" }), appendCandidateRecord: () => ({ id: "unused" }),
+    finalizeRunRecord: () => ({ id: "run-switch" }) });
   runner.start();
   const task = queue.addTask({ kind: "research", goal: "Switch providers", createdBy: "admin",
     accountSelector: { platform: "instagram", accountId: "account-a" }, allowedActions: ["open_feed", "observe"] });

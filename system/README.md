@@ -571,7 +571,7 @@ UI-role pass.
 admin-only APIs, admin access, direct VA AI-control rejection, normal VA device
 control, restricted-admin scheduler dispatch, research ownership/review, model
 adapters, observation fallback, policy enforcement and the bounded worker.
-Full suite: **347/347 passing** on 2026-09-09. A final visual pass in Chrome/Safari on the deployment
+Full suite: **348/348 passing** on 2026-09-09. A final visual pass in Chrome/Safari on the deployment
 Mac is still recommended because the repo does not run a full browser E2E
 harness.
 
