@@ -199,6 +199,19 @@ research-storage validation logic, plus integration tests that drive the
 relay's actual WebSocket protocol and the WDA adapter against the fake-WDA
 fixture below. No hardware or manual setup required.
 
+Run the configurable multi-device soak gate with:
+
+```bash
+npm run soak -- --devices=5 --duration-sec=1800 --actions-per-sec=2
+```
+
+The runner creates isolated temporary storage, authenticated WebSocket clients,
+and one mock device per client. It reports attempts, errors, error rate, and
+heap growth, and exits nonzero when `--max-error-rate` (default `0.01`) or
+`--max-heap-growth-mb` (default `64`) is exceeded. The default duration is 30
+minutes; a shorter run only validates the harness and does not satisfy MS5's
+soak gate.
+
 ## Fake-WDA integration fixture
 
 `server/fixtures/fake-wda-server.js` implements the WDA routes used by the

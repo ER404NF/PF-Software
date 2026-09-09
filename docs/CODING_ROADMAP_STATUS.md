@@ -130,7 +130,7 @@ hardware to build or test.
 | 2 | Human VA core hardening | ✅ Done | ✅ Passing (part of the 347) |
 | 3 | Authentication & authorization | ✅ MS3.1/3.2, VA/admin roles and MS3.3 research-record ownership implemented; customer mappings/migration remain explicit setup | ✅ Passing (347-test full suite, 2026-09-09) |
 | 4 | Persistence, audit & health | ✅ Done (MS4.1 rescoped — see detail) | ✅ Passing (part of the 347) |
-| 5 | Real-device validation & scaling | ⬜ Not started (hardware-dependent) | ❌ Not run |
+| 5 | Real-device validation & scaling | 🟡 Reusable N-device mock soak runner built; physical WDA validation remains | ✅ 5 mocks/60 actions short proof passed; 30-minute and real-device gates not run |
 | 6 | Controller mode & input-lease abstraction | ✅ Done (MS6.3 UI: see detail — STOP AI is now `admin`-only, a deliberate 2026-09-09 decision) | ✅ Passing (part of the 347) |
 | 7 | Command & queue scheduler | ✅ Done | ✅ Passing (part of the 347) |
 | 8 | AI VA read-only research mode | 🟡 Software path complete locally: providers, model selection, three versioned accessibility profiles, production runner, candidate/evidence pipeline and handoff | ✅ Local unit/integration coverage passing; live provider/app/device gate not run |
@@ -396,17 +396,20 @@ once found; it was never meaningful data to begin with.
 
 ## MS5 — Real-device validation & scaling
 
-**Status: ⬜ Not started.** `system/README.md` states this outright: "The
-exact real-hardware behavior remains unverified until bench-tested on the
-target Mac/phone setup." Nothing to verify from this environment — genuinely
-hardware-dependent, not a code gap.
+**Status: 🟡 The automated scale harness is built; physical validation remains.**
+`npm run soak` creates isolated authenticated WebSocket clients and mock devices,
+drives tap/swipe/home traffic concurrently, and fails when its error-rate or
+heap-growth threshold is exceeded. A short 5-device proof completed 60 actions
+with 0 errors and +1.4 MB heap. This proves the harness and concurrency path,
+not the roadmap's 30-minute soak requirement. The one-iPhone WDA bench,
+latency baseline, failure injection, 30-minute soak, and physical 1 → 2 → 5
+gates remain unverified until the hardware is connected.
 
 ---
 
 ## MS6 — Controller mode & input-lease abstraction
 
-**Status: ✅ Done — with MS6.3 (dedicated AI-console UI) deliberately deferred,
-since there's nothing real yet for it to show.**
+**Status: ✅ Done, including the role-gated AI status and takeover UI.**
 
 **Design decision worth flagging:** the six controller modes are a dimension
 *orthogonal* to the existing `idle`/`in-use`/`offline` status, not a
