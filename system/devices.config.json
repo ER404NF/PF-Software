@@ -1,0 +1,18 @@
+{
+  "devices": [
+    {
+      "id": "mock-1",
+      "label": "iPhone SE — Bench 1 (mock)",
+      "type": "mock",
+      "hostLabel": "mac-mini-1",
+      "network": { "egress": "cellular-sim", "simIccid": "8901000000000000001", "controlIface": "usb" }
+    },
+    {
+      "id": "mock-2",
+      "label": "iPhone SE — Bench 2 (mock)",
+      "type": "mock",
+      "hostLabel": "mac-mini-1",
+      "network": { "egress": "vlan-proxy", "vlanId": "vlan-bench-1", "controlIface": "usb" }
+    }
+  ]
+}

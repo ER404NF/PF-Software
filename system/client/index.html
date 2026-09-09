@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Phone Farm — VA Control (dev)</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <form id="login-form">
+    <h1>Phone Farm — Sign in</h1>
+    <input type="text" id="login-username" placeholder="Username" autocomplete="username" required />
+    <input type="password" id="login-password" placeholder="Password" autocomplete="current-password" required />
+    <button type="submit">Sign in</button>
+    <p id="login-error"></p>
+  </form>
+
+  <div id="app" hidden>
+    <header id="top-bar">
+      <div id="top-bar-left">
+        <h1>Phone Farm</h1>
+        <nav id="admin-nav" hidden aria-label="Admin navigation">
+          <button type="button" id="fleet-nav-button" class="top-nav-button active">Fleet</button>
+          <button type="button" id="admin-nav-button" class="top-nav-button">Admin / Dev</button>
+        </nav>
+      </div>
+      <div id="top-bar-right">
+        <span id="role-badge"></span>
+        <span id="whoami"></span>
+        <button type="button" id="research-toggle" aria-controls="research-panel" aria-expanded="false">Research</button>
+        <button type="button" id="logout-button">Sign out</button>
+      </div>
+    </header>
+
+    <p id="connection-status" hidden>Disconnected — reconnecting…</p>
+
+    <section id="fleet-view">
+      <p id="select-error"></p>
+      <div id="fleet-groups"></div>
+    </section>
+
+    <section id="detail-view" hidden>
+      <button type="button" id="back-to-fleet-button">&larr; Fleet</button>
+      <h2 id="detail-title"></h2>
+      <div id="detail-ai-status"></div>
+      <div id="detail-body">
+        <main id="screen-panel">
+          <div id="screen-wrap">
+            <div id="screen"></div>
+          </div>
+          <p id="hint">Select a device to begin.</p>
+          <div id="swipe-controls" hidden>
+            <button type="button" data-direction="up">&uarr;</button>
+            <div id="swipe-row">
+              <button type="button" data-direction="left">&larr;</button>
+              <button type="button" data-direction="right">&rarr;</button>
+            </div>
+            <button type="button" data-direction="down">&darr;</button>
+          </div>
+          <button type="button" id="home-button" hidden>&#9673; Home</button>
+          <form id="type-form" hidden>
+            <input type="text" id="type-input" placeholder="Type on device…" maxlength="1000" />
+            <button type="submit">Send</button>
+          </form>
+          <button type="button" id="release-button" hidden>Release device</button>
+        </main>
+        <aside id="files-panel">
+          <h1>Files</h1>
+          <p id="files-hint">Select a device to see its files.</p>
+          <form id="upload-form" hidden>
+            <input type="file" id="upload-input" />
+            <button type="submit">Upload</button>
+          </form>
+          <ul id="file-list"></ul>
+        </aside>
+      </div>
+    </section>
+
+    <!-- Admin/dev workspace. The server independently enforces the same role
+         boundary; hidden UI is convenience, not authorization. -->
+    <section id="admin-view" hidden>
+      <header class="admin-heading">
+        <div>
+          <h2>Admin / Dev</h2>
+          <p>Command execution, queue state, audit history, and AI-mode oversight.</p>
+        </div>
+        <button type="button" id="admin-refresh-button">Refresh all</button>
+      </header>
+
+      <section class="admin-panel" id="command-console-panel">
+        <div class="admin-panel-heading">
+          <h3>Command Console</h3>
+          <span>Uses the existing command parser and queue API.</span>
+        </div>
+        <form id="command-form">
+          <input id="command-input" type="text" placeholder="/queue list, /mode ai mock-1, /time 09:00-10:00 …" autocomplete="off" />
+          <button type="submit">Run</button>
+        </form>
+        <pre id="command-output" aria-live="polite">No command run yet.</pre>
+      </section>
+
+      <section class="admin-panel" id="queue-panel">
+        <div class="admin-panel-heading">
+          <div>
+            <h3>Task Queue</h3>
+            <span id="queue-state">Loading…</span>
+          </div>
+          <button type="button" id="queue-refresh-button">Refresh</button>
+        </div>
+        <div class="admin-table-wrap">
+          <table class="admin-table">
+            <thead>
+              <tr>
+                <th>Task</th>
+                <th>Goal</th>
+                <th>Device</th>
+                <th>Account</th>
+                <th>State</th>
+                <th>Priority</th>
+                <th>Window</th>
+              </tr>
+            </thead>
+            <tbody id="queue-body"></tbody>
+          </table>
+        </div>
+        <p id="queue-empty" class="admin-empty" hidden>No tasks in the queue.</p>
+      </section>
+
+      <section class="admin-panel" id="audit-panel">
+        <div class="admin-panel-heading">
+          <div>
+            <h3>Audit Log</h3>
+            <span>Newest events first.</span>
+          </div>
+          <button type="button" id="audit-refresh-button">Refresh</button>
+        </div>
+        <div class="admin-table-wrap">
+          <table class="admin-table">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Operator</th>
+                <th>Event</th>
+                <th>Device</th>
+                <th>Detail</th>
+              </tr>
+            </thead>
+            <tbody id="audit-body"></tbody>
+          </table>
+        </div>
+        <p id="audit-empty" class="admin-empty" hidden>No audit events.</p>
+      </section>
+    </section>
+    <aside id="research-panel" hidden aria-label="Research review">
+      <div class="research-heading"><h2>Research</h2><button type="button" id="research-close">Close</button></div>
+      <p>Review collected findings. AI chat and automatic collection are not connected yet.</p>
+      <label for="research-account">Assigned account</label>
+      <select id="research-account"></select>
+      <button type="button" id="research-refresh">Refresh findings</button>
+      <p id="research-message" role="status" aria-live="polite"></p>
+      <div id="research-results"></div>
+    </aside>
+  </div>
+  <script src="research.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

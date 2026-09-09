@@ -1,0 +1,18 @@
+node_modules/
+
+# Generated analysis and third-party research checkouts are local inputs, not
+# maintained project source. Keep the authored research notes themselves.
+graphify-out/
+research/WebDriverAgent/
+research/appium-xcuitest-driver/
+
+# Per-device uploads and AI research records — runtime data, not source.
+# Directory structure is preserved via .gitkeep files; contents are not.
+system/storage/**
+!system/storage/**/
+!system/storage/**/.gitkeep
+
+# Operator accounts (password hashes). Unlike devices.config.json this is
+# credential material, not fixture data — generate it locally with
+# server/scripts/create-operator.js, never commit it.
+system/operators.config.json

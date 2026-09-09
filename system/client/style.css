@@ -1,0 +1,751 @@
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  font-family: -apple-system, "Segoe UI", sans-serif;
+  background: #1c1c1e;
+  color: #f2f2f7;
+}
+
+#app[hidden] { display: none; }
+
+#top-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 24px;
+  background: #2c2c2e;
+  border-bottom: 1px solid #3a3a3c;
+}
+
+#top-bar h1 {
+  font-size: 16px;
+  margin: 0;
+  color: #f2f2f7;
+}
+
+#top-bar-right {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+#whoami {
+  font-size: 13px;
+  color: #8e8e93;
+}
+
+#logout-button {
+  background: none;
+  color: #8e8e93;
+  border: 1px solid #3a3a3c;
+  border-radius: 6px;
+  padding: 6px 14px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+#logout-button:hover { background: #3a3a3c; color: #f2f2f7; }
+
+#connection-status {
+  background: #3a1414;
+  color: #ff8a8a;
+  font-size: 12px;
+  padding: 8px 24px;
+}
+
+#connection-status[hidden] { display: none; }
+
+/* ---------- Fleet view ---------- */
+
+#fleet-view {
+  padding: 20px 24px 40px;
+}
+
+#select-error {
+  margin: 0 0 14px;
+  font-size: 13px;
+  color: #ff453a;
+  min-height: 16px;
+}
+
+.fleet-group { margin-bottom: 28px; }
+
+.fleet-group-heading {
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #8e8e93;
+  margin: 0 0 12px;
+}
+
+.fleet-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 12px;
+}
+
+.device-card {
+  position: relative;
+  background: #2c2c2e;
+  border-radius: 12px;
+  padding: 14px;
+  cursor: pointer;
+  border: 1px solid #3a3a3c;
+  border-left: 4px solid #8e8e93;
+  transition: background 0.1s, border-color 0.1s;
+}
+
+.device-card:hover { background: #333336; }
+.device-card.mine { border-color: #0a84ff; box-shadow: 0 0 0 1px #0a84ff; }
+
+.device-card.idle { border-left-color: #8e8e93; }
+.device-card.in-use { border-left-color: #30d158; }
+.device-card.warning { border-left-color: #ff9f0a; }
+.device-card.offline { border-left-color: #ff453a; opacity: 0.6; }
+
+.device-card-body {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.status-dot {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-top: 4px;
+  background: #8e8e93;
+}
+.device-card.idle .status-dot { background: #8e8e93; }
+.device-card.in-use .status-dot { background: #30d158; }
+.device-card.warning .status-dot { background: #ff9f0a; }
+.device-card.offline .status-dot { background: #ff453a; }
+
+.device-card-info { flex: 1; min-width: 0; }
+
+.device-card-label {
+  font-size: 14px;
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.device-card-meta {
+  font-size: 12px;
+  color: #8e8e93;
+  margin-top: 2px;
+}
+
+.mode-pill {
+  display: inline-block;
+  margin-top: 6px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: #3a3a3c;
+  color: #c7c7cc;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.mine-badge {
+  position: absolute;
+  top: -8px;
+  right: 10px;
+  background: #0a84ff;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 8px;
+  white-space: nowrap;
+}
+
+/* MS6.3.1 — a read-only status pane for a device an AI worker is running,
+   visible to the human operator without taking control of it themselves. */
+.ai-status {
+  font-size: 12px;
+  color: #c7c7cc;
+}
+
+.ai-status .ai-status-row { margin-bottom: 3px; }
+.ai-status .ai-status-label { color: #8e8e93; }
+
+/* MS6.3.2 — "physical-looking high-priority" per COMMAND_QUEUE_SPEC.md §9:
+   deliberately loud/red, unmissable, and always present whenever a device
+   isn't in HUMAN mode. `.compact` is the fleet-card-sized version; the
+   full-size one lives in the detail view's AI-status pane. */
+.emergency-stop-btn {
+  margin-top: 8px;
+  width: 100%;
+  background: #ff453a;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 8px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+}
+
+.emergency-stop-btn.compact {
+  margin-top: 10px;
+  padding: 5px 8px;
+  font-size: 11px;
+}
+
+.emergency-stop-btn:hover { background: #ff6961; }
+.emergency-stop-btn:active { background: #d70015; }
+
+/* ---------- Detail view ---------- */
+
+#detail-view { padding: 20px 24px 40px; }
+#detail-view[hidden] { display: none; }
+
+#back-to-fleet-button {
+  background: none;
+  color: #0a84ff;
+  border: none;
+  font-size: 14px;
+  cursor: pointer;
+  padding: 0;
+  margin-bottom: 14px;
+}
+#back-to-fleet-button:hover { text-decoration: underline; }
+
+#detail-title {
+  font-size: 20px;
+  margin: 0 0 10px;
+}
+
+#detail-ai-status:empty { display: none; }
+#detail-ai-status {
+  background: #2c2c2e;
+  border: 1px solid #3a3a3c;
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 18px;
+  max-width: 420px;
+}
+
+#detail-body {
+  display: flex;
+  gap: 24px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+
+#screen-panel {
+  flex: 1;
+  min-width: 320px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+}
+
+#screen-wrap {
+  border: 8px solid #000;
+  border-radius: 36px;
+  overflow: hidden;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+
+#screen svg,
+#screen img {
+  display: block;
+  width: 300px;
+  height: 534px;
+  cursor: pointer;
+  object-fit: cover;
+}
+
+#screen-wrap.busy #screen {
+  opacity: 0.5;
+  pointer-events: none;
+  transition: opacity 0.1s;
+}
+
+#swipe-controls button:disabled,
+#type-form button:disabled,
+#type-input:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+#hint {
+  color: #8e8e93;
+  font-size: 13px;
+}
+
+#swipe-controls {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+#swipe-controls[hidden] { display: none; }
+
+#swipe-row {
+  display: flex;
+  gap: 40px;
+}
+
+#swipe-controls button {
+  background: #3a3a3c;
+  color: #f2f2f7;
+  border: none;
+  border-radius: 8px;
+  width: 40px;
+  height: 32px;
+  font-size: 16px;
+  cursor: pointer;
+}
+
+#swipe-controls button:hover { background: #48484a; }
+
+#type-form {
+  display: flex;
+  gap: 6px;
+}
+
+#type-form[hidden] { display: none; }
+
+#type-input {
+  background: #2c2c2e;
+  border: 1px solid #3a3a3c;
+  border-radius: 6px;
+  color: #f2f2f7;
+  padding: 6px 10px;
+  font-size: 13px;
+  width: 220px;
+}
+
+#type-form button {
+  background: #0a84ff;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 14px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+#release-button {
+  background: #3a3a3c;
+  color: #f2f2f7;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 14px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+#release-button[hidden] { display: none; }
+#release-button:hover { background: #48484a; }
+
+#home-button {
+  background: #3a3a3c;
+  color: #f2f2f7;
+  border: none;
+  border-radius: 20px;
+  padding: 6px 16px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+#home-button[hidden] { display: none; }
+#home-button:hover { background: #48484a; }
+#home-button:disabled { opacity: 0.4; cursor: default; }
+
+#files-panel {
+  width: 260px;
+  flex: none;
+  background: #2c2c2e;
+  border: 1px solid #3a3a3c;
+  border-radius: 12px;
+  padding: 18px;
+}
+
+#files-panel h1 {
+  font-size: 15px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #8e8e93;
+  margin: 0 0 12px;
+}
+
+#files-hint { color: #8e8e93; font-size: 13px; }
+
+#upload-form {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+#upload-form[hidden] { display: none; }
+
+#upload-input { flex: 1; min-width: 0; font-size: 12px; color: #f2f2f7; }
+
+#upload-form button {
+  background: #0a84ff;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 4px 10px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+#file-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+#file-list li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: 8px;
+  margin-bottom: 6px;
+  background: #3a3a3c;
+  font-size: 13px;
+}
+
+#file-list a {
+  color: #0a84ff;
+  text-decoration: none;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-size { color: #8e8e93; font-size: 11px; white-space: nowrap; }
+
+#file-list button {
+  background: none;
+  border: none;
+  color: #ff453a;
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 4px;
+}
+
+/* ---------- Login ---------- */
+
+#login-form {
+  max-width: 280px;
+  margin: 15vh auto 0;
+  padding: 24px;
+  background: #2c2c2e;
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+#login-form[hidden] { display: none; }
+
+#login-form h1 {
+  font-size: 16px;
+  margin: 0 0 6px;
+  color: #f2f2f7;
+}
+
+#login-form input {
+  padding: 8px 10px;
+  border-radius: 6px;
+  border: 1px solid #3a3a3c;
+  background: #1c1c1e;
+  color: #f2f2f7;
+  font-size: 13px;
+}
+
+#login-form button {
+  background: #0a84ff;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 14px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+#login-form button:hover { background: #3395ff; }
+
+#login-error {
+  color: #ff453a;
+  font-size: 12px;
+  margin: 0;
+  min-height: 14px;
+}
+
+/* ---------- Role-aware top navigation ---------- */
+
+#top-bar-left {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+}
+
+#admin-nav {
+  display: flex;
+  gap: 4px;
+}
+
+#admin-nav[hidden] { display: none; }
+
+.top-nav-button {
+  background: transparent;
+  color: #8e8e93;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.top-nav-button:hover { background: #3a3a3c; color: #f2f2f7; }
+.top-nav-button.active { background: #3a3a3c; color: #f2f2f7; }
+
+#role-badge {
+  display: inline-block;
+  border: 1px solid #48484a;
+  border-radius: 999px;
+  padding: 2px 7px;
+  color: #c7c7cc;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+}
+
+#role-badge[hidden] { display: none; }
+
+/* ---------- Role-aware AI controls ---------- */
+
+.device-card.ai-locked {
+  cursor: default;
+}
+
+.ai-locked-note {
+  margin-top: 10px;
+  border-top: 1px solid #3a3a3c;
+  padding-top: 8px;
+  color: #8e8e93;
+  font-size: 11px;
+}
+
+.ai-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid #3a3a3c;
+}
+
+.ai-control-button {
+  flex: 1 1 auto;
+  min-width: 78px;
+  background: #3a3a3c;
+  color: #f2f2f7;
+  border: 1px solid #48484a;
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.ai-control-button:hover { background: #48484a; }
+.ai-control-button.danger { color: #ff6961; border-color: #6f2b2b; }
+.ai-control-button.danger:hover { background: #4b2020; }
+
+/* ---------- Admin/dev workspace ---------- */
+
+#admin-view {
+  padding: 22px 24px 44px;
+}
+
+#admin-view[hidden] { display: none; }
+
+.admin-heading {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 20px;
+  margin-bottom: 18px;
+}
+
+.admin-heading h2 {
+  margin: 0 0 5px;
+  font-size: 20px;
+}
+
+.admin-heading p {
+  margin: 0;
+  color: #8e8e93;
+  font-size: 13px;
+}
+
+.admin-heading button,
+.admin-panel-heading button {
+  background: #3a3a3c;
+  color: #f2f2f7;
+  border: 1px solid #48484a;
+  border-radius: 6px;
+  padding: 6px 10px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.admin-heading button:hover,
+.admin-panel-heading button:hover { background: #48484a; }
+
+.admin-panel {
+  background: #2c2c2e;
+  border: 1px solid #3a3a3c;
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.admin-panel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 12px;
+}
+
+.admin-panel-heading h3 {
+  margin: 0 0 3px;
+  font-size: 14px;
+}
+
+.admin-panel-heading span {
+  color: #8e8e93;
+  font-size: 11px;
+}
+
+#command-form {
+  display: flex;
+  gap: 8px;
+}
+
+#command-input {
+  flex: 1;
+  min-width: 0;
+  background: #1c1c1e;
+  color: #f2f2f7;
+  border: 1px solid #48484a;
+  border-radius: 6px;
+  padding: 9px 10px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+#command-form button {
+  background: #0a84ff;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 14px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+#command-output {
+  margin: 12px 0 0;
+  padding: 12px;
+  min-height: 62px;
+  max-height: 260px;
+  overflow: auto;
+  background: #1c1c1e;
+  border: 1px solid #3a3a3c;
+  border-radius: 6px;
+  color: #d1d1d6;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
+.admin-table-wrap {
+  overflow-x: auto;
+}
+
+.admin-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.admin-table th,
+.admin-table td {
+  text-align: left;
+  vertical-align: top;
+  border-bottom: 1px solid #3a3a3c;
+  padding: 8px 9px;
+}
+
+.admin-table th {
+  color: #8e8e93;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.admin-table tbody tr:last-child td { border-bottom: none; }
+.admin-table .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.admin-table .goal-cell { min-width: 220px; max-width: 420px; }
+.admin-table .window-cell { min-width: 190px; color: #c7c7cc; }
+.admin-table .time-cell { min-width: 150px; white-space: nowrap; }
+.admin-table .event-cell { white-space: nowrap; }
+.admin-table .detail-cell { min-width: 260px; max-width: 520px; color: #c7c7cc; word-break: break-word; }
+
+.admin-empty {
+  margin: 10px 0 0;
+  color: #8e8e93;
+  font-size: 12px;
+}
+
+@media (max-width: 760px) {
+  #top-bar { align-items: flex-start; gap: 10px; }
+  #top-bar-left { align-items: flex-start; flex-direction: column; gap: 8px; }
+  #top-bar-right { flex-wrap: wrap; justify-content: flex-end; }
+  .admin-heading { flex-direction: column; }
+  #command-form { flex-direction: column; }
+}
+/* Research remains available beside fleet/control without changing input ownership. */
+#research-panel {
+  position: fixed;
+  top: 72px;
+  right: 12px;
+  bottom: 12px;
+  width: min(440px, calc(100vw - 24px));
+  box-sizing: border-box;
+  overflow: auto;
+  z-index: 20;
+  padding: 20px;
+  background: #161b22;
+  color: #eef2f6;
+  border: 1px solid #556274;
+  border-radius: 12px;
+  box-shadow: 0 12px 40px #0008;
+  overflow-wrap: anywhere;
+}
+#research-panel[hidden] { display: none; }
+.research-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+#research-account { width: 100%; margin: 8px 0 12px; padding: 8px; }
+.research-run { border-top: 1px solid #556274; margin-top: 16px; }
+.research-candidate { background: #232c38; padding: 12px; margin: 12px 0; border-radius: 8px; }
+.research-candidate a { color: #9fcaff; }
+.research-candidate button { margin: 8px 8px 0 0; }
