@@ -22,7 +22,14 @@ let hanging = false;
 
 app.get("/ip", (req, res) => {
   if (hanging) return; // never responds — simulates an unreachable check endpoint
-  res.json({ ip: currentIp });
+  res.json({
+    ip: currentIp,
+    ipv6: null,
+    region: "test-region",
+    dnsStatus: "ok",
+    proxyHealthy: true,
+    bandwidthMbps: 100,
+  });
 });
 
 // Not part of any real device's API — lets a test control what this fixture

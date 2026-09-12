@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseNetworkConfig, loadDeviceNetworkMap, egressIdentity } from "../../src/deviceNetworkConfig.js";
+import { parseNetworkConfig, loadDeviceNetworkMap, egressIdentity, publicNetworkConfig } from "../../src/deviceNetworkConfig.js";
 
 test("parseNetworkConfig returns null for a device with no network block yet", () => {
   assert.equal(parseNetworkConfig(undefined, "mock-1"), null);
@@ -9,12 +9,16 @@ test("parseNetworkConfig returns null for a device with no network block yet", (
 
 test("parseNetworkConfig accepts a valid cellular-sim assignment", () => {
   const parsed = parseNetworkConfig({ egress: "cellular-sim", simIccid: "8901410...", controlIface: "usb" }, "d1");
-  assert.deepEqual(parsed, { egress: "cellular-sim", vlanId: null, simIccid: "8901410...", controlIface: "usb" });
+  assert.equal(parsed.egress, "cellular-sim");
+  assert.equal(parsed.simIccid, "8901410...");
+  assert.equal(parsed.failPolicy, "fail-closed");
+  assert.equal(parsed.expectedIpv6Policy, "unspecified");
 });
 
 test("parseNetworkConfig accepts a valid vlan-proxy assignment", () => {
   const parsed = parseNetworkConfig({ egress: "vlan-proxy", vlanId: "vlan-7", controlIface: "usb" }, "d1");
-  assert.deepEqual(parsed, { egress: "vlan-proxy", vlanId: "vlan-7", simIccid: null, controlIface: "usb" });
+  assert.equal(parsed.egress, "vlan-proxy");
+  assert.equal(parsed.vlanId, "vlan-7");
 });
 
 test("parseNetworkConfig rejects a non-object network block", () => {
@@ -101,4 +105,39 @@ test("egressIdentity treats two different simIccids (or vlanIds) as different id
   const a = egressIdentity({ egress: "cellular-sim", simIccid: "111", vlanId: null, controlIface: "usb" });
   const b = egressIdentity({ egress: "cellular-sim", simIccid: "222", vlanId: null, controlIface: "usb" });
   assert.notEqual(a, b);
+});
+
+test("typed proxy and gateway profiles have stable isolation identities", () => {
+  const proxy = parseNetworkConfig({
+    egress: "commercial-proxy", profileId: "proxy-1", providerLabel: "Provider A",
+    configuredRegion: "IT", expectedIpv6Policy: "blocked", failPolicy: "fail-closed", controlIface: "usb",
+  }, "d1");
+  const gateway = parseNetworkConfig({
+    egress: "direct-wifi", gatewayId: "office-wifi", gatewayLabel: "Office Wi-Fi", controlIface: "usb",
+  }, "d2");
+  assert.equal(egressIdentity(proxy), "proxy:proxy-1");
+  assert.equal(egressIdentity(gateway), "gateway:office-wifi");
+});
+
+test("network config rejects inline secrets and credential-bearing check URLs", () => {
+  assert.throws(() => parseNetworkConfig({
+    egress: "commercial-proxy", profileId: "p1", controlIface: "usb", password: "leak",
+  }, "d1"), /secret material/);
+  assert.throws(() => parseNetworkConfig({
+    egress: "commercial-proxy", profileId: "p1", controlIface: "usb", checkUrl: "https://user:pass@example.test/ip",
+  }, "d1"), /without embedded credentials/);
+});
+
+test("public network profiles redact internal route identifiers and full SIM identifiers", () => {
+  const internal = parseNetworkConfig({
+    egress: "cellular-sim", simIccid: "8901000000001234567", controlIface: "usb",
+    providerLabel: "Carrier", credentialEnv: "PRIVATE_TOKEN", checkUrl: "https://check.example.test/ip",
+  }, "d1");
+  const safe = publicNetworkConfig(internal);
+  assert.equal(safe.simIdentifierSuffix, "4567");
+  assert.equal(safe.providerLabel, "Carrier");
+  for (const privateField of ["simIccid", "vlanId", "profileId", "gatewayId", "credentialEnv", "checkUrl"]) {
+    assert.equal(privateField in safe, false);
+  }
+  assert.doesNotMatch(JSON.stringify(safe), /8901000000001234567|PRIVATE_TOKEN|check\.example/);
 });

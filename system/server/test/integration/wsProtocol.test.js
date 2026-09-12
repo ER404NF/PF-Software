@@ -26,10 +26,14 @@ const TEST_PASSWORD = "test-password";
 // hoisted above any other code in a file, means index.js must be imported
 // dynamically here rather than with a normal top-level `import`.
 const tmpStorageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-wstest-"));
+process.env.FILE_STORE_DIR = path.join(tmpStorageRoot, "files");
 process.env.SESSION_STORE_DIR = path.join(tmpStorageRoot, "sessions");
 process.env.AUDIT_LOG_PATH = path.join(tmpStorageRoot, "audit.log");
+process.env.QUEUE_STORE_PATH = path.join(tmpStorageRoot, "tasks.json");
+process.env.MODEL_SELECTION_STORE_PATH = path.join(tmpStorageRoot, "model-selections.json");
+process.env.ASSIGNMENT_STORE_PATH = path.join(tmpStorageRoot, "assignments.json");
 
-const { server, wss, devices, deviceHealth, deviceLease, taskQueue } = await import("../../src/index.js");
+const { server, wss, devices, deviceHealth, deviceLease, taskQueue, assignmentStore } = await import("../../src/index.js");
 const { operators, hashPassword } = await import("../../src/authStore.js");
 
 let relayUrl;
@@ -63,8 +67,8 @@ async function loginCookie(username, password) {
 // juggling raw 'message' listeners. Logs in as `username` first (defaulting
 // to the full-access test operator) since every connection now requires an
 // authenticated session — see index.js's `server.on("upgrade", ...)`.
-async function openClient(username = "test-va", password = TEST_PASSWORD) {
-  const cookie = await loginCookie(username, password);
+async function openClient(username = "test-va", password = TEST_PASSWORD, existingCookie = null) {
+  const cookie = existingCookie ?? await loginCookie(username, password);
   const ws = new WebSocket(relayUrl, { headers: { Cookie: cookie } });
   const received = [];
   const waiters = [];
@@ -81,6 +85,7 @@ async function openClient(username = "test-va", password = TEST_PASSWORD) {
   });
 
   const client = {
+    cookie, ws,
     send: (msg) => ws.send(JSON.stringify(msg)),
     received,
     // Resolves with an already-received match if one exists, otherwise waits
@@ -183,6 +188,12 @@ before(async () => {
     username: "test-va-restricted",
     passwordHash: hashPassword(TEST_PASSWORD),
     allowedDevices: ["mock-1"],
+    role: "va",
+  });
+  operators.set("test-admin-restricted", {
+    username: "test-admin-restricted",
+    passwordHash: hashPassword(TEST_PASSWORD),
+    allowedDevices: ["mock-1"],
     role: "admin",
   });
   operators.set("test-plain-va", {
@@ -202,6 +213,7 @@ after(async () => {
   devices.delete("test-wda");
   operators.delete("test-va");
   operators.delete("test-va-restricted");
+  operators.delete("test-admin-restricted");
   operators.delete("test-plain-va");
   await new Promise((resolve) => wss.close(resolve));
   await new Promise((resolve) => server.close(resolve));
@@ -216,6 +228,7 @@ beforeEach(async () => {
   // failures recorded in one test would bleed into the next test's
   // OFFLINE_AFTER_FAILURES threshold.
   deviceHealth.clear();
+  for (const device of devices.values()) device.status = "idle";
   // Same reasoning for controller-mode state — without this, a device left
   // in AI_IDLE by one test would make an unrelated later test's plain
   // select_device call fail for a reason that has nothing to do with it.
@@ -281,6 +294,12 @@ test("a device already in use cannot be selected by a second connection", async 
 
   a.send({ type: "select_device", deviceId: "mock-2" });
   await a.waitFor((m) => m.type === "frame" && m.deviceId === "mock-2");
+
+  const busyList = await b.waitUntil((m) => m.type === "device_list"
+    && m.devices.find((d) => d.id === "mock-2")?.accessState === "in_use");
+  const busySummary = busyList.devices.find((d) => d.id === "mock-2");
+  assert.equal(busySummary.canOpen, false);
+  assert.match(busySummary.openReason, /in use/);
 
   b.send({ type: "select_device", deviceId: "mock-2" });
   const err = await b.waitFor((m) => m.type === "error" && m.deviceId === "mock-2");
@@ -358,7 +377,7 @@ test("concurrent messages on one connection are processed strictly in order", as
   // tap -> screenshot.
   assert.deepEqual(
     history.map((h) => h.type),
-    ["tap", "screenshot", "tap", "screenshot"]
+    ["window-size", "tap", "screenshot", "window-size", "tap", "screenshot"]
   );
 
   client.send({ type: "release_device" });
@@ -401,7 +420,7 @@ test("a single failure reports an error but does not flip the device offline", a
   );
 });
 
-test("3 consecutive failures flip the device offline; a later success recovers it", async () => {
+test("3 consecutive failures flip the device offline and release the human claim", async () => {
   const client = await openClient();
   await client.waitFor((m) => m.type === "device_list");
   client.send({ type: "select_device", deviceId: "test-wda" });
@@ -415,19 +434,15 @@ test("3 consecutive failures flip the device offline; a later success recovers i
   const offlineList = await client.waitFor(
     (m) => m.type === "device_list" && m.devices.find((d) => d.id === "test-wda")?.status === "offline"
   );
-  assert.equal(offlineList.devices.find((d) => d.id === "test-wda").status, "offline");
+  const offlineSummary = offlineList.devices.find((d) => d.id === "test-wda");
+  assert.equal(offlineSummary.status, "offline");
+  assert.equal(offlineSummary.canOpen, false);
+  assert.equal(offlineSummary.accessState, "offline");
 
   await fetch(`${FAKE_WDA_URL}/debug/unhang`, { method: "POST" });
   client.send({ type: "tap", x: 0.3, y: 0.3 });
-  const recoveredList = await client.waitForNext(
-    (m) => m.type === "device_list" && m.devices.find((d) => d.id === "test-wda")?.status === "in-use"
-  );
-  assert.equal(recoveredList.devices.find((d) => d.id === "test-wda").status, "in-use");
-
-  client.send({ type: "release_device" });
-  await client.waitForNext(
-    (m) => m.type === "device_list" && m.devices.find((d) => d.id === "test-wda")?.status === "idle"
-  );
+  await new Promise(resolve => setTimeout(resolve, 50));
+  assert.equal(devices.get("test-wda").status, "offline", "input after the release cannot revive the device");
 });
 
 test("login/logout HTTP flow: wrong password, right password, then me/logout", async () => {
@@ -442,7 +457,11 @@ test("login/logout HTTP flow: wrong password, right password, then me/logout", a
 
   const me = await fetch(`${httpUrl}/api/me`, { headers: { Cookie: cookie } });
   assert.equal(me.status, 200);
-  assert.deepEqual(await me.json(), { username: "test-va", role: "admin", allowedDevices: null });
+  const profile = await me.json();
+  assert.equal(profile.username, "test-va");
+  assert.equal(profile.role, "admin");
+  assert.equal(profile.allowedDevices, null);
+  assert.ok(profile.capabilities.includes("users:manage"));
 
   const logout = await fetch(`${httpUrl}/api/logout`, { method: "POST", headers: { Cookie: cookie } });
   assert.equal(logout.status, 200);
@@ -451,12 +470,182 @@ test("login/logout HTTP flow: wrong password, right password, then me/logout", a
   assert.equal(meAfter.status, 401);
 });
 
+test("presence API and broadcasts expose safe live status, phone activity, and logout cleanup", async () => {
+  const username = "presence-va";
+  operators.set(username, {
+    username,
+    passwordHash: hashPassword(TEST_PASSWORD),
+    allowedDevices: ["mock-2"],
+    allowedResearchWorkspaces: ["private-workspace"],
+    role: "va",
+  });
+
+  const observer = await openClient("test-va", TEST_PASSWORD);
+  const cookie = await loginCookie(username, TEST_PASSWORD);
+  const client = await openClient(username, TEST_PASSWORD, cookie);
+  try {
+    const online = await observer.waitForNext((message) => message.type === "presence_list"
+      && message.people.some(person => person.username === username && person.online));
+    const publicPerson = online.people.find(person => person.username === username);
+    assert.equal(publicPerson.role, "va");
+    assert.equal(publicPerson.activeSessions, 1);
+    for (const privateField of ["passwordHash", "allowedDevices", "allowedResearchWorkspaces", "sessionId"]) {
+      assert.equal(privateField in publicPerson, false);
+    }
+
+    const response = await fetch(`${httpUrl}/api/people`, { headers: { Cookie: cookie } });
+    assert.equal(response.status, 200);
+    const directoryPerson = (await response.json()).people.find(person => person.username === username);
+    assert.equal(directoryPerson.online, true);
+
+    client.send({ type: "select_device", deviceId: "mock-2" });
+    await client.waitForNext(message => message.type === "frame" && message.deviceId === "mock-2");
+    const controlling = await observer.waitForNext((message) => message.type === "presence_list"
+      && message.people.some(person => person.username === username
+        && person.currentPhones?.some(phone => phone.id === "mock-2")));
+    assert.equal(
+      controlling.people.find(person => person.username === username).activityCategory,
+      "device-control"
+    );
+
+    const logout = await fetch(`${httpUrl}/api/logout`, { method: "POST", headers: { Cookie: cookie } });
+    assert.equal(logout.status, 200);
+    const offline = await observer.waitForNext((message) => message.type === "presence_list"
+      && message.people.some(person => person.username === username && !person.online));
+    const loggedOutPerson = offline.people.find(person => person.username === username);
+    assert.deepEqual(loggedOutPerson.currentPhones, []);
+    assert.equal(loggedOutPerson.activeSessions, 0);
+  } finally {
+    client.ws.close();
+    observer.ws.close();
+    operators.delete(username);
+  }
+});
+
+test("people directory requires authentication", async () => {
+  const response = await fetch(`${httpUrl}/api/people`);
+  assert.equal(response.status, 401);
+});
+
+test("durable assignments enforce role, identity, resource, visibility, and immutable-history boundaries", async () => {
+  const records = [
+    ["assignment-manager", "manager", ["mock-1"]],
+    ["assignment-worker", "editor", ["mock-1"]],
+    ["assignment-worker-2", "va", ["mock-1"]],
+    ["assignment-outsider", "va", ["mock-2"]],
+  ];
+  for (const [username, role, allowedDevices] of records) {
+    operators.set(username, {
+      username,
+      role,
+      allowedDevices,
+      allowedResearchWorkspaces: [],
+      passwordHash: hashPassword(TEST_PASSWORD),
+    });
+  }
+  const cookies = Object.fromEntries(await Promise.all(records.map(async ([username]) => [
+    username, await loginCookie(username, TEST_PASSWORD),
+  ])));
+  const jsonRequest = (url, cookie, method = "GET", body) => fetch(`${httpUrl}${url}`, {
+    method,
+    headers: { Cookie: cookie, ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  try {
+    assert.equal((await jsonRequest("/api/assignments", null)).status, 401);
+    assert.equal((await jsonRequest("/api/assignments", cookies["assignment-worker"], "POST", {
+      assignee: "assignment-worker", instructions: "Unauthorized creation",
+    })).status, 403);
+    assert.equal((await jsonRequest("/api/assignments", cookies["assignment-manager"], "POST", {
+      assignee: "assignment-worker", instructions: "Bad phone", deviceId: "missing-phone",
+    })).status, 400);
+    assert.equal((await jsonRequest("/api/assignments", cookies["assignment-manager"], "POST", {
+      assignee: "assignment-outsider", instructions: "Wrong worker scope", deviceId: "mock-1",
+    })).status, 403);
+    assert.equal((await jsonRequest("/api/assignments", cookies["assignment-manager"], "POST", {
+      assignee: "test-va", instructions: "Manager cannot assign an admin",
+    })).status, 403);
+
+    const createdResponse = await jsonRequest("/api/assignments", cookies["assignment-manager"], "POST", {
+      assignee: "assignment-worker", instructions: "  Review the device export  ", deviceId: "mock-1",
+    });
+    assert.equal(createdResponse.status, 201);
+    const created = (await createdResponse.json()).assignment;
+    assert.equal(created.instructions, "Review the device export");
+    assert.equal(created.createdBy, "assignment-manager");
+    assert.equal(created.history[0].actor, "assignment-manager");
+
+    const workerList = await jsonRequest("/api/assignments", cookies["assignment-worker"]);
+    assert.ok((await workerList.json()).assignments.some(item => item.id === created.id));
+    const outsiderList = await jsonRequest("/api/assignments", cookies["assignment-outsider"]);
+    assert.equal((await outsiderList.json()).assignments.some(item => item.id === created.id), false);
+    assert.equal((await jsonRequest(`/api/assignments/${created.id}`, cookies["assignment-outsider"], "PATCH", {
+      status: "in_progress",
+    })).status, 403);
+
+    const workerStatusResponse = await jsonRequest(`/api/assignments/${created.id}`, cookies["assignment-worker"], "PATCH", {
+      status: "in_progress",
+    });
+    assert.equal(workerStatusResponse.status, 403, "non-management roles cannot mutate assignment state");
+    const startedResponse = await jsonRequest(`/api/assignments/${created.id}`, cookies["assignment-manager"], "PATCH", {
+      status: "in_progress",
+    });
+    assert.equal(startedResponse.status, 200);
+    assert.equal((await startedResponse.json()).assignment.history.at(-1).actor, "assignment-manager");
+    assert.equal((await jsonRequest(`/api/assignments/${created.id}`, cookies["assignment-worker"], "PATCH", {
+      assignee: "assignment-worker-2",
+    })).status, 403);
+    assert.equal((await jsonRequest(`/api/assignments/${created.id}`, cookies["assignment-manager"], "PATCH", {
+      assignee: "assignment-outsider",
+    })).status, 403);
+
+    const movedResponse = await jsonRequest(`/api/assignments/${created.id}`, cookies["assignment-manager"], "PATCH", {
+      assignee: "assignment-worker-2",
+    });
+    assert.equal(movedResponse.status, 200);
+    const moved = (await movedResponse.json()).assignment;
+    assert.equal(moved.assignee, "assignment-worker-2");
+    assert.equal(moved.status, "assigned");
+    assert.equal(moved.history.at(-1).action, "reassigned");
+
+    const scheduledResponse = await jsonRequest("/api/assignments", cookies["assignment-manager"], "POST", {
+      assignee: "assignment-worker", instructions: "Scheduled review", deviceId: "mock-1",
+      startAt: "2099-01-01T10:00:00.000Z", endAt: "2099-01-01T11:00:00.000Z", exclusive: true,
+    });
+    assert.equal(scheduledResponse.status, 201);
+    const scheduled = (await scheduledResponse.json()).assignment;
+    const overlap = await jsonRequest("/api/assignments", cookies["assignment-manager"], "POST", {
+      assignee: "assignment-worker-2", instructions: "Conflicting slot", deviceId: "mock-1",
+      startAt: "2099-01-01T10:30:00.000Z", endAt: "2099-01-01T11:30:00.000Z", exclusive: true,
+    });
+    assert.equal(overlap.status, 409);
+    assert.equal((await jsonRequest(`/api/assignments/${scheduled.id}`, cookies["assignment-worker"], "PATCH", {
+      startAt: "2099-01-01T12:00:00.000Z", endAt: "2099-01-01T13:00:00.000Z",
+    })).status, 403);
+    const rescheduledResponse = await jsonRequest(`/api/assignments/${scheduled.id}`, cookies["assignment-manager"], "PATCH", {
+      startAt: "2099-01-01T12:00:00.000Z", endAt: "2099-01-01T13:00:00.000Z", exclusive: false,
+    });
+    assert.equal(rescheduledResponse.status, 200);
+    const rescheduled = (await rescheduledResponse.json()).assignment;
+    assert.equal(rescheduled.exclusive, false);
+    assert.equal(rescheduled.history.at(-1).action, "rescheduled");
+    assert.equal((await jsonRequest(`/api/assignments/${created.id}`, cookies["assignment-manager"], "DELETE")).status, 404);
+  } finally {
+    for (const [username] of records) operators.delete(username);
+  }
+});
+
 test("VA profile is reported safely and normal device control remains permitted", async () => {
   const cookie = await loginCookie("test-plain-va", TEST_PASSWORD);
   const me = await fetch(`${httpUrl}/api/me`, { headers: { Cookie: cookie } });
   assert.equal(me.status, 200);
   const profile = await me.json();
-  assert.deepEqual(profile, { username: "test-plain-va", role: "va", allowedDevices: ["mock-1"] });
+  assert.equal(profile.username, "test-plain-va");
+  assert.equal(profile.role, "va");
+  assert.deepEqual(profile.allowedDevices, ["mock-1"]);
+  assert.ok(profile.capabilities.includes("device:control"));
+  assert.equal(profile.capabilities.includes("queue:manage"), false);
   assert.equal("passwordHash" in profile, false);
 
   const client = await openClient("test-plain-va", TEST_PASSWORD);
@@ -478,10 +667,22 @@ test("VA receives 403 on admin HTTP surfaces while admin can use them", async ()
   for (const [url, options] of [
     [`${httpUrl}/api/audit`, {}],
     [`${httpUrl}/api/queue`, {}],
+    [`${httpUrl}/api/admin/users`, {}],
+    [`${httpUrl}/api/devices/mock-1/network-check`, { method: "POST" }],
+    [`${httpUrl}/api/assignments`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: vaCookie },
+      body: JSON.stringify({ assignee: "test-plain-va", instructions: "forbidden VA mutation" }),
+    }],
     [`${httpUrl}/api/queue/command`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Cookie: vaCookie },
       body: JSON.stringify({ text: "/queue list" }),
+    }],
+    [`${httpUrl}/api/queue/command`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: vaCookie },
+      body: JSON.stringify({ text: "/model set fake --scope global" }),
     }],
   ]) {
     const headers = options.headers || { Cookie: vaCookie };
@@ -508,8 +709,66 @@ test("VA cannot invoke direct AI-mode WebSocket controls", async () => {
   for (const type of ["switch_to_ai", "takeover", "emergency_stop"]) {
     client.send({ type, deviceId: "mock-1" });
     const err = await client.waitForNext((m) => m.type === "error" && m.deviceId === "mock-1");
-    assert.match(err.message, /Admin role required/);
+    assert.match(err.message, /AI-controller management capability required/);
     assert.equal(deviceLease.getMode("mock-1"), "HUMAN");
+  }
+
+  for (const type of ["pause", "resume", "stop", "pause_task", "resume_task", "stop_task"]) {
+    client.send({ type, deviceId: "mock-1" });
+    const err = await client.waitForNext((m) => m.type === "error" && m.code === "capability_denied");
+    assert.match(err.message, /Queue management capability required/);
+  }
+});
+
+test("monitor contract is capability/device scoped and does not claim the input lease", async () => {
+  const username = "monitor-manager";
+  operators.set(username, {
+    username,
+    passwordHash: hashPassword(TEST_PASSWORD),
+    allowedDevices: ["mock-1"],
+    role: "manager",
+  });
+  try {
+    const managerCookie = await loginCookie(username, TEST_PASSWORD);
+    const vaCookie = await loginCookie("test-plain-va", TEST_PASSWORD);
+    const beforeMode = deviceLease.getMode("mock-1");
+    const response = await fetch(`${httpUrl}/api/devices/mock-1/monitor`, { headers: { Cookie: managerCookie } });
+    assert.equal(response.status, 200);
+    const { monitor } = await response.json();
+    assert.equal(monitor.available, false);
+    assert.equal(monitor.readOnly, true);
+    assert.equal(monitor.claimsInputLease, false);
+    assert.equal(deviceLease.getMode("mock-1"), beforeMode);
+    assert.equal((await fetch(`${httpUrl}/api/devices/mock-2/monitor`, { headers: { Cookie: managerCookie } })).status, 403);
+    assert.equal((await fetch(`${httpUrl}/api/devices/mock-1/monitor`, { headers: { Cookie: vaCookie } })).status, 403);
+    assert.equal((await fetch(`${httpUrl}/api/devices/mock-1/monitor`, {
+      method: "POST", headers: { Cookie: managerCookie },
+    })).status, 404, "there must be no fake start-monitor action before hardware validation");
+  } finally {
+    operators.delete(username);
+  }
+
+});
+
+test("manager can perform an authorized operational handoff but remains device-scoped", async () => {
+  const operator = operators.get("test-plain-va");
+  operator.role = "manager";
+  const client = await openClient("test-plain-va", TEST_PASSWORD);
+  try {
+    await client.waitFor((m) => m.type === "device_list");
+    client.send({ type: "switch_to_ai", deviceId: "mock-1" });
+    await client.waitForNext((m) => m.type === "device_list"
+      && m.devices.find((d) => d.id === "mock-1")?.controllerMode === "AI_IDLE");
+    client.send({ type: "emergency_stop", deviceId: "mock-1" });
+    await client.waitForNext((m) => m.type === "device_list"
+      && m.devices.find((d) => d.id === "mock-1")?.controllerMode === "HUMAN");
+
+    client.send({ type: "switch_to_ai", deviceId: "mock-2" });
+    const denied = await client.waitForNext((m) => m.type === "error" && m.deviceId === "mock-2");
+    assert.match(denied.message, /not authorized/);
+  } finally {
+    operator.role = "va";
+    client.ws.close();
   }
 });
 
@@ -547,7 +806,7 @@ test("an operator's role change takes effect on an already-open WebSocket connec
 
   client.send({ type: "switch_to_ai", deviceId: "mock-1" });
   const deniedFirst = await client.waitForNext((m) => m.type === "error" && m.deviceId === "mock-1");
-  assert.match(deniedFirst.message, /Admin role required/);
+  assert.match(deniedFirst.message, /AI-controller management capability required/);
 
   const operator = operators.get("test-plain-va");
   try {
@@ -561,7 +820,7 @@ test("an operator's role change takes effect on an already-open WebSocket connec
     operator.role = "va";
     client.send({ type: "emergency_stop", deviceId: "mock-1" });
     const deniedAfterDemotion = await client.waitForNext((m) => m.type === "error" && m.deviceId === "mock-1");
-    assert.match(deniedAfterDemotion.message, /Admin role required/);
+    assert.match(deniedAfterDemotion.message, /AI-controller management capability required/);
     assert.equal(deviceLease.getMode("mock-1"), "AI_IDLE", "the demotion must also take effect immediately — the stale check would have let this through");
   } finally {
     operator.role = "va";
@@ -595,11 +854,23 @@ test("an unauthenticated WebSocket upgrade is rejected before any messages are p
 
 test("a restricted operator can only select devices on their allow list", async () => {
   const client = await openClient("test-va-restricted", TEST_PASSWORD);
-  await client.waitFor((m) => m.type === "device_list");
+  const visible = await client.waitFor((m) => m.type === "device_list");
+  assert.deepEqual(visible.devices.map(device => device.id).sort(), [...devices.keys()].sort());
+  const assigned = visible.devices.find(device => device.id === "mock-1");
+  const unassigned = visible.devices.find(device => device.id === "mock-2");
+  assert.equal(assigned.assignedToViewer, true);
+  assert.equal(assigned.canOpen, true);
+  assert.equal(assigned.accessState, "assigned_available");
+  assert.equal(unassigned.assignedToViewer, false);
+  assert.equal(unassigned.canOpen, false);
+  assert.equal(unassigned.accessState, "not_assigned");
+  assert.equal(unassigned.assignment, null);
+  assert.deepEqual(unassigned.authorizedOperators, []);
+  assert.doesNotMatch(JSON.stringify(unassigned), /password|credential|token|secret/i);
 
   client.send({ type: "select_device", deviceId: "mock-2" });
   const err = await client.waitForNext((m) => m.type === "error" && m.deviceId === "mock-2");
-  assert.match(err.message, /not authorized/);
+  assert.match(err.message, /not assigned/);
 
   client.send({ type: "select_device", deviceId: "mock-1" });
   const frame = await client.waitForNext((m) => m.type === "frame" && m.deviceId === "mock-1");
@@ -609,6 +880,64 @@ test("a restricted operator can only select devices on their allow list", async 
   await client.waitForNext(
     (m) => m.type === "device_list" && m.devices.find((d) => d.id === "mock-1")?.status === "idle"
   );
+});
+
+test("a legacy VA with a null grant sees the safe fleet but cannot open any device", async () => {
+  const username = "legacy-null-va";
+  operators.set(username, {
+    username,
+    passwordHash: hashPassword(TEST_PASSWORD),
+    allowedDevices: null,
+    role: "va",
+  });
+  try {
+    const cookie = await loginCookie(username, TEST_PASSWORD);
+    const profileResponse = await fetch(`${httpUrl}/api/me`, { headers: { Cookie: cookie } });
+    const profile = await profileResponse.json();
+    assert.deepEqual(profile.allowedDevices, []);
+    assert.equal("passwordHash" in profile, false);
+
+    const client = await openClient(username, TEST_PASSWORD, cookie);
+    const list = await client.waitFor(message => message.type === "device_list");
+    assert.equal(list.devices.length, devices.size);
+    assert.equal(list.devices.every(device => device.assignedToViewer === false && device.canOpen === false), true);
+    client.send({ type: "select_device", deviceId: "mock-1" });
+    const denied = await client.waitForNext(message => message.type === "error" && message.deviceId === "mock-1");
+    assert.equal(denied.code, "device_open_denied");
+    assert.match(denied.message, /not assigned/);
+  } finally {
+    operators.delete(username);
+  }
+});
+
+test("a durable task assignment alone never grants device access", async () => {
+  const username = "task-only-va";
+  operators.set(username, {
+    username,
+    passwordHash: hashPassword(TEST_PASSWORD),
+    allowedDevices: [],
+    role: "va",
+  });
+  assignmentStore.create({
+    instructions: "Private task text must not appear in fleet summaries",
+    assignee: username,
+    createdBy: "test-va",
+    deviceId: "mock-2",
+  });
+  try {
+    const client = await openClient(username, TEST_PASSWORD);
+    const list = await client.waitFor(message => message.type === "device_list");
+    const summary = list.devices.find(device => device.id === "mock-2");
+    assert.equal(summary.assignedToViewer, false);
+    assert.equal(summary.canOpen, false);
+    assert.equal(summary.assignment, null);
+    assert.doesNotMatch(JSON.stringify(summary), /Private task text/);
+    client.send({ type: "select_device", deviceId: "mock-2" });
+    const denied = await client.waitForNext(message => message.type === "error" && message.deviceId === "mock-2");
+    assert.match(denied.message, /not assigned/);
+  } finally {
+    operators.delete(username);
+  }
 });
 
 test("a restricted operator gets 403 (not 404) on a file route for a device they can't reach", async () => {
@@ -683,11 +1012,14 @@ test("switch_to_ai moves a device out of HUMAN mode and blocks human selection",
   const aiList = await client.waitForNext(
     (m) => m.type === "device_list" && m.devices.find((d) => d.id === "mock-1")?.controllerMode === "AI_IDLE"
   );
-  assert.equal(aiList.devices.find((d) => d.id === "mock-1").controllerMode, "AI_IDLE");
+  const aiSummary = aiList.devices.find((d) => d.id === "mock-1");
+  assert.equal(aiSummary.controllerMode, "AI_IDLE");
+  assert.equal(aiSummary.canOpen, false);
+  assert.equal(aiSummary.accessState, "ai_controlled");
 
   client.send({ type: "select_device", deviceId: "mock-1" });
   const err = await client.waitForNext((m) => m.type === "error" && m.deviceId === "mock-1");
-  assert.match(err.message, /AI mode/);
+  assert.match(err.message, /Human mode/);
 
   // Clean up via the real mechanism under test, not a direct reset — this
   // also doubles as the first half of the next test's scenario.
@@ -696,6 +1028,10 @@ test("switch_to_ai moves a device out of HUMAN mode and blocks human selection",
   client.send({ type: "release_device" });
   await client.waitForNext(
     (m) => m.type === "device_list" && m.devices.find((d) => d.id === "mock-1")?.status === "idle"
+  );
+  client.send({ type: "switch_to_ai", deviceId: "mock-1" });
+  await client.waitForNext(
+    (m) => m.type === "device_list" && m.devices.find((d) => d.id === "mock-1")?.controllerMode === "AI_IDLE"
   );
 });
 
@@ -734,6 +1070,10 @@ test("takeover on an AI-mode device switches it back to HUMAN and claims it for 
   await client.waitForNext(
     (m) => m.type === "device_list" && m.devices.find((d) => d.id === "mock-1")?.status === "idle"
   );
+  client.send({ type: "switch_to_ai", deviceId: "mock-1" });
+  await client.waitForNext(
+    (m) => m.type === "device_list" && m.devices.find((d) => d.id === "mock-1")?.controllerMode === "AI_IDLE"
+  );
 });
 
 test("emergency_stop works immediately even with a hung simulated AI action, and does not claim the device", async () => {
@@ -746,7 +1086,8 @@ test("emergency_stop works immediately even with a hung simulated AI action, and
   // Simulates a stuck AI worker — an action it registered but that will
   // never resolve on its own. A graceful takeover would wait on this (and
   // time out); emergency_stop must not wait on it at all.
-  deviceLease.registerPendingAiAction("mock-2", new Promise(() => {}));
+  let finishPending;
+  deviceLease.registerPendingAiAction("mock-2", new Promise(resolve => { finishPending = resolve; }));
 
   const start = Date.now();
   client.send({ type: "emergency_stop", deviceId: "mock-2" });
@@ -758,12 +1099,20 @@ test("emergency_stop works immediately even with a hung simulated AI action, and
   assert.equal(mock2.controllerMode, "HUMAN");
   assert.equal(mock2.status, "idle", "emergency_stop stops AI control but does not claim the device");
 
-  // Confirm it's genuinely usable again, not just labeled HUMAN.
+  // Immediate revocation must not grant input while the old action drains.
+  client.send({ type: "select_device", deviceId: "mock-2" });
+  await client.waitForNext(m => m.type === "error" && m.deviceId === "mock-2");
+  finishPending();
+  await new Promise(resolve => setImmediate(resolve));
   client.send({ type: "select_device", deviceId: "mock-2" });
   await client.waitForNext((m) => m.type === "frame" && m.deviceId === "mock-2");
   client.send({ type: "release_device" });
   await client.waitForNext(
     (m) => m.type === "device_list" && m.devices.find((d) => d.id === "mock-2")?.status === "idle"
+  );
+  client.send({ type: "switch_to_ai", deviceId: "mock-2" });
+  await client.waitForNext(
+    (m) => m.type === "device_list" && m.devices.find((d) => d.id === "mock-2")?.controllerMode === "AI_IDLE"
   );
 });
 
@@ -779,7 +1128,7 @@ test("emergency_stop cancels a real RUNNING task in the queue, instead of leavin
   const client = await openClient();
   await client.waitFor((m) => m.type === "device_list");
 
-  const task = taskQueue.addTask({ goal: "emergency-stop regression check", deviceSelector: { deviceId: "mock-1" } });
+  const task = taskQueue.addTask({ goal: "emergency-stop regression check", createdBy: "test-va", deviceSelector: { deviceId: "mock-1" } });
   assert.equal(task.state, "RUNNING");
 
   client.send({ type: "emergency_stop", deviceId: "mock-1" });
@@ -788,10 +1137,16 @@ test("emergency_stop cancels a real RUNNING task in the queue, instead of leavin
   );
   assert.equal(taskQueue.getTask(task.id).state, "CANCELLED");
 
-  // The real proof: the device must be genuinely free, not just relabeled —
-  // a fresh task targeting it should dispatch immediately, not sit QUEUED
-  // behind a phantom holder.
-  const next = taskQueue.addTask({ goal: "should dispatch cleanly", deviceSelector: { deviceId: "mock-1" } });
+  // Emergency stop is a durable Human-mode hold: new work can queue, but it
+  // cannot silently retake the phone until an operator explicitly enables
+  // AI mode again. This also proves there is no phantom RUNNING holder.
+  const next = taskQueue.addTask({ goal: "wait for explicit AI enable", createdBy: "test-va", deviceSelector: { deviceId: "mock-1" } });
+  assert.equal(next.state, "QUEUED");
+
+  client.send({ type: "switch_to_ai", deviceId: "mock-1" });
+  await client.waitForNext(
+    (m) => m.type === "device_list" && m.devices.find((d) => d.id === "mock-1")?.controllerMode === "AI_RUNNING"
+  );
   assert.equal(next.state, "RUNNING");
   taskQueue.cancelTask(next.id); // clean up — don't leave mock-1 occupied for later tests in this file
 });
@@ -848,11 +1203,380 @@ test("switch_to_ai is rejected while the device is claimed by a human", async ()
 });
 
 test("switch_to_ai, takeover, and emergency_stop are all blocked by device RBAC", async () => {
-  const client = await openClient("test-va-restricted", TEST_PASSWORD); // only allowed on mock-1
+  const client = await openClient("test-admin-restricted", TEST_PASSWORD); // only allowed on mock-1
 
   for (const type of ["switch_to_ai", "takeover", "emergency_stop"]) {
     client.send({ type, deviceId: "mock-2" });
     const err = await client.waitForNext((m) => m.type === "error" && m.deviceId === "mock-2");
     assert.match(err.message, /not authorized/);
+  }
+});
+
+for (const action of [{ type: "tap", x: 0.2, y: 0.2 }, { type: "swipe", direction: "up" },
+  { type: "home" }, { type: "type_text", text: "revoked" }]) {
+  test(`revoked device access blocks ${action.type} on an existing selection`, async () => {
+    const client = await openClient("test-va-restricted");
+    const device = devices.get("mock-1");
+    const method = { tap: "tap", swipe: "swipe", home: "pressHome", type_text: "typeText" }[action.type];
+    const original = device[method];
+    let calls = 0;
+    try {
+      client.send({ type: "select_device", deviceId: device.id });
+      await client.waitFor(m => m.type === "frame");
+      device[method] = () => { calls++; };
+      operators.get("test-va-restricted").allowedDevices = [];
+      const denied = client.waitForNext(m => m.type === "error");
+      client.send(action);
+      const error = await denied;
+      assert.equal(error.code, "device_access_revoked");
+      assert.match(error.message, /released/);
+      assert.equal(calls, 0);
+      await client.waitUntil(m => m.type === "device_list"
+        && m.devices.find(d => d.id === device.id)?.status === "idle");
+    } finally {
+      device[method] = original;
+      operators.get("test-va-restricted").allowedDevices = ["mock-1"];
+      client.ws.close();
+    }
+  });
+}
+
+test("revocation during a pending action blocks the later render and queued input", async () => {
+  const client = await openClient("test-va-restricted");
+  const operator = operators.get("test-va-restricted");
+  const device = devices.get("mock-1");
+  const originalTap = device.tap;
+  const originalHome = device.pressHome;
+  let enterTap;
+  let settleTap;
+  const tapStarted = new Promise(resolve => { enterTap = resolve; });
+  const tapPending = new Promise(resolve => { settleTap = resolve; });
+  let homeCalls = 0;
+  try {
+    client.send({ type: "select_device", deviceId: device.id });
+    await client.waitFor(message => message.type === "frame" && message.deviceId === device.id);
+    const frameCount = client.received.filter(message => message.type === "frame").length;
+    device.tap = async () => { enterTap(); await tapPending; };
+    device.pressHome = () => { homeCalls++; };
+    client.send({ type: "tap", deviceId: device.id, x: 0.2, y: 0.2 });
+    await tapStarted;
+    operator.allowedDevices = [];
+    client.send({ type: "home", deviceId: device.id });
+    settleTap();
+    const denied = await client.waitForNext(message => message.code === "device_access_revoked");
+    assert.match(denied.message, /released/);
+    assert.equal(homeCalls, 0);
+    assert.equal(client.received.filter(message => message.type === "frame").length, frameCount,
+      "a revoked grant must block the render that would otherwise follow the pending tap");
+    await client.waitUntil(message => message.type === "device_list"
+      && message.devices.find(item => item.id === device.id)?.status === "idle");
+  } finally {
+    settleTap();
+    device.tap = originalTap;
+    device.pressHome = originalHome;
+    operator.allowedDevices = ["mock-1"];
+    client.close();
+  }
+});
+
+for (const change of ["demoted", "removed"]) {
+  test(`${change} operator cannot perform the next action and loses ownership`, async () => {
+    const username = `operator-${change}`;
+    const record = { username, passwordHash: hashPassword(TEST_PASSWORD), allowedDevices: ["mock-1"], role: "va" };
+    operators.set(username, record);
+    const client = await openClient(username);
+    try {
+      client.send({ type: "select_device", deviceId: "mock-1" });
+      await client.waitFor(message => message.type === "frame" && message.deviceId === "mock-1");
+      if (change === "demoted") record.role = "editor";
+      else operators.delete(username);
+      client.send({ type: "home", deviceId: "mock-1" });
+      const denied = await client.waitForNext(message => message.code === "device_access_revoked");
+      assert.match(denied.message, /released/);
+      assert.equal(devices.get("mock-1").status, "idle");
+    } finally {
+      operators.delete(username);
+      client.close();
+    }
+  });
+}
+
+test("human ownership survives an attempted admin takeover", async () => {
+  const owner = await openClient();
+  const contender = await openClient();
+  const device = devices.get("mock-1");
+  owner.send({ type: "select_device", deviceId: device.id });
+  await owner.waitFor(m => m.type === "frame");
+  const denied = contender.waitForNext(m => m.type === "error");
+  contender.send({ type: "takeover", deviceId: device.id });
+  assert.match((await denied).message, /already in use/);
+  const released = owner.waitForNext(m => m.type === "device_list" && m.devices.find(d => d.id === device.id)?.status === "idle");
+  owner.send({ type: "release_device", deviceId: device.id });
+  await released;
+});
+
+test("three device failures mark it offline, release ownership, and block a new open", async () => {
+  const owner = await openClient();
+  const contender = await openClient();
+  const device = devices.get("mock-1");
+  const original = device.tap;
+  try {
+    owner.send({ type: "select_device", deviceId: device.id });
+    await owner.waitFor(m => m.type === "frame");
+    device.tap = () => { throw new Error("offline regression"); };
+    for (let i = 0; i < 3; i++) {
+      const failed = owner.waitForNext(m => m.type === "error");
+      owner.send({ type: "tap", deviceId: device.id, x: 0.2, y: 0.2 });
+      await failed;
+    }
+    assert.equal(device.status, "offline");
+    const offlineList = await owner.waitUntil(m => m.type === "device_list"
+      && m.devices.find(d => d.id === device.id)?.accessState === "offline");
+    assert.equal(offlineList.devices.find(d => d.id === device.id).canOpen, false);
+    for (const type of ["select_device", "takeover"]) {
+      const denied = contender.waitForNext(m => m.type === "error");
+      contender.send({ type, deviceId: device.id });
+      assert.match((await denied).message, /offline/);
+    }
+  } finally {
+    device.tap = original;
+  }
+});
+
+test("logout closes all sockets for that session and releases its device only", async () => {
+  const owner = await openClient();
+  const sibling = await openClient("test-va", TEST_PASSWORD, owner.cookie);
+  const independent = await openClient();
+  owner.send({ type: "select_device", deviceId: "mock-1" });
+  await owner.waitFor(m => m.type === "frame");
+  const res = await fetch(`${httpUrl}/api/logout`, { method: "POST", headers: { Cookie: owner.cookie } });
+  assert.equal(res.status, 200);
+  await res.json();
+  await new Promise(resolve => setTimeout(resolve, 30));
+  assert.notEqual(owner.ws.readyState, WebSocket.OPEN);
+  assert.notEqual(sibling.ws.readyState, WebSocket.OPEN);
+  assert.equal(independent.ws.readyState, WebSocket.OPEN);
+  assert.equal((await fetch(`${httpUrl}/api/me`, { headers: { Cookie: owner.cookie } })).status, 401);
+  const frame = independent.waitForNext(m => m.type === "frame");
+  independent.send({ type: "select_device", deviceId: "mock-1" });
+  await frame;
+  const released = independent.waitForNext(m => m.type === "device_list" && m.devices.find(d => d.id === "mock-1")?.status === "idle");
+  independent.send({ type: "release_device" });
+  await released;
+});
+
+for (const check of ["input", "heartbeat"]) {
+test(`expired session is revoked on ${check}`, async () => {
+  const client = await openClient();
+  const device = devices.get("mock-1");
+  const original = device.tap;
+  let calls = 0;
+  try {
+    client.send({ type: "select_device", deviceId: device.id });
+    await client.waitFor(m => m.type === "frame");
+    device.tap = () => { calls++; };
+    const sid = decodeURIComponent(client.cookie.split("=")[1]).slice(2).split(".")[0];
+    const file = path.join(process.env.SESSION_STORE_DIR, `${sid}.json`);
+    const stored = JSON.parse(fs.readFileSync(file, "utf8"));
+    stored.expires = stored.session.cookie.expires = new Date(Date.now() - 1000).toISOString();
+    fs.writeFileSync(file, JSON.stringify(stored));
+    if (check === "input") client.send({ type: "tap", x: 0.2, y: 0.2 });
+    else {
+      const socket = [...wss.clients].find(ws => ws.sessionId === sid);
+      assert.equal(await socket.validateSession(), false);
+    }
+    await new Promise(resolve => setTimeout(resolve, 50));
+    assert.equal(calls, 0);
+    assert.notEqual(client.ws.readyState, WebSocket.OPEN);
+  } finally {
+    device.tap = original;
+    client.close();
+  }
+});
+
+}
+
+test("oversized messages close only the offending socket", async () => {
+  const offender = await openClient();
+  const healthy = await openClient();
+  const closed = new Promise(resolve => offender.ws.once("close", resolve));
+  offender.ws.send(Buffer.alloc(65537));
+  await closed;
+  assert.equal(healthy.ws.readyState, WebSocket.OPEN);
+  assert.equal((await fetch(`${httpUrl}/api/me`, { headers: { Cookie: healthy.cookie } })).status, 200);
+});
+
+test("concurrent HTTP takeover commands finish without crashing", async () => {
+  const cookie = await loginCookie("test-va", TEST_PASSWORD);
+  deviceLease.switchToAI("mock-1");
+  let finish;
+  deviceLease.registerPendingAiAction("mock-1", new Promise(resolve => { finish = resolve; }));
+  const command = () => fetch(`${httpUrl}/api/queue/command`, { method: "POST",
+    headers: { Cookie: cookie, "Content-Type": "application/json" }, body: JSON.stringify({ text: "/takeover mock-1" }) });
+  try {
+    const first = command();
+    while (deviceLease.getMode("mock-1") !== "HANDOFF") await new Promise(resolve => setTimeout(resolve, 5));
+    const second = command();
+    await new Promise(resolve => setTimeout(resolve, 30));
+    finish();
+    for (const response of await Promise.all([first, second])) {
+      assert.equal(response.status, 200);
+      assert.equal((await response.json()).controllerMode, "HUMAN");
+    }
+  } finally { finish(); }
+});
+
+test("rejected HTTP commands return JSON without crashing", async () => {
+  const cookie = await loginCookie("test-va", TEST_PASSWORD);
+  const original = taskQueue.takeoverDevice;
+  taskQueue.takeoverDevice = async () => { throw new Error("handoff unavailable"); };
+  try {
+    const response = await fetch(`${httpUrl}/api/queue/command`, { method: "POST",
+      headers: { Cookie: cookie, "Content-Type": "application/json" }, body: JSON.stringify({ text: "/takeover mock-1" }) });
+    assert.equal(response.status, 400);
+    assert.match((await response.json()).error, /handoff unavailable/);
+  } finally { taskQueue.takeoverDevice = original; }
+});
+
+test("rejected replacement upload preserves existing bytes and leaves no staging files", async () => {
+  const cookie = await loginCookie("test-va", TEST_PASSWORD);
+  const endpoint = `${httpUrl}/api/devices/mock-1/files`;
+  async function upload(body, extra = false) {
+    const form = new FormData();
+    form.append("file", new Blob([body]), "original.txt");
+    if (extra) form.append("unexpected", new Blob(["extra"]), "extra.txt");
+    const response = await fetch(endpoint, { method: "POST", headers: { Cookie: cookie }, body: form });
+    await response.json();
+    return response.status;
+  }
+  assert.equal(await upload("original bytes"), 200);
+  assert.equal(await upload("rejected replacement", true), 400);
+  const download = await fetch(`${endpoint}/original.txt`, { headers: { Cookie: cookie } });
+  assert.equal(download.status, 200);
+  assert.equal(await download.text(), "original bytes");
+  assert.deepEqual(fs.readdirSync(path.join(process.env.FILE_STORE_DIR, "devices", "mock-1")), ["original.txt"]);
+  assert.equal(await upload("valid replacement"), 200);
+  assert.equal(await (await fetch(`${endpoint}/original.txt`, { headers: { Cookie: cookie } })).text(), "valid replacement");
+});
+
+for (const failure of [false, true]) {
+  test(`disconnect retains ownership until pending input settles (failure: ${failure})`, async () => {
+    const owner = await openClient();
+    const other = await openClient();
+    const device = devices.get("mock-1");
+    const original = device.tap;
+    let settle, entered;
+    const started = new Promise(resolve => { entered = resolve; });
+    const pending = new Promise(resolve => { settle = resolve; });
+    let active = 0, maximum = 0;
+    device.tap = async () => {
+      active++;
+      maximum = Math.max(maximum, active);
+      entered();
+      try { await pending; if (failure) throw new Error("device failure"); }
+      finally { active--; }
+    };
+    try {
+      owner.send({ type: "select_device", deviceId: device.id });
+      await owner.waitFor(m => m.type === "frame");
+      owner.send({ type: "tap", x: 0.1, y: 0.1 });
+      await started;
+      const closed = new Promise(resolve => owner.ws.once("close", resolve));
+      owner.close();
+      await closed;
+      const response = other.waitForNext(m => m.type === "error" || m.type === "frame");
+      other.send({ type: "select_device", deviceId: device.id });
+      const denied = await response;
+      assert.equal(denied.type, "error");
+      assert.match(denied.message, /already in use/);
+      const released = other.waitForNext(m => m.type === "device_list" && m.devices.find(d => d.id === device.id)?.status === "idle");
+      settle();
+      await released;
+      const frame = other.waitForNext(m => m.type === "frame");
+      other.send({ type: "select_device", deviceId: device.id });
+      await frame;
+      const result = other.waitForNext(m => m.type === (failure ? "error" : "frame"));
+      other.send({ type: "tap", x: 0.2, y: 0.2 });
+      await result;
+      assert.equal(maximum, 1);
+    } finally {
+      settle();
+      device.tap = original;
+      const released = other.waitForNext(m => m.type === "device_list" && m.devices.find(d => d.id === device.id)?.status === "idle").catch(() => {});
+      other.send({ type: "release_device" });
+      await released;
+      other.close();
+    }
+  });
+}
+
+test("restricted admins cannot cancel, prioritize or reorder inaccessible tasks", async () => {
+  const first = taskQueue.addTask({ goal: "restricted target", createdBy: "test-va", deviceSelector: { deviceId: "mock-2" } });
+  const second = taskQueue.addTask({ goal: "queued target", createdBy: "test-va", deviceSelector: { deviceId: "mock-2" } });
+  const cookie = await loginCookie("test-admin-restricted", TEST_PASSWORD);
+  try {
+    for (const text of [`/queue cancel ${first.id}`, `/queue priority ${first.id} high`, `/queue move ${first.id} before ${second.id}`]) {
+      const response = await fetch(`${httpUrl}/api/queue/command`, { method: "POST", headers: { Cookie: cookie, "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
+      assert.equal(response.status, 400);
+      assert.match((await response.json()).error, /not authorized/);
+    }
+    assert.equal(first.state, "RUNNING");
+    assert.equal(first.priority, "normal");
+  } finally { taskQueue.cancelTask(second.id); taskQueue.cancelTask(first.id); }
+});
+
+test("reserved media names cannot replace session records through uploads", async () => {
+  devices.set("sessions", { id: "sessions", label: "reserved", status: "idle" });
+  const protectedFile = path.join(process.env.SESSION_STORE_DIR, "protected.json");
+  fs.writeFileSync(protectedFile, "original session fixture");
+  try {
+    const cookie = await loginCookie("test-va", TEST_PASSWORD);
+    const form = new FormData();
+    form.append("file", new Blob(["replacement"]), "protected.json");
+    const response = await fetch(`${httpUrl}/api/devices/sessions/files`, { method: "POST", headers: { Cookie: cookie }, body: form });
+    assert.equal(response.status, 400);
+    await response.json();
+    assert.equal(fs.readFileSync(protectedFile, "utf8"), "original session fixture");
+  } finally { devices.delete("sessions"); }
+});
+test("emergency stop bypasses an unrelated pending human input", async () => {
+  const client = await openClient();
+  const device = devices.get("mock-1"), original = device.tap;
+  let finish, entered;
+  const started = new Promise(resolve => { entered = resolve; });
+  const pending = new Promise(resolve => { finish = resolve; });
+  device.tap = async () => { entered(); await pending; };
+  try {
+    client.send({ type: "select_device", deviceId: "mock-1" });
+    await client.waitFor(m => m.type === "frame");
+    deviceLease.switchToAI("mock-2"); deviceLease.applyEvent("mock-2", "START_TASK");
+    client.send({ type: "tap", deviceId: "mock-1", x: 0.2, y: 0.2 });
+    await started;
+    const stopped = client.waitForNext(m => m.type === "device_list" && m.devices.find(d => d.id === "mock-2")?.controllerMode === "HUMAN");
+    client.send({ type: "emergency_stop", deviceId: "mock-2" });
+    await stopped;
+    assert.equal(deviceLease.canAiAct("mock-2"), false);
+  } finally {
+    finish(); device.tap = original;
+    const released = client.waitForNext(m => m.type === "device_list" && m.devices.find(d => d.id === "mock-1")?.status === "idle");
+    client.send({ type: "release_device" }); await released;
+  }
+});
+test("input scoped to a previously selected device is rejected", async () => {
+  const client = await openClient();
+  const device = devices.get("mock-1"), original = device.tap;
+  let taps = 0;
+  try {
+    client.send({ type: "select_device", deviceId: "mock-1" });
+    await client.waitFor(m => m.type === "frame");
+    device.tap = async () => { taps++; };
+    const denied = client.waitForNext(m => m.type === "error");
+    client.send({ type: "tap", deviceId: "mock-2", x: 0.2, y: 0.2 });
+    assert.match((await denied).message, /Stale/);
+    assert.equal(taps, 0);
+  } finally {
+    device.tap = original;
+    const released = client.waitForNext(m => m.type === "device_list" && m.devices.find(d => d.id === "mock-1")?.status === "idle");
+    client.send({ type: "release_device" }); await released;
   }
 });

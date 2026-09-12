@@ -35,13 +35,13 @@ test("switchToAI throws if the device isn't currently HUMAN", () => {
 });
 
 test("pending-action clear is conditional and cannot erase a newer action", async () => {
+  switchToAI("dev-1");
   const first = Promise.resolve("first");
   let finishSecond;
   const second = new Promise((resolve) => { finishSecond = resolve; });
   registerPendingAiAction("dev-1", first);
   registerPendingAiAction("dev-1", second);
   clearPendingAiAction("dev-1", first);
-  switchToAI("dev-1");
   let handedOff = false;
   const handoff = switchToHuman("dev-1", { timeoutMs: 1000 }).then(() => { handedOff = true; });
   await new Promise((resolve) => setTimeout(resolve, 20));
@@ -68,8 +68,8 @@ test("switchToHuman blocks new AI actions immediately, before the handoff even c
   assert.equal(canAiAct("dev-1"), false);
   assert.ok(neverResolves);
 
-  assert.equal(await handoff, MODES.HUMAN);
-  assert.equal(canHumanSelect("dev-1"), true);
+  await assert.rejects(handoff, /still pending/);
+  assert.equal(canHumanSelect("dev-1"), false);
 });
 
 test("switchToHuman waits for a pending action that finishes before the timeout", async () => {
@@ -89,10 +89,10 @@ test("switchToHuman gives up after timeoutMs on a pending action that never reso
   registerPendingAiAction("dev-1", new Promise(() => {})); // never settles
 
   const start = Date.now();
-  await switchToHuman("dev-1", { timeoutMs: 100 });
+  await assert.rejects(switchToHuman("dev-1", { timeoutMs: 100 }), /still pending/);
   const elapsed = Date.now() - start;
   assert.ok(elapsed < 1000, `expected the timeout to cap the wait, took ${elapsed}ms`);
-  assert.equal(getMode("dev-1"), MODES.HUMAN);
+  assert.equal(getMode("dev-1"), MODES.ERROR);
 });
 
 test("switchToHuman does not fail if the pending action rejects", async () => {
@@ -138,4 +138,40 @@ test("device state is tracked independently per device id", () => {
   switchToAI("dev-1");
   assert.equal(getMode("dev-1"), MODES.AI_IDLE);
   assert.equal(getMode("dev-2"), MODES.HUMAN);
+});
+
+test("concurrent human handoffs share the pending action", async () => {
+  switchToAI("dev-1");
+  let finish;
+  registerPendingAiAction("dev-1", new Promise(resolve => { finish = resolve; }));
+  const first = switchToHuman("dev-1");
+  const second = switchToHuman("dev-1");
+  finish();
+  assert.deepEqual(await Promise.all([first, second]), [MODES.HUMAN, MODES.HUMAN]);
+});
+
+test("an old handoff cannot alter a lease started after emergency stop", async () => {
+  switchToAI("dev-1");
+  let finish;
+  registerPendingAiAction("dev-1", new Promise(resolve => { finish = resolve; }));
+  const handoff = switchToHuman("dev-1");
+  emergencyStop("dev-1");
+  assert.throws(() => switchToAI("dev-1"), /draining/);
+  finish();
+  await handoff;
+  await new Promise(resolve => setImmediate(resolve));
+  switchToAI("dev-1");
+  assert.equal(getMode("dev-1"), MODES.AI_IDLE);
+});
+
+test("timed-out handoff remains unavailable until submitted input settles", async () => {
+  switchToAI("dev-1");
+  let finish;
+  registerPendingAiAction("dev-1", new Promise(resolve => { finish = resolve; }));
+  await assert.rejects(switchToHuman("dev-1", { timeoutMs: 5 }), /still pending/);
+  assert.equal(canHumanSelect("dev-1"), false);
+  assert.equal(canAiAct("dev-1"), false);
+  finish();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(canHumanSelect("dev-1"), true);
 });

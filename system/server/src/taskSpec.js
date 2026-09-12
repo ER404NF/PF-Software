@@ -88,6 +88,10 @@ function createTaskSpec({
     throw new Error("earliestStart must be before latestEnd");
   }
 
+  if (maxDurationSec !== null && (!Number.isFinite(maxDurationSec) || maxDurationSec <= 0
+    || Date.now() + maxDurationSec * 1000 > 8640000000000000)) {
+    throw new Error("maxDurationSec must be a positive finite duration or null");
+  }
   const normalizedRetryPolicy = normalizeRetryPolicy(retryPolicy);
 
   const now = new Date().toISOString();
@@ -134,3 +138,11 @@ function hasWindowExpired(task, now) {
 }
 
 export { TASK_STATES, PRIORITIES, isTerminal, createTaskSpec, isWindowOpen, hasWindowExpired, normalizeRetryPolicy };
+
+// Duration is elapsed wall time per dispatch attempt, including pauses.
+// Retries start a new attempt; dispatchedAt makes the deadline durable.
+export function hasExecutionExpired(task, now = new Date()) {
+  const durationEnd = task.maxDurationSec != null && task.dispatchedAt
+    ? new Date(task.dispatchedAt).getTime() + task.maxDurationSec * 1000 : Infinity;
+  return now.getTime() >= durationEnd || (!task.allowOverrun && hasWindowExpired(task, now));
+}

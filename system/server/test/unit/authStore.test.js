@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { hashPassword, verifyPassword, authenticate, canAccessDevice, operators, normalizeRole, publicOperator, hasRole, filterValidResearchGrants } from "../../src/authStore.js";
+import { hashPassword, verifyPassword, authenticate, canAccessDevice, operators, normalizeRole, publicOperator, hasRole, filterValidResearchGrants, capabilitiesForRole, hasCapability } from "../../src/authStore.js";
+import { CAPABILITIES, OPERATOR_ROLES, ROLE_CAPABILITIES } from "../../src/roleCapabilities.js";
 
 test("hashPassword + verifyPassword round-trip correctly", () => {
   const hash = hashPassword("correct horse battery staple");
@@ -35,7 +36,7 @@ test("authenticate returns the operator on correct credentials, null otherwise",
   });
   try {
     const ok = authenticate("unit-test-op", "s3cret");
-    assert.deepEqual(ok, { username: "unit-test-op", allowedDevices: ["mock-1"], role: "admin" });
+    assert.deepEqual(ok, { username: "unit-test-op", allowedDevices: ["mock-1"], role: "admin", authVersion: 0 });
 
     assert.equal(authenticate("unit-test-op", "wrong"), null);
     assert.equal(authenticate("does-not-exist", "s3cret"), null);
@@ -44,10 +45,18 @@ test("authenticate returns the operator on correct credentials, null otherwise",
   }
 });
 
-test("canAccessDevice: null allowedDevices means every device is allowed", () => {
-  const admin = { username: "admin", allowedDevices: null };
+test("canAccessDevice: null allowedDevices keeps non-VA unrestricted behavior", () => {
+  const admin = { username: "admin", role: "admin", allowedDevices: null };
   assert.equal(canAccessDevice(admin, "mock-1"), true);
   assert.equal(canAccessDevice(admin, "anything"), true);
+});
+
+test("VA null or missing device grants fail closed and are reported as an explicit empty grant", () => {
+  for (const allowedDevices of [null, undefined]) {
+    const va = { username: "legacy-va", role: "va", allowedDevices };
+    assert.equal(canAccessDevice(va, "mock-1"), false);
+    assert.deepEqual(publicOperator(va).allowedDevices, []);
+  }
 });
 
 test("canAccessDevice: an allowedDevices array restricts to exactly those ids", () => {
@@ -66,6 +75,9 @@ test("normalizeRole defaults missing or unknown roles to va", () => {
   assert.equal(normalizeRole(undefined), "va");
   assert.equal(normalizeRole("typo"), "va");
   assert.equal(normalizeRole("admin"), "admin");
+  assert.equal(normalizeRole("manager"), "manager");
+  assert.equal(normalizeRole("content_creator"), "content_creator");
+  assert.equal(normalizeRole("editor"), "editor");
 });
 
 test("publicOperator returns only safe browser fields", () => {
@@ -76,8 +88,23 @@ test("publicOperator returns only safe browser fields", () => {
     passwordHash: "must-not-leak",
     anotherSecret: "also-private",
   });
-  assert.deepEqual(safe, { username: "admin", role: "admin", allowedDevices: ["mock-1"] });
+  assert.deepEqual(safe, { username: "admin", role: "admin", allowedDevices: ["mock-1"],
+    capabilities: capabilitiesForRole("admin") });
   assert.equal("passwordHash" in safe, false);
+});
+
+test("five roles use explicit capabilities without a numeric rank", () => {
+  assert.deepEqual(Object.keys(ROLE_CAPABILITIES).sort(), Object.values(OPERATOR_ROLES).sort());
+  assert.equal(hasCapability({ role: "admin" }, CAPABILITIES.MANAGE_SECURITY), true);
+  assert.equal(hasCapability({ role: "manager" }, CAPABILITIES.MANAGE_QUEUE), true);
+  assert.equal(hasCapability({ role: "manager" }, CAPABILITIES.MANAGE_USERS), false);
+  assert.equal(hasCapability({ role: "manager" }, CAPABILITIES.MANAGE_GLOBAL_QUEUE), false);
+  assert.equal(hasCapability({ role: "va" }, CAPABILITIES.CONTROL_DEVICE), true);
+  assert.equal(hasCapability({ role: "content_creator" }, CAPABILITIES.CONTROL_DEVICE), false);
+  assert.equal(hasCapability({ role: "content_creator" }, CAPABILITIES.OPERATE_RESEARCH), true);
+  assert.equal(hasCapability({ role: "editor" }, CAPABILITIES.REVIEW_RESEARCH), true);
+  assert.equal(hasCapability({ role: "editor" }, CAPABILITIES.OPERATE_RESEARCH), false);
+  assert.equal(hasCapability({ role: "not-real" }, CAPABILITIES.MANAGE_QUEUE), false);
 });
 
 test("hasRole is explicit and legacy operators are not admins", () => {

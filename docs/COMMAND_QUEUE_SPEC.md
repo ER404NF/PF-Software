@@ -169,6 +169,8 @@ For `/time 09:00-10:00 ...`:
 
 A task does not continue past its configured window unless `allow_overrun=true` is an explicit setting.
 
+`maxDurationSec` is a positive finite elapsed-time limit per dispatch attempt, measured from the persisted `dispatchedAt`. Pauses count toward this limit; a retry receives a new attempt deadline. `allowOverrun` affects the schedule window only and never disables the duration cap. On expiry, new input is revoked immediately; already submitted input must settle before another task receives the device. The worker also checks the deadline before executing a decision, between scheduler ticks.
+
 ## 8. Immediate chaining
 
 When Task A completes:
@@ -185,7 +187,7 @@ Do not require a human click between normal successful tasks.
 
 - `/pause`: finish current atomic action, checkpoint, hold lease or release according to policy, no new actions.
 - `/resume`: continue from checkpoint after re-observing current screen.
-- `/stop`: cancel active task and revoke future actions; preserve audit/result data.
+- `/stop`: cancel active task and revoke future actions; preserve audit/result data. Already-submitted input must settle before ownership can be reused. If saving the cancellation fails, report the failure and hold the device in `ERROR`; do not dispatch replacement work.
 - `/takeover`: pause/cancel AI control as configured and transfer device to Human VA Mode.
 
 The UI should always expose a physical-looking high-priority **STOP AI / TAKE OVER** control independent of chat/command parsing — always visible to whichever operator can see the device at all, i.e. gated by the same role check as the rest of the AI-mode surface (as of 2026-09-09, that's the `admin` role; a VA-role operator sees a read-only "admin handoff required" indicator instead and must escalate). "Independent of chat/command parsing" means it bypasses the text-command parser, not that it bypasses operator-role authorization.

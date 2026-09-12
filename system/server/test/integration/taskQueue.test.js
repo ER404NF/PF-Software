@@ -49,6 +49,7 @@ async function command(cookie, text) {
 
 let cookie;
 let restrictedCookie;
+let managerCookie;
 
 before(async () => {
   operators.set("queue-test-va", {
@@ -65,6 +66,13 @@ before(async () => {
     allowedResearchWorkspaces: ["queue-test"],
     role: "admin",
   });
+  operators.set("queue-test-manager", {
+    username: "queue-test-manager",
+    passwordHash: hashPassword(TEST_PASSWORD),
+    allowedDevices: ["mock-1"],
+    allowedResearchWorkspaces: ["queue-test"],
+    role: "manager",
+  });
   for (const account of [
     { id: "queue-instagram", workspaceId: "queue-test", platform: "instagram" },
     { id: "queue-reddit", workspaceId: "queue-test", platform: "reddit" },
@@ -78,11 +86,13 @@ before(async () => {
   httpUrl = `http://127.0.0.1:${server.address().port}`;
   cookie = await loginCookie("queue-test-va", TEST_PASSWORD);
   restrictedCookie = await loginCookie("queue-test-restricted", TEST_PASSWORD);
+  managerCookie = await loginCookie("queue-test-manager", TEST_PASSWORD);
 });
 
 after(async () => {
   operators.delete("queue-test-va");
   operators.delete("queue-test-restricted");
+  operators.delete("queue-test-manager");
   for (const id of ["queue-instagram", "queue-reddit", "queue-instagram-two"]) {
     researchAccounts.delete(id);
     researchAccountDefinitions.delete(id);
@@ -229,7 +239,7 @@ test("/mode ai, /pause, /resume, /stop, and /takeover drive a device through the
   // SPEC.md's /time doesn't show one either) — targeting a specific device is
   // exercised directly through the queue API, which /time and /cresearch
   // both go through underneath.
-  const targeted = taskQueue.addTask({ goal: "run on mock-2", deviceSelector: { deviceId: "mock-2" } });
+  const targeted = taskQueue.addTask({ goal: "run on mock-2", createdBy: "queue-test-va", deviceSelector: { deviceId: "mock-2" } });
   assert.equal(taskQueue.getTask(targeted.id).state, "RUNNING");
 
   const pauseRes = await command(cookie, "/pause mock-2");
@@ -308,13 +318,23 @@ test("/device health on an unknown device is a 400, not a crash", async () => {
   assert.match(body.error, /unknown device/);
 });
 
-test("/device health is not RBAC-restricted, like the WS device list", async () => {
-  // restrictedCookie's operator is only allowed mock-1, but health is
-  // read-only oversight, not a control action — see the comment on the
-  // device_health case in index.js's executeCommand.
+test("/device health still obeys device authorization", async () => {
   const { status, body } = await command(restrictedCookie, "/device health mock-2");
-  assert.equal(status, 200);
-  assert.equal(body.health.id, "mock-2");
+  assert.equal(status, 400);
+  assert.match(body.error, /not authorized/);
+});
+
+test("manager can run scoped operations but not global queue, model, or audit administration", async () => {
+  const list = await command(managerCookie, "/queue list");
+  assert.equal(list.status, 200);
+  assert.ok(list.body.tasks.every(task => !task.deviceSelector?.deviceId || task.deviceSelector.deviceId === "mock-1"));
+
+  const health = await command(managerCookie, "/device health mock-1");
+  assert.equal(health.status, 200);
+  for (const text of ["/queue pause", "/model set queue-model global", "/audit"]) {
+    const denied = await command(managerCookie, text);
+    assert.equal(denied.status, 403, text);
+  }
 });
 
 test("/audit returns real events, filterable by device or operator", async () => {
@@ -335,4 +355,18 @@ test("/audit returns real events, filterable by device or operator", async () =>
   assert.ok(byDevice.body.events.length > 0);
   assert.ok(byDevice.body.events.length <= 5);
   assert.ok(byDevice.body.events.every((e) => e.deviceId === "mock-1"));
+});
+
+test("task-scoped provider changes require the research workspace grant", async () => {
+  const operator = operators.get("queue-test-restricted");
+  const task = taskQueue.addTask({ goal: "research scope", kind: "research", createdBy: "queue-test-va",
+    deviceSelector: { deviceId: "mock-1" }, accountSelector: { accountId: "queue-instagram", platform: "instagram" } });
+  const prior = operator.allowedResearchWorkspaces;
+  operator.allowedResearchWorkspaces = [];
+  try {
+    const result = await command(restrictedCookie, `/model set queue-model task ${task.id}`);
+    assert.equal(result.status, 400);
+    assert.match(result.body.error, /not authorized/);
+    assert.equal(modelSelection.describe().selections.task[task.id], undefined);
+  } finally { operator.allowedResearchWorkspaces = prior; taskQueue.cancelTask(task.id); }
 });

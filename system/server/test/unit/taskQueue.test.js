@@ -629,6 +629,25 @@ test("stopDevice frees the device for the next eligible task", () => {
   assert.equal(queue.getTask(second.id).state, TASK_STATES.RUNNING);
 });
 
+test("device controls still target the lease holder after a queued task is reordered ahead of it", () => {
+  const { queue, deviceLease } = setup(["dev-1"]);
+  const running = queue.addTask({ goal: "running", deviceSelector: { deviceId: "dev-1" } });
+  const queued = queue.addTask({ goal: "queued", deviceSelector: { deviceId: "dev-1" } });
+  queue.moveTask(queued.id, "before", running.id);
+
+  const paused = queue.pauseDevice("dev-1");
+  assert.equal(paused.id, running.id);
+  assert.equal(queue.getTask(running.id).state, TASK_STATES.PAUSED);
+  assert.equal(queue.getTask(queued.id).state, TASK_STATES.QUEUED);
+  assert.equal(deviceLease.getMode("dev-1"), "AI_PAUSED");
+
+  queue.resumeDevice("dev-1");
+  const stopped = queue.stopDevice("dev-1");
+  assert.equal(stopped.id, running.id);
+  assert.equal(queue.getTask(running.id).state, TASK_STATES.CANCELLED);
+  assert.equal(queue.getTask(queued.id).state, TASK_STATES.RUNNING);
+});
+
 test("takeoverDevice cancels the active task and hands the device to a real human, not AI_IDLE", async () => {
   const { queue, deviceLease } = setup(["dev-1"]);
   const task = queue.addTask({ goal: "x", deviceSelector: { deviceId: "dev-1" } });
@@ -637,6 +656,34 @@ test("takeoverDevice cancels the active task and hands the device to a real huma
   assert.equal(taken.id, task.id);
   assert.equal(queue.getTask(task.id).state, TASK_STATES.CANCELLED);
   assert.equal(deviceLease.getMode("dev-1"), "HUMAN");
+});
+
+test("takeover holds the device in HUMAN until an explicit AI switch", async () => {
+  const { dir, devices, queue, deviceLease } = setup(["dev-1"]);
+  const first = queue.addTask({ goal: "first", deviceSelector: { deviceId: "dev-1" } });
+  const second = queue.addTask({ goal: "second", deviceSelector: { deviceId: "dev-1" } });
+
+  await queue.takeoverDevice("dev-1");
+  assert.equal(queue.getTask(first.id).state, TASK_STATES.CANCELLED);
+  assert.equal(queue.getTask(second.id).state, TASK_STATES.QUEUED);
+  assert.equal(deviceLease.getMode("dev-1"), "HUMAN");
+
+  queue.tick(new Date());
+  assert.equal(queue.getTask(second.id).state, TASK_STATES.QUEUED);
+
+  const restartedLease = createMockDeviceLease();
+  const restarted = createTaskQueue({
+    devices,
+    deviceLease: restartedLease,
+    auditLog: null,
+    storePath: path.join(dir, "tasks.json"),
+  });
+  assert.equal(restarted.getTask(second.id).state, TASK_STATES.QUEUED);
+  assert.equal(restartedLease.getMode("dev-1"), "HUMAN");
+
+  restartedLease.switchToAI("dev-1");
+  restarted.allowAiDispatch("dev-1");
+  assert.equal(restarted.getTask(second.id).state, TASK_STATES.RUNNING);
 });
 
 test("takeoverDevice on an idle device is a harmless no-op that still ends up HUMAN", async () => {
@@ -673,14 +720,20 @@ test("emergencyStopDevice on a device with nothing active is a harmless no-op th
   assert.equal(deviceLease.getMode("dev-1"), "HUMAN");
 });
 
-test("emergencyStopDevice frees the device for the next eligible task, same as stopDevice", () => {
-  const { queue } = setup(["dev-1"]);
+test("emergencyStopDevice holds queued work until an explicit AI switch", () => {
+  const { queue, deviceLease } = setup(["dev-1"]);
   const first = queue.addTask({ goal: "first", deviceSelector: { deviceId: "dev-1" } });
   const second = queue.addTask({ goal: "second", deviceSelector: { deviceId: "dev-1" } });
   assert.equal(queue.getTask(second.id).state, TASK_STATES.QUEUED);
 
   queue.emergencyStopDevice("dev-1");
   assert.equal(queue.getTask(first.id).state, TASK_STATES.CANCELLED);
+  assert.equal(queue.getTask(second.id).state, TASK_STATES.QUEUED);
+  queue.tick(new Date());
+  assert.equal(queue.getTask(second.id).state, TASK_STATES.QUEUED);
+
+  deviceLease.switchToAI("dev-1");
+  queue.allowAiDispatch("dev-1");
   assert.equal(queue.getTask(second.id).state, TASK_STATES.RUNNING);
 });
 
@@ -702,4 +755,59 @@ test("pauseDevice/resumeDevice on a device with nothing active or nothing paused
   assert.equal(queue.pauseDevice("dev-1"), null);
   queue.addTask({ goal: "x", deviceSelector: { deviceId: "dev-1" } });
   assert.equal(queue.resumeDevice("dev-1"), null); // it's RUNNING, not PAUSED
+});
+
+test("NEEDS_HUMAN durably holds the device in HUMAN until an explicit AI switch", async () => {
+  const { dir, devices, queue, deviceLease } = setup(["dev-1"]);
+  const first = queue.addTask({ goal: "first", deviceSelector: { deviceId: "dev-1" } });
+  const second = queue.addTask({ goal: "second", deviceSelector: { deviceId: "dev-1" } });
+
+  await queue.reportResult(first.id, TASK_STATES.NEEDS_HUMAN);
+  assert.equal(queue.getTask(first.id).state, TASK_STATES.NEEDS_HUMAN);
+  assert.equal(queue.getTask(second.id).state, TASK_STATES.QUEUED);
+  assert.equal(deviceLease.getMode("dev-1"), "HUMAN");
+
+  queue.tick(new Date());
+  assert.equal(queue.getTask(second.id).state, TASK_STATES.QUEUED);
+
+  const restartedLease = createMockDeviceLease();
+  const restarted = createTaskQueue({
+    devices,
+    deviceLease: restartedLease,
+    auditLog: null,
+    storePath: path.join(dir, "tasks.json"),
+  });
+  assert.equal(restarted.getTask(second.id).state, TASK_STATES.QUEUED);
+  assert.equal(restartedLease.getMode("dev-1"), "HUMAN");
+
+  restartedLease.switchToAI("dev-1");
+  restarted.allowAiDispatch("dev-1");
+  assert.equal(restarted.getTask(second.id).state, TASK_STATES.RUNNING);
+});
+
+test("restart restores a paused lease and resume notifies the worker", () => {
+  const { dir, queue } = setup(["dev-1"]);
+  const task = queue.addTask({ goal: "pause across restart" });
+  queue.pauseTask(task.id);
+  const lease = createMockDeviceLease();
+  const recovered = createTaskQueue({ devices: makeDevices(["dev-1"]), deviceLease: lease,
+    storePath: path.join(dir, "tasks.json") });
+  assert.equal(lease.getMode("dev-1"), MODES.AI_PAUSED);
+  assert.equal(recovered.getTask(task.id).state, TASK_STATES.PAUSED);
+  let resumed;
+  recovered.on("dispatched", payload => { resumed = payload.task.id; });
+  recovered.resumeTask(task.id);
+  assert.equal(lease.getMode("dev-1"), MODES.AI_RUNNING);
+  assert.equal(resumed, task.id);
+});
+
+test("rejected resume preserves paused state in memory and on disk", () => {
+  const { dir, queue, deviceLease: lease } = setup(["dev-1"]);
+  const task = queue.addTask({ goal: "invalid resume" });
+  queue.pauseTask(task.id);
+  lease.emergencyStop("dev-1");
+  const before = JSON.stringify(task);
+  assert.throws(() => queue.resumeTask(task.id), /transition/);
+  assert.equal(JSON.stringify(task), before);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "tasks.json"))).tasks[0].state, TASK_STATES.PAUSED);
 });

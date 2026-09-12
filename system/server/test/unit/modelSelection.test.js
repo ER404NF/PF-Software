@@ -49,3 +49,19 @@ test("a persistence failure does not change the live model selection", () => {
     assert.equal(selection.describe().selections.global, null);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test("scope dictionaries never resolve inherited properties after changes or restart", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-model-prototypes-"));
+  const args = { providers: new Map([["one", {}], ["two", {}]]), defaultProviderName: "one", storePath: path.join(root, "models.json") };
+  try {
+    const selection = createModelSelection(args);
+    selection.set("two");
+    for (const instance of [selection, createModelSelection(args)]) {
+      for (const id of ["constructor", "toString", "valueOf"]) {
+        assert.equal(instance.resolve({ taskId: id, deviceId: id, workspaceId: id }), "two");
+      }
+    }
+    selection.set("one", { scope: "device", scopeId: "constructor" });
+    assert.equal(selection.resolve({ deviceId: "constructor" }), "one");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

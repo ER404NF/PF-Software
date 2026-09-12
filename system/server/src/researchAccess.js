@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import { operators } from "./authStore.js";
+import { operatorByUsername } from "./authStore.js";
 import { validResearchId } from "./researchId.js";
 import { parseActionPolicies } from "./actionPolicy.js";
 
@@ -44,7 +44,7 @@ export function researchWorkspaceFor(operator, accountId) {
   const workspaceId = researchAccounts.get(accountId);
   // Resolve grants from the current operator registry, never a persisted
   // session snapshot. Removed operators and legacy sessions fail closed.
-  const current = operators.get(operator?.username);
+  const current = operatorByUsername(operator?.username);
   const grants = current?.allowedResearchWorkspaces;
   return workspaceId && Array.isArray(grants) && grants.includes(workspaceId) ? workspaceId : null;
 }

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { safeFilename, safeDeviceId } from "../../src/fileStore.js";
+import { safeFilename, safeDeviceId, deviceDir, MEDIA_ROOT, assertMediaStorageIsolated } from "../../src/fileStore.js";
 
 test("safeFilename accepts a plain filename", () => {
   assert.equal(safeFilename("clip.mp4"), "clip.mp4");
@@ -50,4 +50,14 @@ test("safeDeviceId rejects traversal and unsafe characters", () => {
   assert.equal(safeDeviceId("mock/1"), null);
   assert.equal(safeDeviceId(""), null);
   assert.equal(safeDeviceId(undefined), null);
+});
+
+test("media namespace rejects internal device names and overlapping storage", () => {
+  for (const id of ["sessions", "Sessions", "queue", "research", "audit", "models"]) {
+    assert.equal(safeDeviceId(id), null);
+    assert.equal(deviceDir(id), null);
+  }
+  assert.ok(deviceDir("phone").startsWith(MEDIA_ROOT));
+  assert.throws(() => assertMediaStorageIsolated([MEDIA_ROOT]), /overlaps/);
+  assert.throws(() => assertMediaStorageIsolated([deviceDir("phone")]), /overlaps/);
 });

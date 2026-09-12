@@ -24,6 +24,8 @@ function jsonElements(tree) {
   function visit(node) {
     if (!node || typeof node !== "object" || seen.has(node)) return;
     seen.add(node);
+    if (node.visible === false || node.visible === "false" || node.enabled === false || node.enabled === "false"
+      || node.hidden === true || node.hidden === "true") return;
     const fields = ["type", "role", "id", "identifier", "name", "label", "value", "text", "screen", "app"];
     const text = fields.map((key) => node[key]).filter((value) => typeof value === "string").join(" ");
     const frame = frameFrom(node);
@@ -78,10 +80,10 @@ export function includesAny(text, patterns = []) {
   });
 }
 
-export function findAccessibleElement(tree, patterns = []) {
+export function findAccessibleElement(tree, patterns = [], eligible = () => true) {
   const needles = patterns.map(normalizeUiText).filter(Boolean);
   return uiElements(tree).find((element) => {
-    if (!element.frame) return false;
+    if (!element.frame || !eligible(element)) return false;
     const tokens = new Set(element.text.split(" ").filter(Boolean));
     return needles.some((needle) => needle.length <= 2
       ? tokens.has(needle)
@@ -91,14 +93,16 @@ export function findAccessibleElement(tree, patterns = []) {
 
 export function normalizedCenter(tree, element) {
   if (!element?.frame) throw new Error("accessible target has no usable frame");
-  const framed = uiElements(tree).filter((candidate) => candidate.frame);
-  const width = Math.max(...framed.map(({ frame }) => frame.x + frame.width), 0);
-  const height = Math.max(...framed.map(({ frame }) => frame.y + frame.height), 0);
-  if (!(width > 0 && height > 0)) throw new Error("UI tree has no usable viewport");
-  return {
-    x: Math.max(0, Math.min(1, (element.frame.x + element.frame.width / 2) / width)),
-    y: Math.max(0, Math.min(1, (element.frame.y + element.frame.height / 2) / height)),
-  };
+  const viewport = tree && typeof tree === "object"
+    ? frameFrom({ x: 0, y: 0, ...(tree.viewport ?? tree.window ?? tree) })
+    : uiElements(tree).find(candidate => /XCUIElementType(?:Application|Window)/i.test(candidate.text.replaceAll(" ", "")))?.frame;
+  if (!viewport) throw new Error("UI tree has no explicit screen viewport");
+  const x = element.frame.x + element.frame.width / 2;
+  const y = element.frame.y + element.frame.height / 2;
+  if (x < viewport.x || y < viewport.y || x > viewport.x + viewport.width || y > viewport.y + viewport.height) {
+    throw new Error("accessible target is outside the viewport");
+  }
+  return { x: (x - viewport.x) / viewport.width, y: (y - viewport.y) / viewport.height };
 }
 
 export function observationTree(observation) {

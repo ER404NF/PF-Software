@@ -7,15 +7,42 @@ const whoamiEl = document.getElementById("whoami");
 const roleBadgeEl = document.getElementById("role-badge");
 const adminNavEl = document.getElementById("admin-nav");
 const fleetNavButtonEl = document.getElementById("fleet-nav-button");
+const assignmentsNavButtonEl = document.getElementById("assignments-nav-button");
 const adminNavButtonEl = document.getElementById("admin-nav-button");
 const appEl = document.getElementById("app");
 const connectionStatusEl = document.getElementById("connection-status");
+const peopleSidebarEl = document.getElementById("people-sidebar");
+const peopleListEl = document.getElementById("people-list");
+const peopleSummaryEl = document.getElementById("people-summary");
+const peopleErrorEl = document.getElementById("people-error");
+const peopleRefreshButtonEl = document.getElementById("people-refresh-button");
 const fleetViewEl = document.getElementById("fleet-view");
+const fleetHeadingEl = document.getElementById("fleet-heading");
+const fleetDescriptionEl = document.getElementById("fleet-description");
+const fleetAccessMessageEl = document.getElementById("fleet-access-message");
+const fleetSummaryEl = document.getElementById("fleet-summary");
+const fleetStatusFilterEl = document.getElementById("fleet-status-filter");
+const fleetEmptyEl = document.getElementById("fleet-empty");
 const fleetGroupsEl = document.getElementById("fleet-groups");
 const selectErrorEl = document.getElementById("select-error");
 const detailViewEl = document.getElementById("detail-view");
+const assignmentsViewEl = document.getElementById("assignments-view");
+const assignmentsRefreshButtonEl = document.getElementById("assignments-refresh-button");
+const assignmentCreateFormEl = document.getElementById("assignment-create-form");
+const assignmentAssigneeEl = document.getElementById("assignment-assignee");
+const assignmentDeviceEl = document.getElementById("assignment-device");
+const assignmentAccountEl = document.getElementById("assignment-account");
+const assignmentStartEl = document.getElementById("assignment-start");
+const assignmentEndEl = document.getElementById("assignment-end");
+const assignmentExclusiveEl = document.getElementById("assignment-exclusive");
+const assignmentInstructionsEl = document.getElementById("assignment-instructions");
+const assignmentsMessageEl = document.getElementById("assignments-message");
+const assignmentsListEl = document.getElementById("assignments-list");
+const assignmentsEmptyEl = document.getElementById("assignments-empty");
 const backToFleetButtonEl = document.getElementById("back-to-fleet-button");
 const detailTitleEl = document.getElementById("detail-title");
+const detailAccessNoteEl = document.getElementById("detail-access-note");
+const detailDeviceFactsEl = document.getElementById("detail-device-facts");
 const detailAiStatusEl = document.getElementById("detail-ai-status");
 const screenWrapEl = document.getElementById("screen-wrap");
 const screenEl = document.getElementById("screen");
@@ -38,6 +65,18 @@ const queueRefreshButtonEl = document.getElementById("queue-refresh-button");
 const queueStateEl = document.getElementById("queue-state");
 const queueBodyEl = document.getElementById("queue-body");
 const queueEmptyEl = document.getElementById("queue-empty");
+const usersPanelEl = document.getElementById("users-panel");
+const usersRefreshButtonEl = document.getElementById("users-refresh-button");
+const userCreateFormEl = document.getElementById("user-create-form");
+const userCreateUsernameEl = document.getElementById("user-create-username");
+const userCreatePasswordEl = document.getElementById("user-create-password");
+const userCreateRoleEl = document.getElementById("user-create-role");
+const userCreateDevicesEl = document.getElementById("user-create-devices");
+const userCreateResearchEl = document.getElementById("user-create-research");
+const userCreateAllDevicesEl = document.getElementById("user-create-all-devices");
+const usersMessageEl = document.getElementById("users-message");
+const usersListEl = document.getElementById("users-list");
+const usersEmptyEl = document.getElementById("users-empty");
 const auditRefreshButtonEl = document.getElementById("audit-refresh-button");
 const auditBodyEl = document.getElementById("audit-body");
 const auditEmptyEl = document.getElementById("audit-empty");
@@ -47,15 +86,36 @@ const auditEmptyEl = document.getElementById("audit-empty");
 // failed attempt to switch to someone else's device would incorrectly wipe
 // out an already-working session that the server never actually released.
 let currentDeviceId = null;
+let fileRequestGeneration = 0;
 let pendingDeviceId = null;
 
 // Safe profile returned by /api/me or /api/login. Role controls management
 // surfaces; allowedDevices remains a separate server-enforced device RBAC
 // concern. Never infer admin from allowedDevices === null.
 let currentOperator = null;
+let operatorProfileGeneration = 0;
 
-function isAdmin() {
-  return currentOperator?.role === "admin";
+const UI_CAPABILITIES = Object.freeze({
+  CONTROL_DEVICE: "device:control",
+  MANAGE_QUEUE: "queue:manage",
+  MANAGE_AI_CONTROLLER: "ai-controller:manage",
+  VIEW_AUDIT: "audit:view-sensitive",
+  VIEW_ASSIGNMENTS: "assignments:view",
+  MANAGE_ASSIGNMENTS: "assignments:manage",
+  MANAGE_USERS: "users:manage",
+  VIEW_PEOPLE: "people:view",
+});
+
+function can(capability) {
+  return currentOperator?.capabilities?.includes(capability) === true;
+}
+
+function canManageOperations() {
+  return can(UI_CAPABILITIES.MANAGE_QUEUE);
+}
+
+function profileRequestActive(generation, capability = null) {
+  return generation === operatorProfileGeneration && (!capability || can(capability));
 }
 
 
@@ -64,7 +124,7 @@ function isAdmin() {
 // without waiting for the next broadcast — e.g. right after confirmSelection.
 let lastDevices = [];
 
-// 'fleet' | 'detail' | 'admin'. Purely a client-side view switch, not a route — no
+// 'fleet' | 'detail' | 'assignments' | 'admin'. Purely a client-side view switch, not a route — no
 // server/protocol involvement. Navigating to detail view IS optimistic
 // (unlike currentDeviceId above): it happens the instant a card is clicked,
 // showing a loading hint while the real select_device/takeover round trip
@@ -76,6 +136,7 @@ let currentView = "fleet";
 
 function updateTopNav() {
   fleetNavButtonEl.classList.toggle("active", currentView === "fleet" || currentView === "detail");
+  assignmentsNavButtonEl.classList.toggle("active", currentView === "assignments");
   adminNavButtonEl.classList.toggle("active", currentView === "admin");
 }
 
@@ -83,6 +144,7 @@ function showFleetView() {
   currentView = "fleet";
   fleetViewEl.hidden = false;
   detailViewEl.hidden = true;
+  assignmentsViewEl.hidden = true;
   adminViewEl.hidden = true;
   updateTopNav();
 }
@@ -91,20 +153,35 @@ function showDetailView(deviceId) {
   currentView = "detail";
   fleetViewEl.hidden = true;
   detailViewEl.hidden = false;
+  assignmentsViewEl.hidden = true;
   adminViewEl.hidden = true;
   updateTopNav();
   const device = lastDevices.find((d) => d.id === deviceId);
   detailTitleEl.textContent = device ? device.label : "";
+  renderDeviceFacts(device);
 }
 
 function showAdminView() {
-  if (!isAdmin()) return;
+  if (!canManageOperations()) return;
   currentView = "admin";
   fleetViewEl.hidden = true;
   detailViewEl.hidden = true;
+  assignmentsViewEl.hidden = true;
   adminViewEl.hidden = false;
   updateTopNav();
   refreshAdminView();
+}
+
+function showAssignmentsView() {
+  if (!can(UI_CAPABILITIES.VIEW_ASSIGNMENTS)) return;
+  currentView = "assignments";
+  fleetViewEl.hidden = true;
+  detailViewEl.hidden = true;
+  adminViewEl.hidden = true;
+  assignmentsViewEl.hidden = false;
+  updateTopNav();
+  populateAssignmentForm();
+  void refreshAssignments();
 }
 
 // True while a tap/swipe/type_text is in flight. Against a real device this
@@ -178,20 +255,85 @@ function showApp() {
 }
 
 function setOperatorProfile(profile) {
+  operatorProfileGeneration++;
   window.dispatchEvent(new Event("operator-profile-changed"));
   currentOperator = profile?.username ? {
     username: profile.username,
-    role: profile.role === "admin" ? "admin" : "va",
+    role: typeof profile.role === "string" ? profile.role : "va",
     allowedDevices: profile.allowedDevices ?? null,
+    capabilities: Array.isArray(profile.capabilities) ? profile.capabilities.filter(value => typeof value === "string") : [],
   } : null;
 
   whoamiEl.textContent = currentOperator ? `Signed in as ${currentOperator.username}` : "";
   roleBadgeEl.textContent = currentOperator ? currentOperator.role.toUpperCase() : "";
   roleBadgeEl.hidden = !currentOperator;
-  adminNavEl.hidden = !isAdmin();
+  const isVa = currentOperator?.role === "va";
+  fleetHeadingEl.textContent = isVa ? "VA Fleet" : "Fleet";
+  fleetDescriptionEl.textContent = isVa
+    ? "View fleet status and open your assigned phones."
+    : "View fleet status and open available phones.";
+  adminNavEl.hidden = !currentOperator;
+  assignmentsNavButtonEl.hidden = !can(UI_CAPABILITIES.VIEW_ASSIGNMENTS);
+  adminNavButtonEl.hidden = !canManageOperations();
+  document.getElementById("audit-panel").hidden = !can(UI_CAPABILITIES.VIEW_AUDIT);
+  usersPanelEl.hidden = !can(UI_CAPABILITIES.MANAGE_USERS);
+  assignmentCreateFormEl.hidden = !can(UI_CAPABILITIES.MANAGE_ASSIGNMENTS);
+  peopleSidebarEl.hidden = !currentOperator;
+  if (!currentOperator) renderPeople([]);
 
   // Never leave a privileged surface visible after logout or a role change.
-  if (!isAdmin() && currentView === "admin") showFleetView();
+  if ((!canManageOperations() && currentView === "admin")
+    || (!can(UI_CAPABILITIES.VIEW_ASSIGNMENTS) && currentView === "assignments")) showFleetView();
+}
+
+function applyLiveOperatorProfile(profile) {
+  if (!profile?.username || profile.username !== currentOperator?.username) return;
+  setOperatorProfile(profile);
+
+  // The profile message is sent before the matching fleet broadcast. Remove
+  // summaries and management data rendered under the old capability set so a
+  // demoted operator cannot keep reading stale privileged DOM while the safe
+  // viewer-specific responses are in flight.
+  lastDevices = [];
+  renderToken++;
+  fleetGroupsEl.replaceChildren();
+  fleetSummaryEl.textContent = "Refreshing fleet access…";
+  fleetAccessMessageEl.hidden = true;
+  fleetEmptyEl.hidden = false;
+  fleetEmptyEl.textContent = "Refreshing fleet access…";
+  detailDeviceFactsEl.replaceChildren();
+  detailAiStatusEl.replaceChildren();
+
+  renderAssignments([]);
+  assignmentsMessageEl.textContent = "";
+  if (can(UI_CAPABILITIES.VIEW_ASSIGNMENTS)) void refreshAssignments();
+
+  if (!can(UI_CAPABILITIES.MANAGE_ASSIGNMENTS)) {
+    assignmentInstructionsEl.value = "";
+    assignmentAccountEl.value = "";
+    assignmentStartEl.value = "";
+    assignmentEndEl.value = "";
+  }
+  if (!canManageOperations()) {
+    commandInputEl.value = "";
+    commandOutputEl.textContent = "";
+    queueBodyEl.replaceChildren();
+    queueStateEl.textContent = "";
+    queueEmptyEl.hidden = false;
+    queueEmptyEl.textContent = "Queue access is not available for this role.";
+  }
+  if (!can(UI_CAPABILITIES.VIEW_AUDIT)) {
+    auditBodyEl.replaceChildren();
+    auditEmptyEl.hidden = false;
+    auditEmptyEl.textContent = "Audit access is not available for this role.";
+  }
+  if (!can(UI_CAPABILITIES.MANAGE_USERS)) {
+    userCreateFormEl.reset();
+    usersListEl.replaceChildren();
+    usersMessageEl.textContent = "";
+    usersEmptyEl.hidden = false;
+    usersEmptyEl.textContent = "User management is not available for this role.";
+  }
 }
 
 // Every route below this needs a session; a WS connection needs one too
@@ -245,10 +387,278 @@ loginFormEl.addEventListener("submit", async (e) => {
 
 logoutButtonEl.addEventListener("click", async () => {
   signedOut = true;
+  fileRequestGeneration++;
   if (ws) ws.close();
   await fetch("/api/logout", { method: "POST" });
   setOperatorProfile(null);
   showLogin();
+});
+
+function formatLastSeen(value) {
+  if (!value) return "Never seen";
+  const timestamp = Date.parse(value);
+  if (!Number.isFinite(timestamp)) return "Last seen unavailable";
+  const seconds = Math.max(0, Math.round((Date.now() - timestamp) / 1000));
+  if (seconds < 10) return "Active now";
+  if (seconds < 60) return `Seen ${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `Seen ${minutes}m ago`;
+  return `Seen ${Math.round(minutes / 60)}h ago`;
+}
+
+let lastPeople = [];
+
+function renderPeople(people) {
+  lastPeople = people;
+  peopleListEl.replaceChildren();
+  const onlineCount = people.filter(person => person.online).length;
+  peopleSummaryEl.textContent = `${onlineCount} online · ${people.length} staff`;
+  for (const person of people) {
+    const item = document.createElement("li");
+    item.className = `person-row ${person.online ? "online" : "offline"}`;
+
+    const dot = document.createElement("span");
+    dot.className = "presence-dot";
+    dot.setAttribute("aria-label", person.online ? "Online" : "Offline");
+
+    const details = document.createElement("div");
+    details.className = "person-details";
+    const name = document.createElement("strong");
+    name.textContent = person.username;
+    const meta = document.createElement("span");
+    const sessions = person.activeSessions > 1 ? ` · ${person.activeSessions} sessions` : "";
+    meta.textContent = `${String(person.role || "va").replaceAll("_", " ")} · ${formatLastSeen(person.lastSeenAt)}${sessions}`;
+    details.append(name, meta);
+
+    if (Array.isArray(person.currentPhones) && person.currentPhones.length) {
+      const activity = document.createElement("span");
+      activity.className = "person-activity";
+      activity.textContent = `On ${person.currentPhones.map(phone => phone.label).join(", ")}`;
+      details.append(activity);
+    }
+    if (person.assignment) {
+      const assignment = document.createElement("span");
+      assignment.className = "person-assignment";
+      assignment.textContent = `${person.assignment.status.replaceAll("_", " ")}`
+        + (person.assignment.deviceId ? ` · ${person.assignment.deviceId}` : "")
+        + (person.assignment.startAt && person.assignment.endAt
+          ? ` · ${formatDate(person.assignment.startAt)} → ${formatDate(person.assignment.endAt)}` : "");
+      details.append(assignment);
+    }
+
+    item.append(dot, details);
+    peopleListEl.append(item);
+  }
+}
+
+async function refreshPeople() {
+  const generation = operatorProfileGeneration;
+  peopleErrorEl.textContent = "";
+  try {
+    const response = await fetch("/api/people");
+    const body = await response.json().catch(() => ({}));
+    if (!profileRequestActive(generation, UI_CAPABILITIES.VIEW_PEOPLE)) return;
+    if (!response.ok) throw new Error(body.error || "Could not load staff presence");
+    renderPeople(Array.isArray(body.people) ? body.people : []);
+  } catch (error) {
+    if (!profileRequestActive(generation, UI_CAPABILITIES.VIEW_PEOPLE)) return;
+    peopleErrorEl.textContent = error.message;
+  }
+}
+
+peopleRefreshButtonEl.addEventListener("click", refreshPeople);
+
+function populateAssignmentForm() {
+  const selectedAssignee = assignmentAssigneeEl.value;
+  assignmentAssigneeEl.replaceChildren();
+  for (const person of lastPeople) {
+    const canTarget = currentOperator?.role === "admin"
+      || person.username === currentOperator?.username
+      || !["admin", "manager"].includes(person.role);
+    if (!canTarget) continue;
+    const option = document.createElement("option");
+    option.value = person.username;
+    option.textContent = `${person.username} (${String(person.role).replaceAll("_", " ")})`;
+    assignmentAssigneeEl.append(option);
+  }
+  if ([...assignmentAssigneeEl.options].some(option => option.value === selectedAssignee)) {
+    assignmentAssigneeEl.value = selectedAssignee;
+  }
+
+  const selectedDevice = assignmentDeviceEl.value;
+  assignmentDeviceEl.replaceChildren(new Option("No phone", ""));
+  const allowed = currentOperator?.allowedDevices;
+  for (const device of lastDevices.filter(item => !Array.isArray(allowed) || allowed.includes(item.id))) {
+    assignmentDeviceEl.append(new Option(device.label, device.id));
+  }
+  assignmentDeviceEl.value = [...assignmentDeviceEl.options].some(option => option.value === selectedDevice) ? selectedDevice : "";
+}
+
+function assignmentNextStatuses(assignment) {
+  if (assignment.status === "assigned") {
+    const opensLater = assignment.startAt && Date.parse(assignment.startAt) > Date.now();
+    return opensLater ? ["cancelled"] : ["in_progress", "cancelled"];
+  }
+  if (assignment.status === "in_progress") return ["completed", "cancelled"];
+  return [];
+}
+
+function localInputToIso(value) {
+  if (!value) return null;
+  const date = new Date(value);
+  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
+}
+
+function isoToLocalInput(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (!Number.isFinite(date.getTime())) return "";
+  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
+  return local.toISOString().slice(0, 16);
+}
+
+function assignmentWindow(assignment) {
+  if (!assignment.startAt || !assignment.endAt) return "Unscheduled";
+  return `${formatDate(assignment.startAt)} → ${formatDate(assignment.endAt)}${assignment.exclusive === false ? " · shared" : " · exclusive"}`;
+}
+
+function renderAssignments(assignments) {
+  assignmentsListEl.replaceChildren();
+  assignmentsEmptyEl.hidden = assignments.length > 0;
+  for (const assignment of assignments) {
+    const card = document.createElement("article");
+    card.className = "assignment-card";
+    const heading = document.createElement("div");
+    heading.className = "assignment-card-heading";
+    const title = document.createElement("strong");
+    title.textContent = assignment.instructions;
+    const status = document.createElement("span");
+    status.className = `assignment-status ${assignment.status}`;
+    status.textContent = assignment.status.replaceAll("_", " ");
+    heading.append(title, status);
+
+    const meta = document.createElement("p");
+    meta.textContent = `Assigned to ${assignment.assignee} by ${assignment.createdBy}`
+      + (assignment.deviceId ? ` · Phone ${assignment.deviceId}` : "")
+      + (assignment.accountId ? ` · Account ${assignment.accountId}` : "")
+      + ` · ${assignmentWindow(assignment)}`;
+    card.append(heading, meta);
+
+    const controls = document.createElement("div");
+    controls.className = "assignment-controls";
+    const nextStatuses = assignmentNextStatuses(assignment);
+    if (nextStatuses.length && can(UI_CAPABILITIES.MANAGE_ASSIGNMENTS)) {
+      for (const nextStatus of nextStatuses) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = nextStatus === "in_progress" ? "Start" : nextStatus === "completed" ? "Complete" : "Cancel";
+        button.addEventListener("click", () => updateAssignment(assignment.id, { status: nextStatus }));
+        controls.append(button);
+      }
+    }
+    if (nextStatuses.length && can(UI_CAPABILITIES.MANAGE_ASSIGNMENTS)) {
+      const reassign = document.createElement("select");
+      reassign.setAttribute("aria-label", `Reassign ${assignment.instructions}`);
+      reassign.append(new Option("Reassign…", ""));
+      for (const option of assignmentAssigneeEl.options) reassign.append(option.cloneNode(true));
+      reassign.addEventListener("change", () => {
+        if (reassign.value) void updateAssignment(assignment.id, { assignee: reassign.value });
+      });
+      controls.append(reassign);
+
+      const scheduleStart = document.createElement("input");
+      scheduleStart.type = "datetime-local";
+      scheduleStart.value = isoToLocalInput(assignment.startAt);
+      scheduleStart.setAttribute("aria-label", `Start time for ${assignment.instructions}`);
+      const scheduleEnd = document.createElement("input");
+      scheduleEnd.type = "datetime-local";
+      scheduleEnd.value = isoToLocalInput(assignment.endAt);
+      scheduleEnd.setAttribute("aria-label", `End time for ${assignment.instructions}`);
+      const scheduleExclusive = document.createElement("input");
+      scheduleExclusive.type = "checkbox";
+      scheduleExclusive.checked = assignment.exclusive !== false;
+      scheduleExclusive.setAttribute("aria-label", `Exclusive schedule for ${assignment.instructions}`);
+      const reschedule = document.createElement("button");
+      reschedule.type = "button";
+      reschedule.textContent = "Update schedule";
+      reschedule.addEventListener("click", () => updateAssignment(assignment.id, {
+        startAt: localInputToIso(scheduleStart.value),
+        endAt: localInputToIso(scheduleEnd.value),
+        exclusive: scheduleExclusive.checked,
+      }));
+      controls.append(scheduleStart, scheduleEnd, scheduleExclusive, reschedule);
+    }
+    card.append(controls);
+
+    const history = document.createElement("details");
+    const summary = document.createElement("summary");
+    summary.textContent = `History (${assignment.history.length})`;
+    const list = document.createElement("ol");
+    for (const event of assignment.history) {
+      const item = document.createElement("li");
+      item.textContent = `${new Date(event.at).toLocaleString()} · ${event.actor} · ${event.action.replaceAll("_", " ")}`;
+      list.append(item);
+    }
+    history.append(summary, list);
+    card.append(history);
+    assignmentsListEl.append(card);
+  }
+}
+
+async function refreshAssignments() {
+  const generation = operatorProfileGeneration;
+  assignmentsMessageEl.textContent = "";
+  try {
+    const response = await fetch("/api/assignments");
+    const body = await response.json().catch(() => ({}));
+    if (!profileRequestActive(generation, UI_CAPABILITIES.VIEW_ASSIGNMENTS)) return;
+    if (!response.ok) throw new Error(body.error || "Could not load assignments");
+    renderAssignments(Array.isArray(body.assignments) ? body.assignments : []);
+  } catch (error) {
+    if (!profileRequestActive(generation, UI_CAPABILITIES.VIEW_ASSIGNMENTS)) return;
+    assignmentsMessageEl.textContent = error.message;
+  }
+}
+
+async function updateAssignment(id, change) {
+  assignmentsMessageEl.textContent = "";
+  const response = await fetch(`/api/assignments/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(change),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) assignmentsMessageEl.textContent = body.error || "Could not update assignment";
+  await refreshAssignments();
+}
+
+assignmentsRefreshButtonEl.addEventListener("click", refreshAssignments);
+assignmentCreateFormEl.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  assignmentsMessageEl.textContent = "";
+  const response = await fetch("/api/assignments", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      assignee: assignmentAssigneeEl.value,
+      instructions: assignmentInstructionsEl.value,
+      deviceId: assignmentDeviceEl.value || null,
+      accountId: assignmentAccountEl.value.trim() || null,
+      startAt: localInputToIso(assignmentStartEl.value),
+      endAt: localInputToIso(assignmentEndEl.value),
+      exclusive: assignmentExclusiveEl.checked,
+    }),
+  });
+  const body = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    assignmentsMessageEl.textContent = body.error || "Could not create assignment";
+    return;
+  }
+  assignmentInstructionsEl.value = "";
+  assignmentAccountEl.value = "";
+  assignmentStartEl.value = "";
+  assignmentEndEl.value = "";
+  await refreshAssignments();
 });
 
 backToFleetButtonEl.addEventListener("click", () => {
@@ -256,38 +666,57 @@ backToFleetButtonEl.addEventListener("click", () => {
 });
 
 fleetNavButtonEl.addEventListener("click", () => showFleetView());
+assignmentsNavButtonEl.addEventListener("click", () => showAssignmentsView());
 adminNavButtonEl.addEventListener("click", () => showAdminView());
 
 function connect() {
-  ws = new WebSocket(`ws://${location.host}`);
+  ws = new WebSocket(`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}`);
 
   ws.addEventListener("open", () => {
     connectionStatusEl.hidden = true;
+    void refreshPeople();
   });
 
   ws.addEventListener("message", (event) => {
     const msg = JSON.parse(event.data);
-    if (msg.type === "device_list") renderFleetSafely(msg.devices);
+    if (msg.type === "operator_profile") {
+      applyLiveOperatorProfile(msg.operator);
+    }
+    if (msg.type === "device_list") {
+      renderFleetSafely(msg.devices);
+      populateAssignmentForm();
+    }
+    if (msg.type === "presence_list") {
+      renderPeople(Array.isArray(msg.people) ? msg.people : []);
+      populateAssignmentForm();
+    }
 
     if (msg.type === "frame") {
       if (msg.deviceId === pendingDeviceId) confirmSelection(pendingDeviceId);
-      if (msg.deviceId === currentDeviceId) {
+      if (msg.deviceId === currentDeviceId && !pendingDeviceId) {
         renderFrame(msg);
         setBusy(false);
       }
     }
 
     if (msg.type === "error") {
-      if (msg.deviceId === pendingDeviceId) {
+      if (msg.code === "device_access_revoked") {
+        deselect(msg.message || "Your access to this phone was revoked.");
+        selectErrorEl.textContent = msg.message || "Your access to this phone was revoked.";
+      } else if (msg.deviceId === pendingDeviceId) {
         // A selection attempt failed — surface it without touching whatever
         // device (if any) is already confirmed and working, and bounce back
         // from the optimistic detail-view navigation selectDevice/
         // takeOverDevice already did.
         pendingDeviceId = null;
+        setBusy(false);
         selectErrorEl.textContent = msg.message;
         if (!currentDeviceId) showFleetView();
       } else if (msg.deviceId === currentDeviceId) {
-        deselect(msg.message);
+        // Device errors do not revoke the server-side claim. Keep retry and
+        // Release available instead of abandoning an owned device locally.
+        hintEl.textContent = msg.message;
+        setBusy(false);
       } else {
         // Neither pending nor current — e.g. a fleet-card AI control
         // button failing for a device this connection never selected in the
@@ -300,14 +729,33 @@ function connect() {
     }
   });
 
-  ws.addEventListener("close", () => {
+  ws.addEventListener("close", (event) => {
     pendingDeviceId = null;
     fleetGroupsEl.innerHTML = "";
     selectErrorEl.textContent = "";
     if (signedOut) return; // don't fight an intentional sign-out
+    if (event.code === 1008) {
+      signedOut = true;
+      deselect("Session expired. Sign in again.");
+      setOperatorProfile(null);
+      showLogin();
+      return;
+    }
     connectionStatusEl.hidden = false;
     deselect("Disconnected — reconnecting…");
-    setTimeout(connect, 2000);
+    setTimeout(async () => {
+      if (signedOut) return;
+      try {
+        const response = await fetch("/api/me");
+        if (response.status === 401) {
+          signedOut = true;
+          setOperatorProfile(null);
+          showLogin();
+          return;
+        }
+      } catch { /* A network outage may recover on the next connection. */ }
+      if (!signedOut) connect();
+    }, 2000);
   });
 }
 
@@ -322,20 +770,69 @@ let renderToken = 0;
 
 async function renderFleetSafely(devices) {
   lastDevices = devices;
+  if (currentDeviceId) {
+    const selectedSummary = devices.find(device => device.id === currentDeviceId);
+    if (!selectedSummary || !selectedSummary.canOpen) {
+      const reason = selectedSummary?.openReason || "This phone is no longer available in the fleet.";
+      deselect(reason);
+      selectErrorEl.textContent = reason;
+    }
+  }
   const token = ++renderToken;
   const aiDevices = devices.filter((d) => d.controllerMode && d.controllerMode !== "HUMAN");
-  // Queue/audit are admin-only surfaces now. A VA never calls either endpoint
-  // merely to render the fleet; it only sees the device's coarse controller
-  // mode so it understands why an AI-controlled phone cannot be claimed.
-  const [tasksByDevice, lastActionByDevice] = isAdmin() && aiDevices.length
-    ? await Promise.all([fetchActiveTasksByDevice(), fetchLastActionByDevice()])
+  // Queue and sensitive audit access are separate capabilities. An operations
+  // user can see scoped tasks without gaining access to the global audit log.
+  const [tasksByDevice, lastActionByDevice] = canManageOperations() && aiDevices.length
+    ? await Promise.all([
+      fetchActiveTasksByDevice(),
+      can(UI_CAPABILITIES.VIEW_AUDIT) ? fetchLastActionByDevice() : Promise.resolve(new Map()),
+    ])
     : [new Map(), new Map()];
   if (token !== renderToken) return; // a newer device_list has already re-rendered
+  renderFleetSummary(devices);
   renderFleet(devices, tasksByDevice, lastActionByDevice);
   if (currentView === "detail" && currentDeviceId) {
+    renderDeviceFacts(devices.find(device => device.id === currentDeviceId));
     renderDetailAiStatus(currentDeviceId, tasksByDevice.get(currentDeviceId), lastActionByDevice.get(currentDeviceId));
   }
 }
+
+function renderFleetSummary(devices) {
+  const assignedCount = devices.filter(device => device.assignedToViewer).length;
+  const openableCount = devices.filter(device => device.canOpen).length;
+  fleetAccessMessageEl.hidden = currentOperator?.role !== "va" || openableCount > 0;
+  if (!fleetAccessMessageEl.hidden) {
+    fleetAccessMessageEl.textContent = assignedCount === 0
+      ? "You can view the fleet, but no phones are assigned to you."
+      : "Your assigned phones are currently offline, in use, or controlled by AI.";
+  }
+  const counts = [
+    ["Total", devices.length],
+    ["Available", devices.filter(device => device.status === "idle" && device.controllerMode === "HUMAN").length],
+    ["In use", devices.filter(device => device.status === "in-use").length],
+    ["Offline", devices.filter(device => device.status === "offline").length],
+    ["AI", devices.filter(device => device.controllerMode !== "HUMAN").length],
+  ];
+  fleetSummaryEl.replaceChildren();
+  for (const [label, value] of counts) {
+    const card = document.createElement("span");
+    const count = document.createElement("strong");
+    count.textContent = value;
+    card.append(count, document.createTextNode(label));
+    fleetSummaryEl.append(card);
+  }
+}
+
+function fleetMatchesFilter(device) {
+  const filter = fleetStatusFilterEl.value;
+  if (filter === "all") return true;
+  if (filter === "ai") return device.controllerMode !== "HUMAN";
+  return device.status === filter;
+}
+
+fleetStatusFilterEl.addEventListener("change", () => {
+  void renderFleetSafely(lastDevices);
+});
 
 async function fetchActiveTasksByDevice() {
   const map = new Map();
@@ -344,7 +841,7 @@ async function fetchActiveTasksByDevice() {
     const { tasks } = await res.json();
     for (const t of tasks) {
       const id = t.deviceSelector?.deviceId;
-      if (id) map.set(id, t);
+      if (id && ["RUNNING", "PAUSED"].includes(t.state)) map.set(id, t);
     }
   } catch {
     // Best-effort — the status pane just shows less detail, never blocks
@@ -388,7 +885,9 @@ function groupByHost(devices) {
 
 function renderFleet(devices, tasksByDevice, lastActionByDevice) {
   fleetGroupsEl.innerHTML = "";
-  for (const [hostLabel, groupDevices] of groupByHost(devices)) {
+  const visibleDevices = devices.filter(fleetMatchesFilter);
+  fleetEmptyEl.hidden = visibleDevices.length > 0;
+  for (const [hostLabel, groupDevices] of groupByHost(visibleDevices)) {
     const section = document.createElement("section");
     section.className = "fleet-group";
 
@@ -408,6 +907,58 @@ function renderFleet(devices, tasksByDevice, lastActionByDevice) {
   }
 }
 
+function renderDeviceFacts(device) {
+  detailDeviceFactsEl.replaceChildren();
+  detailAccessNoteEl.textContent = "";
+  if (!device) return;
+  detailAccessNoteEl.textContent = currentOperator?.role === "va" && device.assignedToViewer
+    ? "Assigned device — you may operate this phone. Fleet settings are read-only."
+    : device.openReason || "Fleet settings are read-only.";
+  const facts = [
+    ["Phone", device.id],
+    ["Host", device.hostLabel || "this-mac"],
+    ["State", device.status],
+    ["Controller", device.controllerMode || "HUMAN"],
+    ["Current operator", device.currentOperator || (device.controllerMode !== "HUMAN" ? "AI controller" : "None")],
+    ["Your access", device.assignedToViewer ? "Assigned to you" : "Not assigned to you"],
+    ["Last seen", device.lastSeenAt ? formatLastSeen(device.lastSeenAt) : "No successful check"],
+    ["Failures", String(device.consecutiveFailures || 0)],
+    ["Network", device.network?.egress || "Not assigned"],
+    ["Provider / gateway", device.network?.providerLabel || device.network?.gatewayLabel || "Not configured"],
+    ["Configured region", device.network?.configuredRegion || "Not configured"],
+    ["Expected IPv4", device.network?.expectedPublicIpv4 || "Not configured"],
+    ["IPv6 policy", device.network?.expectedIpv6Policy || "Unspecified"],
+    ["Observed IPv4", device.networkObservedIp || "Not checked"],
+    ["Observed IPv6", device.networkObservedIpv6 || "None observed"],
+    ["Observed region", device.networkObservedRegion || "Not checked"],
+    ["DNS", device.networkDnsStatus || "Not checked"],
+    ["Proxy health", device.networkProxyHealthy === null ? "Not checked" : device.networkProxyHealthy ? "Healthy" : "Unhealthy"],
+    ["Fail policy", device.network?.failPolicy || "Not configured"],
+    ["Bandwidth", Number.isFinite(device.networkBandwidthMbps) ? `${device.networkBandwidthMbps} Mbps` : "Not checked"],
+    ["Last verification", device.networkCheckedAt ? formatDate(device.networkCheckedAt) : "Never"],
+    ["Isolation", device.networkMismatch ? "Mismatch" : device.networkVerified ? "Verified" : "Not verified"],
+    ["Monitor", device.monitor?.available ? "Available" : device.monitor?.reason || "Unavailable"],
+  ];
+  if (device.assignment) {
+    facts.splice(6, 0,
+      ["Assigned user", device.assignment.assignee],
+      ["Assignment window", assignmentWindow(device.assignment)]);
+  }
+  if (Array.isArray(device.authorizedOperators) && device.authorizedOperators.length) {
+    facts.splice(6, 0, ["Authorized staff", device.authorizedOperators
+      .map(operator => `${operator.username} (${operator.role.replaceAll("_", " ")})`).join(", ")]);
+  }
+  for (const [label, value] of facts) {
+    const item = document.createElement("div");
+    const name = document.createElement("span");
+    name.textContent = label;
+    const content = document.createElement("strong");
+    content.textContent = value;
+    item.append(name, content);
+    detailDeviceFactsEl.append(item);
+  }
+}
+
 // "warning" is a rendering-layer read of two already-existing fields
 // (status, consecutiveFailures) — the protocol itself still only has three
 // raw states (idle/in-use/offline). A device that's had recent trouble but
@@ -422,10 +973,10 @@ function cardStatusClass(d) {
 function renderDeviceCard(d, task, lastAction) {
   const isAiMode = d.controllerMode && d.controllerMode !== "HUMAN";
   const isMine = d.id === currentDeviceId;
-  const admin = isAdmin();
+  const canManageAi = can(UI_CAPABILITIES.MANAGE_AI_CONTROLLER);
 
   const card = document.createElement("article");
-  card.className = `device-card ${cardStatusClass(d)}${isMine ? " mine" : ""}${isAiMode && !admin ? " ai-locked" : ""}`;
+  card.className = `device-card ${cardStatusClass(d)}${isMine ? " mine" : ""}${isAiMode && !canManageAi ? " ai-locked" : ""}${d.canOpen ? " openable" : " restricted"}`;
   if (d.lastSeenAt) card.title = `Last responded: ${new Date(d.lastSeenAt).toLocaleString()}`;
 
   const body = document.createElement("div");
@@ -445,7 +996,7 @@ function renderDeviceCard(d, task, lastAction) {
 
   const metaRow = document.createElement("div");
   metaRow.className = "device-card-meta";
-  const metaParts = [d.status];
+  const metaParts = [d.status, d.id, d.hostLabel || "this-mac"];
   const health = healthSuffix(d);
   if (health) metaParts.push(health.trim());
   metaRow.textContent = metaParts.join(" · ");
@@ -472,25 +1023,54 @@ function renderDeviceCard(d, task, lastAction) {
 
   card.appendChild(body);
 
-  if (admin && isAiMode) {
+  const access = document.createElement("div");
+  access.className = `device-access ${d.assignedToViewer ? "assigned" : "unassigned"}`;
+  const accessLabel = document.createElement("strong");
+  accessLabel.textContent = d.assignedToViewer ? "Assigned to you" : "Not assigned to you";
+  const accessReason = document.createElement("span");
+  accessReason.textContent = d.openReason || (d.canOpen ? "Available to open." : "This phone cannot be opened.");
+  access.append(accessLabel, accessReason);
+  card.appendChild(access);
+
+  const networkState = document.createElement("div");
+  networkState.className = "device-safe-status";
+  const egress = d.network?.providerLabel || d.network?.gatewayLabel || d.network?.egress || "No egress assigned";
+  const verification = d.networkMismatch ? "Network mismatch"
+    : d.networkVerified ? "Network verified" : "Network not verified";
+  networkState.textContent = `${egress} · ${verification} · ${formatLastSeen(d.lastSeenAt)}`;
+  card.appendChild(networkState);
+
+  if (d.currentOperator || d.assignment) {
+    const context = document.createElement("div");
+    context.className = "device-card-context";
+    const controller = d.currentOperator ? `Controlled by ${d.currentOperator}` : "No active human controller";
+    const assigned = d.assignment
+      ? `Assigned to ${d.assignment.assignee} · ${assignmentWindow(d.assignment)}`
+      : "No assignment";
+    context.textContent = `${controller} · ${assigned}`;
+    card.appendChild(context);
+  }
+
+  if (canManageAi && isAiMode) {
     card.appendChild(buildAiStatusRows(task, lastAction, { includeMode: false }));
-  } else if (!admin && isAiMode) {
+  } else if (!canManageAi && isAiMode) {
     const locked = document.createElement("div");
     locked.className = "ai-locked-note";
-    locked.textContent = "AI-controlled — admin handoff required.";
+    locked.textContent = "AI-controlled — an operations handoff is required.";
     card.appendChild(locked);
   }
 
-  card.addEventListener("click", () => {
-    if (isAiMode) {
-      if (admin) takeOverDevice(d.id);
-      else selectErrorEl.textContent = `${d.label} is in AI mode. An admin must hand it back to Human mode first.`;
-      return;
-    }
-    selectDevice(d.id);
-  });
+  if (d.assignedToViewer && !isAiMode) {
+    const open = document.createElement("button");
+    open.type = "button";
+    open.className = "open-device-button";
+    open.textContent = d.canOpen ? "Open device" : d.accessState === "in_use" ? "In use" : "Open device";
+    open.disabled = !d.canOpen;
+    open.addEventListener("click", () => requestDeviceOpen(d));
+    card.appendChild(open);
+  }
 
-  if (admin) {
+  if (canManageAi) {
     const controls = buildFleetAiControls(d, task);
     if (controls) card.appendChild(controls);
   }
@@ -548,13 +1128,15 @@ function buildControlButton(label, onClick, className = "") {
 }
 
 async function runAdminCommand(text, { showOutput = false } = {}) {
-  if (!isAdmin()) return null;
+  if (!canManageOperations()) return null;
+  const generation = operatorProfileGeneration;
   const res = await fetch("/api/queue/command", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ text }),
   });
   const body = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+  if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_QUEUE)) return null;
   if (showOutput) commandOutputEl.textContent = formatCommandResult(body);
   if (!res.ok && !showOutput) selectErrorEl.textContent = body.error || `Command failed (HTTP ${res.status}).`;
   if (currentView === "admin") refreshAdminView();
@@ -562,7 +1144,7 @@ async function runAdminCommand(text, { showOutput = false } = {}) {
 }
 
 function buildFleetAiControls(device, task) {
-  if (!isAdmin()) return null;
+  if (!can(UI_CAPABILITIES.MANAGE_AI_CONTROLLER)) return null;
   const mode = device.controllerMode || "HUMAN";
   const wrap = document.createElement("div");
   wrap.className = "ai-controls";
@@ -602,7 +1184,7 @@ function renderDetailAiStatus(deviceId, task, lastAction) {
   const device = lastDevices.find((d) => d.id === deviceId);
   const isAiMode = device?.controllerMode && device.controllerMode !== "HUMAN";
   detailAiStatusEl.innerHTML = "";
-  if (!isAdmin() || !isAiMode) return;
+  if (!can(UI_CAPABILITIES.MANAGE_AI_CONTROLLER) || !isAiMode) return;
 
   const wrap = buildAiStatusRows(task, lastAction, { includeMode: true, mode: device.controllerMode });
   const controls = buildFleetAiControls(device, task);
@@ -618,11 +1200,22 @@ function healthSuffix(d) {
 }
 
 function selectDevice(id) {
+  if (!can(UI_CAPABILITIES.CONTROL_DEVICE)) return;
   pendingDeviceId = id;
+  setBusy(true);
   selectErrorEl.textContent = "";
   showDetailView(id);
   if (!currentDeviceId) hintEl.textContent = "Loading…";
   safeSend({ type: "select_device", deviceId: id });
+}
+
+function requestDeviceOpen(device) {
+  if (!device?.canOpen) {
+    selectErrorEl.textContent = device?.openReason || "This phone cannot be opened.";
+    return false;
+  }
+  selectDevice(device.id);
+  return true;
 }
 
 // Stops whatever AI control a device has and claims it, in one step
@@ -630,7 +1223,9 @@ function selectDevice(id) {
 // replies the same way select_device does (a frame for pendingDeviceId), so
 // confirmSelection below handles both identically.
 function takeOverDevice(id) {
+  if (!can(UI_CAPABILITIES.MANAGE_AI_CONTROLLER)) return;
   pendingDeviceId = id;
+  setBusy(true);
   selectErrorEl.textContent = "";
   showDetailView(id);
   if (!currentDeviceId) hintEl.textContent = "Taking over…";
@@ -643,6 +1238,8 @@ function takeOverDevice(id) {
 // populates it and refreshes the fleet render so the "you're controlling
 // this" badge shows up on the right card.
 function confirmSelection(id) {
+  fileRequestGeneration++;
+  fileListEl.innerHTML = "";
   currentDeviceId = id;
   pendingDeviceId = null;
   selectErrorEl.textContent = "";
@@ -668,7 +1265,9 @@ function confirmSelection(id) {
 // operator explicitly released it. Stop pretending this client still
 // controls it, and there's nothing left to show in detail view for it.
 function deselect(message) {
+  fileRequestGeneration++;
   currentDeviceId = null;
+  pendingDeviceId = null;
   screenEl.innerHTML = "";
   hintEl.textContent = message;
   uploadFormEl.hidden = true;
@@ -689,7 +1288,7 @@ function deselect(message) {
 // response that isn't coming.
 releaseButtonEl.addEventListener("click", () => {
   if (!currentDeviceId) return;
-  safeSend({ type: "release_device" });
+  safeSend({ type: "release_device", deviceId: currentDeviceId });
   deselect("Select a device to begin.");
 });
 
@@ -703,44 +1302,51 @@ function renderFrame(frame) {
 }
 
 screenEl.addEventListener("click", (e) => {
-  if (!currentDeviceId || busy) return;
-  const rect = screenEl.getBoundingClientRect();
+  if (!currentDeviceId || pendingDeviceId || busy) return;
+  const image = screenEl.querySelector("img, svg");
+  if (!image) return;
+  const rect = image.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
   const x = (e.clientX - rect.left) / rect.width;
   const y = (e.clientY - rect.top) / rect.height;
+  if (x < 0 || x > 1 || y < 0 || y > 1) return;
   setBusy(true);
-  safeSend({ type: "tap", x, y });
+  safeSend({ type: "tap", deviceId: currentDeviceId, x, y });
 });
 
 swipeControlsEl.addEventListener("click", (e) => {
   const direction = e.target.dataset.direction;
-  if (!direction || !currentDeviceId || busy) return;
+  if (!direction || !currentDeviceId || pendingDeviceId || busy) return;
   setBusy(true);
-  safeSend({ type: "swipe", direction });
+  safeSend({ type: "swipe", deviceId: currentDeviceId, direction });
 });
 
 homeButtonEl.addEventListener("click", () => {
-  if (!currentDeviceId || busy) return;
+  if (!currentDeviceId || pendingDeviceId || busy) return;
   setBusy(true);
-  safeSend({ type: "home" });
+  safeSend({ type: "home", deviceId: currentDeviceId });
 });
 
 typeFormEl.addEventListener("submit", (e) => {
   e.preventDefault();
   const text = typeInputEl.value;
-  if (!text || !currentDeviceId || busy) return;
+  if (!text || !currentDeviceId || pendingDeviceId || busy) return;
   setBusy(true);
-  safeSend({ type: "type_text", text });
+  safeSend({ type: "type_text", deviceId: currentDeviceId, text });
   typeInputEl.value = "";
 });
 
 async function refreshFiles() {
   if (!currentDeviceId) return;
-  const res = await fetch(`/api/devices/${currentDeviceId}/files`);
+  const deviceId = currentDeviceId;
+  const generation = ++fileRequestGeneration;
+  const res = await fetch(`/api/devices/${deviceId}/files`);
   const { files } = await res.json();
-  renderFileList(files);
+  if (generation !== fileRequestGeneration || deviceId !== currentDeviceId || signedOut) return;
+  renderFileList(files, deviceId);
 }
 
-function renderFileList(files) {
+function renderFileList(files, deviceId) {
   fileListEl.innerHTML = "";
   if (files.length === 0) {
     filesHintEl.textContent = "No files yet.";
@@ -751,7 +1357,7 @@ function renderFileList(files) {
     const li = document.createElement("li");
 
     const link = document.createElement("a");
-    link.href = `/api/devices/${currentDeviceId}/files/${encodeURIComponent(f.name)}`;
+    link.href = `/api/devices/${deviceId}/files/${encodeURIComponent(f.name)}`;
     link.textContent = f.name;
     link.download = f.name;
 
@@ -762,16 +1368,17 @@ function renderFileList(files) {
     const del = document.createElement("button");
     del.textContent = "×";
     del.title = "Delete";
-    del.addEventListener("click", () => deleteFile(f.name));
+    del.addEventListener("click", () => deleteFile(f.name, deviceId));
 
     li.append(link, size, del);
     fileListEl.appendChild(li);
   }
 }
 
-async function deleteFile(name) {
-  await fetch(`/api/devices/${currentDeviceId}/files/${encodeURIComponent(name)}`, { method: "DELETE" });
-  refreshFiles();
+async function deleteFile(name, deviceId) {
+  if (deviceId !== currentDeviceId || signedOut) return;
+  await fetch(`/api/devices/${deviceId}/files/${encodeURIComponent(name)}`, { method: "DELETE" });
+  if (deviceId === currentDeviceId) refreshFiles();
 }
 
 function formatSize(bytes) {
@@ -843,11 +1450,13 @@ function addCell(row, text, className = "") {
 }
 
 async function refreshQueueViewer() {
-  if (!isAdmin()) return;
+  if (!canManageOperations()) return;
+  const generation = operatorProfileGeneration;
   queueStateEl.textContent = "Loading…";
   try {
     const res = await fetch("/api/queue");
     const body = await res.json().catch(() => ({}));
+    if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_QUEUE)) return;
     if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
 
     queueStateEl.textContent = body.paused ? "Queue paused" : "Queue running";
@@ -868,6 +1477,7 @@ async function refreshQueueViewer() {
       queueBodyEl.appendChild(row);
     }
   } catch (err) {
+    if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_QUEUE)) return;
     queueBodyEl.innerHTML = "";
     queueEmptyEl.hidden = false;
     queueEmptyEl.textContent = `Could not load queue: ${err.message}`;
@@ -876,10 +1486,12 @@ async function refreshQueueViewer() {
 }
 
 async function refreshAuditViewer() {
-  if (!isAdmin()) return;
+  if (!can(UI_CAPABILITIES.VIEW_AUDIT)) return;
+  const generation = operatorProfileGeneration;
   try {
     const res = await fetch("/api/audit?limit=200");
     const body = await res.json().catch(() => ({}));
+    if (!profileRequestActive(generation, UI_CAPABILITIES.VIEW_AUDIT)) return;
     if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
 
     auditBodyEl.innerHTML = "";
@@ -897,15 +1509,255 @@ async function refreshAuditViewer() {
       auditBodyEl.appendChild(row);
     }
   } catch (err) {
+    if (!profileRequestActive(generation, UI_CAPABILITIES.VIEW_AUDIT)) return;
     auditBodyEl.innerHTML = "";
     auditEmptyEl.hidden = false;
     auditEmptyEl.textContent = `Could not load audit log: ${err.message}`;
   }
 }
 
+const USER_ROLES = Object.freeze([
+  ["va", "VA"],
+  ["content_creator", "Content creator"],
+  ["editor", "Editor"],
+  ["manager", "Manager"],
+  ["admin", "Admin"],
+]);
+
+function parseIdList(value) {
+  return [...new Set(value.split(",").map(item => item.trim()).filter(Boolean))];
+}
+
+function roleSelect(selected) {
+  const select = document.createElement("select");
+  for (const [value, label] of USER_ROLES) select.append(new Option(label, value, false, value === selected));
+  return select;
+}
+
+function labeledControl(text, control) {
+  const label = document.createElement("label");
+  label.append(document.createTextNode(text), control);
+  return label;
+}
+
+function syncAllDevicesControl(roleControl, allDevicesControl, deviceIdsControl) {
+  const isVa = roleControl.value === "va";
+  if (isVa) allDevicesControl.checked = false;
+  allDevicesControl.disabled = isVa;
+  deviceIdsControl.disabled = allDevicesControl.checked;
+}
+
+function renderUsers(users) {
+  usersListEl.replaceChildren();
+  usersEmptyEl.hidden = users.length !== 0;
+  for (const user of users) {
+    const card = document.createElement("article");
+    card.className = "user-card";
+
+    const heading = document.createElement("div");
+    heading.className = "user-card-heading";
+    const username = document.createElement("strong");
+    username.textContent = user.username;
+    const state = document.createElement("span");
+    state.className = `user-state ${user.active ? "active" : "inactive"}`;
+    state.textContent = user.active ? "Active" : "Inactive";
+    heading.append(username, state);
+
+    const presence = document.createElement("p");
+    presence.className = "user-presence";
+    const live = user.presence?.online ? "Online" : "Offline";
+    const sessions = Number(user.presence?.activeSessions) || 0;
+    const phones = Array.isArray(user.presence?.currentPhones)
+      ? user.presence.currentPhones.map(phone => phone.label).join(", ") : "";
+    presence.textContent = `${live} · ${sessions} active session${sessions === 1 ? "" : "s"}`
+      + (phones ? ` · Using ${phones}` : "")
+      + (!user.presence?.online && user.presence?.lastSeenAt ? ` · ${formatLastSeen(user.presence.lastSeenAt)}` : "");
+
+    const form = document.createElement("form");
+    form.className = "user-form user-edit-form";
+    const role = roleSelect(user.role);
+    const active = document.createElement("input");
+    active.type = "checkbox";
+    active.checked = user.active === true;
+    const activeLabel = labeledControl("Active", active);
+    activeLabel.className = "user-checkbox";
+
+    const allDevices = document.createElement("input");
+    allDevices.type = "checkbox";
+    allDevices.checked = user.allowedDevices === null;
+    const allDevicesLabel = labeledControl("All devices", allDevices);
+    allDevicesLabel.className = "user-checkbox";
+    const deviceIds = document.createElement("input");
+    deviceIds.value = Array.isArray(user.allowedDevices) ? user.allowedDevices.join(", ") : "";
+    deviceIds.placeholder = "No devices";
+    allDevices.addEventListener("change", () => syncAllDevicesControl(role, allDevices, deviceIds));
+    role.addEventListener("change", () => syncAllDevicesControl(role, allDevices, deviceIds));
+    syncAllDevicesControl(role, allDevices, deviceIds);
+
+    const research = document.createElement("input");
+    research.value = Array.isArray(user.allowedResearchWorkspaces) ? user.allowedResearchWorkspaces.join(", ") : "";
+    research.placeholder = "No research workspaces";
+    const password = document.createElement("input");
+    password.type = "password";
+    password.minLength = 12;
+    password.maxLength = 512;
+    password.autocomplete = "new-password";
+    password.placeholder = "Leave blank to keep password";
+    const save = document.createElement("button");
+    save.type = "submit";
+    save.textContent = "Save";
+    const revoke = document.createElement("button");
+    revoke.type = "button";
+    revoke.className = "danger";
+    revoke.textContent = "Sign out all sessions";
+
+    form.append(
+      labeledControl("Role", role),
+      activeLabel,
+      labeledControl("Device IDs", deviceIds),
+      allDevicesLabel,
+      labeledControl("Research workspaces", research),
+      labeledControl("Reset password", password),
+      save,
+      revoke,
+    );
+    form.addEventListener("submit", async event => {
+      event.preventDefault();
+      usersMessageEl.textContent = "";
+      save.disabled = true;
+      const change = {
+        role: role.value,
+        active: active.checked,
+        allowedDevices: allDevices.checked ? null : parseIdList(deviceIds.value),
+        allowedResearchWorkspaces: parseIdList(research.value),
+      };
+      if (password.value) change.password = password.value;
+      try {
+        const response = await fetch(`/api/admin/users/${encodeURIComponent(user.username)}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(change),
+        });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error || "Could not update user");
+        usersMessageEl.textContent = `${user.username} updated.`;
+        await refreshUsers();
+      } catch (error) {
+        usersMessageEl.textContent = error.message;
+      } finally {
+        save.disabled = false;
+      }
+    });
+
+    revoke.addEventListener("click", async () => {
+      usersMessageEl.textContent = "";
+      revoke.disabled = true;
+      try {
+        const response = await fetch(`/api/admin/users/${encodeURIComponent(user.username)}/revoke-sessions`, { method: "POST" });
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) throw new Error(body.error || "Could not sign out sessions");
+        usersMessageEl.textContent = `${user.username} sessions signed out.`;
+        await refreshUsers();
+      } catch (error) {
+        usersMessageEl.textContent = error.message;
+      } finally {
+        revoke.disabled = false;
+      }
+    });
+
+    const activity = document.createElement("details");
+    const activitySummary = document.createElement("summary");
+    const assignments = Array.isArray(user.assignments) ? user.assignments : [];
+    const recentAudit = Array.isArray(user.recentAudit) ? user.recentAudit : [];
+    activitySummary.textContent = `${assignments.length} assignment${assignments.length === 1 ? "" : "s"} · ${recentAudit.length} recent audit event${recentAudit.length === 1 ? "" : "s"}`;
+    const assignmentList = document.createElement("ul");
+    for (const assignment of assignments.slice(0, 10)) {
+      const item = document.createElement("li");
+      item.textContent = `${assignment.status.replaceAll("_", " ")} · ${assignment.instructions}`
+        + (assignment.deviceId ? ` · ${assignment.deviceId}` : "")
+        + (assignment.startAt || assignment.endAt ? ` · ${formatDate(assignment.startAt)} → ${formatDate(assignment.endAt)}` : "");
+      assignmentList.append(item);
+    }
+    const auditList = document.createElement("ul");
+    for (const event of recentAudit) {
+      const item = document.createElement("li");
+      item.textContent = `${formatDate(event.at)} · ${event.type}` + (event.deviceId ? ` · ${event.deviceId}` : "");
+      auditList.append(item);
+    }
+    activity.append(activitySummary);
+    if (assignments.length) activity.append(assignmentList);
+    if (recentAudit.length) activity.append(auditList);
+
+    card.append(heading, presence, form, activity);
+    usersListEl.append(card);
+  }
+}
+
+async function refreshUsers() {
+  if (!can(UI_CAPABILITIES.MANAGE_USERS)) return;
+  const generation = operatorProfileGeneration;
+  try {
+    const response = await fetch("/api/admin/users");
+    const body = await response.json().catch(() => ({}));
+    if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_USERS)) return;
+    if (!response.ok) throw new Error(body.error || "Could not load users");
+    renderUsers(Array.isArray(body.users) ? body.users : []);
+  } catch (error) {
+    if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_USERS)) return;
+    usersListEl.replaceChildren();
+    usersEmptyEl.hidden = false;
+    usersEmptyEl.textContent = `Could not load users: ${error.message}`;
+  }
+}
+
+userCreateAllDevicesEl.addEventListener("change", () => {
+  syncAllDevicesControl(userCreateRoleEl, userCreateAllDevicesEl, userCreateDevicesEl);
+});
+userCreateRoleEl.addEventListener("change", () => {
+  syncAllDevicesControl(userCreateRoleEl, userCreateAllDevicesEl, userCreateDevicesEl);
+});
+syncAllDevicesControl(userCreateRoleEl, userCreateAllDevicesEl, userCreateDevicesEl);
+
+userCreateFormEl.addEventListener("submit", async event => {
+  event.preventDefault();
+  usersMessageEl.textContent = "";
+  const submit = userCreateFormEl.querySelector("button[type=submit]");
+  submit.disabled = true;
+  try {
+    const response = await fetch("/api/admin/users", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        username: userCreateUsernameEl.value,
+        password: userCreatePasswordEl.value,
+        role: userCreateRoleEl.value,
+        active: true,
+        allowedDevices: userCreateAllDevicesEl.checked ? null : parseIdList(userCreateDevicesEl.value),
+        allowedResearchWorkspaces: parseIdList(userCreateResearchEl.value),
+      }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(body.error || "Could not create user");
+    usersMessageEl.textContent = `${body.operator.username} created.`;
+    userCreateFormEl.reset();
+    syncAllDevicesControl(userCreateRoleEl, userCreateAllDevicesEl, userCreateDevicesEl);
+    await refreshUsers();
+  } catch (error) {
+    usersMessageEl.textContent = error.message;
+  } finally {
+    submit.disabled = false;
+  }
+});
+
+usersRefreshButtonEl.addEventListener("click", refreshUsers);
+
 async function refreshAdminView() {
-  if (!isAdmin()) return;
-  await Promise.all([refreshQueueViewer(), refreshAuditViewer()]);
+  if (!canManageOperations()) return;
+  await Promise.all([
+    refreshQueueViewer(),
+    can(UI_CAPABILITIES.VIEW_AUDIT) ? refreshAuditViewer() : Promise.resolve(),
+    can(UI_CAPABILITIES.MANAGE_USERS) ? refreshUsers() : Promise.resolve(),
+  ]);
 }
 
 function formatCommandResult(body) {
@@ -953,7 +1805,7 @@ function formatCommandResult(body) {
 commandFormEl.addEventListener("submit", async (e) => {
   e.preventDefault();
   const text = commandInputEl.value.trim();
-  if (!text || !isAdmin()) return;
+  if (!text || !canManageOperations()) return;
   commandOutputEl.textContent = "Running…";
   const result = await runAdminCommand(text, { showOutput: true });
   if (result?.ok) commandInputEl.value = "";

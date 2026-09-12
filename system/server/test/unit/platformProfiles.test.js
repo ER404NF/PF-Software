@@ -129,3 +129,13 @@ test("skill registry requires explicit app versions and rejects duplicates", () 
   ] }), /duplicate/);
   assert.throws(() => buildPlatformSkills({ skills: [{ platform: "tiktok", appVersion: "1" }] }), /unsupported/);
 });
+
+test("model target text cannot redirect read-only navigation to Like", async () => {
+  const skill = createInstagramSkill({ appVersion: "fixture" });
+  const tree = { viewport: { width: 100, height: 100 }, elements: [
+    { label: "Like", frame: { x: 10, y: 10, width: 10, height: 10 } },
+    { label: "Profile", frame: { x: 70, y: 70, width: 10, height: 10 } }] };
+  let point;
+  await skill.execute({ action: "open_profile", target: "Like" }, { state: "feed", observation: { ui_tree: tree }, device: { async tap(x, y) { point = { x, y }; } } });
+  assert.ok(point.x > 0.5 && point.y > 0.5);
+});

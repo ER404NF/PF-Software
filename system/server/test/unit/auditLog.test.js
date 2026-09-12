@@ -76,3 +76,12 @@ test("type_text audit detail never contains the actual typed text (caller's resp
   assert.deepEqual(entry.detail, { length: 42 });
   assert.deepEqual(log6.listEvents()[0].detail, { length: 42 });
 });
+
+test("the first append after a torn tail remains readable", () => {
+  const file = path.join(path.dirname(tmpFile), "torn.log");
+  fs.writeFileSync(file, '{"id":"partial');
+  const recovered = createAuditLog(file);
+  const event = recovered.logEvent({ type: "after_restart" });
+  assert.equal(recovered.listEvents()[0].id, event.id);
+  assert.ok(fs.readFileSync(file, "utf8").startsWith('{"id":"partial\n'));
+});

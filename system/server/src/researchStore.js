@@ -146,6 +146,18 @@ function findIndexEntry(index, c) {
   return null;
 }
 function upsertIndexEntry(index, entry) {
+  const prior = findIndexEntry(index, entry);
+  entry = { ...prior, ...entry,
+    platform_content_id: entry.platform_content_id ?? prior?.platform_content_id ?? null,
+    canonical_url: entry.canonical_url ?? prior?.canonical_url ?? null };
+  // JSON persistence duplicates objects. Repoint every known alias, rather
+  // than relying on in-memory object identity to propagate a human review.
+  for (const table of [index.byContentId, index.byUrl]) {
+    for (const [key, value] of Object.entries(table)) {
+      if ((entry.platform_content_id && value.platform === entry.platform && value.platform_content_id === entry.platform_content_id)
+        || (entry.canonical_url && value.canonical_url === entry.canonical_url)) table[key] = entry;
+    }
+  }
   if (entry.platform_content_id) index.byContentId[`${entry.platform}\u0000${entry.platform_content_id}`] = entry;
   if (entry.canonical_url) index.byUrl[entry.canonical_url] = entry;
 }
@@ -155,6 +167,7 @@ function mergeCandidate(duplicate, candidate) {
   duplicate.tags = [...new Set([...duplicate.tags, ...candidate.tags])];
   duplicate.platform_actions.push(...candidate.platform_actions);
   duplicate.last_seen_at = candidate.last_seen_at;
+  if (Object.keys(candidate.metrics).length) duplicate.metrics = { ...candidate.metrics };
   for (const field of ["platform_content_id", "canonical_url", "url", "source_handle", "sourceHandle",
     "niche", "device_id", "text_extract", "ai_summary", "selection_reason", "score", "task_id"]) {
     if (duplicate[field] === null && candidate[field] !== null) duplicate[field] = candidate[field];
@@ -164,6 +177,12 @@ function mergeCandidate(duplicate, candidate) {
 
 function indexCandidate(index, candidate, runId, now) {
   const existing = findIndexEntry(index, candidate);
+  // Observations may arrive for an older run after a newer human review.
+  // Only setCandidateStatus can change an established shared decision.
+  if (existing) {
+    candidate.review_state = existing.review_state;
+    candidate.status = existing.status;
+  }
   upsertIndexEntry(index, {
     review_state: candidate.review_state,
     status: candidate.status,

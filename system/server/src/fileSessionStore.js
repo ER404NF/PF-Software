@@ -21,6 +21,7 @@ export class FileSessionStore extends session.Store {
   constructor(dir) {
     super();
     this.dir = dir;
+    this.revoked = new Set();
     fs.mkdirSync(dir, { recursive: true });
   }
 
@@ -29,11 +30,15 @@ export class FileSessionStore extends session.Store {
     return path.join(this.dir, `${sid}.json`);
   }
 
+  _isRevoked(sid) {
+    return this.revoked.has(sid) || fs.existsSync(path.join(this.dir, `.${sid}.revoked`));
+  }
+
   get(sid, cb) {
     const file = this._file(sid);
-    if (!file) return cb(null, null);
+    if (!file || this._isRevoked(sid)) return cb(null, null);
     fs.readFile(file, "utf8", (err, data) => {
-      if (err) return cb(null, null); // ENOENT (no session yet) is not an error here
+      if (err || this._isRevoked(sid)) return cb(null, null); // ENOENT (no session yet) is not an error here
       let parsed;
       try {
         parsed = JSON.parse(data);
@@ -65,11 +70,17 @@ export class FileSessionStore extends session.Store {
   set(sid, sessionData, cb) {
     const file = this._file(sid);
     if (!file) return cb(new Error("invalid session id"));
+    if (this._isRevoked(sid)) return cb(null);
     const expires = sessionData.cookie?.expires || null;
     const tmpFile = path.join(this.dir, `.${sid}.${crypto.randomUUID()}.tmp`);
     fs.writeFile(tmpFile, JSON.stringify({ session: sessionData, expires }), (writeErr) => {
       if (writeErr) return cb(writeErr);
+      if (this._isRevoked(sid)) return fs.unlink(tmpFile, () => cb(null));
       this._renameWithRetry(tmpFile, file, (renameErr) => {
+        if (this._isRevoked(sid)) {
+          fs.unlink(tmpFile, () => {});
+          return fs.unlink(file, () => cb(null));
+        }
         if (renameErr) fs.unlink(tmpFile, () => {}); // best-effort — don't leak the temp file on a failed rename
         cb(renameErr);
       });
@@ -96,6 +107,12 @@ export class FileSessionStore extends session.Store {
   destroy(sid, cb) {
     const file = this._file(sid);
     if (!file) return cb();
+    this.revoked.add(sid);
+    try {
+      // IDs are never reused. This tombstone also blocks stale writes/reads
+      // across store instances or a relay restart.
+      fs.writeFileSync(path.join(this.dir, `.${sid}.revoked`), "revoked\n");
+    } catch (error) { return cb(error); }
     fs.unlink(file, (err) => {
       if (err && err.code !== "ENOENT") return cb(err);
       cb();

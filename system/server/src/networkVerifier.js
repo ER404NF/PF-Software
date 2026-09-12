@@ -29,6 +29,7 @@
 // exists to have a URL at all.
 
 import { egressIdentity } from "./deviceNetworkConfig.js";
+import { isIP } from "node:net";
 
 const DEFAULT_TIMEOUT_MS = 5000;
 
@@ -39,6 +40,12 @@ function emptyStatus() {
     networkVerified: null,
     networkMismatch: null,
     networkMismatchReason: null,
+    networkObservedIpv6: null,
+    networkObservedRegion: null,
+    networkDnsStatus: null,
+    networkProxyHealthy: null,
+    networkBandwidthMbps: null,
+    networkRouteMatch: null,
   };
 }
 
@@ -67,14 +74,25 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS }
     const checkedAt = () => new Date().toISOString();
 
     let observedIp;
+    let observedIpv6 = null;
+    let observedRegion = null;
+    let dnsStatus = null;
+    let proxyHealthy = null;
+    let bandwidthMbps = null;
     try {
       const res = await fetch(checkUrl, { signal: AbortSignal.timeout(timeoutMs) });
       if (!res.ok) throw new Error(`network check failed: HTTP ${res.status}`);
       const body = await res.json();
-      if (typeof body.ip !== "string" || body.ip.length === 0) {
+      if (typeof body.ip !== "string" || isIP(body.ip) !== 4) {
         throw new Error("network check returned no ip");
       }
       observedIp = body.ip;
+      observedIpv6 = typeof body.ipv6 === "string" && isIP(body.ipv6) === 6 ? body.ipv6 : null;
+      observedRegion = typeof body.region === "string" && body.region.length <= 100 ? body.region : null;
+      dnsStatus = typeof body.dnsStatus === "string" && body.dnsStatus.length <= 100 ? body.dnsStatus : null;
+      proxyHealthy = typeof body.proxyHealthy === "boolean" ? body.proxyHealthy : null;
+      bandwidthMbps = Number.isFinite(body.bandwidthMbps) && body.bandwidthMbps >= 0 && body.bandwidthMbps <= 1_000_000
+        ? body.bandwidthMbps : null;
     } catch (err) {
       const entry = { ...emptyStatus(), networkCheckedAt: checkedAt(), networkVerified: false, networkMismatchReason: `network check failed: ${err.message}` };
       status.set(deviceId, entry);
@@ -82,14 +100,27 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS }
     }
 
     const collision = findCollision(deviceId, observedIp, identity);
+    const network = deviceNetwork.get(deviceId);
+    const mismatches = [];
+    if (collision) mismatches.push(`shares egress IP ${observedIp} with device "${collision}", which is on a different network assignment`);
+    if (network?.expectedPublicIpv4 && network.expectedPublicIpv4 !== observedIp) {
+      mismatches.push(`observed IPv4 ${observedIp} does not match configured IPv4 ${network.expectedPublicIpv4}`);
+    }
+    if (network?.expectedIpv6Policy === "blocked" && observedIpv6) mismatches.push("IPv6 was observed but policy requires it blocked");
+    if (network?.expectedIpv6Policy === "required" && !observedIpv6) mismatches.push("IPv6 was not observed but policy requires it");
+    if (proxyHealthy === false) mismatches.push("proxy health endpoint reported unhealthy");
     const entry = {
       networkObservedIp: observedIp,
       networkCheckedAt: checkedAt(),
-      networkVerified: !collision,
-      networkMismatch: Boolean(collision),
-      networkMismatchReason: collision
-        ? `shares egress IP ${observedIp} with device "${collision}", which is on a different network assignment`
-        : null,
+      networkVerified: mismatches.length === 0,
+      networkMismatch: mismatches.length > 0,
+      networkMismatchReason: mismatches.length ? mismatches.join("; ") : null,
+      networkObservedIpv6: observedIpv6,
+      networkObservedRegion: observedRegion,
+      networkDnsStatus: dnsStatus,
+      networkProxyHealthy: proxyHealthy,
+      networkBandwidthMbps: bandwidthMbps,
+      networkRouteMatch: mismatches.length === 0,
     };
     status.set(deviceId, entry);
 
@@ -103,6 +134,7 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS }
         networkVerified: false,
         networkMismatch: true,
         networkMismatchReason: `shares egress IP ${observedIp} with device "${deviceId}", which is on a different network assignment`,
+        networkRouteMatch: false,
       });
     }
 

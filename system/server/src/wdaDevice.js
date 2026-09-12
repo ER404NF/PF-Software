@@ -44,7 +44,8 @@ export class WdaDevice {
   }
 
   async ensureWindowSize() {
-    if (this.windowSize) return this.windowSize;
+    // Orientation may change without invalidating the WDA session.
+    // Read current dimensions at every coordinate transformation.
     const id = await this.ensureSession();
     const res = await fetch(`${this.baseUrl}/session/${id}/window/size`, {
       signal: AbortSignal.timeout(this.timeoutMs),

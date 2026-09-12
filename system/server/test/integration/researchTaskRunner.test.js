@@ -14,7 +14,7 @@ let root;
 beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-research-runner-")); deviceLease.reset(); });
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 
-function setup({ provider = null, skill = createInstagramSkill({ appVersion: "fixture-1" }) } = {}) {
+function setup({ operatorForUsername = () => ({ username: "admin", role: "admin", allowedDevices: null }), sleep = async () => {}, provider = null, skill = createInstagramSkill({ appVersion: "fixture-1" }) } = {}) {
   const device = new MockDevice("mock-1", "Mock");
   const devices = new Map([[device.id, device]]);
   const queue = createTaskQueue({ devices, deviceLease, storePath: path.join(root, "tasks.json") });
@@ -24,8 +24,8 @@ function setup({ provider = null, skill = createInstagramSkill({ appVersion: "fi
   const runner = createResearchTaskRunner({ taskQueue: queue, devices, deviceLease,
     accountWorkspaces: workspaceMap, accountPolicies: policies,
     providerForTask: () => provider, skillForPlatform: () => skill,
-    operatorForUsername: () => ({ username: "admin" }),
-    workspaceForOperatorAccount: () => "client-a", stepDelayMs: 0, sleep: async () => {},
+    operatorForUsername,
+    workspaceForOperatorAccount: () => "client-a", stepDelayMs: 0, sleep,
     createRunRecord(workspaceId, accountId, input) {
       const run = { id: `run-${runs.length + 1}`, workspaceId, accountId, ...input, candidates: [] };
       runs.push(run); return run;
@@ -138,7 +138,7 @@ test("the next decision uses a provider selected while the task is running", asy
     accountWorkspaces: new Map([["account-a", "client-a"]]),
     accountPolicies: new Map([["account-a", { open_feed: "ALLOW_AUTONOMOUS", observe: "ALLOW_AUTONOMOUS" }]]),
     providerForTask: () => providerMap[selected], skillForPlatform: () => createInstagramSkill({ appVersion: "fixture-1" }),
-    operatorForUsername: () => ({ username: "admin" }), workspaceForOperatorAccount: () => "client-a",
+    operatorForUsername: () => ({ username: "admin", role: "admin", allowedDevices: null }), workspaceForOperatorAccount: () => "client-a",
     stepDelayMs: 0, sleep: async () => { selected = "second"; },
     createRunRecord: () => ({ id: "run-switch" }), appendCandidateRecord: () => ({ id: "unused" }),
     finalizeRunRecord: () => ({ id: "run-switch" }) });
@@ -156,4 +156,112 @@ test("generic tasks are ignored by the research runner", () => {
   assert.equal(task.kind, "generic");
   assert.equal(runner.waitForTask(task.id), null);
   assert.equal(task.state, TASK_STATES.RUNNING);
+});
+
+for (const rapidResume of [false, true]) {
+  test(`pause during planning retains the worker (rapid resume: ${rapidResume})`, async () => {
+    let releaseModel, modelEntered;
+    const planning = new Promise(resolve => { modelEntered = resolve; });
+    const pendingModel = new Promise(resolve => { releaseModel = resolve; });
+    let releaseSleep;
+    const sleeping = new Promise(resolve => { releaseSleep = resolve; });
+    let calls = 0;
+    const provider = { async observeAndPlan() {
+      if (++calls === 1) { modelEntered(); await pendingModel; }
+      return { screen_state: "springboard", goal_progress: "complete", action: "observe",
+        target: null, reason: "done", confidence: 0.99 };
+    } };
+    const { queue, runner } = setup({ provider, sleep: () => sleeping });
+    const task = queue.addTask({ kind: "research", goal: "Pause safely", createdBy: "admin",
+      accountSelector: { platform: "instagram", accountId: "account-a" }, allowedActions: ["observe"] });
+    const worker = runner.waitForTask(task.id);
+    try {
+      await planning;
+      queue.pauseTask(task.id);
+      if (rapidResume) queue.resumeTask(task.id);
+      releaseModel();
+      await new Promise(resolve => setImmediate(resolve));
+      assert.equal(runner.waitForTask(task.id), worker, "worker must remain attached to paused/resumed task");
+      assert.equal(calls, 1);
+      if (!rapidResume) queue.resumeTask(task.id);
+      releaseSleep();
+      await worker;
+      assert.equal(calls, 2, "resuming must obtain a fresh decision");
+      assert.equal(queue.getTask(task.id).state, TASK_STATES.SUCCEEDED);
+    } finally {
+      queue.cancelTask(task.id);
+      releaseModel();
+      releaseSleep();
+      await worker;
+    }
+  });
+}
+
+test("a paused research task resumes with a worker after restart", async () => {
+  const device = new MockDevice("mock-1", "Mock");
+  const originalQueue = createTaskQueue({ devices: new Map([[device.id, device]]), deviceLease,
+    storePath: path.join(root, "tasks.json") });
+  const task = originalQueue.addTask({ kind: "research", goal: "Resume after restart", createdBy: "admin",
+    accountSelector: { platform: "instagram", accountId: "account-a" }, allowedActions: ["observe"] });
+  originalQueue.pauseTask(task.id);
+  deviceLease.reset();
+  let calls = 0;
+  const { queue, runner } = setup({ provider: { async observeAndPlan() {
+    calls++;
+    return { screen_state: "springboard", goal_progress: "complete", action: "observe",
+      target: null, reason: "done", confidence: 0.99 };
+  } } });
+  assert.equal(queue.getTask(task.id).state, TASK_STATES.PAUSED);
+  assert.equal(deviceLease.getMode(device.id), "AI_PAUSED");
+  assert.equal(calls, 0);
+  queue.resumeTask(task.id);
+  const worker = runner.waitForTask(task.id);
+  assert.ok(worker, "resume must launch the recovered task's worker");
+  await worker;
+  assert.equal(calls, 1);
+  assert.equal(queue.getTask(task.id).state, TASK_STATES.SUCCEEDED);
+});
+
+test("revoking device access during model planning blocks research input", async () => {
+  const operator = { username: "admin", role: "admin", allowedDevices: ["mock-1"] };
+  const { queue, runner, device } = setup({ operatorForUsername: () => operator, provider: { async observeAndPlan() {
+    operator.allowedDevices = [];
+    return { screen_state: "feed", goal_progress: "complete", action: "observe", target: null, reason: "done", confidence: 0.99 };
+  } } });
+  let actions = 0;
+  device.swipe = async () => { actions++; };
+  device.pressHome = async () => { actions++; };
+  const task = queue.addTask({ kind: "research", goal: "Revoked", createdBy: "admin", accountSelector: { platform: "instagram", accountId: "account-a" } });
+  await runner.waitForTask(task.id);
+  assert.equal(actions, 0);
+  assert.equal(queue.getTask(task.id).state, TASK_STATES.FAILED_FINAL);
+});
+
+test("cancellation during evidence capture cannot finalize research as successful", async () => {
+  const { queue, runner, runs, device } = setup({ provider: { async observeAndPlan() {
+    return { screen_state: "springboard", goal_progress: "complete", action: "observe", target: null,
+      reason: "candidate", confidence: 0.99, candidate: { canonical_url: "https://example.com/cancelled" } };
+  } } });
+  let task;
+  device.render = async () => { queue.cancelTask(task.id); return { kind: "image", mime: "image/png", data: "eA==" }; };
+  task = queue.addTask({ kind: "research", goal: "cancel evidence", createdBy: "admin",
+    accountSelector: { platform: "instagram", accountId: "account-a" }, allowedActions: ["observe"] });
+  await runner.waitForTask(task.id);
+  assert.equal(task.state, TASK_STATES.CANCELLED);
+  assert.equal(runs[0].outcome, TASK_STATES.CANCELLED);
+  assert.equal(runs[0].candidates.length, 0);
+});
+
+test("cancellation between steps finalizes the existing research run", async () => {
+  let task, queueRef;
+  const { queue, runner, runs } = setup({ provider: { async observeAndPlan() {
+    return { screen_state: "springboard", goal_progress: "working", action: "observe", target: null, reason: "candidate",
+      confidence: 0.99, candidate: { canonical_url: "https://example.com/interrupted" } };
+  } }, sleep: async () => { queueRef.cancelTask(task.id); } });
+  queueRef = queue;
+  task = queue.addTask({ kind: "research", goal: "between steps", createdBy: "admin", accountSelector: { platform: "instagram", accountId: "account-a" } });
+  await runner.waitForTask(task.id);
+  assert.equal(task.state, TASK_STATES.CANCELLED);
+  assert.equal(runs.length, 1); assert.equal(runs[0].outcome, TASK_STATES.CANCELLED);
+  assert.ok(runs[0].completedAt); assert.equal(runs[0].candidates.length, 1);
 });

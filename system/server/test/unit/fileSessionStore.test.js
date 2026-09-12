@@ -101,3 +101,23 @@ test("session data survives across a fresh FileSessionStore instance pointed at 
   );
   assert.equal(data.operator.username, "va2");
 });
+
+test("delayed and post-logout writes cannot revive a revoked session", async () => {
+  const local = new FileSessionStore(dir);
+  const call = (method, ...args) => new Promise((resolve, reject) => local[method](...args, (error, value) => error ? reject(error) : resolve(value)));
+  const data = { operator: { username: "fixture" }, cookie: {} };
+  await call("set", "revocation-race", data);
+  const realRename = local._renameWithRetry.bind(local);
+  let reached, release;
+  const paused = new Promise(resolve => { reached = resolve; });
+  local._renameWithRetry = (...args) => { release = () => realRename(...args); reached(); };
+  const touch = call("touch", "revocation-race", data);
+  await paused;
+  await call("destroy", "revocation-race");
+  release(); await touch;
+  await call("set", "revocation-race", data);
+  assert.equal(await call("get", "revocation-race"), null);
+  const reopened = new FileSessionStore(dir);
+  await new Promise((resolve, reject) => reopened.touch("revocation-race", data, error => error ? reject(error) : resolve()));
+  assert.equal(await new Promise(resolve => reopened.get("revocation-race", (_, value) => resolve(value))), null);
+});

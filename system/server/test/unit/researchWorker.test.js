@@ -18,7 +18,7 @@ function setup({ screen = "feed", confidence = 0.9, policy = "ALLOW_AUTONOMOUS",
     async verify() { calls.push("verify"); return true; }, async recover() { calls.push("recover"); return {}; } };
   const taskQueue = { getTask: () => task, checkpoints: [], results: [], checkpoint(id, data) { this.checkpoints.push([id, data]); },
     async reportResult(id, outcome, options) { this.results.push([id, outcome, options]); task.state = outcome; } };
-  const deviceLease = { canAiAct: () => lease, pending: null, registerPendingAiAction(id, promise) { this.pending = [id, promise]; },
+  const deviceLease = { getAiToken: () => "test-lease", canAiAct: () => lease, pending: null, registerPendingAiAction(id, promise) { this.pending = [id, promise]; },
     clearPendingAiAction(id, promise) { if (this.pending?.[0] === id && this.pending?.[1] === promise) this.pending = null; } };
   const accountWorkspaces = new Map([["account-a", "client-a"]]);
   const accountPolicies = new Map([["account-a", { scroll_next: policy }]]);
@@ -143,4 +143,19 @@ test("worker rejects mismatched devices and missing active leases before observa
   const noLease = setup({ revokeDuringDetection: true });
   noLease.deviceLease.canAiAct = () => false;
   await assert.rejects(() => runResearchStep(noLease), /lease is not active/);
+});
+
+for (const revoked of ["access", "ownership"]) test(`revoked ${revoked} during capture blocks model submission`, async () => {
+  const ctx = setup();
+  let allowed = true, submissions = 0;
+  ctx.canAccessAccount = () => allowed;
+  ctx.device.getUiTree = async () => {
+    if (revoked === "access") allowed = false;
+    else ctx.task.state = TASK_STATES.CANCELLED;
+    return { screen: "feed" };
+  };
+  ctx.provider.observeAndPlan = async () => { submissions++; throw new Error("must not send"); };
+  const result = await runResearchStep(ctx);
+  assert.equal(submissions, 0);
+  assert.equal(result.outcome, revoked === "access" ? TASK_STATES.FAILED_FINAL : TASK_STATES.CANCELLED);
 });

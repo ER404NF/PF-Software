@@ -23,6 +23,7 @@ const tmpStorageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-networkc
 process.env.SESSION_STORE_DIR = path.join(tmpStorageRoot, "sessions");
 process.env.AUDIT_LOG_PATH = path.join(tmpStorageRoot, "audit.log");
 process.env.QUEUE_STORE_PATH = path.join(tmpStorageRoot, "tasks.json");
+process.env.ALLOW_NETWORK_CHECK_URL_OVERRIDE = "true";
 
 const { server, wss } = await import("../../src/index.js");
 const { operators, hashPassword } = await import("../../src/authStore.js");
@@ -74,7 +75,7 @@ before(async () => {
     username: "netcheck-test-restricted",
     passwordHash: hashPassword(TEST_PASSWORD),
     allowedDevices: ["mock-2"], // deliberately NOT mock-1
-    role: "va",
+    role: "manager",
   });
 
   await new Promise((resolve) => server.listen(0, resolve));
@@ -105,15 +106,15 @@ test("commands require authentication like every other device route", async () =
   assert.equal(res.status, 401);
 });
 
-test("checkUrl is required", async () => {
+test("a verification endpoint is required", async () => {
   const res = await fetch(`${httpUrl}/api/devices/mock-1/network-check`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Cookie: cookie },
     body: JSON.stringify({}),
   });
-  assert.equal(res.status, 400);
+  assert.equal(res.status, 409);
   const body = await res.json();
-  assert.match(body.error, /checkUrl is required/);
+  assert.match(body.error, /endpoint is not configured/);
 });
 
 test("an unknown device is rejected", async () => {
@@ -158,6 +159,8 @@ test("a successful check updates the device summary and is audited with the assi
   assert.equal(res.status, 200);
   const { network } = await res.json();
   assert.equal(network.egress, "cellular-sim"); // mock-1's real devices.config.json assignment
+  assert.equal(network.simIdentifierSuffix, "0001");
+  assert.equal("simIccid" in network, false);
   assert.equal(network.networkObservedIp, "198.51.100.77");
   assert.equal(network.networkVerified, true);
 
@@ -183,6 +186,7 @@ test("device_list over WebSocket carries the same network fields as the HTTP rou
 
   const mock1 = deviceListMsg.devices.find((d) => d.id === "mock-1");
   assert.equal(mock1.network.egress, "cellular-sim");
+  assert.equal("simIccid" in mock1.network, false);
   assert.ok("networkVerified" in mock1);
   assert.ok("networkMismatch" in mock1);
 

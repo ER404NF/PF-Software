@@ -1,3 +1,4 @@
+import { canAccessDevice } from "./authStore.js";
 import { runResearchStep } from "./researchWorker.js";
 import { TASK_STATES } from "./taskSpec.js";
 import { createRun, appendCandidate, finalizeRun } from "./researchStore.js";
@@ -42,7 +43,7 @@ export function createResearchTaskRunner({
     }
   }
 
-  async function runTask({ task, deviceId }) {
+  async function runTaskBody({ task, deviceId }) {
     if (task.kind !== "research") return { outcome: "IGNORED" };
     const accountId = task.accountSelector?.accountId;
     const platform = task.accountSelector?.platform;
@@ -62,7 +63,7 @@ export function createResearchTaskRunner({
 
     const canAccessAccount = () => {
       const operator = operatorForUsername(task.createdBy);
-      return workspaceForOperatorAccount(operator, accountId) === workspaceId;
+      return canAccessDevice(operator, deviceId) && workspaceForOperatorAccount(operator, accountId) === workspaceId;
     };
 
     let runId = [...(task.checkpoints || [])].reverse()
@@ -100,16 +101,20 @@ export function createResearchTaskRunner({
         await failIfRunning(current, "the selected model provider is no longer available");
         return { outcome: TASK_STATES.FAILED_FINAL, error: "the selected model provider is no longer available" };
       }
+      const stepToken = deviceLease.getAiToken(deviceId);
       const result = await runResearchStep({ task: current, device, accountId, workspaceId, provider, skill,
-        accountWorkspaces, accountPolicies, taskQueue, deviceLease, auditLog, canAccessAccount });
+        accountWorkspaces, accountPolicies, taskQueue, deviceLease, auditLog, canAccessAccount, saveEvidence: saveEvidenceRecord });
       if (result.outcome !== "VERIFIED") {
         // reportResult(FAILED_RETRYABLE) may release the device and
         // synchronously redispatch this same task before runResearchStep()
         // returns. launch() deliberately coalesces duplicate task IDs, so
         // this promise must own that new attempt instead of exiting and
         // leaving the redispatched task RUNNING without a worker.
-        if (result.outcome === TASK_STATES.FAILED_RETRYABLE
-          && taskQueue.getTask(task.id)?.state === TASK_STATES.RUNNING) {
+        // A pause can happen inside a pending step, and can even be resumed
+        // before that step returns. Keep this worker and obtain a fresh
+        // decision on the next iteration; never reuse the stale result.
+        const state = taskQueue.getTask(task.id)?.state;
+        if (state === TASK_STATES.PAUSED || state === TASK_STATES.RUNNING) {
           await sleep(stepDelayMs);
           continue;
         }
@@ -120,7 +125,8 @@ export function createResearchTaskRunner({
         const evidence = [];
         try {
           const frame = result.observation?.screenshot ?? (typeof device.render === "function" ? await device.render() : null);
-          if (frame && deviceLease.canAiAct(deviceId) && canAccessAccount()) {
+          if (frame && taskQueue.getTask(task.id)?.state === TASK_STATES.RUNNING
+            && deviceLease.getAiToken(deviceId) === stepToken && deviceLease.canAiAct(deviceId) && canAccessAccount()) {
             const saved = saveEvidenceRecord(workspaceId, accountId, frame);
             if (saved?.ref) evidence.push(saved.ref);
           }
@@ -128,6 +134,15 @@ export function createResearchTaskRunner({
           auditLog?.logEvent({ operator: task.createdBy, type: "research_evidence_failed", deviceId,
             detail: { taskId: task.id, accountId, workspaceId, runId: candidateRunId,
               error: error?.message || String(error) } });
+        }
+        const afterCapture = taskQueue.getTask(task.id);
+        if (afterCapture?.state !== TASK_STATES.RUNNING || deviceLease.getAiToken(deviceId) !== stepToken || !canAccessAccount()) {
+          if (afterCapture?.state === TASK_STATES.RUNNING && !canAccessAccount()) {
+            await failIfRunning(task, "research authorization was revoked during evidence capture");
+          }
+          const outcome = taskQueue.getTask(task.id)?.state ?? "CANCELLED";
+          if ([TASK_STATES.PAUSED, TASK_STATES.RUNNING].includes(outcome)) continue;
+          return { outcome };
         }
         const recorded = appendCandidateRecord(workspaceId, accountId, candidateRunId, {
           ...result.decision.candidate,
@@ -157,6 +172,25 @@ export function createResearchTaskRunner({
         return { ...result, outcome: TASK_STATES.SUCCEEDED };
       }
       await sleep(stepDelayMs);
+    }
+  }
+
+  async function runTask(payload) {
+    try { return await runTaskBody(payload); }
+    catch (error) {
+      await failIfRunning(payload.task, error?.message || String(error));
+      throw error;
+    } finally {
+      const task = taskQueue.getTask(payload.task.id);
+      if ([TASK_STATES.CANCELLED, TASK_STATES.NEEDS_HUMAN, TASK_STATES.FAILED_FINAL,
+        TASK_STATES.PARTIAL, TASK_STATES.EXPIRED].includes(task?.state)) {
+        const runId = [...(task.checkpoints || [])].reverse().find(cp => cp.data?.researchRunId)?.data.researchRunId;
+        if (runId) {
+          const accountId = task.accountSelector?.accountId;
+          finalizeRunRecord(accountWorkspaces.get(accountId), accountId, runId,
+            { overview: task.result?.detail || "Research stopped before completion", outcome: task.state });
+        }
+      }
     }
   }
 

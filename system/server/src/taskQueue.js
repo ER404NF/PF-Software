@@ -19,6 +19,7 @@ import {
   isWindowOpen,
   hasWindowExpired,
   normalizeRetryPolicy,
+  hasExecutionExpired,
 } from "./taskSpec.js";
 
 const PRIORITY_ORDER = { urgent: 0, high: 1, normal: 2, low: 3 };
@@ -32,11 +33,11 @@ const REPORTABLE_OUTCOMES = new Set([
 ]);
 
 const replaceWaitArray = new Int32Array(new SharedArrayBuffer(4));
-function writeQueueSnapshot(storePath, tasks, paused) {
+function writeQueueSnapshot(storePath, tasks, paused, humanHolds = new Set()) {
   fs.mkdirSync(path.dirname(storePath), { recursive: true });
   const temporary = `${storePath}.${crypto.randomUUID()}.tmp`;
   try {
-    fs.writeFileSync(temporary, JSON.stringify({ version: 1, paused, tasks }, null, 2), { flag: "wx" });
+    fs.writeFileSync(temporary, JSON.stringify({ version: 2, paused, humanHolds: [...humanHolds], tasks }, null, 2), { flag: "wx" });
     for (let attempt = 0; ; attempt++) {
       try {
         fs.renameSync(temporary, storePath);
@@ -52,7 +53,7 @@ function writeQueueSnapshot(storePath, tasks, paused) {
 }
 
 function loadQueueSnapshot(storePath) {
-  if (!fs.existsSync(storePath)) return { tasks: [], paused: false };
+  if (!fs.existsSync(storePath)) return { tasks: [], paused: false, humanHolds: new Set() };
   const stored = JSON.parse(fs.readFileSync(storePath, "utf8"));
   const isLegacyArray = Array.isArray(stored);
   if (!isLegacyArray && (!stored || typeof stored !== "object" || !Array.isArray(stored.tasks))) {
@@ -60,7 +61,10 @@ function loadQueueSnapshot(storePath) {
   }
   const tasks = isLegacyArray ? stored : stored.tasks;
   const paused = isLegacyArray ? false : stored.paused === true;
-  let changed = isLegacyArray;
+  const humanHolds = new Set(isLegacyArray || !Array.isArray(stored.humanHolds)
+    ? []
+    : stored.humanHolds.filter((deviceId) => typeof deviceId === "string" && deviceId));
+  let changed = isLegacyArray || stored.version !== 2 || !Array.isArray(stored.humanHolds);
   for (const task of tasks) {
     // Migrate snapshots written before retry timing became durable. Keeping
     // the normalized policy on every loaded task also prevents old files
@@ -90,22 +94,23 @@ function loadQueueSnapshot(storePath) {
       changed = true;
     }
   }
-  if (changed) writeQueueSnapshot(storePath, tasks, paused);
-  return { tasks, paused };
+  if (changed) writeQueueSnapshot(storePath, tasks, paused, humanHolds);
+  return { tasks, paused, humanHolds };
 }
 
-function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOnCreate = true }) {
+function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOnCreate = true, canDispatch = () => true }) {
   fs.mkdirSync(path.dirname(storePath), { recursive: true });
   const snapshot = loadQueueSnapshot(storePath);
   const tasks = snapshot.tasks;
   let paused = snapshot.paused;
+  const humanHolds = snapshot.humanHolds;
   const listeners = { dispatched: [], completed: [] };
 
   function persist() {
     // A crash during a direct truncate/write can destroy the only durable
     // queue snapshot. Write a complete sibling file and atomically replace
     // the destination so restart recovery sees the old or new state only.
-    writeQueueSnapshot(storePath, tasks, paused);
+    writeQueueSnapshot(storePath, tasks, paused, humanHolds);
   }
 
   // Restart recovery (COMMAND_QUEUE_SPEC.md §14): loadQueueSnapshot() above already
@@ -113,6 +118,18 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
   // what actually lets a requeued one resume immediately on a fresh device
   // set (every device starts HUMAN/idle on a new process) rather than
   // waiting for the first scheduled tick.
+  // Paused tasks retain exclusive ownership across restart without running
+  // input. Rebuild their lease before the scheduler examines free devices.
+  for (const task of tasks.filter(task => task.state === TASK_STATES.PAUSED)) {
+    const id = task.deviceSelector?.deviceId;
+    if (!devices.has(id) || humanHolds.has(id)) continue;
+    if (deviceLease.getMode(id) !== "HUMAN" || devices.get(id).status !== "idle") {
+      throw new Error(`cannot restore paused ownership for device ${id}`);
+    }
+    deviceLease.switchToAI(id);
+    deviceLease.applyEvent(id, "START_TASK");
+    deviceLease.applyEvent(id, "PAUSE_TASK");
+  }
   if (dispatchOnCreate) tick(new Date());
 
   function on(event, cb) {
@@ -136,7 +153,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     // Admit the task durably before exposing it to the live scheduler. If
     // storage is unavailable, callers receive an error and no hidden task is
     // left in memory to dispatch on a later tick.
-    writeQueueSnapshot(storePath, [...tasks, task], paused);
+    writeQueueSnapshot(storePath, [...tasks, task], paused, humanHolds);
     tasks.push(task);
     auditLog?.logEvent({
       operator: task.createdBy,
@@ -155,13 +172,20 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
   function releaseDevice(deviceId) {
     const mode = deviceLease.getMode(deviceId);
     if (mode === "AI_RUNNING" || mode === "AI_PAUSED") {
-      deviceLease.applyEvent(deviceId, "TASK_FINISHED"); // -> AI_IDLE, ready for the next task
+      if (deviceLease.finishAiTask) {
+        const draining = deviceLease.finishAiTask(deviceId);
+        if (draining) void draining.then(() => tryDispatch(new Date())).catch(error => {
+          deviceLease.markError(deviceId);
+          auditLog?.logEvent({ type: "task_drain_failed", deviceId, detail: { error: error.message } });
+        });
+      } else deviceLease.applyEvent(deviceId, "TASK_FINISHED");
     }
   }
 
   function findActiveTaskForDevice(deviceId) {
     return tasks.find(
-      (t) => t.deviceSelector?.deviceId === deviceId && !isTerminal(t.state) && t.state !== TASK_STATES.NEEDS_HUMAN
+      (t) => t.deviceSelector?.deviceId === deviceId
+        && (t.state === TASK_STATES.RUNNING || t.state === TASK_STATES.PAUSED)
     );
   }
 
@@ -188,9 +212,9 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     const task = getTask(taskId);
     if (!task || task.state !== TASK_STATES.RUNNING) return null;
     const deviceId = task.deviceSelector?.deviceId;
+    if (deviceId) deviceLease.applyEvent(deviceId, "PAUSE_TASK");
     task.state = TASK_STATES.PAUSED;
     task.updatedAt = new Date().toISOString();
-    if (deviceId) deviceLease.applyEvent(deviceId, "PAUSE_TASK");
     persist();
     auditLog?.logEvent({ type: "task_paused", deviceId, detail: { taskId } });
     return task;
@@ -200,11 +224,13 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     const task = getTask(taskId);
     if (!task || task.state !== TASK_STATES.PAUSED) return null;
     const deviceId = task.deviceSelector?.deviceId;
+    if (deviceId) deviceLease.applyEvent(deviceId, "RESUME_TASK");
     task.state = TASK_STATES.RUNNING;
     task.updatedAt = new Date().toISOString();
-    if (deviceId) deviceLease.applyEvent(deviceId, "RESUME_TASK");
     persist();
     auditLog?.logEvent({ type: "task_resumed", deviceId, detail: { taskId } });
+    // Starts a recovered worker; the runner coalesces an already active one.
+    emit("dispatched", { task, deviceId });
     return task;
   }
 
@@ -230,10 +256,16 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
       task.state = TASK_STATES.CANCELLED;
       task.result = { outcome: TASK_STATES.CANCELLED, detail: "stopped by operator", at: new Date().toISOString() };
       task.updatedAt = task.result.at;
-      persist();
-      auditLog?.logEvent({ type: "task_cancelled", deviceId, detail: { taskId: task.id, reason: "stop" } });
     }
+    // Physical input revocation must not depend on a successful disk write.
     releaseDevice(deviceId);
+    try { persist(); }
+    catch (error) {
+      humanHolds.add(deviceId);
+      deviceLease.markError?.(deviceId);
+      throw error; // cancellation was not durable; require explicit recovery
+    }
+    if (task) auditLog?.logEvent({ type: "task_cancelled", deviceId, detail: { taskId: task.id, reason: "stop" } });
     tryDispatch(new Date());
     return task ?? null;
   }
@@ -244,6 +276,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
   // message already uses.
   async function takeoverDevice(deviceId) {
     const task = findActiveTaskForDevice(deviceId);
+    humanHolds.add(deviceId);
     if (task) {
       task.state = TASK_STATES.CANCELLED;
       task.result = {
@@ -252,11 +285,10 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
         at: new Date().toISOString(),
       };
       task.updatedAt = task.result.at;
-      persist();
       auditLog?.logEvent({ type: "task_cancelled", deviceId, detail: { taskId: task.id, reason: "takeover" } });
     }
+    persist();
     await deviceLease.switchToHuman(deviceId);
-    tryDispatch(new Date());
     return task ?? null;
   }
 
@@ -273,6 +305,11 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
   // a stuck action was supposed to bypass.
   function emergencyStopDevice(deviceId) {
     const task = findActiveTaskForDevice(deviceId);
+    // Revoke input first: emergency stop must never wait on storage or an
+    // in-flight action. The durable human hold below prevents a later tick
+    // or restart from immediately assigning queued AI work back to it.
+    deviceLease.emergencyStop(deviceId);
+    humanHolds.add(deviceId);
     if (task) {
       task.state = TASK_STATES.CANCELLED;
       task.result = {
@@ -281,12 +318,23 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
         at: new Date().toISOString(),
       };
       task.updatedAt = task.result.at;
-      persist();
       auditLog?.logEvent({ type: "task_cancelled", deviceId, detail: { taskId: task.id, reason: "emergency_stop" } });
     }
-    deviceLease.emergencyStop(deviceId);
-    tryDispatch(new Date());
+    persist();
     return task ?? null;
+  }
+
+  // An explicit operator switch to AI mode is the only action that clears a
+  // takeover/emergency hold. Persist the release before dispatching work so
+  // a restart cannot revive a hold the operator already removed.
+  function allowAiDispatch(deviceId) {
+    if (humanHolds.has(deviceId)) {
+      const nextHolds = new Set(humanHolds);
+      nextHolds.delete(deviceId);
+      writeQueueSnapshot(storePath, tasks, paused, nextHolds);
+      humanHolds.delete(deviceId);
+    }
+    tryDispatch(new Date());
   }
 
   function moveTask(taskId, relation, targetId) {
@@ -354,6 +402,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
 
   function freeDevices() {
     return [...devices.values()].filter((d) => {
+      if (humanHolds.has(d.id) || deviceLease.hasPendingAiAction?.(d.id)) return false;
       const mode = deviceLease.getMode(d.id);
       return (mode === "HUMAN" && d.status === "idle") || mode === "AI_IDLE";
     });
@@ -366,7 +415,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     let best = null;
     let bestIdx = -1;
     tasks.forEach((t, idx) => {
-      if (!isEligible(t, now)) return;
+      if (!isEligible(t, now) || !canDispatch(t, deviceId)) return;
       const wants = t.deviceSelector?.deviceId;
       if (wants && wants !== deviceId) return;
       const allowedDeviceIds = t.deviceSelector?.allowedDeviceIds;
@@ -447,7 +496,8 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     // PARTIAL, not EXPIRED (§7): the distinction future review depends on.
     task.state = task.checkpoints.length > 0 ? TASK_STATES.PARTIAL : TASK_STATES.EXPIRED;
     task.updatedAt = now.toISOString();
-    task.result = { outcome: task.state, detail: "time window closed", at: now.toISOString() };
+    task.result = { outcome: task.state, detail: task.maxDurationSec && new Date(task.dispatchedAt).getTime() + task.maxDurationSec * 1000 <= now.getTime()
+      ? "task duration limit reached" : "time window closed", at: now.toISOString() };
     if (deviceId) releaseDevice(deviceId);
     persist();
     auditLog?.logEvent({
@@ -478,7 +528,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
         task.updatedAt = now.toISOString();
         changed = true;
       } else if ([TASK_STATES.RUNNING, TASK_STATES.PAUSED].includes(task.state)
-        && hasWindowExpired(task, now) && !task.allowOverrun) {
+        && hasExecutionExpired(task, now)) {
         finishRunningTaskAtWindowEnd(task, now);
         changed = true;
       }
@@ -508,7 +558,13 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     } else if (outcome === TASK_STATES.NEEDS_HUMAN) {
       task.state = TASK_STATES.NEEDS_HUMAN;
       task.retryNotBefore = null;
-      if (deviceId) await deviceLease.switchToHuman(deviceId); // a real handoff, not just a status flag
+      if (deviceId) {
+        // Persist the hold before awaiting handoff: neither a tick nor a
+        // restart may dispatch another task while the operator is needed.
+        humanHolds.add(deviceId);
+        persist();
+        await deviceLease.switchToHuman(deviceId);
+      }
     } else {
       task.state = outcome; // SUCCEEDED | PARTIAL | FAILED_FINAL | CANCELLED
       task.retryNotBefore = null;
@@ -550,6 +606,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     stopDevice,
     takeoverDevice,
     emergencyStopDevice,
+    allowAiDispatch,
     on,
   };
 }

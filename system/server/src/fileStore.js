@@ -13,7 +13,11 @@ import path from "path";
 import { fileURLToPath } from "url";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-export const STORAGE_ROOT = path.join(__dirname, "../../storage");
+export const STORAGE_ROOT = process.env.FILE_STORE_DIR
+  ? path.resolve(process.env.FILE_STORE_DIR)
+  : path.join(__dirname, "../../storage");
+export const MEDIA_ROOT = path.join(STORAGE_ROOT, "devices");
+const RESERVED_IDS = new Set(["sessions", "audit", "queue", "models", "research", "research-evidence", "devices"]);
 
 // Reject anything that isn't a plain filename: no path separators, no "..",
 // no leading dot (prevents path traversal), and no control characters or
@@ -34,13 +38,13 @@ function safeFilename(name) {
 
 function safeDeviceId(id) {
   if (typeof id !== "string" || !/^[a-zA-Z0-9_-]+$/.test(id)) return null;
-  return id;
+  return RESERVED_IDS.has(id.toLowerCase()) ? null : id;
 }
 
 export function deviceDir(deviceId) {
   const safe = safeDeviceId(deviceId);
   if (!safe) return null;
-  return path.join(STORAGE_ROOT, safe);
+  return path.join(MEDIA_ROOT, safe);
 }
 
 export function ensureDeviceDir(deviceId) {
@@ -79,3 +83,20 @@ export function deleteFile(deviceId, filename) {
 }
 
 export { safeFilename, safeDeviceId };
+
+function canonicalPath(value) {
+  const full = path.resolve(value);
+  if (fs.existsSync(full)) return fs.realpathSync(full);
+  const parent = path.dirname(full);
+  return parent === full ? full : path.join(canonicalPath(parent), path.basename(full));
+}
+export function assertMediaStorageIsolated(internalPaths, mediaRoot = MEDIA_ROOT) {
+  const inside = (a, b) => {
+    const relative = path.relative(a, b);
+    return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+  };
+  const media = canonicalPath(mediaRoot);
+  for (const internal of internalPaths.map(canonicalPath)) {
+    if (inside(media, internal) || inside(internal, media)) throw new Error("Device media overlaps internal storage");
+  }
+}

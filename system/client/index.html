@@ -19,9 +19,10 @@
     <header id="top-bar">
       <div id="top-bar-left">
         <h1>Phone Farm</h1>
-        <nav id="admin-nav" hidden aria-label="Admin navigation">
+        <nav id="admin-nav" hidden aria-label="Operations navigation">
           <button type="button" id="fleet-nav-button" class="top-nav-button active">Fleet</button>
-          <button type="button" id="admin-nav-button" class="top-nav-button">Admin / Dev</button>
+          <button type="button" id="assignments-nav-button" class="top-nav-button">Assignments</button>
+          <button type="button" id="admin-nav-button" class="top-nav-button" hidden>Operations</button>
         </nav>
       </div>
       <div id="top-bar-right">
@@ -34,14 +35,46 @@
 
     <p id="connection-status" hidden>Disconnected — reconnecting…</p>
 
+    <aside id="people-sidebar" aria-label="Staff presence">
+      <div id="people-heading">
+        <div>
+          <h2>People</h2>
+          <span id="people-summary">Loading…</span>
+        </div>
+        <button type="button" id="people-refresh-button" aria-label="Refresh people">&#8635;</button>
+      </div>
+      <ul id="people-list" aria-live="polite"></ul>
+      <p id="people-error" role="status"></p>
+    </aside>
+
     <section id="fleet-view">
+      <header id="fleet-intro">
+        <h2 id="fleet-heading">Fleet</h2>
+        <p id="fleet-description">View fleet status and open available phones.</p>
+        <p id="fleet-access-message" hidden></p>
+      </header>
+      <div id="fleet-toolbar">
+        <div id="fleet-summary" aria-label="Fleet summary"></div>
+        <label for="fleet-status-filter">Show
+          <select id="fleet-status-filter">
+            <option value="all">All phones</option>
+            <option value="idle">Available</option>
+            <option value="in-use">In use</option>
+            <option value="offline">Offline</option>
+            <option value="ai">AI controlled</option>
+          </select>
+        </label>
+      </div>
       <p id="select-error"></p>
+      <p id="fleet-empty" hidden>No phones match this filter.</p>
       <div id="fleet-groups"></div>
     </section>
 
     <section id="detail-view" hidden>
       <button type="button" id="back-to-fleet-button">&larr; Fleet</button>
       <h2 id="detail-title"></h2>
+      <p id="detail-access-note"></p>
+      <div id="detail-device-facts"></div>
       <div id="detail-ai-status"></div>
       <div id="detail-body">
         <main id="screen-panel">
@@ -76,13 +109,39 @@
       </div>
     </section>
 
-    <!-- Admin/dev workspace. The server independently enforces the same role
+    <section id="assignments-view" hidden>
+      <header class="admin-heading">
+        <div>
+          <h2>Assignments</h2>
+          <p>Your durable work list and its change history.</p>
+        </div>
+        <button type="button" id="assignments-refresh-button">Refresh</button>
+      </header>
+      <form id="assignment-create-form" class="admin-panel" hidden>
+        <h3>Create assignment</h3>
+        <div class="assignment-form-grid">
+          <label>Assignee<select id="assignment-assignee" required></select></label>
+          <label>Phone<select id="assignment-device"><option value="">No phone</option></select></label>
+          <label>Account ID<input id="assignment-account" maxlength="200" placeholder="Optional research account" /></label>
+          <label>Starts (local)<input id="assignment-start" type="datetime-local" /></label>
+          <label>Ends (local)<input id="assignment-end" type="datetime-local" /></label>
+          <label class="assignment-checkbox"><input id="assignment-exclusive" type="checkbox" checked /> Exclusive time slot</label>
+        </div>
+        <label>Instructions<textarea id="assignment-instructions" maxlength="2000" required></textarea></label>
+        <button type="submit">Assign work</button>
+      </form>
+      <p id="assignments-message" role="status" aria-live="polite"></p>
+      <div id="assignments-list"></div>
+      <p id="assignments-empty" class="admin-empty" hidden>No assignments are visible to you.</p>
+    </section>
+
+    <!-- Operations workspace. The server independently enforces capabilities;
          boundary; hidden UI is convenience, not authorization. -->
     <section id="admin-view" hidden>
       <header class="admin-heading">
         <div>
-          <h2>Admin / Dev</h2>
-          <p>Command execution, queue state, audit history, and AI-mode oversight.</p>
+          <h2>Operations</h2>
+          <p>Role-aware command execution, queue state, and AI-mode oversight.</p>
         </div>
         <button type="button" id="admin-refresh-button">Refresh all</button>
       </header>
@@ -124,6 +183,36 @@
           </table>
         </div>
         <p id="queue-empty" class="admin-empty" hidden>No tasks in the queue.</p>
+      </section>
+
+      <section class="admin-panel" id="users-panel" hidden>
+        <div class="admin-panel-heading">
+          <div>
+            <h3>Users and Access</h3>
+            <span>Create accounts, assign roles and grants, or revoke access.</span>
+          </div>
+          <button type="button" id="users-refresh-button">Refresh</button>
+        </div>
+        <form id="user-create-form" class="user-form">
+          <label>Username<input id="user-create-username" maxlength="100" autocomplete="off" required /></label>
+          <label>Initial password<input id="user-create-password" type="password" minlength="12" maxlength="512" autocomplete="new-password" required /></label>
+          <label>Role
+            <select id="user-create-role">
+              <option value="va">VA</option>
+              <option value="content_creator">Content creator</option>
+              <option value="editor">Editor</option>
+              <option value="manager">Manager</option>
+              <option value="admin">Admin</option>
+            </select>
+          </label>
+          <label>Device IDs<input id="user-create-devices" placeholder="mock-1, phone-2" /></label>
+          <label>Research workspaces<input id="user-create-research" placeholder="client-a, client-b" /></label>
+          <label class="user-checkbox"><input id="user-create-all-devices" type="checkbox" /> All devices</label>
+          <button type="submit">Create user</button>
+        </form>
+        <p id="users-message" role="status" aria-live="polite"></p>
+        <div id="users-list" class="users-list"></div>
+        <p id="users-empty" class="admin-empty" hidden>No users configured.</p>
       </section>
 
       <section class="admin-panel" id="audit-panel">

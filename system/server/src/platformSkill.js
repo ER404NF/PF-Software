@@ -71,11 +71,15 @@ export async function executeSkillAction({ skill, decision, observation, policyR
     if (typeof canExecute !== "function" || !canExecute()) {
       return { outcome: "BLOCKED", state, reason: "AI input lease is no longer active" };
     }
-    const execution = await skill.execute(decision, { ...context, state, observation });
+    const execution = await skill.execute(decision, { ...context, state, observation, canExecute });
+    if (!canExecute()) return { outcome: "BLOCKED", reason: "AI input authorization was revoked during execution", execution };
     if (typeof observeAfter !== "function") throw new Error("observeAfter callback is required for verification");
     const observationAfter = await observeAfter();
+    if (!canExecute()) return { outcome: "BLOCKED", reason: "AI input authorization was revoked during observation", execution };
     const verified = await skill.verify(decision, observationAfter,
       { ...context, state, execution, observationBefore: observation });
+    if (!canExecute()) return { outcome: "BLOCKED", reason: "AI input authorization was revoked during verification", execution };
+    if (verified?.outcome === "NEEDS_HUMAN") return { ...verified, state, execution, observationAfter };
     if (!verified) {
       const failure = new Error("action did not verify");
       const { recovery, recoveryError } = await recoverSafely(skill, failure,

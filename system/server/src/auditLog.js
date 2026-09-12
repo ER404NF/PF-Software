@@ -13,6 +13,17 @@ import crypto from "crypto";
 export function createAuditLog(filePath) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
 
+  if (fs.existsSync(filePath)) {
+    const fd = fs.openSync(filePath, "r");
+    try {
+      const size = fs.fstatSync(fd).size;
+      const last = Buffer.alloc(1);
+      if (size && fs.readSync(fd, last, 0, 1, size - 1) && last[0] !== 10) {
+        fs.appendFileSync(filePath, "\n");
+      }
+    } finally { fs.closeSync(fd); }
+  }
+
   function logEvent({ operator, type, deviceId = null, detail = {} }) {
     const entry = {
       id: crypto.randomUUID(),

@@ -38,6 +38,7 @@ export async function captureObservation(device, {
   accountId = null,
   taskId = null,
   now = () => new Date(),
+  canObserve = () => true,
   maxUiTreeBytes = DEFAULT_MAX_UI_TREE_BYTES,
   maxScreenshotBytes = DEFAULT_MAX_SCREENSHOT_BYTES,
 } = {}) {
@@ -59,6 +60,7 @@ export async function captureObservation(device, {
     screenshot: null,
   };
 
+  if (!canObserve()) throw new Error("Observation authorization was revoked");
   if (typeof device.getUiTree === "function") {
     try {
       const tree = await device.getUiTree();
@@ -76,6 +78,7 @@ export async function captureObservation(device, {
     base.ui_tree_error = "device adapter does not expose a UI tree";
   }
 
+  if (!canObserve()) throw new Error("Observation authorization was revoked");
   if (typeof device.render !== "function") throw new Error(`${base.ui_tree_error}; screenshot fallback is unavailable`);
   const screenshot = validateImageFrame(await device.render(), maxScreenshotBytes);
   return {

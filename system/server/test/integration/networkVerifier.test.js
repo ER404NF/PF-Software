@@ -80,6 +80,12 @@ test("getStatus for a never-checked device returns all-null defaults", () => {
     networkVerified: null,
     networkMismatch: null,
     networkMismatchReason: null,
+    networkObservedIpv6: null,
+    networkObservedRegion: null,
+    networkDnsStatus: null,
+    networkProxyHealthy: null,
+    networkBandwidthMbps: null,
+    networkRouteMatch: null,
   });
 });
 
@@ -168,4 +174,24 @@ test("re-checking a device replaces its status rather than accumulating stale fi
 
   assert.notEqual(first.networkObservedIp, second.networkObservedIp);
   assert.equal(verifier.getStatus("d1").networkObservedIp, "198.51.100.41");
+});
+
+test("verification compares configured IPv4 and IPv6 policy and records safe health metadata", async () => {
+  const verifier = makeVerifier([{
+    id: "d1",
+    network: {
+      egress: "cellular-sim", simIccid: "111", controlIface: "usb",
+      expectedPublicIpv4: "198.51.100.99", expectedIpv6Policy: "required",
+    },
+  }]);
+  await setIp("198.51.100.98");
+  const result = await verifier.checkDevice("d1", CHECK_URL);
+  assert.equal(result.networkVerified, false);
+  assert.equal(result.networkRouteMatch, false);
+  assert.match(result.networkMismatchReason, /does not match configured IPv4/);
+  assert.match(result.networkMismatchReason, /IPv6 was not observed/);
+  assert.equal(result.networkObservedRegion, "test-region");
+  assert.equal(result.networkDnsStatus, "ok");
+  assert.equal(result.networkProxyHealthy, true);
+  assert.equal(result.networkBandwidthMbps, 100);
 });

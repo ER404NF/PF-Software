@@ -3,25 +3,20 @@
 // a plaintext password into it).
 //
 // Usage:
-//   node server/scripts/create-operator.js <username> <password> [device1,device2,...] [--role=va|admin] [--research-workspaces=client-a,client-b]
+//   node server/scripts/create-operator.js <username> <password> [device1,device2,...] [--role=<role>] [--research-workspaces=client-a,client-b]
 //
-// Omit the device list to grant access to every device. Role defaults to
-// `va` when omitted. Role and device access are independent: an admin can be
-// device-restricted, and a VA can be allowed every device.
+// Omit the device list to grant every device to non-VA roles. Role defaults
+// to `va`; a VA with no list gets no devices and must receive explicit grants.
 
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
-import { hashPassword, normalizeRole, OPERATOR_ROLES } from "../src/authStore.js";
+import {
+  normalizeRole, OPERATOR_ROLES, operators, createOperatorAccount, updateOperatorAccount,
+} from "../src/authStore.js";
 import { validResearchId } from "../src/researchId.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const configPath = path.join(__dirname, "../../operators.config.json");
 
 const [, , username, password, ...rest] = process.argv;
 if (!username || !password) {
   console.error(
-    "Usage: node server/scripts/create-operator.js <username> <password> [device1,device2,...] [--role=va|admin] [--research-workspaces=client-a,client-b]"
+    "Usage: node server/scripts/create-operator.js <username> <password> [device1,device2,...] [--role=admin|manager|va|content_creator|editor] [--research-workspaces=client-a,client-b]"
   );
   process.exit(1);
 }
@@ -48,8 +43,8 @@ for (const arg of rest) {
     }
   } else if (arg.startsWith("--role=")) {
     const requested = arg.slice("--role=".length);
-    if (![OPERATOR_ROLES.VA, OPERATOR_ROLES.ADMIN].includes(requested)) {
-      console.error('role must be "va" or "admin"');
+    if (!Object.values(OPERATOR_ROLES).includes(requested)) {
+      console.error(`role must be one of: ${Object.values(OPERATOR_ROLES).join(", ")}`);
       process.exit(1);
     }
     role = normalizeRole(requested);
@@ -61,22 +56,32 @@ for (const arg of rest) {
   }
 }
 
-const data = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, "utf8")) : { operators: [] };
 const allowedDevices = deviceList ? deviceList.split(",").map((s) => s.trim()).filter(Boolean) : null;
-const passwordHash = hashPassword(password);
-
-const existing = data.operators.find((o) => o.username === username);
-if (existing) {
-  existing.passwordHash = passwordHash;
-  existing.allowedDevices = allowedDevices;
-  existing.role = role;
-  if (researchWorkspaces !== undefined) existing.allowedResearchWorkspaces = researchWorkspaces;
-  console.log(`Updated operator "${username}".`);
-} else {
-  data.operators.push({ username, passwordHash, allowedDevices, role, allowedResearchWorkspaces: researchWorkspaces ?? [] });
-  console.log(`Created operator "${username}".`);
+try {
+  if (operators.has(username)) {
+    updateOperatorAccount(username, {
+      password,
+      allowedDevices,
+      role,
+      ...(researchWorkspaces !== undefined ? { allowedResearchWorkspaces: researchWorkspaces } : {}),
+    });
+    console.log(`Updated operator "${username}" and revoked its previous sessions.`);
+  } else {
+    createOperatorAccount({
+      username,
+      password,
+      allowedDevices,
+      role,
+      allowedResearchWorkspaces: researchWorkspaces ?? [],
+    });
+    console.log(`Created operator "${username}".`);
+  }
+} catch (error) {
+  console.error(error.message);
+  process.exit(1);
 }
-
-fs.writeFileSync(configPath, JSON.stringify(data, null, 2) + "\n");
 console.log(`role: ${role}`);
-console.log(`allowedDevices: ${allowedDevices ? allowedDevices.join(", ") : "(all devices)"}`);
+const effectiveDevices = operators.get(username)?.allowedDevices;
+console.log(`allowedDevices: ${Array.isArray(effectiveDevices)
+  ? effectiveDevices.length ? effectiveDevices.join(", ") : "(no devices; explicit VA grants required)"
+  : "(all devices)"}`);

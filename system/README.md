@@ -26,15 +26,17 @@ Implemented now:
   and for the WebSocket connection itself;
 - per-operator device authorization (an operator only reaches the devices
   they're allowed to — enforced server-side, not just hidden in the UI);
-- explicit operator feature roles (`va` / `admin`) layered on top of device
-  authorization: VAs keep normal fleet/control/file operations, while admin-only
-  queue, audit, command-console, and AI-mode management are protected both in
-  the client and server-side;
+- five explicit operator roles mapped to server-side capabilities, layered on
+  top of separate device and workspace authorization;
+- authenticated live staff presence and a persistent People roster, with
+  multi-tab/session aggregation and safe current-phone activity only;
+- durable role-aware work assignments with optional phone/account scope,
+  manager-controlled status/reassignment, and immutable actor history;
 - file-backed sessions that survive a relay restart, and an append-only
   audit log of who did what (see "Persistence, audit & health" below);
 - per-device health tracking (last-seen timestamp, consecutive-failure
   count) — a device only flips offline after a run of failures, not one blip,
-  and auto-recovers on the next success;
+  and releases the human claim when it becomes offline;
 - the controller-mode/input-lease abstraction (`HUMAN`/`AI_IDLE`/`AI_RUNNING`/
   `AI_PAUSED`/`HANDOFF`/`ERROR`) and the take-over/emergency-stop mechanics —
   see "Controller mode and the input lease" below;
@@ -89,23 +91,34 @@ generated, never hand-edited, because it holds password hashes:
 
 ```bash
 node server/scripts/create-operator.js va1 <password> mock-1,mock-2 --role=va
+node server/scripts/create-operator.js manager1 <password> mock-1,mock-2 --role=manager
+node server/scripts/create-operator.js creator1 <password> --role=content_creator
+node server/scripts/create-operator.js editor1 <password> --role=editor
 node server/scripts/create-operator.js admin1 <password> --role=admin
 ```
 
 `role` and `allowedDevices` answer different questions and are enforced
 separately:
 
-- `role: "va"` vs `role: "admin"` controls which management features the
-  operator can use. Missing or unknown roles safely normalize to `va`.
-- `allowedDevices: null` means all configured devices; otherwise the array is
-  the exact set that operator may control or access through device/file routes.
-  An admin role does **not** bypass this device scope.
+- `role` accepts `admin`, `manager`, `va`, `content_creator`, or `editor`.
+  Each maps to explicit capabilities documented in
+  `../docs/ROLE_CAPABILITY_MATRIX.md`; missing or unknown roles safely
+  normalize to `va`.
+- For Admin, Manager, Content Creator, and Editor, `allowedDevices: null` means
+  all configured devices. Otherwise the array is the exact set that operator
+  may control or access through device/file routes. Admin does **not** bypass
+  an explicit device array.
+- A VA always requires an explicit array. A missing or null VA grant resolves
+  to `[]`, so the VA can see safe fleet summaries but cannot open any phone.
+  Create one with explicit IDs, for example `mock-1,mock-2`, then manage the
+  same grants in Operations > Users and Access.
 
 Re-running the script for an existing username updates that operator's
 password, device list, and role. `operators.config.json` is gitignored — it's
 credential material, not fixture data like `devices.config.json` — so a fresh
 checkout needs at least one operator created before `npm start` is useful. The
-browser receives only the safe profile (`username`, `role`, `allowedDevices`)
+browser receives only the safe profile (`username`, `role`, `allowedDevices`, and
+the role's non-secret capability names)
 from `/api/me`; password hashes never leave the server.
 
 Sessions are cookie-based (`express-session`, file-backed — see "Persistence,
@@ -131,14 +144,15 @@ default.
   status changes. Typed text is logged by **length only** — the text itself
   never reaches the log. Query it with `GET /api/audit` (optional
   `?operator=`, `?deviceId=`, `?limit=` query params). This endpoint is
-  **admin-only**; an authenticated `va` receives HTTP 403. The client also
-  hides the viewer for VAs, but the server check is the actual security
+  protected by `audit:view-sensitive` (Admin-only); other roles receive HTTP
+  403. The client also hides the viewer, but the server check is the actual security
   boundary.
 - **Device health** — each device tracks a last-seen timestamp and a
   consecutive-failure count, visible in the device list. A device only flips
   to `offline` after 3 failures in a row (`OFFLINE_AFTER_FAILURES` in
-  `index.js`), not one blip, and automatically recovers to `in-use` on the
-  next success. This is a byproduct of actual use, not active polling — an
+  `index.js`), not one blip, and releases its human claim at that boundary.
+  Recovery requires a later health/device availability update; an offline
+  phone cannot be opened. This is a byproduct of actual use, not active polling — an
   idle device nobody has selected gets no health signal until someone does.
 - **What device state deliberately does *not* persist**: which device is
   "in-use" and by whom. That claim is inherently tied to a live WebSocket
@@ -254,7 +268,16 @@ test suite both do this correctly; it's only a risk for a future client
 
 Server -> client:
 
-- `device_list`: `{ devices: [{ id, label, status, lastSeenAt, consecutiveFailures, controllerMode }] }`
+- `operator_profile`: the current safe public operator profile. It is sent on
+  connection and immediately after an Admin changes that operator's role or
+  grants, so the browser replaces cached capabilities without requiring logout
+  or refresh. The client clears capability-scoped DOM and rejects responses
+  started under the older profile generation before loading the new safe view.
+- `device_list`: viewer-specific safe summaries for every fleet device,
+  including `id`, `label`, `hostLabel`, status/health, controller mode, safe
+  network state, `assignedToViewer`, `canOpen`, `accessState`, and `openReason`.
+  Task instructions, credentials, proxy secrets, and access lists are omitted
+  for viewers without the corresponding management capability.
 - `frame`: `{ deviceId, kind, data, mime? }`
 - `error`: `{ deviceId?, message }`
 
@@ -268,11 +291,11 @@ Client -> server:
   Back control, which only works from screens that have one)
 - `type_text`: `{ text }`, 1-1000 characters
 - `release_device`
-- `switch_to_ai`: `{ deviceId }` — **admin-only**; moves an idle device into
+- `switch_to_ai`: `{ deviceId }` — Manager/Admin; moves an authorized idle device into
   `AI_IDLE`; rejected if it is claimed by a human
-- `takeover`: `{ deviceId }` — **admin-only**; stops AI control (gracefully)
+- `takeover`: `{ deviceId }` — Manager/Admin; stops AI control (gracefully)
   and claims the device for the caller, in one step
-- `emergency_stop`: `{ deviceId }` — **admin-only**; stops AI control
+- `emergency_stop`: `{ deviceId }` — Manager/Admin; stops AI control
   immediately, without waiting on anything; does not claim the device
 
 Every message is processed strictly in the order it was sent, per connection
@@ -281,7 +304,7 @@ lets a later message's response arrive out of order.
 
 ## File transfer
 
-Each configured device has a separate server-side folder under `storage/<deviceId>/`.
+Each configured device has a separate server-side folder under `storage/devices/<deviceId>/`. `FILE_STORE_DIR` overrides the parent storage directory; media still uses its `devices/` namespace. Internal names such as `sessions`, `audit`, and `queue` cannot be device IDs, and startup rejects overlapping media and internal-state paths. Legacy media from an older installation must be relocated from `storage/<deviceId>/` to this new namespace before use; internal storage must never be migrated as media.
 
 Routes:
 
@@ -350,6 +373,9 @@ What the lease guarantees independently of the worker implementation:
   `taskQueue.emergencyStopDevice()`, not `deviceLease.emergencyStop()`
   directly, so a `RUNNING` task gets cancelled instead of being left
   believing it still holds a device that was just yanked back to `HUMAN`.
+  A submitted physical action remains tracked until it settles: human selection
+  and new AI dispatch stay blocked even though stop is acknowledged immediately.
+  A graceful takeover timeout leaves the device in `ERROR` until that action settles.
 - The browser client surfaces this according to operator role. Admins see the
   current task/audit detail and AI-management controls; VAs see only the
   controller-mode state and an `AI-controlled — admin handoff required` note.
@@ -379,9 +405,10 @@ POST /api/queue/command   { "text": "/time 09:00-10:00 Research AI coding reels"
 GET  /api/queue
 ```
 
-Supported commands (the command endpoint, queue endpoint, and audit endpoint
-are **admin-only** in addition to normal authentication; every device-targeting
-command is still checked against that admin's `allowedDevices` scope):
+Supported commands require explicit capabilities in addition to authentication.
+Every device-targeting command is still checked against the operator's
+`allowedDevices` scope. Global queue changes, model configuration, and sensitive
+audit history remain Admin-only:
 
 - `/time <start>-<end> <task>` (optional explicit `YYYY-MM-DD`), `/cresearch
   <platform> <minutes> <goal>` — queue a real task
@@ -531,11 +558,12 @@ The client (`system/client/`) remains plain `index.html`/`app.js`/`style.css`
 with no framework or build step. It now has a role-aware view split on top of
 the existing authentication system:
 
-- **VA view**: fleet/device list, claim/release, live screen control,
-  tap/swipe/type/Home, and normal file transfer. A VA can see the coarse
-  controller-mode pill so they understand why an AI-controlled phone cannot
-  be claimed, but they do not receive queue/audit internals in the UI and do
-  not get AI-management controls.
+- **VA view**: safe cards for every fleet phone, with explicit assigned/not
+  assigned text and server-calculated availability. Only an explicitly granted,
+  online, idle, Human-mode phone has an Open device action. After opening, a VA
+  can view/control the phone, tap/swipe/type/Home, use normal file transfer,
+  return to Fleet, release, and sign out. Queue, audit, network-check, user,
+  assignment, proxy/security, and AI-management controls are absent.
 - **Admin/dev view**: everything a VA sees, plus a dedicated Admin workspace
   containing the existing command console, readable task-queue viewer, audit
   viewer, refresh controls, and AI-mode management. The UI calls the existing
@@ -544,8 +572,9 @@ the existing authentication system:
 
 The fleet view itself is a responsive grid of device cards grouped by
 `hostLabel`. Each card shows live status (`idle`/`in-use`/rendered `warning`/
-`offline`), device label, controller mode, and whether the current operator is
-controlling it. Drilling into a device opens the existing live-control screen.
+`offline`), label/ID/host, controller mode, grant state, current controller,
+last seen/health, and safe egress/verification state. Opening a device enters
+the existing live-control screen.
 Returning to Fleet does **not** silently release the claim.
 
 For admins, AI-mode cards include task state and relevant audit context plus
@@ -563,12 +592,15 @@ yet.
 fields: `status !== "offline" && consecutiveFailures > 0`. No new device
 state was added to the protocol.
 
-**Visibility vs authorization:** the authenticated WebSocket `device_list` is
-still broadcast as a fleet-status view. A restricted VA may therefore see
-that another device exists/status changed, but `allowedDevices` continues to
-block selecting it or using its protected file/device routes. This behavior
-was preserved intentionally rather than silently changing the protocol in a
-UI-role pass.
+**Visibility vs authorization:** an operator with `fleet:view` receives every
+device as a safe viewer-specific summary. `canOpen` is display metadata only;
+the server independently rechecks the live session, operator, role capability,
+explicit grant, Human lease, device status, and WebSocket ownership for selection
+and every later input. Grant/role/operator revocation releases the claim and
+returns the client to Fleet without leaving a stale frame. Role/grant edits also
+push a safe `operator_profile` update before the corresponding fleet broadcast;
+late queue, audit, user, assignment, and People responses from the previous role
+are discarded instead of repopulating cleared privileged UI.
 
 **Test coverage:** `npm test` now includes static client-role safety checks
 (including that every `getElementById` used by `app.js` exists in
@@ -576,7 +608,7 @@ UI-role pass.
 admin-only APIs, admin access, direct VA AI-control rejection, normal VA device
 control, restricted-admin scheduler dispatch, research ownership/review, model
 adapters, observation fallback, policy enforcement and the bounded worker.
-Full suite: **354/354 passing** on 2026-09-09. A final visual pass in Chrome/Safari on the deployment
+Full suite: **470/470 passing** on 2026-09-12. A final visual pass in Chrome/Safari on the deployment
 Mac is still recommended because the repo does not run a full browser E2E
 harness.
 

@@ -39,9 +39,9 @@ export function createModelSelection({ providers, defaultProviderName = null, st
     if (!SCOPES.includes(scope)) throw new Error(`invalid model scope: ${scope}`);
     const nextSelections = {
       global: selections.global,
-      workspace: { ...selections.workspace },
-      device: { ...selections.device },
-      task: { ...selections.task },
+      workspace: Object.assign(Object.create(null), selections.workspace),
+      device: Object.assign(Object.create(null), selections.device),
+      task: Object.assign(Object.create(null), selections.task),
     };
     if (scope === "global") {
       if (scopeId != null) throw new Error("global model scope does not take an id");

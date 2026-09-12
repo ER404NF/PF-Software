@@ -117,7 +117,11 @@ test("a session and the audit log both survive a real relay restart", async () =
   // backed (FileSessionStore), not express-session's default in-memory store.
   const meAfter = await fetch(`${baseUrl}/api/me`, { headers: { Cookie: cookie } });
   assert.equal(meAfter.status, 200);
-  assert.deepEqual(await meAfter.json(), { username: "restart-va", role: "admin", allowedDevices: null });
+  const profile = await meAfter.json();
+  assert.equal(profile.username, "restart-va");
+  assert.equal(profile.role, "admin");
+  assert.equal(profile.allowedDevices, null);
+  assert.ok(profile.capabilities.includes("security:manage"));
 
   // The pre-restart login event is still there — the audit file wasn't
   // truncated or replaced by the new process starting up.

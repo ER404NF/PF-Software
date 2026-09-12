@@ -1,4 +1,50 @@
-# Roadmap Status Report — updated 2026-09-09
+# Roadmap Status Report — updated 2026-09-12
+
+## 2026-09-12 — restricted VA fleet
+
+Implemented one role-aware login flow, safe all-device fleet summaries, explicit
+VA device grants that fail closed, and server-enforced Human-mode ownership for
+selection and every later phone input. Grant and role changes are resolved live;
+revocation immediately releases an open claim and removes the phone-control view.
+The server now also pushes safe live operator profiles after role/grant edits,
+and the browser discards in-flight privileged responses from the prior profile
+generation instead of letting them repopulate cleared Admin data after demotion.
+VA fleet summaries omit assignment instructions, authorized-operator lists, and
+secret-bearing network configuration. Admin and Manager capability behavior is
+preserved.
+
+Verification: **470/470 full-suite tests passed** with `npm.cmd test`. Separate
+browser sessions confirmed the Admin fleet/Operations experience and the VA
+fleet, assigned-device control, release, logout, and restricted-device states.
+No physical iPhone or WDA validation was performed for this milestone.
+
+## 2026-09-11 — role capabilities and authenticated staff presence
+
+The control plane now has five explicit roles mapped to named server-side
+capabilities; route, command, and WebSocket checks use capabilities while device
+and research grants remain independent boundaries. The matrix is documented in
+[ROLE_CAPABILITY_MATRIX.md](ROLE_CAPABILITY_MATRIX.md).
+
+The browser now has a persistent People sidebar backed by `GET /api/people` and
+WebSocket presence broadcasts. It aggregates tabs into authenticated sessions,
+shows only safe public identity/activity fields, tracks current human-controlled
+phones, and handles logout, expiry, disconnect, and stale heartbeat cleanup. See
+[PRESENCE_AND_PEOPLE.md](PRESENCE_AND_PEOPLE.md). The completed capability pass
+was verified by a 435/435 full suite; presence then passed its 51 focused tests.
+Physical phone/WDA validation remains a separate gate.
+
+The same pass added [durable assignments](ASSIGNMENTS.md): role-aware creation,
+assignee status updates, Manager/Admin reassignment, optional phone/account
+scope, append-only history, and restart-safe persistence. The browser exposes an
+Assignments workspace to every role and management controls only to operators
+with `assignments:manage`.
+
+Integrated verification after the assignment, scoped fleet, dashboard, and
+phone-detail changes: **445/445 tests passed** with `npm test`. A browser review
+against an isolated disposable local instance covered sign-in, People presence,
+fleet summaries/filtering, assignment creation/history, and phone detail. It
+found and fixed narrow-viewport top-bar overflow and a clipped assignment field;
+the recheck showed no horizontal overflow and the browser console was clean.
 
 ## 2026-09-09 — MS3.3 research ownership
 
@@ -291,12 +337,14 @@ and implemented the following day (2026-09-09); see the section above.**
 
 What changed:
 
-- Operators now carry an explicit feature role: `va` or `admin`. Missing or
-  unknown role values normalize to `va` (fail closed). This role is separate
+- Operators now carry one of five explicit feature roles: `admin`, `manager`,
+  `va`, `content_creator`, or `editor`. Missing or unknown role values normalize
+  to `va` (fail closed). This role is separate
   from `allowedDevices`; an admin does not automatically gain access to every
   phone.
-- `GET /api/me` exposes only the safe browser profile: `username`, `role`, and
-  `allowedDevices`. Password hashes remain server-only.
+- `GET /api/me` exposes only the safe browser profile: `username`, `role`,
+  `allowedDevices`, and non-secret capability names. Password hashes remain
+  server-only.
 - `GET /api/audit`, `GET /api/queue`, and `POST /api/queue/command` require
   `admin` server-side. A VA calling them directly gets 403, even if the UI is
   bypassed.

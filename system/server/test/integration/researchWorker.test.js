@@ -59,3 +59,40 @@ test("real queue hands the device to HUMAN when the model sees a challenge", asy
   assert.equal(deviceLease.getMode("dev-1"), "HUMAN");
   assert.ok(ctx.events.some((event) => event.type === "research_needs_human"));
 });
+
+for (const boundary of ["model", "detection", "resume"]) {
+  test(`stale AI decision cannot act across ownership changes during ${boundary}`, async () => {
+    const decision = { screen_state: "home", goal_progress: "working", action: "open_post", target: "Instagram", reason: "inspect", confidence: 0.95 };
+    const ctx = build(decision);
+    const replacement = ctx.queue.addTask({ goal: "Replacement", createdBy: "admin",
+      deviceSelector: { deviceId: ctx.device.id } });
+    let entered;
+    const started = new Promise(resolve => { entered = resolve; });
+    let release;
+    const pending = new Promise(resolve => { release = resolve; });
+    if (boundary === "model") ctx.provider.observeAndPlan = async () => { entered(); await pending; return decision; };
+    else ctx.skill.detectState = async () => { entered(); await pending; return "home"; };
+    let executions = 0;
+    ctx.skill.execute = async () => { executions++; };
+    const step = runResearchStep({ task: ctx.task, device: ctx.device, provider: ctx.provider, skill: ctx.skill,
+      accountId: "account-a", workspaceId: "client-a", accountWorkspaces: new Map([["account-a", "client-a"]]),
+      accountPolicies: new Map([["account-a", { open_post: "ALLOW_AUTONOMOUS" }]]), taskQueue: ctx.queue,
+      deviceLease, canAccessAccount: () => true });
+    await started;
+    if (boundary === "resume") {
+      ctx.queue.pauseTask(ctx.task.id);
+      ctx.queue.resumeTask(ctx.task.id);
+    } else {
+      ctx.queue.cancelTask(ctx.task.id);
+      assert.equal(ctx.queue.getTask(replacement.id).state, boundary === "detection" ? TASK_STATES.QUEUED : TASK_STATES.RUNNING);
+    }
+    assert.equal(deviceLease.canAiAct(ctx.device.id), boundary !== "detection");
+    release();
+    await step;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(executions, 0);
+    assert.equal(ctx.queue.getTask(ctx.task.id).state, boundary === "resume" ? TASK_STATES.RUNNING : TASK_STATES.CANCELLED);
+    assert.equal(ctx.queue.getTask(replacement.id).state, boundary === "resume" ? TASK_STATES.QUEUED : TASK_STATES.RUNNING);
+    assert.equal(ctx.queue.getTask(replacement.id).checkpoints.length, 0);
+  });
+}

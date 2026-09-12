@@ -253,3 +253,38 @@ test("unsafe links and malformed optional metadata never become trusted candidat
   assert.deepEqual(run.candidates[0].platform_actions, []);
   assert.equal(run.candidates[0].score, null);
 });
+
+for (const latest of ["confirmed", "removed"]) {
+  test(`appending an older observation preserves the latest ${latest} review`, () => {
+    const account = `review-${latest}`;
+    const payload = { platform: "instagram", overview: "review", candidates: [{ platform_content_id: "post-1",
+      canonical_url: "https://example.com/review", evidence_refs: ["first"] }] };
+    const first = createRun(account, payload);
+    setCandidateStatus(account, first.id, first.candidates[0].id, latest === "removed" ? "confirmed" : "removed");
+    const second = createRun(account, payload);
+    setCandidateStatus(account, second.id, second.candidates[0].id, latest);
+    const observed = appendCandidate(account, first.id, { platform_content_id: "post-1", evidence_refs: ["later"] });
+    assert.equal(observed.review_state, latest);
+    assert.equal(observed.status, latest);
+    assert.deepEqual(observed.evidence_refs, ["first", "later"]);
+    assert.equal(createRun(account, payload).candidates[0].review_state, latest);
+  });
+}
+
+test("review changes propagate across ID-only and URL-only aliases", () => {
+  const account = "alias-reviews";
+  const first = createRun(account, { platform: "instagram", overview: "first", candidates: [{ platform_content_id: "p", canonical_url: "https://example.com/alias" }] });
+  setCandidateStatus(account, first.id, first.candidates[0].id, "confirmed");
+  const second = createRun(account, { platform: "instagram", overview: "second", candidates: [{ platform_content_id: "p" }] });
+  setCandidateStatus(account, second.id, second.candidates[0].id, "removed");
+  const third = createRun(account, { platform: "instagram", overview: "third", candidates: [{ canonical_url: "https://example.com/alias" }] });
+  assert.equal(third.candidates[0].review_state, "removed");
+  setCandidateStatus(account, third.id, third.candidates[0].id, "confirmed");
+  assert.equal(createRun(account, { platform: "instagram", overview: "fourth", candidates: [{ platform_content_id: "p" }] }).candidates[0].review_state, "confirmed");
+});
+test("duplicate observations replace metrics with the latest supplied snapshot", () => {
+  const run = createRun("fresh-metrics", { platform: "instagram", overview: "metrics", candidates: [{ platform_content_id: "p", metrics: { likes: 10, views: 20 } }] });
+  const updated = appendCandidate("fresh-metrics", run.id, { platform_content_id: "p", metrics: { likes: 100 } });
+  assert.deepEqual(updated.metrics, { likes: 100 });
+  assert.deepEqual(getRun("fresh-metrics", run.id).candidates[0].metrics, { likes: 100 });
+});
