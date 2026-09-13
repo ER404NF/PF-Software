@@ -38,11 +38,11 @@ async function loginCookie(username, password) {
   return setCookie.split(";")[0];
 }
 
-async function command(cookie, text) {
+async function command(cookie, text, deviceId = null) {
   const res = await fetch(`${httpUrl}/api/queue/command`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Cookie: cookie },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify(deviceId ? { text, deviceId } : { text }),
   });
   return { status: res.status, body: await res.json() };
 }
@@ -93,7 +93,7 @@ after(async () => {
   operators.delete("queue-test-va");
   operators.delete("queue-test-restricted");
   operators.delete("queue-test-manager");
-  for (const id of ["queue-instagram", "queue-reddit", "queue-instagram-two"]) {
+  for (const id of ["queue-instagram", "queue-reddit", "queue-instagram-two", "123"]) {
     researchAccounts.delete(id);
     researchAccountDefinitions.delete(id);
   }
@@ -116,14 +116,18 @@ test("a bare-text command with no leading slash returns a proposal, not a queued
   assert.equal(taskQueue.listTasks().length, 0);
 });
 
-test("/time queues a real task, visible via GET /api/queue", async () => {
+test("/time is rejected before queue admission because no generic worker is registered", async () => {
+  const beforeTasks = taskQueue.listTasks().length;
+  const beforeModes = new Map([...devices.keys()].map((id) => [id, deviceLease.getMode(id)]));
   const { status, body } = await command(cookie, "/time 00:00-23:59 Research AI coding reels on Instagram");
-  assert.equal(status, 200);
-  assert.equal(body.task.goal, "Research AI coding reels on Instagram");
+  assert.equal(status, 400);
+  assert.match(body.error, /General scheduled tasks are not available yet/);
+  assert.equal(taskQueue.listTasks().length, beforeTasks);
+  for (const [id, mode] of beforeModes) assert.equal(deviceLease.getMode(id), mode);
 
   const listRes = await fetch(`${httpUrl}/api/queue`, { headers: { Cookie: cookie } });
   const { tasks } = await listRes.json();
-  assert.ok(tasks.some((t) => t.id === body.task.id));
+  assert.equal(tasks.length, beforeTasks);
 });
 
 test("a device-restricted admin's queued task cannot dispatch onto an unauthorized phone", async () => {
@@ -174,9 +178,12 @@ test("/cresearch fails closed on ambiguous accounts and accepts an explicit acco
   }
 });
 
-test("/queue add re-parses its argument as a /time or /cresearch command", async () => {
+test("/queue add rejects unsupported /time work and re-parses /cresearch", async () => {
+  const beforeTasks = taskQueue.listTasks().length;
   const timeAdd = await command(cookie, "/queue add /time 00:00-23:59 Do the thing");
-  assert.equal(timeAdd.body.task.goal, "Do the thing");
+  assert.equal(timeAdd.status, 400);
+  assert.match(timeAdd.body.error, /General scheduled tasks are not available yet/);
+  assert.equal(taskQueue.listTasks().length, beforeTasks);
 
   const cresearchAdd = await command(cookie, "/queue add /cresearch reddit 15 Do the other thing");
   assert.equal(cresearchAdd.body.task.goal, "Do the other thing");
@@ -203,8 +210,9 @@ test("/model lists providers and enforces provider-scope authorization", async (
 });
 
 test("/queue list, priority, move, and cancel operate on real queued tasks", async () => {
-  const a = (await command(cookie, "/time 00:00-23:59 task a")).body.task;
-  const b = (await command(cookie, "/time 00:00-23:59 task b")).body.task;
+  await command(cookie, "/queue pause");
+  const a = (await command(cookie, "/cresearch instagram queue-instagram 30 task a")).body.task;
+  const b = (await command(cookie, "/cresearch reddit queue-reddit 30 task b")).body.task;
 
   const priorityRes = await command(cookie, `/queue priority ${a.id} urgent`);
   assert.equal(priorityRes.body.task.priority, "urgent");
@@ -221,7 +229,7 @@ test("/queue list, priority, move, and cancel operate on real queued tasks", asy
 
 test("/queue pause stops new dispatches; /queue resume lets them proceed", async () => {
   await command(cookie, "/queue pause");
-  const added = (await command(cookie, "/time 00:00-23:59 paused-queue task")).body.task;
+  const added = (await command(cookie, "/cresearch instagram queue-instagram 30 paused-queue task")).body.task;
   assert.equal(added.state, "QUEUED");
 
   await command(cookie, "/queue resume");
@@ -322,6 +330,43 @@ test("/device health still obeys device authorization", async () => {
   const { status, body } = await command(restrictedCookie, "/device health mock-2");
   assert.equal(status, 400);
   assert.match(body.error, /not authorized/);
+});
+
+test("/cresearch flags address a numeric account and ambiguous positional input queues nothing", async () => {
+  researchAccounts.set("123", "queue-test");
+  researchAccountDefinitions.set("123", Object.freeze({ id: "123", workspaceId: "queue-test", platform: "instagram" }));
+  try {
+    const beforeTasks = taskQueue.listTasks().length;
+    const rejected = await command(cookie, "/cresearch instagram 123 30 inspect numeric account");
+    assert.equal(rejected.status, 400);
+    assert.match(rejected.body.error, /ambiguous numeric account/);
+    assert.equal(taskQueue.listTasks().length, beforeTasks);
+
+    const accepted = await command(cookie, "/cresearch instagram --account 123 --minutes 30 inspect numeric account");
+    assert.equal(accepted.status, 200);
+    assert.deepEqual(accepted.body.task.accountSelector, { platform: "instagram", accountId: "123" });
+  } finally {
+    researchAccounts.delete("123");
+    researchAccountDefinitions.delete("123");
+  }
+});
+
+test("an AI workspace /cresearch command is pinned to its authorized phone", async () => {
+  deviceLease.switchToAI("mock-1");
+  const { status, body } = await command(
+    restrictedCookie,
+    "/cresearch instagram 30 Find strong AI coding reels",
+    "mock-1"
+  );
+  assert.equal(status, 200);
+  assert.deepEqual(body.task.deviceSelector, { deviceId: "mock-1" });
+
+  const outsideScope = await command(restrictedCookie, "/cresearch instagram 30 Find posts", "mock-2");
+  assert.equal(outsideScope.status, 403);
+
+  const crossDevice = await command(restrictedCookie, "/pause mock-2", "mock-1");
+  assert.equal(crossDevice.status, 400);
+  assert.match(crossDevice.body.error, /cannot target another phone/);
 });
 
 test("manager can run scoped operations but not global queue, model, or audit administration", async () => {

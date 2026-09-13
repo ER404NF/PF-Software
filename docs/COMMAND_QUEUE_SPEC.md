@@ -19,6 +19,11 @@ Provide an operator-facing command system for AI VA Mode. Commands compile into 
 /time <start>-<end> <task>
 ```
 
+Current implementation note (2026-09-13): this general form is parsed but
+rejected before queue admission because no generic task worker is registered.
+Use `/cresearch` for the currently supported executable research workflow. This
+prevents a task with no executor from acquiring and holding an AI device lease.
+
 Examples:
 
 ```text
@@ -39,6 +44,7 @@ Workspace timezone is configured centrally. Do not silently reinterpret an expir
 
 ```text
 /cresearch <platform> [account-id] <minutes> <goal>
+/cresearch <platform> [--account <account-id>] --minutes <minutes> <goal>
 ```
 
 Sugar over `/time`: compiles to the same bounded-window `TaskSpec` as
@@ -52,6 +58,7 @@ Example:
 ```text
 /cresearch instagram 30 Research AI coding reels on Instagram. Save strong examples and collect their links.
 /cresearch reddit client-a-reddit 20 Find recurring objections in current threads.
+/cresearch instagram --account 123 --minutes 30 Inspect the numeric account.
 ```
 
 The short form is accepted only when the operator has exactly one configured

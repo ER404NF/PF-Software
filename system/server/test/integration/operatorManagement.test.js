@@ -16,8 +16,12 @@ process.env.ASSIGNMENT_STORE_PATH = path.join(root, "assignments.json");
 process.env.RESEARCH_STORE_DIR = path.join(root, "research");
 process.env.RESEARCH_EVIDENCE_DIR = path.join(root, "evidence");
 process.env.SESSION_SECRET = "operator-management-test-secret";
+process.env.TWO_FACTOR_MASTER_KEY = "operator-management-test-two-factor-key-123456";
+process.env.ACCOUNT_NOTIFICATION_STORE_PATH = path.join(root, "account-notifications.json");
+process.env.AUTO_DISCOVER_IOS_DEVICES = "false";
 
 const auth = await import("../../src/authStore.js");
+const { totpCode } = await import("../../src/twoFactor.js");
 auth.createOperatorAccount({
   username: "admin-test",
   password: "admin-password-123",
@@ -29,6 +33,7 @@ auth.createOperatorAccount({
   username: "manager-test",
   password: "manager-password-123",
   role: "manager",
+  teamId: "team-a",
   allowedDevices: ["mock-1"],
   allowedResearchWorkspaces: [],
 });
@@ -94,8 +99,162 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
     const adminCookie = await login(baseUrl, "admin-test", "admin-password-123");
     const managerCookie = await login(baseUrl, "manager-test", "manager-password-123");
 
-    const forbidden = await request(baseUrl, "/api/admin/users", { cookie: managerCookie });
-    assert.equal(forbidden.status, 403);
+    const managerScope = await request(baseUrl, "/api/admin/users", { cookie: managerCookie });
+    assert.equal(managerScope.status, 200);
+    assert.deepEqual(managerScope.body.users.map(user => user.username), ["manager-test"]);
+    assert.deepEqual(managerScope.body.users[0].recentAudit, []);
+    assert.equal(managerScope.body.users[0].canRename, false);
+    assert.equal(managerScope.body.users[0].canReview, false);
+    assert.match(managerScope.body.users[0].actionReason, /currently using/);
+    assert.equal((await request(baseUrl, "/api/admin/users/manager-test/2fa/reset", {
+      cookie: managerCookie, method: "POST",
+    })).status, 403);
+
+    const signup = await request(baseUrl, "/api/signup", {
+      method: "POST",
+      body: {
+        fullName: "New Assistant",
+        email: "new.assistant+farm@gmail.com",
+        username: "new-assistant",
+        password: "new-assistant-password",
+        passwordConfirmation: "new-assistant-password",
+      },
+    });
+    assert.equal(signup.status, 201);
+    assert.equal(signup.body.operator.accountStatus, "pending");
+    assert.equal(signup.body.operator.email, "newassistant@gmail.com");
+    assert.equal("passwordHash" in signup.body.operator, false);
+    assert.equal((await request(baseUrl, "/api/login", {
+      method: "POST", body: { username: "new-assistant", password: "new-assistant-password" },
+    })).status, 403);
+
+    const duplicateEmail = await request(baseUrl, "/api/signup", {
+      method: "POST",
+      body: {
+        fullName: "Duplicate Assistant",
+        email: "newassistant@gmail.com",
+        username: "duplicate-assistant",
+        password: "duplicate-password-123",
+        passwordConfirmation: "duplicate-password-123",
+      },
+    });
+    assert.equal(duplicateEmail.status, 409);
+
+    const assignedTeam = await request(baseUrl, "/api/admin/users/new-assistant", {
+      cookie: adminCookie,
+      method: "PATCH",
+      body: { teamId: "team-a" },
+    });
+    assert.equal(assignedTeam.status, 200);
+    const scopedAfterAssignment = await request(baseUrl, "/api/admin/users", { cookie: managerCookie });
+    assert.deepEqual(scopedAfterAssignment.body.users.map(user => user.username).sort(), ["manager-test", "new-assistant"]);
+
+    const managerCannotMutateGrants = await request(baseUrl, "/api/admin/users/new-assistant", {
+      cookie: managerCookie,
+      method: "PATCH",
+      body: { allowedDevices: ["mock-1"] },
+    });
+    assert.equal(managerCannotMutateGrants.status, 403);
+    assert.equal((await request(baseUrl, "/api/admin/users/manager-test/status", {
+      cookie: managerCookie, method: "PATCH", body: { status: "rejected" },
+    })).status, 403);
+
+    const approved = await request(baseUrl, "/api/admin/users/new-assistant/status", {
+      cookie: managerCookie,
+      method: "PATCH",
+      body: { status: "approved" },
+    });
+    assert.equal(approved.status, 200);
+    assert.equal(approved.body.notification.deliveryState, "awaiting_sender_configuration");
+
+    const firstLogin = await fetch(`${baseUrl}/api/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "new-assistant", password: "new-assistant-password" }),
+    });
+    assert.equal(firstLogin.status, 202);
+    assert.equal((await firstLogin.json()).requiresTwoFactorSetup, true);
+    const pendingCookie = firstLogin.headers.get("set-cookie").split(";")[0];
+    const setup = await request(baseUrl, "/api/2fa/setup", { cookie: pendingCookie, method: "POST" });
+    assert.equal(setup.status, 200);
+    const confirmed = await request(baseUrl, "/api/2fa/confirm", {
+      cookie: pendingCookie,
+      method: "POST",
+      body: { code: totpCode(setup.body.secret) },
+    });
+    assert.equal(confirmed.status, 200);
+    assert.equal(confirmed.body.recoveryCodes.length, 10);
+    assert.equal("email" in confirmed.body.operator, false);
+    assert.equal("twoFactorSecret" in confirmed.body.operator, false);
+    assert.equal((await request(baseUrl, "/api/me", { cookie: pendingCookie })).status, 401);
+    const receipt = await request(baseUrl, "/api/2fa/recovery-receipt", { cookie: pendingCookie });
+    assert.equal(receipt.status, 200);
+    assert.deepEqual(receipt.body.recoveryCodes, confirmed.body.recoveryCodes);
+    assert.equal((await request(baseUrl, "/api/2fa/acknowledge-recovery", {
+      cookie: pendingCookie, method: "POST",
+    })).status, 200);
+    assert.equal((await request(baseUrl, "/api/2fa/recovery-receipt", { cookie: pendingCookie })).status, 401);
+    assert.equal((await request(baseUrl, "/api/me", { cookie: pendingCookie })).status, 200);
+
+    await request(baseUrl, "/api/logout", { cookie: pendingCookie, method: "POST" });
+    const secondLogin = await fetch(`${baseUrl}/api/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "new-assistant", password: "new-assistant-password" }),
+    });
+    assert.equal(secondLogin.status, 202);
+    assert.equal((await secondLogin.json()).requiresTwoFactor, true);
+    const verifyCookie = secondLogin.headers.get("set-cookie").split(";")[0];
+    const verified = await request(baseUrl, "/api/2fa/verify", {
+      cookie: verifyCookie, method: "POST", body: { code: totpCode(setup.body.secret) },
+    });
+    assert.equal(verified.status, 200);
+
+    const renamed = await request(baseUrl, "/api/admin/users/new-assistant/rename", {
+      cookie: managerCookie, method: "PATCH", body: { username: "assistant-renamed" },
+    });
+    assert.equal(renamed.status, 200);
+    assert.equal((await request(baseUrl, "/api/me", { cookie: verifyCookie })).status, 401);
+    assert.equal((await request(baseUrl, "/api/admin/users/manager-test/rename", {
+      cookie: managerCookie, method: "PATCH", body: { username: "manager-self-renamed" },
+    })).status, 403);
+
+    const recoveryRequested = await request(baseUrl, "/api/recovery/request", {
+      method: "POST", body: { identifier: "assistant-renamed" },
+    });
+    assert.equal(recoveryRequested.status, 200);
+    const notificationList = await request(baseUrl, "/api/admin/account-notifications", { cookie: adminCookie });
+    assert.equal(notificationList.status, 200);
+    assert.equal(notificationList.body.notifications.some(item => "body" in item), false);
+    assert.equal(notificationList.body.notifications.some(item => item.kind === "account_recovery"), true);
+    const notificationStore = JSON.parse(fs.readFileSync(process.env.ACCOUNT_NOTIFICATION_STORE_PATH, "utf8"));
+    const recoveryBody = notificationStore.notifications.find(item => item.kind === "account_recovery").body;
+    const recoveryToken = recoveryBody.match(/minutes: (\S+)$/)[1];
+    const recovered = await request(baseUrl, "/api/recovery/complete", {
+      method: "POST",
+      body: {
+        token: recoveryToken,
+        password: "recovered-password-456",
+        passwordConfirmation: "recovered-password-456",
+      },
+    });
+    assert.equal(recovered.status, 200);
+    const afterRecoveryLogin = await fetch(`${baseUrl}/api/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "assistant-renamed", password: "recovered-password-456" }),
+    });
+    assert.equal(afterRecoveryLogin.status, 202);
+    assert.equal((await afterRecoveryLogin.json()).requiresTwoFactorSetup, true);
+    const recoveryLoginCookie = afterRecoveryLogin.headers.get("set-cookie").split(";")[0];
+    assert.equal((await request(baseUrl, "/api/2fa/setup", { cookie: recoveryLoginCookie, method: "POST" })).status, 200);
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const invalid = await request(baseUrl, "/api/2fa/confirm", {
+        cookie: recoveryLoginCookie, method: "POST", body: { code: "invalid" },
+      });
+      assert.equal(invalid.status, attempt === 5 ? 429 : 401);
+    }
+    assert.equal((await request(baseUrl, "/api/2fa/setup", { cookie: recoveryLoginCookie, method: "POST" })).status, 401);
 
     const unknownDevice = await request(baseUrl, "/api/admin/users", {
       cookie: adminCookie,
@@ -169,6 +328,7 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
         username: "demotion-target",
         password: "demotion-target-password",
         role: "manager",
+        teamId: "team-b",
         allowedDevices: null,
         allowedResearchWorkspaces: [],
       },
@@ -271,10 +431,51 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
     const lastAdmin = await request(baseUrl, "/api/admin/users/admin-test", {
       cookie: adminCookie,
       method: "PATCH",
-      body: { role: "manager" },
+      body: { role: "manager", teamId: "team-a" },
     });
     assert.equal(lastAdmin.status, 409);
     assert.match(lastAdmin.body.error, /last active admin/);
+
+    const selfRejected = await request(baseUrl, "/api/admin/users/admin-test/status", {
+      cookie: adminCookie,
+      method: "PATCH",
+      body: { status: "rejected" },
+    });
+    assert.equal(selfRejected.status, 403);
+    assert.match(selfRejected.body.error, /account you are currently using/);
+    assert.equal((await request(baseUrl, "/api/me", { cookie: adminCookie })).status, 200,
+      "a rejected self-review request must leave the current session valid");
+
+    const listedBeforeSecondAdmin = await request(baseUrl, "/api/admin/users", { cookie: adminCookie });
+    const ownAdminCard = listedBeforeSecondAdmin.body.users.find(user => user.username === "admin-test");
+    assert.equal(ownAdminCard.canReview, false);
+    assert.match(ownAdminCard.actionReason, /currently using/);
+
+    const secondAdmin = await request(baseUrl, "/api/admin/users", {
+      cookie: adminCookie,
+      method: "POST",
+      body: {
+        username: "second-admin",
+        password: "second-admin-password",
+        fullName: "Second Admin",
+        email: "second.admin@gmail.com",
+        role: "admin",
+        allowedDevices: null,
+        allowedResearchWorkspaces: [],
+      },
+    });
+    assert.equal(secondAdmin.status, 201);
+    const secondAdminRejected = await request(baseUrl, "/api/admin/users/second-admin/status", {
+      cookie: adminCookie,
+      method: "PATCH",
+      body: { status: "rejected" },
+    });
+    assert.equal(secondAdminRejected.status, 200,
+      "an admin may reject another admin when a second active admin remains");
+    assert.equal((await request(baseUrl, "/api/me", { cookie: adminCookie })).status, 200);
+    assert.throws(() => auth.setOperatorAccountStatus("admin-test", "rejected"), /last active admin/);
+    assert.equal((await request(baseUrl, "/api/me", { cookie: adminCookie })).status, 200,
+      "last-admin rejection must leave the account and its sessions unchanged");
 
     const listed = await request(baseUrl, "/api/admin/users", { cookie: adminCookie });
     assert.equal(listed.status, 200);

@@ -30,6 +30,14 @@ function researchText(parent, tag, value) {
   return el;
 }
 
+function safeEvidenceReference(account, reference) {
+  if (typeof reference !== "string") return null;
+  const prefix = `/api/research/${encodeURIComponent(account)}/evidence/`;
+  if (!reference.startsWith(prefix)) return null;
+  const evidenceId = reference.slice(prefix.length);
+  return /^evidence-[0-9a-f-]+\.(?:png|jpg|webp)$/.test(evidenceId) ? reference : null;
+}
+
 function renderResearchRun(run, account, epoch) {
   const section = document.createElement("section");
   section.className = "research-run";
@@ -43,7 +51,22 @@ function renderResearchRun(run, account, epoch) {
     if (candidate.text_extract) researchText(card, "p", candidate.text_extract);
     if (candidate.tags?.length) researchText(card, "p", `Tags: ${candidate.tags.join(", ")}`);
     if (candidate.score != null) researchText(card, "p", `Score: ${candidate.score}`);
-    if (candidate.evidence_refs?.length) researchText(card, "p", `Evidence: ${candidate.evidence_refs.join(", ")}`);
+    if (candidate.evidence_refs?.length) {
+      const evidence = document.createElement("p");
+      researchText(evidence, "span", "Evidence: ");
+      let rendered = 0;
+      for (const reference of candidate.evidence_refs) {
+        const href = safeEvidenceReference(account, reference);
+        if (!href) continue;
+        if (rendered) researchText(evidence, "span", " · ");
+        const link = researchText(evidence, "a", `View evidence ${rendered + 1}`);
+        link.href = href;
+        link.target = "_blank";
+        link.rel = "noopener noreferrer";
+        rendered++;
+      }
+      if (rendered) card.append(evidence);
+    }
     if (candidate.platform_actions?.length) {
       researchText(card, "p", `Recorded actions: ${candidate.platform_actions.map((a) => `${a.action} (${a.status || "unspecified"})`).join(", ")}`);
     }

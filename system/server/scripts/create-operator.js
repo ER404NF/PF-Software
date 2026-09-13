@@ -3,7 +3,7 @@
 // a plaintext password into it).
 //
 // Usage:
-//   node server/scripts/create-operator.js <username> <password> [device1,device2,...] [--role=<role>] [--research-workspaces=client-a,client-b]
+//   node server/scripts/create-operator.js <username> <password> [device1,device2,...] [--role=<role>] [--full-name="Name"] [--email=name@gmail.com] [--team=team-a] [--research-workspaces=client-a,client-b]
 //
 // Omit the device list to grant every device to non-VA roles. Role defaults
 // to `va`; a VA with no list gets no devices and must receive explicit grants.
@@ -16,7 +16,7 @@ import { validResearchId } from "../src/researchId.js";
 const [, , username, password, ...rest] = process.argv;
 if (!username || !password) {
   console.error(
-    "Usage: node server/scripts/create-operator.js <username> <password> [device1,device2,...] [--role=admin|manager|va|content_creator|editor] [--research-workspaces=client-a,client-b]"
+    "Usage: node server/scripts/create-operator.js <username> <password> [device1,device2,...] [--role=admin|manager|va|content_creator|editor] [--full-name=Name] [--email=name@gmail.com] [--team=team-a] [--research-workspaces=client-a,client-b]"
   );
   process.exit(1);
 }
@@ -24,6 +24,9 @@ if (!username || !password) {
 let role = OPERATOR_ROLES.VA;
 let deviceList = null;
 let researchWorkspaces;
+let fullName;
+let email;
+let teamId;
 for (const arg of rest) {
   if (arg.startsWith("--research-workspaces=")) {
     const value = arg.slice("--research-workspaces=".length);
@@ -48,6 +51,12 @@ for (const arg of rest) {
       process.exit(1);
     }
     role = normalizeRole(requested);
+  } else if (arg.startsWith("--full-name=")) {
+    fullName = arg.slice("--full-name=".length);
+  } else if (arg.startsWith("--email=")) {
+    email = arg.slice("--email=".length);
+  } else if (arg.startsWith("--team=")) {
+    teamId = arg.slice("--team=".length);
   } else if (!arg.startsWith("--") && deviceList === null) {
     deviceList = arg;
   } else {
@@ -63,6 +72,9 @@ try {
       password,
       allowedDevices,
       role,
+      ...(fullName !== undefined ? { fullName } : {}),
+      ...(email !== undefined ? { email } : {}),
+      ...(teamId !== undefined ? { teamId } : {}),
       ...(researchWorkspaces !== undefined ? { allowedResearchWorkspaces: researchWorkspaces } : {}),
     });
     console.log(`Updated operator "${username}" and revoked its previous sessions.`);
@@ -72,6 +84,9 @@ try {
       password,
       allowedDevices,
       role,
+      fullName,
+      email,
+      teamId,
       allowedResearchWorkspaces: researchWorkspaces ?? [],
     });
     console.log(`Created operator "${username}".`);
@@ -81,6 +96,7 @@ try {
   process.exit(1);
 }
 console.log(`role: ${role}`);
+console.log(`team: ${operators.get(username)?.teamId || "(none)"}`);
 const effectiveDevices = operators.get(username)?.allowedDevices;
 console.log(`allowedDevices: ${Array.isArray(effectiveDevices)
   ? effectiveDevices.length ? effectiveDevices.join(", ") : "(no devices; explicit VA grants required)"

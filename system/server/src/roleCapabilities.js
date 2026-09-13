@@ -27,6 +27,7 @@ export const CAPABILITIES = Object.freeze({
   VIEW_AUDIT: "audit:view-sensitive",
   MANAGE_MODELS: "models:manage",
   MANAGE_USERS: "users:manage",
+  MANAGE_TEAM_MEMBERS: "team-members:manage",
   MANAGE_ACCESS: "access:manage",
   MANAGE_PROXY: "proxy:manage",
   MANAGE_SECURITY: "security:manage",
@@ -54,6 +55,7 @@ export const ROLE_CAPABILITIES = Object.freeze({
     CAPABILITIES.MANAGE_AI_CONTROLLER,
     CAPABILITIES.RUN_NETWORK_CHECK,
     CAPABILITIES.MONITOR_DEVICE,
+    CAPABILITIES.MANAGE_TEAM_MEMBERS,
   ]),
   [OPERATOR_ROLES.VA]: Object.freeze([
     ...lowerOperational,

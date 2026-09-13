@@ -19,9 +19,11 @@ app.use(express.json());
 
 let currentIp = "203.0.113.10"; // TEST-NET-3 (RFC 5737) — obviously not a routable real IP
 let hanging = false;
+let delayMs = 0;
 
-app.get("/ip", (req, res) => {
+app.get("/ip", async (req, res) => {
   if (hanging) return; // never responds — simulates an unreachable check endpoint
+  if (delayMs > 0) await new Promise(resolve => setTimeout(resolve, delayMs));
   res.json({
     ip: currentIp,
     ipv6: null,
@@ -51,9 +53,19 @@ app.post("/debug/unhang", (req, res) => {
   res.json({ ok: true });
 });
 
+app.post("/debug/delay", (req, res) => {
+  const requested = Number(req.body?.ms);
+  if (!Number.isInteger(requested) || requested < 0 || requested > 5000) {
+    return res.status(400).json({ error: "ms must be an integer from 0 to 5000" });
+  }
+  delayMs = requested;
+  res.json({ ok: true, delayMs });
+});
+
 app.post("/debug/reset", (req, res) => {
   currentIp = "203.0.113.10";
   hanging = false;
+  delayMs = 0;
   res.json({ ok: true });
 });
 

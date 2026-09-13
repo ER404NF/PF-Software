@@ -36,6 +36,18 @@ test("hidden ancestors and disabled JSON controls are ineligible", () => {
     { visible: false, children: [profile(3)] }, profile(70)] };
   assert.equal(findAccessibleElement(ui_tree, ["profile"]).frame.x, 70);
 });
+test("hidden, disabled, zero-size, and offscreen XML ancestors make descendants ineligible", () => {
+  const xml = '<XCUIElementTypeApplication name="Instagram" x="0" y="0" width="100" height="200">'
+    + '<XCUIElementTypeOther visible="false" x="0" y="0" width="50" height="50"><XCUIElementTypeButton label="Profile" x="1" y="1" width="10" height="10"/></XCUIElementTypeOther>'
+    + '<XCUIElementTypeOther enabled="false" x="0" y="0" width="50" height="50"><XCUIElementTypeButton label="Profile" x="2" y="2" width="10" height="10"/></XCUIElementTypeOther>'
+    + '<XCUIElementTypeOther x="0" y="0" width="0" height="50"><XCUIElementTypeButton label="Profile" x="3" y="3" width="10" height="10"/></XCUIElementTypeOther>'
+    + '<XCUIElementTypeOther x="150" y="0" width="20" height="20"><XCUIElementTypeButton label="Profile" x="151" y="1" width="10" height="10"/></XCUIElementTypeOther>'
+    + '<XCUIElementTypeOther x="60" y="60" width="30" height="30"><XCUIElementTypeButton label="Profile" x="70" y="70" width="10" height="10"/></XCUIElementTypeOther>'
+    + '</XCUIElementTypeApplication>';
+  const target = findAccessibleElement(xml, ["profile"]);
+  assert.equal(target.frame.x, 70);
+  assert.deepEqual(normalizedCenter(xml, target), { x: 0.75, y: 0.375 });
+});
 test("post-action challenge pauses the real worker without Home recovery", async () => {
   let homes = 0, scrolled = false;
   const device = { id: "d", status: "idle", async getUiTree() { return scrolled ? { ...tree, name: "Enter security code to verify your identity" } : tree; },

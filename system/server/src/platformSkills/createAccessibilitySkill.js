@@ -3,17 +3,21 @@ import { MS8_READ_ONLY_ACTIONS } from "../actionPolicy.js";
 import { findAccessibleElement, includesAny, normalizedCenter, normalizeUiText, observationTree, uiText } from "./accessibilityTree.js";
 
 const PASSIVE_ACTIONS = new Set(["observe", "capture", "capture_screenshot", "extract_visible"]);
+const DETAIL_NAVIGATION_ACTIONS = new Set(["open_post", "open_thread", "open_comments"]);
 const CHALLENGE_PATTERNS = ["captcha", "security challenge", "security code", "two factor", "verification code",
   "verify it is you", "verify your identity", "suspicious login", "account recovery", "challenge required"];
 
-function navigationControl(action, element) {
+function navigationControl(action, element, commentNavigationTerms) {
   const raw = element.raw;
   const label = normalizeUiText(raw.label ?? raw.name ?? raw.identifier ?? raw.text ?? "");
   const role = normalizeUiText(raw.type ?? raw.role ?? "");
   if (/application|window|scroll|textfield|text field/.test(role)) return false;
   if (/\b(send|submit|publish|delete|remove|like|unlike|follow|unfollow|repost|share|save|bookmark|upvote|downvote)\b/.test(label)
     || /^(post|add|write) (a )?comment/.test(label)) return false;
-  if (action === "open_comments") return /^(?:(?:view|open|show|all) )?comments(?:\b|$)/.test(label);
+  if (action === "open_comments") {
+    return commentNavigationTerms.some(term => label === term
+      || new RegExp(`^(?:view|open|show|all) ${term}(?:\\b|$)`).test(label));
+  }
   if (action === "open_post" || action === "open_thread") {
     return /^(?:(?:view|open|show) (?:post|thread)|reel(?:s| by| viewer|$)|(?:post|thread) (?:viewer|by|in|card))/.test(label);
   }
@@ -25,7 +29,8 @@ function fingerprint(observation) {
   return typeof tree === "string" ? tree : JSON.stringify(tree);
 }
 
-export function createAccessibilitySkill({ name, platform, appVersion, appAliases, stateRules, actionTargets }) {
+export function createAccessibilitySkill({ name, platform, appVersion, appAliases, stateRules, actionTargets,
+  commentNavigationTerms = ["comments"] }) {
   if (typeof appVersion !== "string" || !appVersion.trim()) throw new Error(`${platform} skill requires an appVersion`);
   const skill = {
     name,
@@ -82,7 +87,8 @@ export function createAccessibilitySkill({ name, platform, appVersion, appAliase
       // action. Select only the platform's action-specific navigation targets.
       const patterns = context.state === "springboard" && decision.action === "open_feed"
         ? appAliases : (actionTargets[decision.action] ?? []);
-      const element = findAccessibleElement(tree, patterns, element => navigationControl(decision.action, element));
+      const element = findAccessibleElement(tree, patterns,
+        element => navigationControl(decision.action, element, commentNavigationTerms));
       if (!element) throw new Error(`${platform} ${decision.action} target was not accessible`);
       const point = normalizedCenter(tree, element);
       await device.tap(point.x, point.y);
@@ -109,6 +115,8 @@ export function createAccessibilitySkill({ name, platform, appVersion, appAliase
         open_feed: ["feed"], search: ["search"], open_post: ["post", "reel"],
         open_thread: ["post", "thread", "comments"], open_profile: ["profile"], open_comments: ["comments"],
       }[decision.action] ?? [];
+      if (DETAIL_NAVIGATION_ACTIONS.has(decision.action)
+        && fingerprint(observationAfter) === fingerprint(context.observationBefore)) return false;
       return expected.includes(afterState)
         || (context.state === "springboard" && decision.action === "open_feed" && afterState !== "springboard" && afterState !== "unknown");
     },

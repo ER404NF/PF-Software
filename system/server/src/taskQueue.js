@@ -250,11 +250,13 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
   // /stop <deviceId> — cancels whatever's active on that device and returns
   // it to AI_IDLE (still AI-enabled, just nothing running). Distinct from
   // /takeover, which hands the device back to a human entirely.
-  function stopDevice(deviceId) {
+  function stopDevice(deviceId, reason = "operator") {
     const task = findActiveTaskForDevice(deviceId);
     if (task) {
       task.state = TASK_STATES.CANCELLED;
-      task.result = { outcome: TASK_STATES.CANCELLED, detail: "stopped by operator", at: new Date().toISOString() };
+      task.result = { outcome: TASK_STATES.CANCELLED,
+        detail: reason === "network_policy" ? "stopped by fail-closed network policy" : "stopped by operator",
+        at: new Date().toISOString() };
       task.updatedAt = task.result.at;
     }
     // Physical input revocation must not depend on a successful disk write.
@@ -265,7 +267,8 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
       deviceLease.markError?.(deviceId);
       throw error; // cancellation was not durable; require explicit recovery
     }
-    if (task) auditLog?.logEvent({ type: "task_cancelled", deviceId, detail: { taskId: task.id, reason: "stop" } });
+    if (task) auditLog?.logEvent({ type: "task_cancelled", deviceId,
+      detail: { taskId: task.id, reason: reason === "network_policy" ? "network_policy" : "stop" } });
     tryDispatch(new Date());
     return task ?? null;
   }

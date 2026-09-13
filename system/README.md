@@ -22,6 +22,8 @@ Implemented now:
 - WebSocket heartbeat + client auto-reconnect;
 - device-side failure isolation (`offline` instead of crashing the server);
 - per-device server-side file folders with list/upload/download/delete routes;
+- lease-free, device-scoped media workspaces for every role granted
+  `media:access`, including Content Creator and Editor;
 - operator login/logout sessions, required for every device/research route
   and for the WebSocket connection itself;
 - per-operator device authorization (an operator only reaches the devices
@@ -31,7 +33,8 @@ Implemented now:
 - authenticated live staff presence and a persistent People roster, with
   multi-tab/session aggregation and safe current-phone activity only;
 - durable role-aware work assignments with optional phone/account scope,
-  manager-controlled status/reassignment, and immutable actor history;
+  once/daily/weekly recurrence, VA progress controls, management-only
+  reassignment/scheduling, and immutable actor history;
 - file-backed sessions that survive a relay restart, and an append-only
   audit log of who did what (see "Persistence, audit & health" below);
 - per-device health tracking (last-seen timestamp, consecutive-failure
@@ -40,7 +43,7 @@ Implemented now:
 - the controller-mode/input-lease abstraction (`HUMAN`/`AI_IDLE`/`AI_RUNNING`/
   `AI_PAUSED`/`HANDOFF`/`ERROR`) and the take-over/emergency-stop mechanics —
   see "Controller mode and the input lease" below;
-- the AI command console and task queue/scheduler (`/time`, `/cresearch`,
+- the AI command console and task queue/scheduler (`/cresearch`,
   `/queue`, `/mode`, `/pause`/`/resume`/`/stop`/`/takeover`) — durable,
   restart-safe, with no production AI worker subscribed yet; see "AI command console
   and task queue" below;
@@ -91,7 +94,7 @@ generated, never hand-edited, because it holds password hashes:
 
 ```bash
 node server/scripts/create-operator.js va1 <password> mock-1,mock-2 --role=va
-node server/scripts/create-operator.js manager1 <password> mock-1,mock-2 --role=manager
+node server/scripts/create-operator.js manager1 <password> mock-1,mock-2 --role=manager --team=team-a --full-name="Manager Name" --email=manager@gmail.com
 node server/scripts/create-operator.js creator1 <password> --role=content_creator
 node server/scripts/create-operator.js editor1 <password> --role=editor
 node server/scripts/create-operator.js admin1 <password> --role=admin
@@ -112,6 +115,40 @@ separately:
   to `[]`, so the VA can see safe fleet summaries but cannot open any phone.
   Create one with explicit IDs, for example `mock-1,mock-2`, then manage the
   same grants in Operations > Users and Access.
+- Relay startup rejects duplicate usernames and malformed `allowedDevices`
+  values (including strings, invalid IDs, mixed arrays, and duplicate entries)
+  before any account is published to the live authorization registry.
+- Every newly created Manager requires a `teamId`. A Manager's user view is
+  server-filtered to the same team and to VA, Content Creator, and Editor
+  roles. Managers can review applications and rename those members. Admin
+  remains the authority for assigning teams, roles, and grants.
+
+### Signup, approval, 2FA, and recovery
+
+Self-signup requires a full name, a canonical `@gmail.com` address, a username,
+and the same 12+ character password twice. New applications are inactive VAs
+with no device or research grants. They cannot sign in until an Admin or an
+assigned same-team Manager accepts them. An Admin must assign the team before
+the application appears to that Manager.
+
+Accepted signup accounts enroll a TOTP authenticator on first sign-in. The
+TOTP secret is encrypted at rest and ten one-time recovery codes are shown
+until the operator explicitly acknowledges saving them. Refreshing that screen
+restores the codes from a short-lived encrypted session receipt; the normal app
+session is not authenticated until acknowledgement. Only recovery-code digests
+remain in the account record afterward. Email recovery resets the password
+and requires authenticator enrollment again. Configure a stable secret before
+accepting real users:
+
+```powershell
+$env:TWO_FACTOR_MASTER_KEY = "use-a-long-random-secret-of-at-least-32-characters"
+```
+
+Approval, rejection, and recovery messages are written to the durable account
+notification outbox. Set `COMPANY_FROM_EMAIL` when the company mailbox is
+known. Until an SMTP/API delivery adapter and its credentials are configured,
+items remain `awaiting_sender_configuration`; the app does not report them as
+delivered. `ACCOUNT_NOTIFICATION_STORE_PATH` overrides the outbox path.
 
 Re-running the script for an existing username updates that operator's
 password, device list, and role. `operators.config.json` is gitignored — it's
@@ -174,7 +211,7 @@ The server reads device definitions at startup rather than hardcoding the fleet.
 {
   "devices": [
     { "id": "mock-1", "label": "iPhone SE — Bench 1 (mock)", "type": "mock" },
-    { "id": "iphone-1", "label": "iPhone SE #1", "type": "wda", "port": 8100 }
+    { "id": "iphone-1", "label": "Fallback label", "type": "wda", "port": 8100, "udid": "00008110-..." }
   ]
 }
 ```
@@ -187,6 +224,14 @@ An in-memory fake screen from `server/src/mockDevice.js`. Use it for client/serv
 
 A real authorized iOS test device controlled through WebDriverAgent via `server/src/wdaDevice.js`. `port` is the local forwarded WDA endpoint for that phone.
 
+On macOS the relay runs `idevice_id -l` and `ideviceinfo` at startup. When a
+configured WDA entry includes the matching `udid`, the fleet label is replaced
+with the phone's current DeviceName automatically. Connected phones without a
+matching WDA entry are shown as detected but unavailable, so USB discovery is
+never mistaken for a configured control tunnel. Install `libimobiledevice` on
+the main Mac and restart the relay after connecting or renaming phones. Set
+`AUTO_DISCOVER_IOS_DEVICES=false` to disable discovery.
+
 Both adapters expose the same tap/swipe/typeText/render contract. As new capabilities are added, extend the adapter interface consistently rather than special-casing the browser for WDA.
 
 ### `network` (optional, Phase 0 of per-phone network isolation)
@@ -197,7 +242,8 @@ See "Network isolation (Phase 0)" below.
 
 1. Build/install WebDriverAgent on the authorized test iPhone using Xcode.
 2. Make that phone's WDA endpoint reachable on a dedicated local port on the Mac host (for example through the existing USB forwarding approach).
-3. Add the WDA device and local port to `devices.config.json`.
+3. Add the WDA device, its UDID, and local port to `devices.config.json`. The
+   displayed name then follows the device automatically.
 4. Restart the relay and validate one device before adding more.
 
 The exact real-hardware behavior remains unverified until bench-tested on the target Mac/phone setup.
@@ -306,6 +352,16 @@ lets a later message's response arrive out of order.
 
 Each configured device has a separate server-side folder under `storage/devices/<deviceId>/`. `FILE_STORE_DIR` overrides the parent storage directory; media still uses its `devices/` namespace. Internal names such as `sessions`, `audit`, and `queue` cannot be device IDs, and startup rejects overlapping media and internal-state paths. Legacy media from an older installation must be relocated from `storage/<deviceId>/` to this new namespace before use; internal storage must never be migrated as media.
 
+Uploads are streamed through server-enforced capacity gates. Defaults are 10 GiB
+per device, 100 GiB across all device media, and a 5 GiB filesystem free-space
+reserve. Override these byte counts with `MEDIA_DEVICE_QUOTA_BYTES`,
+`MEDIA_GLOBAL_QUOTA_BYTES`, and `MEDIA_MIN_FREE_BYTES`. Invalid values fail
+startup; `0` is allowed when a limit or reserve intentionally needs to be
+disabled. Quota rejection returns JSON with HTTP 413, while a threatened disk
+reserve returns HTTP 507. Responses include the measured and configured byte
+counts. Partial staging files are removed and an existing file is preserved
+when its replacement fails.
+
 Routes:
 
 - `GET /api/devices/:id/files`
@@ -401,19 +457,30 @@ dispatch correctly; `researchTaskRunner.js` subscribes research tasks to the
 bounded worker after all listeners exist, including restart recovery.
 
 ```text
-POST /api/queue/command   { "text": "/time 09:00-10:00 Research AI coding reels" }
+POST /api/queue/command   { "text": "/cresearch instagram 30 Research AI coding reels" }
 GET  /api/queue
 ```
+
+The read-only AI device workspace sends the same endpoint an additional
+`deviceId`. The server revalidates AI-workspace access and pins `/cresearch`,
+`/cresearch`, and their `/queue add` forms to that exact phone; commands cannot
+use the workspace context to target a different device. The chat accepts
+`/cresearch <platform> [account-id] <minutes> <goal>` or the unambiguous
+`/cresearch <platform> [--account <id>] --minutes <minutes> <goal>` (including `/ cresearch`
+with an accidental space), `/device health`, `/pause`, `/resume`,
+`/stop`, and `/mode human`.
 
 Supported commands require explicit capabilities in addition to authentication.
 Every device-targeting command is still checked against the operator's
 `allowedDevices` scope. Global queue changes, model configuration, and sensitive
 audit history remain Admin-only:
 
-- `/time <start>-<end> <task>` (optional explicit `YYYY-MM-DD`), `/cresearch
+- `/time <start>-<end> <task>` is parsed for forward compatibility but rejected
+  before queue admission until a generic task worker exists. `/cresearch
   <platform> <minutes> <goal>` — queue a real task
 - `/queue add|list|pause|resume|cancel|move|priority ...` — queue management;
-  `/queue add` accepts a `/time` or `/cresearch` command as its argument
+  `/queue add` accepts a `/time` or `/cresearch` command as its argument, but
+  the same unsupported-worker rejection applies to `/time`
 - `/mode ai|human <deviceId>`, `/pause|/resume|/stop|/takeover <deviceId>` —
   per-device AI control, built directly on `deviceLease`
 - `/device health [deviceId]` — the same live status (`status`, `lastSeenAt`,
@@ -489,8 +556,14 @@ platform-visible action disabled. `server/src/platformSkill.js` defines the
 detect/available/execute/verify/recover contract and rechecks the input lease
 immediately before an action. `server/src/researchWorker.js` joins these pieces
 for one bounded step and routes challenge/low-confidence states through the
-real queue handoff. Tests use fixtures and `MockDevice`; no live vendor or real
-platform app has been exercised. See `docs/CODING_ROADMAP_STATUS.md` for the
+real queue handoff. JSON and XML accessibility targets inherit hidden/disabled
+ancestor state; zero-size or offscreen XML containers also make every
+descendant ineligible, so stale covered coordinates cannot be tapped. Feed and
+detail detection uses stable screen/container labels rather than descendant
+engagement metrics, and post/thread/comments navigation requires a changed
+before/after accessibility structure. Tests use fixtures and `MockDevice`; no
+live vendor or real platform app has been exercised. See
+`docs/CODING_ROADMAP_STATUS.md` for the
 remaining MS8 gates.
 
 ## Network isolation (Phase 0)
@@ -523,6 +596,18 @@ assignment once hardware exists to have one:
   through a VLAN's shared dedicated modem, identified by `vlanId`).
 - `controlIface` is always `"usb"` — WDA's control channel stays on the
   existing USB iproxy tunnel regardless of egress, untouched by this work.
+- `enabled` records whether a configured proxy assignment is active in the
+  control plane. Admins can change it from the fleet card through
+  `PATCH /api/admin/devices/:deviceId/proxy`; the update is persisted and
+  audited, and safe summaries are broadcast immediately. The external gateway
+  or proxy provider remains responsible for applying the route to phone traffic.
+- `failPolicy` defaults to `"fail-closed"` for real assignments. A missing,
+  failed, mismatched, or stale check (15 minutes by default), and a disabled
+  proxy assignment, block Human selection and AI dispatch. Set
+  `NETWORK_VERIFICATION_MAX_AGE_MS` to 1000-86400000 to change the freshness
+  window. A fresh passing check restores eligibility. The committed mock-only
+  devices explicitly use `"fail-open"` so local simulation remains usable and
+  visibly unverified; do not copy that exception into the Mac mini live config.
 - Omitting `network` entirely (every device today) means "not yet assigned"
   — loading never fails or invents a default for a device without one.
 
@@ -537,6 +622,10 @@ the *same* IP — the concrete, checkable form of "isolation silently failed"
 devices on the *same* `vlanId` sharing an IP is expected, not a mismatch.
 [fake-network-check-server.js](server/fixtures/fake-network-check-server.js)
 stands in for the real check endpoint so this is fully testable today.
+The network-check route re-resolves the live session, capability, and exact
+device grant after the probe completes and before returning observed IP,
+region, DNS, bandwidth, or proxy-health data; revocation during a slow check
+therefore returns only `401`/`403` and no operational result.
 
 `networkVerified`/`networkMismatch`/`network` (the assignment) appear
 alongside `status`/`controllerMode` in the WS `device_list` message and
@@ -547,10 +636,10 @@ assigned `network.egress` in its `detail`, when one exists — the
 "account/device context" field CLAUDE.md §8 requires for AI VA Mode's future
 research records, applied here to today's Human VA Mode audit trail.
 
-Not built (deliberately out of scope for this session): the actual
-hardware/routers/SIMs (Phases 1-3), and any automatic/periodic checking — a
-check is triggered on demand today since no real check endpoint exists yet
-to poll.
+Not built: the actual hardware/routers/SIMs (Phases 1-3), and automatic or
+periodic checking. Checks are on demand; once a fail-closed check ages past the
+configured freshness window, the next Human action and every new/continuing AI
+step fail closed until verification passes again.
 
 ## Fleet UI
 
@@ -564,11 +653,28 @@ the existing authentication system:
   can view/control the phone, tap/swipe/type/Home, use normal file transfer,
   return to Fleet, release, and sign out. Queue, audit, network-check, user,
   assignment, proxy/security, and AI-management controls are absent.
-- **Admin/dev view**: everything a VA sees, plus a dedicated Admin workspace
+- **Admin/dev view**: everything a VA sees, plus an Admin-only proxy-assignment
+  switch on proxy-routed device cards and a dedicated Admin workspace
   containing the existing command console, readable task-queue viewer, audit
   viewer, refresh controls, and AI-mode management. The UI calls the existing
   `/api/queue/command`, `/api/queue`, and `/api/audit` APIs rather than
   inventing a second control path.
+- **To-do view**: Admins and Managers create once, daily, or weekly tasks for
+  VAs they are authorized to manage. VAs see only their own scoped list and
+  can Start or Complete it; reassignment, cancellation, and scheduling remain
+  management-only. Completing a recurring task records that occurrence and
+  advances its durable schedule.
+- **Read-only live watch**: an Admin, or a Manager assigned to the active VA's
+  team, can open an in-use VA phone as a read-only screen. The server requires
+  `device:monitor`, the viewer's device grant, Human mode, active VA ownership,
+  and same-team scope for Managers. It never transfers the input lease. Frames
+  update after VA actions and through a two-second read-only refresh; stopping,
+  revocation, logout, disconnect, or VA release clears the watched screen.
+  Fleet details label runtime adapter availability separately from physical
+  acceptance. A configured WDA adapter can provide frames without claiming that
+  passive capture passed hardware acceptance. Set
+  `monitorPhysicallyValidated: true` only on a `type: "wda"` device after that
+  exact phone passes the live test; startup rejects the flag on mock devices.
 
 The fleet view itself is a responsive grid of device cards grouped by
 `hostLabel`. Each card shows live status (`idle`/`in-use`/rendered `warning`/
@@ -608,7 +714,7 @@ are discarded instead of repopulating cleared privileged UI.
 admin-only APIs, admin access, direct VA AI-control rejection, normal VA device
 control, restricted-admin scheduler dispatch, research ownership/review, model
 adapters, observation fallback, policy enforcement and the bounded worker.
-Full suite: **470/470 passing** on 2026-09-12. A final visual pass in Chrome/Safari on the deployment
+Full suite: **490/490 passing** on 2026-09-12. A final visual pass in Chrome/Safari on the deployment
 Mac is still recommended because the repo does not run a full browser E2E
 harness.
 

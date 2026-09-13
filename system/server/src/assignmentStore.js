@@ -3,7 +3,9 @@ import path from "path";
 import crypto from "crypto";
 
 export const ASSIGNMENT_STATUSES = Object.freeze(["assigned", "in_progress", "completed", "cancelled", "expired"]);
+export const ASSIGNMENT_RECURRENCES = Object.freeze(["once", "daily", "weekly"]);
 const STATUS_SET = new Set(ASSIGNMENT_STATUSES);
+const RECURRENCE_SET = new Set(ASSIGNMENT_RECURRENCES);
 const TRANSITIONS = Object.freeze({
   assigned: new Set(["in_progress", "cancelled"]),
   in_progress: new Set(["completed", "cancelled"]),
@@ -30,6 +32,9 @@ function validateLoadedAssignment(value) {
     || ((value.startAt ?? null) === null) !== ((value.endAt ?? null) === null)
     || (value.startAt && Date.parse(value.startAt) >= Date.parse(value.endAt))
     || (value.exclusive !== undefined && typeof value.exclusive !== "boolean")
+    || (value.recurrence !== undefined && !RECURRENCE_SET.has(value.recurrence))
+    || (value.occurrence !== undefined && (!Number.isInteger(value.occurrence) || value.occurrence < 1))
+    || ((value.recurrence === "daily" || value.recurrence === "weekly") && (!value.startAt || !value.endAt))
     || !Array.isArray(value.history)) {
     throw new Error("assignment store contains an invalid assignment");
   }
@@ -108,13 +113,15 @@ export function createAssignmentStore({ storePath, now = () => new Date(), id = 
   }
 
   function create({ instructions, assignee, createdBy, deviceId = null, accountId = null,
-    startAt = null, endAt = null, exclusive = true }) {
+    startAt = null, endAt = null, exclusive = true, recurrence = "once" }) {
     if (!validText(instructions, 2_000)) throw new Error("instructions must be 1-2000 characters");
     if (!validText(assignee, 100) || !validText(createdBy, 100)) throw new Error("assignee and creator are required");
     if (deviceId !== null && !validText(deviceId, 200)) throw new Error("deviceId must be a non-empty string or null");
     if (accountId !== null && !validText(accountId, 200)) throw new Error("accountId must be a non-empty string or null");
+    if (!RECURRENCE_SET.has(recurrence)) throw new Error("recurrence must be once, daily, or weekly");
     const at = timestamp();
     const timing = schedule(startAt, endAt, exclusive);
+    if (recurrence !== "once" && !timing.startAt) throw new Error("daily and weekly assignments require a schedule");
     if (timing.endAt && Date.parse(timing.endAt) <= Date.parse(at)) throw new Error("assignment endAt must be in the future");
     const assignment = {
       id: id(),
@@ -124,6 +131,8 @@ export function createAssignmentStore({ storePath, now = () => new Date(), id = 
       deviceId,
       accountId,
       ...timing,
+      recurrence,
+      occurrence: 1,
       status: "assigned",
       createdAt: at,
       updatedAt: at,
@@ -148,12 +157,45 @@ export function createAssignmentStore({ storePath, now = () => new Date(), id = 
     if (status === "in_progress" && current.startAt && Date.parse(at) < Date.parse(current.startAt)) {
       throw new Error("cannot start assignment before startAt");
     }
-    const updated = {
-      ...current,
-      status,
-      updatedAt: at,
-      history: [...current.history, { at, actor: actor.trim(), action: "status_changed", fromStatus: current.status, toStatus: status }],
-    };
+    let updated;
+    const recurrence = current.recurrence ?? "once";
+    if (status === "completed" && recurrence !== "once") {
+      const intervalMs = recurrence === "daily" ? 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
+      let nextStart = Date.parse(current.startAt) + intervalMs;
+      let nextEnd = Date.parse(current.endAt) + intervalMs;
+      let advanced = 1;
+      while (nextEnd <= Date.parse(at)) {
+        nextStart += intervalMs;
+        nextEnd += intervalMs;
+        advanced += 1;
+      }
+      updated = {
+        ...current,
+        status: "assigned",
+        startAt: new Date(nextStart).toISOString(),
+        endAt: new Date(nextEnd).toISOString(),
+        occurrence: (current.occurrence ?? 1) + advanced,
+        lastCompletedAt: at,
+        updatedAt: at,
+        history: [...current.history, {
+          at,
+          actor: actor.trim(),
+          action: "recurrence_completed",
+          fromStatus: current.status,
+          toStatus: "assigned",
+          completedOccurrence: current.occurrence ?? 1,
+          recurrence,
+        }],
+      };
+      assertNoOverlap(updated, current.id);
+    } else {
+      updated = {
+        ...current,
+        status,
+        updatedAt: at,
+        history: [...current.history, { at, actor: actor.trim(), action: "status_changed", fromStatus: current.status, toStatus: status }],
+      };
+    }
     const next = [...assignments];
     next[index] = updated;
     commit(next);
@@ -190,6 +232,36 @@ export function createAssignmentStore({ storePath, now = () => new Date(), id = 
     return clone(updated);
   }
 
+  function renamePrincipal(previousUsername, username, actor) {
+    if (!validText(previousUsername, 100) || !validText(username, 100) || !validText(actor, 100)) {
+      throw new Error("previous username, username, and actor are required");
+    }
+    const previous = previousUsername.trim();
+    const nextUsername = username.trim();
+    const changed = assignments.map(assignment => {
+      const wasAssignee = assignment.assignee === previous;
+      const wasCreator = assignment.createdBy === previous;
+      if (!wasAssignee && !wasCreator) return assignment;
+      const at = timestamp();
+      return {
+        ...assignment,
+        ...(wasAssignee ? { assignee: nextUsername } : {}),
+        ...(wasCreator ? { createdBy: nextUsername } : {}),
+        updatedAt: at,
+        history: [...assignment.history, {
+          at,
+          actor: actor.trim(),
+          action: "principal_renamed",
+          previousUsername: previous,
+          username: nextUsername,
+        }],
+      };
+    });
+    const updated = changed.filter((assignment, index) => assignment !== assignments[index]);
+    if (updated.length) commit(changed);
+    return clone(updated);
+  }
+
   function reschedule(assignmentId, { startAt = null, endAt = null, exclusive = true }, actor) {
     if (!validText(actor, 100)) throw new Error("actor is required");
     const index = assignments.findIndex(assignment => assignment.id === assignmentId);
@@ -197,6 +269,9 @@ export function createAssignmentStore({ storePath, now = () => new Date(), id = 
     const current = assignments[index];
     if (["completed", "cancelled", "expired"].includes(current.status)) throw new Error("terminal assignments cannot be rescheduled");
     const timing = schedule(startAt, endAt, exclusive);
+    if ((current.recurrence ?? "once") !== "once" && !timing.startAt) {
+      throw new Error("daily and weekly assignments require a schedule");
+    }
     const at = timestamp();
     if (timing.endAt && Date.parse(timing.endAt) <= Date.parse(at)) throw new Error("assignment endAt must be in the future");
     if (current.status === "in_progress" && timing.startAt && Date.parse(timing.startAt) > Date.parse(at)) {
@@ -232,6 +307,38 @@ export function createAssignmentStore({ storePath, now = () => new Date(), id = 
     const next = assignments.map(assignment => {
       if (!["assigned", "in_progress"].includes(assignment.status)
         || !assignment.endAt || Date.parse(assignment.endAt) > cutoff.getTime()) return assignment;
+      const recurrence = assignment.recurrence ?? "once";
+      if (recurrence !== "once") {
+        const intervalMs = recurrence === "daily" ? 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
+        let nextStart = Date.parse(assignment.startAt);
+        let nextEnd = Date.parse(assignment.endAt);
+        let advanced = 0;
+        while (nextEnd <= cutoff.getTime()) {
+          nextStart += intervalMs;
+          nextEnd += intervalMs;
+          advanced += 1;
+        }
+        const updated = {
+          ...assignment,
+          status: "assigned",
+          startAt: new Date(nextStart).toISOString(),
+          endAt: new Date(nextEnd).toISOString(),
+          occurrence: (assignment.occurrence ?? 1) + advanced,
+          updatedAt: stamp,
+          history: [...assignment.history, {
+            at: stamp,
+            actor: "system",
+            action: "recurrence_advanced",
+            fromStatus: assignment.status,
+            toStatus: "assigned",
+            skippedOccurrences: advanced,
+            recurrence,
+          }],
+        };
+        assertNoOverlap(updated, assignment.id);
+        expired.push(clone(updated));
+        return updated;
+      }
       const updated = {
         ...assignment,
         status: "expired",
@@ -251,5 +358,5 @@ export function createAssignmentStore({ storePath, now = () => new Date(), id = 
     return expired;
   }
 
-  return { list, get, create, setStatus, reassign, reschedule, expireDue };
+  return { list, get, create, setStatus, reassign, renamePrincipal, reschedule, expireDue };
 }

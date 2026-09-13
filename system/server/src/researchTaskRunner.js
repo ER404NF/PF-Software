@@ -21,6 +21,7 @@ export function createResearchTaskRunner({
   skillForPlatform,
   operatorForUsername,
   workspaceForOperatorAccount,
+  canUseDevice = () => true,
   stepDelayMs = 1000,
   sleep = wait,
   createRunRecord = createRun,
@@ -29,7 +30,7 @@ export function createResearchTaskRunner({
   saveEvidenceRecord = saveResearchEvidence,
 } = {}) {
   if (!taskQueue || !devices || !deviceLease) throw new Error("research task runner requires queue, devices and lease");
-  if (![providerForTask, skillForPlatform, operatorForUsername, workspaceForOperatorAccount].every((fn) => typeof fn === "function")) {
+  if (![providerForTask, skillForPlatform, operatorForUsername, workspaceForOperatorAccount, canUseDevice].every((fn) => typeof fn === "function")) {
     throw new Error("research task runner requires provider, skill and authorization resolvers");
   }
   if (!Number.isFinite(stepDelayMs) || stepDelayMs < 0) throw new Error("stepDelayMs must be non-negative");
@@ -63,7 +64,8 @@ export function createResearchTaskRunner({
 
     const canAccessAccount = () => {
       const operator = operatorForUsername(task.createdBy);
-      return canAccessDevice(operator, deviceId) && workspaceForOperatorAccount(operator, accountId) === workspaceId;
+      return canAccessDevice(operator, deviceId) && canUseDevice(deviceId)
+        && workspaceForOperatorAccount(operator, accountId) === workspaceId;
     };
 
     let runId = [...(task.checkpoints || [])].reverse()

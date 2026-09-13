@@ -86,6 +86,15 @@ test("/cresearch rejects a non-numeric or non-positive duration, and a missing g
   assert.ok(parseCommand("/cresearch instagram 1e300 Find reels").error);
 });
 
+test("/cresearch supports numeric account IDs only through unambiguous flags", () => {
+  const now = new Date("2026-09-05T12:00:00.000Z");
+  const result = parseCommand("/cresearch instagram --account 123 --minutes 30 inspect numeric account", now);
+  assert.deepEqual(result.accountSelector, { platform: "instagram", accountId: "123" });
+  assert.equal(result.goal, "inspect numeric account");
+  assert.match(parseCommand("/cresearch instagram 123 30 inspect numeric account", now).error, /ambiguous numeric account/);
+  assert.equal(parseCommand("/cresearch instagram --minutes 30 2026 trends", now).goal, "2026 trends");
+});
+
 test("/queue add captures the remaining text verbatim for re-parsing", () => {
   const result = parseCommand("/queue add /time 09:00-10:00 Do the thing");
   assert.deepEqual(result, { type: "queue_add", commandText: "/time 09:00-10:00 Do the thing" });
@@ -95,11 +104,15 @@ test("/queue list|pause|resume take no arguments", () => {
   assert.deepEqual(parseCommand("/queue list"), { type: "queue_list" });
   assert.deepEqual(parseCommand("/queue pause"), { type: "queue_pause" });
   assert.deepEqual(parseCommand("/queue resume"), { type: "queue_resume" });
+  for (const command of ["/queue list extra", "/queue pause extra", "/queue resume extra"]) {
+    assert.match(parseCommand(command).error, /^usage:/);
+  }
 });
 
 test("/queue cancel requires a task id", () => {
   assert.deepEqual(parseCommand("/queue cancel task_abc"), { type: "queue_cancel", taskId: "task_abc" });
   assert.ok(parseCommand("/queue cancel").error);
+  assert.match(parseCommand("/queue cancel task_abc extra").error, /^usage:/);
 });
 
 test("/queue move requires task id, before|after, and target id", () => {
@@ -111,6 +124,7 @@ test("/queue move requires task id, before|after, and target id", () => {
   });
   assert.ok(parseCommand("/queue move task_a sideways task_b").error);
   assert.ok(parseCommand("/queue move task_a before").error);
+  assert.match(parseCommand("/queue move task_a before task_b extra").error, /^usage:/);
 });
 
 test("/queue priority requires a valid priority value", () => {
@@ -120,6 +134,7 @@ test("/queue priority requires a valid priority value", () => {
     priority: "high",
   });
   assert.ok(parseCommand("/queue priority task_a extreme").error);
+  assert.match(parseCommand("/queue priority task_a high extra").error, /^usage:/);
 });
 
 test("/queue with an unknown subcommand is an error", () => {
@@ -133,16 +148,25 @@ test("/pause, /resume, /stop take an optional device id, like /takeover", () => 
   assert.deepEqual(parseCommand("/resume mock-1"), { type: "ai_resume", deviceId: "mock-1" });
   assert.deepEqual(parseCommand("/stop"), { type: "ai_stop", deviceId: null });
   assert.deepEqual(parseCommand("/stop mock-1"), { type: "ai_stop", deviceId: "mock-1" });
+  for (const command of ["/pause mock-1 extra", "/resume mock-1 extra", "/stop mock-1 extra"]) {
+    assert.match(parseCommand(command).error, /^usage:/);
+  }
 });
 
 test("/takeover parses an optional device id", () => {
   assert.deepEqual(parseCommand("/takeover"), { type: "ai_takeover", deviceId: null });
   assert.deepEqual(parseCommand("/takeover mock-1"), { type: "ai_takeover", deviceId: "mock-1" });
+  assert.match(parseCommand("/takeover mock-1 extra").error, /^usage:/);
+});
+
+test("/mode rejects trailing arguments before execution", () => {
+  assert.match(parseCommand("/mode ai mock-1 extra").error, /^usage:/);
 });
 
 test("/device health parses an optional device id", () => {
   assert.deepEqual(parseCommand("/device health"), { type: "device_health", deviceId: null });
   assert.deepEqual(parseCommand("/device health mock-1"), { type: "device_health", deviceId: "mock-1" });
+  assert.match(parseCommand("/device health mock-1 extra").error, /^usage:/);
 });
 
 test("/device with an unknown subcommand is an error", () => {

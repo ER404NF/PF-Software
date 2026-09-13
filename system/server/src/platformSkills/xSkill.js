@@ -6,13 +6,14 @@ export function createXSkill({ appVersion } = {}) {
     platform: "x",
     appVersion,
     appAliases: ["x", "twitter"],
+    commentNavigationTerms: ["comments", "reply", "replies"],
     stateRules: [
-      { state: "comments", patterns: ["replies", "replying to", "post your reply"] },
+      { state: "feed", patterns: ["home timeline", "for you timeline", "following timeline"] },
+      { state: "comments", patterns: ["replies screen", "replying to", "post your reply"] },
       { state: "search", patterns: ["search x", "explore", "search twitter"] },
       { state: "profile", patterns: ["followers", "following", "profile"] },
       { state: "thread", patterns: ["show this thread", "thread"] },
-      { state: "post", patterns: ["post details", "views", "reposts", "likes"] },
-      { state: "feed", patterns: ["home timeline", "for you", "following timeline", "app x", "app twitter"] },
+      { state: "post", patterns: ["post details", "post viewer"] },
     ],
     actionTargets: {
       open_feed: ["home"], search: ["search", "explore"], open_post: ["post"],

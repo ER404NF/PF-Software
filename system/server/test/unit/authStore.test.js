@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { hashPassword, verifyPassword, authenticate, canAccessDevice, operators, normalizeRole, publicOperator, hasRole, filterValidResearchGrants, capabilitiesForRole, hasCapability } from "../../src/authStore.js";
+import { hashPassword, verifyPassword, authenticate, canAccessDevice, operators, normalizeRole, publicOperator, hasRole, filterValidResearchGrants, capabilitiesForRole, hasCapability, validateOperatorConfig } from "../../src/authStore.js";
 import { CAPABILITIES, OPERATOR_ROLES, ROLE_CAPABILITIES } from "../../src/roleCapabilities.js";
 
 test("hashPassword + verifyPassword round-trip correctly", () => {
@@ -65,6 +65,33 @@ test("canAccessDevice: an allowedDevices array restricts to exactly those ids", 
   assert.equal(canAccessDevice(restricted, "mock-2"), false);
 });
 
+test("malformed non-VA grants fail closed instead of authorizing substring device ids", () => {
+  const malformed = { username: "admin", role: "admin", allowedDevices: "mock-10" };
+  assert.equal(canAccessDevice(malformed, "mock-1"), false);
+  assert.equal(canAccessDevice(malformed, "mock-10"), false);
+});
+
+test("operator config rejects malformed or duplicate device grants before publishing accounts", () => {
+  const base = { username: "valid-user", passwordHash: "irrelevant", role: "admin" };
+  for (const allowedDevices of ["mock-10", { id: "mock-1" }, ["mock-1", 42], ["mock-1", "mock-1"]]) {
+    assert.throws(
+      () => validateOperatorConfig({ operators: [{ ...base, allowedDevices }] }),
+      /allowedDevices/
+    );
+  }
+  assert.doesNotThrow(() => validateOperatorConfig({ operators: [{ ...base, allowedDevices: null }] }));
+  assert.doesNotThrow(() => validateOperatorConfig({ operators: [{ ...base, allowedDevices: ["mock-1"] }] }));
+});
+
+test("operator config rejects duplicate usernames before authorization and mutation can diverge", () => {
+  assert.throws(() => validateOperatorConfig({
+    operators: [
+      { username: "duplicate", passwordHash: "first", role: "va", allowedDevices: [] },
+      { username: "duplicate", passwordHash: "second", role: "admin", allowedDevices: null },
+    ],
+  }), /duplicate operator username: duplicate/);
+});
+
 test("canAccessDevice: no operator at all is never allowed", () => {
   assert.equal(canAccessDevice(null, "mock-1"), false);
   assert.equal(canAccessDevice(undefined, "mock-1"), false);
@@ -98,6 +125,7 @@ test("five roles use explicit capabilities without a numeric rank", () => {
   assert.equal(hasCapability({ role: "admin" }, CAPABILITIES.MANAGE_SECURITY), true);
   assert.equal(hasCapability({ role: "manager" }, CAPABILITIES.MANAGE_QUEUE), true);
   assert.equal(hasCapability({ role: "manager" }, CAPABILITIES.MANAGE_USERS), false);
+  assert.equal(hasCapability({ role: "manager" }, CAPABILITIES.MANAGE_TEAM_MEMBERS), true);
   assert.equal(hasCapability({ role: "manager" }, CAPABILITIES.MANAGE_GLOBAL_QUEUE), false);
   assert.equal(hasCapability({ role: "va" }, CAPABILITIES.CONTROL_DEVICE), true);
   assert.equal(hasCapability({ role: "content_creator" }, CAPABILITIES.CONTROL_DEVICE), false);

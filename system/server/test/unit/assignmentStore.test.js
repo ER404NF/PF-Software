@@ -154,3 +154,78 @@ test("expiration is idempotent, terminal, and records the system actor without t
     assert.throws(() => store.reassign(assignment.id, "bob", "manager"), /terminal/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test("renamePrincipal updates durable assignee and creator references", () => {
+  const { root, args, store } = fixture();
+  try {
+    store.create({ instructions: "Prepare clips", assignee: "old-name", createdBy: "old-name" });
+    const changed = store.renamePrincipal("old-name", "new-name", "admin");
+    assert.equal(changed.length, 1);
+    assert.equal(changed[0].assignee, "new-name");
+    assert.equal(changed[0].createdBy, "new-name");
+    assert.equal(changed[0].history.at(-1).action, "principal_renamed");
+    assert.equal(createAssignmentStore(args).list()[0].assignee, "new-name");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("daily and weekly assignments require schedules and persist their recurrence", () => {
+  const { root, args, store } = fixture();
+  try {
+    assert.throws(() => store.create({
+      instructions: "Daily check", assignee: "va", createdBy: "manager", recurrence: "daily",
+    }), /require a schedule/);
+    const weekly = store.create({
+      instructions: "Weekly report", assignee: "va", createdBy: "manager", recurrence: "weekly",
+      startAt: "2026-09-12T12:00:00.000Z", endAt: "2026-09-12T13:00:00.000Z",
+    });
+    assert.equal(weekly.recurrence, "weekly");
+    assert.equal(weekly.occurrence, 1);
+    assert.equal(createAssignmentStore(args).get(weekly.id).recurrence, "weekly");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("completing a recurring assignment records the occurrence and advances its schedule", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-assignment-recur-complete-"));
+  let at = "2026-09-11T10:00:00.000Z";
+  const store = createAssignmentStore({
+    storePath: path.join(root, "assignments.json"), now: () => new Date(at), id: () => "daily-1",
+  });
+  try {
+    const assignment = store.create({
+      instructions: "Daily phone check", assignee: "va", createdBy: "manager", recurrence: "daily",
+      startAt: "2026-09-11T11:00:00.000Z", endAt: "2026-09-11T12:00:00.000Z",
+    });
+    at = "2026-09-11T11:15:00.000Z";
+    store.setStatus(assignment.id, "in_progress", "va");
+    at = "2026-09-11T11:30:00.000Z";
+    const next = store.setStatus(assignment.id, "completed", "va");
+    assert.equal(next.status, "assigned");
+    assert.equal(next.occurrence, 2);
+    assert.equal(next.startAt, "2026-09-12T11:00:00.000Z");
+    assert.equal(next.endAt, "2026-09-12T12:00:00.000Z");
+    assert.equal(next.lastCompletedAt, at);
+    assert.equal(next.history.at(-1).action, "recurrence_completed");
+    assert.equal(next.history.at(-1).completedOccurrence, 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
+test("missed recurring windows advance to the next future occurrence", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-assignment-recur-expire-"));
+  const store = createAssignmentStore({
+    storePath: path.join(root, "assignments.json"),
+    now: () => new Date("2026-09-11T09:00:00.000Z"), id: () => "daily-1",
+  });
+  try {
+    const assignment = store.create({
+      instructions: "Daily phone check", assignee: "va", createdBy: "manager", recurrence: "daily",
+      startAt: "2026-09-11T10:00:00.000Z", endAt: "2026-09-11T11:00:00.000Z",
+    });
+    const advanced = store.expireDue("2026-09-12T11:00:00.000Z");
+    assert.equal(advanced[0].id, assignment.id);
+    assert.equal(advanced[0].status, "assigned");
+    assert.equal(advanced[0].occurrence, 3);
+    assert.equal(advanced[0].startAt, "2026-09-13T10:00:00.000Z");
+    assert.equal(advanced[0].history.at(-1).action, "recurrence_advanced");
+    assert.equal(advanced[0].history.at(-1).skippedOccurrences, 2);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

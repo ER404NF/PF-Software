@@ -10,6 +10,11 @@ const APPS = {
   camera: { label: "Camera", color: "#3a3a3c" },
   settings: { label: "Settings", color: "#8e8e93" },
 };
+const APP_SCREEN_LABELS = {
+  instagram: "Instagram home",
+  reddit: "Reddit home",
+  x: "Home timeline",
+};
 
 const HOME_ICONS = [
   { id: "instagram", cx: 70, cy: 120 },
@@ -89,6 +94,7 @@ export class MockDevice {
     return { format: "mock-json", screen: "app", app: this.openApp,
       viewport: { x: 0, y: 0, width: WIDTH, height: HEIGHT },
       lastSwipe: this.lastSwipe, elements: [
+      { type: "staticText", id: "screen-title", label: APP_SCREEN_LABELS[this.openApp] ?? "App home" },
       { type: "button", id: "back", label: "Back", frame: { ...BACK_BUTTON } },
     ] };
   }

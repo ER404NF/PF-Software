@@ -20,12 +20,18 @@ const fixturePath = path.join(__dirname, "../../fixtures/fake-network-check-serv
 const TEST_PASSWORD = "test-password";
 
 const tmpStorageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-networkcheck-"));
+const isolatedDeviceConfigPath = path.join(tmpStorageRoot, "devices.config.json");
+fs.copyFileSync(path.join(__dirname, "../../../devices.config.json"), isolatedDeviceConfigPath);
+const isolatedDeviceConfig = JSON.parse(fs.readFileSync(isolatedDeviceConfigPath, "utf8"));
+isolatedDeviceConfig.devices.find(device => device.id === "mock-1").network.failPolicy = "fail-closed";
+fs.writeFileSync(isolatedDeviceConfigPath, `${JSON.stringify(isolatedDeviceConfig, null, 2)}\n`);
+process.env.DEVICE_CONFIG_PATH = isolatedDeviceConfigPath;
 process.env.SESSION_STORE_DIR = path.join(tmpStorageRoot, "sessions");
 process.env.AUDIT_LOG_PATH = path.join(tmpStorageRoot, "audit.log");
 process.env.QUEUE_STORE_PATH = path.join(tmpStorageRoot, "tasks.json");
 process.env.ALLOW_NETWORK_CHECK_URL_OVERRIDE = "true";
 
-const { server, wss } = await import("../../src/index.js");
+const { server, wss, deviceLease, taskQueue } = await import("../../src/index.js");
 const { operators, hashPassword } = await import("../../src/authStore.js");
 
 let httpUrl;
@@ -59,6 +65,19 @@ async function loginCookie(username, password) {
   const setCookie = res.headers.get("set-cookie");
   await res.json();
   return setCookie.split(";")[0];
+}
+
+async function fleetSnapshot(sessionCookie) {
+  const ws = new (await import("ws")).WebSocket(httpUrl.replace("http", "ws"), { headers: { Cookie: sessionCookie } });
+  const message = await new Promise((resolve, reject) => {
+    ws.on("message", (raw) => {
+      const parsed = JSON.parse(raw.toString());
+      if (parsed.type === "device_list") resolve(parsed);
+    });
+    ws.on("error", reject);
+  });
+  ws.close();
+  return message.devices;
 }
 
 let cookie;
@@ -144,6 +163,37 @@ test("device RBAC applies the same as every other device route", async () => {
   assert.equal(allowed.status, 200);
 });
 
+test("revocation during a delayed network check returns no observed network data", async () => {
+  await fetch(`${CHECK_URL.replace("/ip", "/debug/set-ip")}`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ip: "198.51.100.93" }),
+  });
+  await fetch(`${CHECK_URL.replace("/ip", "/debug/delay")}`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ms: 100 }),
+  });
+
+  const pending = fetch(`${httpUrl}/api/devices/mock-2/network-check`, {
+    method: "POST", headers: { "Content-Type": "application/json", Cookie: restrictedCookie },
+    body: JSON.stringify({ checkUrl: CHECK_URL }),
+  });
+  await new Promise(resolve => setTimeout(resolve, 25));
+  const operator = operators.get("netcheck-test-restricted");
+  const previousGrant = operator.allowedDevices;
+  operator.allowedDevices = [];
+  try {
+    const response = await pending;
+    assert.equal(response.status, 403);
+    const body = await response.json();
+    assert.deepEqual(body, { error: "not authorized for this device" });
+    assert.equal(JSON.stringify(body).includes("198.51.100.93"), false);
+    assert.equal(JSON.stringify(body).includes("test-region"), false);
+  } finally {
+    operator.allowedDevices = previousGrant;
+    await fetch(`${CHECK_URL.replace("/ip", "/debug/delay")}`, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ms: 0 }),
+    });
+  }
+});
+
 test("a successful check updates the device summary and is audited with the assigned network egress", async () => {
   await fetch(`${CHECK_URL.replace("/ip", "/debug/set-ip")}`, {
     method: "POST",
@@ -192,4 +242,86 @@ test("device_list over WebSocket carries the same network fields as the HTTP rou
 
   const mock2 = deviceListMsg.devices.find((d) => d.id === "mock-2");
   assert.equal(mock2.network.egress, "vlan-proxy");
+});
+
+test("only a proxy manager can persist and broadcast the safe proxy assignment switch", async () => {
+  const denied = await fetch(`${httpUrl}/api/admin/devices/mock-2/proxy`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", Cookie: restrictedCookie },
+    body: JSON.stringify({ enabled: false }),
+  });
+  assert.equal(denied.status, 403);
+
+  const notProxy = await fetch(`${httpUrl}/api/admin/devices/mock-1/proxy`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ enabled: false }),
+  });
+  assert.equal(notProxy.status, 409);
+
+  const disabled = await fetch(`${httpUrl}/api/admin/devices/mock-2/proxy`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ enabled: false }),
+  });
+  assert.equal(disabled.status, 200);
+  assert.equal((await disabled.json()).network.enabled, false);
+  const saved = JSON.parse(fs.readFileSync(isolatedDeviceConfigPath, "utf8"));
+  assert.equal(saved.devices.find(device => device.id === "mock-2").network.enabled, false);
+
+  const blockedCheck = await fetch(`${httpUrl}/api/devices/mock-2/network-check`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ checkUrl: CHECK_URL }),
+  });
+  assert.equal(blockedCheck.status, 409);
+  assert.match((await blockedCheck.json()).error, /proxy assignment is disabled/);
+
+  const restored = await fetch(`${httpUrl}/api/admin/devices/mock-2/proxy`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ enabled: true }),
+  });
+  assert.equal(restored.status, 200);
+  assert.equal((await restored.json()).network.enabled, true);
+
+  const audit = await fetch(`${httpUrl}/api/audit?deviceId=mock-2&limit=10`, { headers: { Cookie: cookie } }).then(response => response.json());
+  assert.ok(audit.events.some(event => event.type === "proxy_setting_changed" && event.detail.enabled === false));
+  assert.ok(audit.events.every(event => !JSON.stringify(event).includes("vlan-bench-1")));
+});
+
+test("fail-closed mismatch blocks Human selection and AI dispatch until a fresh passing check", async () => {
+  await fetch(`${CHECK_URL.replace("/ip", "/debug/set-ip")}`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ip: "198.51.100.91" }),
+  });
+  for (const deviceId of ["mock-2", "mock-1"]) {
+    const response = await fetch(`${httpUrl}/api/devices/${deviceId}/network-check`, {
+      method: "POST", headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ checkUrl: CHECK_URL }),
+    });
+    assert.equal(response.status, 200);
+  }
+
+  const blocked = (await fleetSnapshot(cookie)).find(device => device.id === "mock-1");
+  assert.equal(blocked.networkMismatch, true);
+  assert.equal(blocked.canOpen, false);
+  assert.equal(blocked.accessState, "network_mismatch");
+
+  const task = taskQueue.addTask({ goal: "must wait for safe network", createdBy: "netcheck-test-va",
+    deviceSelector: { deviceId: "mock-1" } });
+  assert.equal(task.state, "QUEUED");
+  assert.equal(deviceLease.getMode("mock-1"), "HUMAN");
+
+  await fetch(`${CHECK_URL.replace("/ip", "/debug/set-ip")}`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ip: "198.51.100.92" }),
+  });
+  const restored = await fetch(`${httpUrl}/api/devices/mock-1/network-check`, {
+    method: "POST", headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ checkUrl: CHECK_URL }),
+  });
+  assert.equal(restored.status, 200);
+  assert.equal((await restored.json()).network.networkVerified, true);
+  assert.equal(taskQueue.getTask(task.id).state, "RUNNING");
+
+  taskQueue.emergencyStopDevice("mock-1");
 });

@@ -12,9 +12,12 @@ import { WdaDevice } from "./wdaDevice.js";
 import { ensureDeviceDir, listFiles, resolveFile, deleteFile, safeFilename, safeDeviceId, assertMediaStorageIsolated } from "./fileStore.js";
 import { listRuns, getRun, createRun, setCandidateStatus } from "./researchStore.js";
 import {
-  authenticate, canAccessDevice, publicOperator, resolveOperator, hasCapability, operators,
+  canAccessDevice, publicOperator, resolveOperator, hasCapability, operators, verifyPassword,
   listOperatorAccounts, createOperatorAccount, updateOperatorAccount, operatorByUsername,
-  invalidateOperatorSessions,
+  invalidateOperatorSessions, createSignupAccount, setOperatorAccountStatus, renameOperatorAccount,
+  configureOperatorTwoFactor, verifyOperatorSecondFactor, createEmailRecoveryToken, completeEmailRecovery,
+  assertValidUsername,
+  resetOperatorSecondFactor,
 } from "./authStore.js";
 import { CAPABILITIES } from "./roleCapabilities.js";
 import { researchWorkspaceFor, researchAccounts, researchAccountDefinitions, researchActionPolicies } from "./researchAccess.js";
@@ -24,7 +27,9 @@ import * as deviceLease from "./deviceLease.js";
 import { createTaskQueue } from "./taskQueue.js";
 import { parseCommand } from "./commandParser.js";
 import { loadDeviceNetworkMap, publicNetworkConfig } from "./deviceNetworkConfig.js";
+import { isProxyEgress, setDeviceProxyEnabled } from "./deviceNetworkStore.js";
 import { createNetworkVerifier } from "./networkVerifier.js";
+import { networkAccessDecision, networkVerificationMaxAge } from "./networkPolicy.js";
 import { providers, defaultProviderName, getProvider } from "./providerRegistry.js";
 import { getPlatformSkill } from "./platformSkillRegistry.js";
 import { createResearchTaskRunner } from "./researchTaskRunner.js";
@@ -34,10 +39,19 @@ import { createPresenceStore } from "./presenceStore.js";
 import { createAssignmentStore, ASSIGNMENT_STATUSES } from "./assignmentStore.js";
 import { OPERATOR_ROLES } from "./roleCapabilities.js";
 import { monitorState } from "./monitorContract.js";
+import { createAccountNotificationStore } from "./accountNotificationStore.js";
+import { decryptTotpSecret, encryptTotpSecret, generateRecoveryCodes, generateTotpSecret, otpauthUri, recoveryCodeDigest, verifyTotp } from "./twoFactor.js";
+import { discoverIosDevices, DiscoveredIosDevice } from "./deviceDiscovery.js";
+import {
+  createMediaQuotaManager, createQuotaStorage, mediaByteSetting,
+  DEFAULT_DEVICE_MEDIA_QUOTA_BYTES, DEFAULT_GLOBAL_MEDIA_QUOTA_BYTES, DEFAULT_MEDIA_MIN_FREE_BYTES,
+} from "./mediaUploadQuota.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const clientDir = path.join(__dirname, "../../client");
-const configPath = path.join(__dirname, "../../devices.config.json");
+const configPath = process.env.DEVICE_CONFIG_PATH || path.join(__dirname, "../../devices.config.json");
+const rawDeviceConfig = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, "utf8")) : { devices: [] };
+const discoveredIosDevices = process.env.AUTO_DISCOVER_IOS_DEVICES === "false" ? [] : discoverIosDevices();
 
 const app = express();
 app.use(express.static(clientDir));
@@ -57,6 +71,11 @@ assertMediaStorageIsolated([
   process.env.RESEARCH_EVIDENCE_DIR || path.join(__dirname, "../../storage/research-evidence"),
 ]);
 const auditLog = createAuditLog(auditLogPath);
+const accountNotificationStore = createAccountNotificationStore({
+  storePath: process.env.ACCOUNT_NOTIFICATION_STORE_PATH || path.join(__dirname, "../../storage/notifications/accounts.json"),
+  companyEmail: process.env.COMPANY_FROM_EMAIL || null,
+});
+const twoFactorMasterKey = process.env.TWO_FACTOR_MASTER_KEY || null;
 
 const SESSION_SECRET = process.env.SESSION_SECRET || "dev-only-insecure-secret-change-me";
 if (!process.env.SESSION_SECRET) {
@@ -75,24 +94,173 @@ const sessionParser = session({
 });
 app.use(sessionParser);
 
-app.post("/api/login", (req, res) => {
-  const { username, password } = req.body || {};
-  if (typeof username !== "string" || typeof password !== "string" || username.length > 100) {
-    return res.status(400).json({ error: "username and password are required" });
-  }
-  const operator = authenticate(username, password);
-  if (!operator) {
-    auditLog.logEvent({ operator: username, type: "login_failed" });
-    return res.status(401).json({ error: "invalid credentials" });
-  }
-  req.session.operator = operator;
+function completeLogin(req, res, operator, { secondFactor = null } = {}) {
+  req.session.operator = { username: operator.username, authVersion: operator.authVersion ?? 0 };
+  delete req.session.pendingAuth;
+  delete req.session.twoFactorEnrollmentSecret;
+  delete req.session.twoFactorRecoveryReceipt;
   presenceStore.touchSession({
     sessionId: req.sessionID,
     username: operator.username,
     expiresAt: req.session.cookie.expires,
   });
-  auditLog.logEvent({ operator: operator.username, type: "login_success" });
+  auditLog.logEvent({ operator: operator.username, type: "login_success", detail: secondFactor ? { secondFactor } : {} });
   res.json(publicOperator(operator));
+}
+
+function pendingAuthOperator(req) {
+  const challenge = req.session?.pendingAuth;
+  if (!challenge || Date.parse(challenge.expiresAt) <= Date.now()) return null;
+  const operator = operators.get(challenge.username);
+  if (!operator || operator.active === false || (operator.accountStatus ?? "approved") !== "approved"
+    || operator.authVersion !== challenge.authVersion) return null;
+  return operator;
+}
+
+function rejectSecondFactorAttempt(req, res, message) {
+  const challenge = req.session?.pendingAuth;
+  if (!challenge) return res.status(401).json({ error: "password verification has expired" });
+  challenge.failedAttempts = (Number(challenge.failedAttempts) || 0) + 1;
+  if (challenge.failedAttempts >= 5) {
+    delete req.session.pendingAuth;
+    delete req.session.twoFactorEnrollmentSecret;
+    return res.status(429).json({ error: "too many two-factor attempts; sign in again" });
+  }
+  return res.status(401).json({ error: message });
+}
+
+app.post("/api/signup", (req, res, next) => {
+  try {
+    const operator = createSignupAccount(req.body);
+    auditLog.logEvent({ operator: operator.username, type: "signup_submitted" });
+    res.status(201).json({
+      status: "pending",
+      message: "Application received. An administrator must accept it before sign-in.",
+      operator,
+    });
+  } catch (error) {
+    if (error?.status) return res.status(error.status).json({ error: error.message });
+    next(error);
+  }
+});
+
+app.post("/api/login", (req, res) => {
+  const { username, password } = req.body || {};
+  if (typeof username !== "string" || typeof password !== "string" || username.length > 100) {
+    return res.status(400).json({ error: "username and password are required" });
+  }
+  const operator = operators.get(username);
+  if (!operator || !verifyPassword(password, operator.passwordHash)) {
+    auditLog.logEvent({ operator: username, type: "login_failed" });
+    return res.status(401).json({ error: "invalid credentials" });
+  }
+  if (operator.accountStatus === "pending") return res.status(403).json({ code: "approval_pending", error: "account approval is pending" });
+  if (operator.accountStatus === "rejected") return res.status(403).json({ code: "account_rejected", error: "account application was not accepted" });
+  if (operator.active === false) return res.status(401).json({ error: "invalid credentials" });
+  if (operator.twoFactorRequired) {
+    req.session.pendingAuth = {
+      username: operator.username,
+      authVersion: operator.authVersion ?? 0,
+      failedAttempts: 0,
+      expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+    };
+    return res.status(202).json(operator.twoFactorSecret
+      ? { requiresTwoFactor: true }
+      : { requiresTwoFactorSetup: true });
+  }
+  completeLogin(req, res, operator);
+});
+
+app.post("/api/2fa/setup", (req, res) => {
+  const operator = pendingAuthOperator(req);
+  if (!operator) return res.status(401).json({ error: "password verification has expired" });
+  if (operator.twoFactorSecret) return res.status(409).json({ error: "2FA is already configured" });
+  if (!twoFactorMasterKey) return res.status(503).json({ error: "2FA enrollment is unavailable until TWO_FACTOR_MASTER_KEY is configured" });
+  const secret = generateTotpSecret();
+  req.session.twoFactorEnrollmentSecret = secret;
+  res.json({ secret, otpauthUri: otpauthUri({ secret, email: operator.email || operator.username }) });
+});
+
+app.post("/api/2fa/confirm", (req, res, next) => {
+  try {
+    const operator = pendingAuthOperator(req);
+    const secret = req.session?.twoFactorEnrollmentSecret;
+    if (!operator || !secret) return res.status(401).json({ error: "2FA enrollment has expired" });
+    if (!verifyTotp(secret, req.body?.code)) return rejectSecondFactorAttempt(req, res, "invalid authenticator code");
+    const recoveryCodes = generateRecoveryCodes();
+    configureOperatorTwoFactor(
+      operator.username,
+      encryptTotpSecret(secret, twoFactorMasterKey),
+      recoveryCodes.map(recoveryCodeDigest),
+    );
+    auditLog.logEvent({ operator: operator.username, type: "two_factor_enabled" });
+    const current = operators.get(operator.username);
+    req.session.twoFactorRecoveryReceipt = encryptTotpSecret(JSON.stringify(recoveryCodes), twoFactorMasterKey);
+    delete req.session.twoFactorEnrollmentSecret;
+    res.json({ operator: publicOperator(current), recoveryCodes });
+  } catch (error) {
+    if (error?.status) return res.status(error.status).json({ error: error.message });
+    next(error);
+  }
+});
+
+app.get("/api/2fa/recovery-receipt", (req, res) => {
+  const operator = pendingAuthOperator(req);
+  const encrypted = req.session?.twoFactorRecoveryReceipt;
+  if (!operator || !encrypted || !twoFactorMasterKey) return res.status(401).json({ error: "2FA recovery-code receipt has expired" });
+  try {
+    const recoveryCodes = JSON.parse(decryptTotpSecret(encrypted, twoFactorMasterKey));
+    if (!Array.isArray(recoveryCodes)) throw new Error("invalid receipt");
+    res.json({ operator: publicOperator(operator), recoveryCodes });
+  } catch {
+    res.status(401).json({ error: "2FA recovery-code receipt is unavailable; sign in and restart enrollment" });
+  }
+});
+
+app.post("/api/2fa/acknowledge-recovery", (req, res) => {
+  const operator = pendingAuthOperator(req);
+  if (!operator || !req.session?.twoFactorRecoveryReceipt) {
+    return res.status(401).json({ error: "2FA recovery-code receipt has expired" });
+  }
+  auditLog.logEvent({ operator: operator.username, type: "two_factor_recovery_acknowledged" });
+  completeLogin(req, res, operator, { secondFactor: "enrollment" });
+});
+
+app.post("/api/2fa/verify", (req, res, next) => {
+  try {
+    const operator = pendingAuthOperator(req);
+    if (!operator) return res.status(401).json({ error: "password verification has expired" });
+    const result = verifyOperatorSecondFactor(operator.username, req.body?.code, twoFactorMasterKey);
+    if (!result) return rejectSecondFactorAttempt(req, res, "invalid two-factor code");
+    completeLogin(req, res, operators.get(operator.username), { secondFactor: result.method });
+  } catch (error) {
+    if (error?.status) return res.status(error.status).json({ error: error.message });
+    next(error);
+  }
+});
+
+app.post("/api/recovery/request", (req, res) => {
+  const recovery = createEmailRecoveryToken(req.body?.identifier);
+  if (recovery) accountNotificationStore.queue({
+    to: recovery.operator.email,
+    fullName: recovery.operator.fullName || recovery.operator.username,
+    username: recovery.operator.username,
+    status: "recovery",
+    recoveryToken: recovery.token,
+  });
+  res.json({ ok: true, message: "If the account is eligible, recovery instructions have been queued." });
+});
+
+app.post("/api/recovery/complete", (req, res, next) => {
+  try {
+    const operator = completeEmailRecovery(req.body?.token, req.body?.password, req.body?.passwordConfirmation);
+    auditLog.logEvent({ operator: operator.username, type: "account_recovered" });
+    revokeLiveOperatorSessions(operator.username);
+    res.json({ ok: true, requiresTwoFactorSetup: true });
+  } catch (error) {
+    if (error?.status) return res.status(error.status).json({ error: error.message });
+    next(error);
+  }
 });
 
 app.post("/api/logout", (req, res) => {
@@ -157,6 +325,25 @@ function requireCapability(capability) {
   };
 }
 
+function requireAnyCapability(...capabilities) {
+  return (req, res, next) => {
+    if (!req.session?.operator) return res.status(401).json({ error: "not logged in" });
+    const current = resolveOperator(req.session.operator);
+    if (!current) return res.status(401).json({ error: "not logged in" });
+    req.currentOperator = current;
+    if (!capabilities.some(capability => hasCapability(current, capability))) {
+      auditLog.logEvent({
+        operator: current.username,
+        type: "capability_access_denied",
+        detail: { method: req.method, path: req.path, capabilities },
+      });
+      return res.status(403).json({ error: "user-management capability required" });
+    }
+    presenceStore.touchSession({ sessionId: req.sessionID, username: current.username, expiresAt: req.session.cookie.expires });
+    next();
+  };
+}
+
 // Login/logout/me stay open; every device and research route below requires
 // an authenticated session.
 app.use("/api/devices", requireAuth);
@@ -183,6 +370,8 @@ function publicPeople(viewer = null) {
       && ["assigned", "in_progress"].includes(item.status)) ?? null;
     return {
       ...person,
+      canAssign: Boolean(viewer && hasCapability(viewer, CAPABILITIES.MANAGE_ASSIGNMENTS)
+        && canManagePerson(viewer, person.username)),
       currentDeviceIds: person.currentDeviceIds.filter(id => !viewer || canAccessDevice(viewer, id)),
       currentPhones: person.currentDeviceIds
         .filter(id => !viewer || canAccessDevice(viewer, id))
@@ -239,21 +428,44 @@ server.on("upgrade", (request, socket, head) => {
 // MockDevice or a WdaDevice — both expose the same
 // {id, label, status, tap(), render()} contract, so nothing else here
 // (or in the client) needs to know which kind of device it's talking to.
-function loadDevices() {
-  const raw = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, "utf8")) : { devices: [] };
+function loadDevices(raw, discoveries = []) {
   const map = new Map();
+  const discoveryByUdid = new Map(discoveries.map(device => [device.udid, device]));
   for (const d of raw.devices) {
     if (!safeDeviceId(d.id)) throw new Error(`Invalid or reserved device id: ${d.id}`);
+    const discovered = typeof d.udid === "string" ? discoveryByUdid.get(d.udid) : null;
+    const label = discovered?.label || d.label;
     if (d.type === "wda") {
-      map.set(d.id, new WdaDevice(d.id, d.label, { host: d.host, port: d.port, timeoutMs: d.timeoutMs }));
+      map.set(d.id, new WdaDevice(d.id, label, { host: d.host, port: d.port, timeoutMs: d.timeoutMs }));
     } else {
-      map.set(d.id, new MockDevice(d.id, d.label));
+      map.set(d.id, new MockDevice(d.id, label));
     }
+    if (discovered) discoveryByUdid.delete(d.udid);
   }
+  for (const discovered of discoveryByUdid.values()) map.set(discovered.id, new DiscoveredIosDevice(discovered));
   return map;
 }
 
-const devices = loadDevices();
+const devices = loadDevices(rawDeviceConfig, discoveredIosDevices);
+const deviceMonitorConfig = new Map();
+for (const configured of rawDeviceConfig.devices ?? []) {
+  if (configured.monitorPhysicallyValidated !== undefined
+    && typeof configured.monitorPhysicallyValidated !== "boolean") {
+    throw new Error(`monitorPhysicallyValidated must be boolean for device ${configured.id}`);
+  }
+  if (configured.monitorPhysicallyValidated === true && configured.type !== "wda") {
+    throw new Error(`Only a WDA device can be marked monitorPhysicallyValidated: ${configured.id}`);
+  }
+  deviceMonitorConfig.set(configured.id, {
+    adapter: configured.type === "wda" ? "wda" : "mock",
+    physicallyValidated: configured.monitorPhysicallyValidated === true,
+  });
+}
+for (const discovered of discoveredIosDevices) {
+  if (!deviceMonitorConfig.has(discovered.id)) {
+    deviceMonitorConfig.set(discovered.id, { adapter: "unconfigured", physicallyValidated: false });
+  }
+}
 
 function validateOperatorResources(input) {
   if (Object.hasOwn(input ?? {}, "allowedDevices") && input.allowedDevices !== null) {
@@ -288,16 +500,110 @@ function reconcileLiveOperatorAccess(username) {
   }
 }
 
-app.get("/api/admin/users", requireCapability(CAPABILITIES.MANAGE_USERS), (req, res) => {
+app.get("/api/admin/users", requireAnyCapability(CAPABILITIES.MANAGE_USERS, CAPABILITIES.MANAGE_TEAM_MEMBERS), (req, res) => {
   expireAssignments();
   const people = new Map(publicPeople(req.currentOperator).map(person => [person.username, person]));
   const visibleAssignments = assignmentStore.list().filter(item => canViewAssignment(item, req.currentOperator));
-  res.json({ users: listOperatorAccounts().map(user => ({
+  const allUsers = listOperatorAccounts();
+  const activeAdminCount = allUsers.filter(user => user.active !== false
+    && (user.accountStatus ?? "approved") === "approved"
+    && user.role === OPERATOR_ROLES.ADMIN).length;
+  const visibleUsers = allUsers.filter(user => canManagePerson(req.currentOperator, user.username));
+  res.json({ users: visibleUsers.map(user => ({
     ...user,
+    canRename: req.currentOperator.role === OPERATOR_ROLES.ADMIN || user.username !== req.currentOperator.username,
+    canReview: user.username !== req.currentOperator.username
+      && !(user.role === OPERATOR_ROLES.ADMIN && user.active !== false
+        && (user.accountStatus ?? "approved") === "approved" && activeAdminCount === 1),
+    actionReason: user.username === req.currentOperator.username
+      ? req.currentOperator.role === OPERATOR_ROLES.MANAGER
+        ? "You cannot rename or review the account you are currently using."
+        : "You cannot reject the account you are currently using."
+      : user.role === OPERATOR_ROLES.ADMIN && user.active !== false
+          && (user.accountStatus ?? "approved") === "approved" && activeAdminCount === 1
+        ? "This is the last active admin account. Create or activate another admin first."
+        : null,
     presence: people.get(user.username) ?? { online: false, activeSessions: 0, currentPhones: [], lastSeenAt: null },
     assignments: visibleAssignments.filter(item => item.assignee === user.username || item.createdBy === user.username),
-    recentAudit: auditLog.listEvents({ operator: user.username, limit: 200 })
-      .filter(event => !event.deviceId || canAccessDevice(req.currentOperator, event.deviceId)).slice(0, 10),
+    recentAudit: hasCapability(req.currentOperator, CAPABILITIES.VIEW_AUDIT)
+      ? auditLog.listEvents({ operator: user.username, limit: 200 })
+        .filter(event => !event.deviceId || canAccessDevice(req.currentOperator, event.deviceId)).slice(0, 10)
+      : [],
+  })) });
+});
+
+app.patch("/api/admin/users/:username/status", requireAnyCapability(CAPABILITIES.MANAGE_USERS, CAPABILITIES.MANAGE_TEAM_MEMBERS), (req, res, next) => {
+  try {
+    if (!canManagePerson(req.currentOperator, req.params.username)) {
+      return res.status(403).json({ error: "not authorized to review this account" });
+    }
+    if (req.currentOperator.role === OPERATOR_ROLES.MANAGER && req.params.username === req.currentOperator.username) {
+      return res.status(403).json({ error: "a manager cannot review their own account" });
+    }
+    if (req.body?.status === "rejected" && req.params.username === req.currentOperator.username) {
+      return res.status(403).json({ error: "you cannot reject the account you are currently using" });
+    }
+    const target = operators.get(req.params.username);
+    if (!target?.email) return res.status(409).json({ error: "account must have a Gmail address before review" });
+    const operator = setOperatorAccountStatus(req.params.username, req.body?.status);
+    const notification = accountNotificationStore.queue({
+      to: operator.email,
+      fullName: operator.fullName || operator.username,
+      username: operator.username,
+      status: req.body.status,
+    });
+    auditLog.logEvent({
+      operator: req.currentOperator.username,
+      type: `operator_${req.body.status}`,
+      detail: { target: operator.username, teamId: operator.teamId || null, notificationState: notification.deliveryState },
+    });
+    revokeLiveOperatorSessions(operator.username);
+    broadcastPresence();
+    res.json({ operator, notification: { deliveryState: notification.deliveryState } });
+  } catch (error) {
+    if (error?.status) return res.status(error.status).json({ error: error.message });
+    next(error);
+  }
+});
+
+app.patch("/api/admin/users/:username/rename", requireAnyCapability(CAPABILITIES.MANAGE_USERS, CAPABILITIES.MANAGE_TEAM_MEMBERS), (req, res, next) => {
+  const previousUsername = req.params.username;
+  try {
+    if (!canManagePerson(req.currentOperator, previousUsername)) {
+      return res.status(403).json({ error: "not authorized to rename this account" });
+    }
+    if (req.currentOperator.role === OPERATOR_ROLES.MANAGER && previousUsername === req.currentOperator.username) {
+      return res.status(403).json({ error: "a manager cannot rename their own account" });
+    }
+    assertValidUsername(req.body?.username);
+    if (operators.has(req.body?.username)) return res.status(409).json({ error: "username already exists" });
+    assignmentStore.renamePrincipal(previousUsername, req.body?.username, req.currentOperator.username);
+    const operator = renameOperatorAccount(previousUsername, req.body?.username);
+    auditLog.logEvent({
+      operator: req.currentOperator.username,
+      type: "operator_renamed",
+      detail: { previousUsername, username: operator.username },
+    });
+    revokeLiveOperatorSessions(previousUsername);
+    broadcastPresence();
+    broadcastDeviceList();
+    res.json({ operator });
+  } catch (error) {
+    if (error?.status) return res.status(error.status).json({ error: error.message });
+    if (/username|required/.test(error.message)) return res.status(400).json({ error: error.message });
+    next(error);
+  }
+});
+
+app.get("/api/admin/account-notifications", requireCapability(CAPABILITIES.MANAGE_USERS), (req, res) => {
+  res.json({ notifications: accountNotificationStore.list().map(item => ({
+    id: item.id,
+    to: item.to,
+    from: item.from,
+    subject: item.subject,
+    kind: item.kind,
+    deliveryState: item.deliveryState,
+    createdAt: item.createdAt,
   })) });
 });
 
@@ -359,6 +665,22 @@ app.post("/api/admin/users/:username/revoke-sessions", requireCapability(CAPABIL
   }
 });
 
+app.post("/api/admin/users/:username/2fa/reset", requireCapability(CAPABILITIES.MANAGE_USERS), (req, res, next) => {
+  try {
+    const operator = resetOperatorSecondFactor(req.params.username);
+    auditLog.logEvent({
+      operator: req.currentOperator.username,
+      type: "operator_two_factor_reset",
+      detail: { target: operator.username },
+    });
+    revokeLiveOperatorSessions(operator.username);
+    res.json({ operator });
+  } catch (error) {
+    if (error?.status) return res.status(error.status).json({ error: error.message });
+    next(error);
+  }
+});
+
 // Phase 0 of per-phone network isolation (source-material/Client Account
 // Separation — Technical Reference (REDACTED).md §3.5) — see
 // deviceNetworkConfig.js/networkVerifier.js for the full rationale. Kept as
@@ -366,9 +688,15 @@ app.post("/api/admin/users/:username/revoke-sessions", requireCapability(CAPABIL
 // device objects themselves, for the same reason `deviceHealth` below is:
 // the device adapter executes deterministic primitives and shouldn't also
 // carry control-plane bookkeeping about its own network assignment.
-const rawDeviceConfig = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, "utf8")) : { devices: [] };
 const deviceNetwork = loadDeviceNetworkMap(rawDeviceConfig);
 const networkVerifier = createNetworkVerifier({ deviceNetwork });
+const networkMaxAgeMs = networkVerificationMaxAge();
+const networkDecision = (deviceId, now = new Date()) => networkAccessDecision({
+  network: deviceNetwork.get(deviceId),
+  status: networkVerifier.getStatus(deviceId),
+  now,
+  maxAgeMs: networkMaxAgeMs,
+});
 
 // Fleet UI grouping (client/app.js's fleet view) — deliberately named
 // `hostLabel`, not `host`: WdaDevice already has a same-named `host`
@@ -382,6 +710,9 @@ const networkVerifier = createNetworkVerifier({ deviceNetwork });
 // key ready for whenever there is one.
 const DEFAULT_HOST_LABEL = "this-mac";
 const deviceHost = new Map((rawDeviceConfig.devices ?? []).map((d) => [d.id, d.hostLabel || DEFAULT_HOST_LABEL]));
+for (const discovered of discoveredIosDevices) {
+  if (!deviceHost.has(discovered.id)) deviceHost.set(discovered.id, DEFAULT_HOST_LABEL);
+}
 
 // Env-overridable like auditLogPath/sessionStoreDir above, for the same
 // reason — tests need an isolated queue file, not the real one under
@@ -391,6 +722,7 @@ const taskQueue = createTaskQueue({ devices, deviceLease, auditLog, storePath: q
   canDispatch: (task, deviceId) => {
     const operator = operatorByUsername(task.createdBy);
     return canAccessDevice(operator, deviceId)
+      && networkDecision(deviceId).allowed
       && (task.kind !== "research" || !!researchWorkspaceFor(operator, task.accountSelector?.accountId));
   } });
 const modelSelectionStorePath = process.env.MODEL_SELECTION_STORE_PATH
@@ -405,9 +737,14 @@ function expireAssignments(at = new Date()) {
   for (const assignment of expired) {
     auditLog.logEvent({
       operator: "system",
-      type: "assignment_expired",
+      type: assignment.status === "expired" ? "assignment_expired" : "assignment_recurrence_advanced",
       deviceId: assignment.deviceId,
-      detail: { assignmentId: assignment.id, assignee: assignment.assignee },
+      detail: {
+        assignmentId: assignment.id,
+        assignee: assignment.assignee,
+        recurrence: assignment.recurrence ?? "once",
+        occurrence: assignment.occurrence ?? 1,
+      },
     });
   }
   if (expired.length) {
@@ -428,6 +765,8 @@ function canManagePerson(operator, username) {
   if (!target) return false;
   if (operator.role === OPERATOR_ROLES.ADMIN) return true;
   return operator.role === OPERATOR_ROLES.MANAGER
+    && Boolean(operator.teamId)
+    && target.teamId === operator.teamId
     && (username === operator.username || MANAGER_ASSIGNABLE_ROLES.has(target.role));
 }
 
@@ -490,23 +829,25 @@ app.post("/api/assignments", requireCapability(CAPABILITIES.MANAGE_ASSIGNMENTS),
       startAt: req.body?.startAt ?? null,
       endAt: req.body?.endAt ?? null,
       exclusive: req.body?.exclusive ?? true,
+      recurrence: req.body?.recurrence ?? "once",
     });
     auditLog.logEvent({ operator: req.currentOperator.username, type: "assignment_created",
       deviceId: assignment.deviceId, detail: {
         assignmentId: assignment.id, assignee: assignment.assignee, accountId: assignment.accountId,
         startAt: assignment.startAt, endAt: assignment.endAt, exclusive: assignment.exclusive,
+        recurrence: assignment.recurrence, occurrence: assignment.occurrence,
       } });
     broadcastDeviceList();
     broadcastPresence();
     res.status(201).json({ assignment });
   } catch (error) {
     if (/overlaps/.test(error.message)) return res.status(409).json({ error: error.message });
-    if (/instructions|deviceId|accountId|schedule|startAt|endAt|exclusive/.test(error.message)) return res.status(400).json({ error: error.message });
+    if (/instructions|deviceId|accountId|schedule|startAt|endAt|exclusive|recurrence/.test(error.message)) return res.status(400).json({ error: error.message });
     next(error);
   }
 });
 
-app.patch("/api/assignments/:assignmentId", requireCapability(CAPABILITIES.MANAGE_ASSIGNMENTS), (req, res, next) => {
+app.patch("/api/assignments/:assignmentId", requireCapability(CAPABILITIES.VIEW_ASSIGNMENTS), (req, res, next) => {
   try {
     expireAssignments();
     const current = assignmentStore.get(req.params.assignmentId);
@@ -534,7 +875,11 @@ app.patch("/api/assignments/:assignmentId", requireCapability(CAPABILITIES.MANAG
       assignment = assignmentStore.reassign(current.id, req.body.assignee, req.currentOperator.username);
     } else if (wantsStatus) {
       if (!ASSIGNMENT_STATUSES.includes(req.body.status)) return res.status(400).json({ error: "invalid assignment status" });
-      if (!hasManage) return res.status(403).json({ error: "assignment management capability required" });
+      const ownVaProgress = req.currentOperator.role === OPERATOR_ROLES.VA
+        && current.assignee === req.currentOperator.username
+        && ((current.status === "assigned" && req.body.status === "in_progress")
+          || (current.status === "in_progress" && req.body.status === "completed"));
+      if (!hasManage && !ownVaProgress) return res.status(403).json({ error: "assignment management capability required" });
       assignment = assignmentStore.setStatus(current.id, req.body.status, req.currentOperator.username);
     } else {
       if (!hasManage) return res.status(403).json({ error: "assignment management capability required" });
@@ -551,7 +896,7 @@ app.patch("/api/assignments/:assignmentId", requireCapability(CAPABILITIES.MANAG
     res.json({ assignment });
   } catch (error) {
     if (/cannot move|cannot start|in-progress|terminal|invalid assignment|overlaps/.test(error.message)) return res.status(409).json({ error: error.message });
-    if (/schedule|startAt|endAt|exclusive/.test(error.message)) return res.status(400).json({ error: error.message });
+    if (/schedule|startAt|endAt|exclusive|recurrence/.test(error.message)) return res.status(400).json({ error: error.message });
     next(error);
   }
 });
@@ -569,6 +914,7 @@ const researchTaskRunner = createResearchTaskRunner({
   skillForPlatform: (platform) => getPlatformSkill(platform),
   operatorForUsername: operatorByUsername,
   workspaceForOperatorAccount: researchWorkspaceFor,
+  canUseDevice: (deviceId) => networkDecision(deviceId).allowed,
 });
 // Without this, a task dispatching or completing on its own — via the
 // background queueTickTimer, or the MS8 research runner calling
@@ -638,8 +984,15 @@ function deviceOpenDecision(d, viewer, viewerSocket = null) {
   if (!hasCapability(viewer, CAPABILITIES.CONTROL_DEVICE)) {
     return { assignedToViewer: true, canOpen: false, accessState: "role_read_only", openReason: "Your role can view this phone but cannot control it." };
   }
+  if (d.discoveryState === "detected_unconfigured") {
+    return { assignedToViewer: true, canOpen: false, accessState: "wda_unconfigured", openReason: "Detected on this Mac. Configure its WDA tunnel before opening it." };
+  }
   if (d.status === "offline") {
     return { assignedToViewer: true, canOpen: false, accessState: "offline", openReason: "This assigned phone is offline." };
+  }
+  const networkAccess = networkDecision(d.id);
+  if (!networkAccess.allowed) {
+    return { assignedToViewer: true, canOpen: false, accessState: networkAccess.state, openReason: networkAccess.reason };
   }
   if (deviceLease.getMode(d.id) !== "HUMAN") {
     return { assignedToViewer: true, canOpen: false, accessState: "ai_controlled", openReason: "An authorized operations user must return this phone to Human mode." };
@@ -663,32 +1016,82 @@ function deviceOpenDecision(d, viewer, viewerSocket = null) {
   return { assignedToViewer: true, canOpen: true, accessState: "assigned_available", openReason: "Assigned to you and available." };
 }
 
+function deviceWatchDecision(d, viewer, viewerSocket = null) {
+  if (!viewer || !hasCapability(viewer, CAPABILITIES.MONITOR_DEVICE)) {
+    return { canWatch: false, watchState: "role_not_permitted", watchReason: "Live watching is available to authorized Admins and Managers." };
+  }
+  if (!canAccessDevice(viewer, d.id)) {
+    return { canWatch: false, watchState: "device_not_permitted", watchReason: "This phone is outside your device access." };
+  }
+  const monitor = runtimeMonitorState(d.id);
+  if (!monitor.available) {
+    return { canWatch: false, watchState: "monitor_unavailable", watchReason: monitor.reason };
+  }
+  const controllerMode = deviceLease.getMode(d.id);
+  if (controllerMode !== "HUMAN") {
+    if (!hasCapability(viewer, CAPABILITIES.MANAGE_AI_CONTROLLER)) {
+      return { canWatch: false, watchState: "ai_not_permitted", watchReason: "AI device inspection is not permitted for this role." };
+    }
+    if (d.status === "offline") {
+      return { canWatch: false, watchState: "offline", watchReason: "This AI-controlled phone is offline." };
+    }
+    return { canWatch: true, watchState: "ai_read_only", watchReason: "Open this AI-controlled phone in a read-only command workspace." };
+  }
+  const ownerSocket = humanOwners.get(d.id);
+  const owner = ownerSocket?.currentOperator?.() ?? null;
+  if (!ownerSocket || !owner || d.status !== "in-use") {
+    return { canWatch: false, watchState: "not_in_use", watchReason: "No VA is currently operating this phone." };
+  }
+  if (ownerSocket === viewerSocket) {
+    return { canWatch: false, watchState: "own_session", watchReason: "You are operating this phone." };
+  }
+  if (owner.role !== OPERATOR_ROLES.VA) {
+    return { canWatch: false, watchState: "operator_not_va", watchReason: "The active operator is not a VA." };
+  }
+  if (viewer.role === OPERATOR_ROLES.MANAGER && !canManagePerson(viewer, owner.username)) {
+    return { canWatch: false, watchState: "outside_team", watchReason: "This VA is outside your team." };
+  }
+  return { canWatch: true, watchState: "va_active", watchReason: `Watch ${owner.username}'s read-only live screen.` };
+}
+
 const summary = (d, viewer = null, viewerSocket = null) => {
   const assignment = relevantAssignment(d.id);
   const mayManageAssignments = hasCapability(viewer, CAPABILITIES.MANAGE_ASSIGNMENTS);
   const mayManageAccess = hasCapability(viewer, CAPABILITIES.MANAGE_ACCESS);
+  const mayAccessMedia = Boolean(viewer && hasCapability(viewer, CAPABILITIES.ACCESS_MEDIA)
+    && canAccessDevice(viewer, d.id));
   return {
     id: d.id,
     label: d.label,
     status: d.status,
+    discoveryState: d.discoveryState ?? null,
     hostLabel: deviceHost.get(d.id) ?? DEFAULT_HOST_LABEL,
     ...getHealth(d.id),
     controllerMode: deviceLease.getMode(d.id),
     currentOperator: humanOwners.get(d.id)?.operatorUsername ?? null,
     ...deviceOpenDecision(d, viewer, viewerSocket),
-    assignment: assignment && mayManageAssignments ? {
+    ...deviceWatchDecision(d, viewer, viewerSocket),
+    mediaActions: {
+      list: mayAccessMedia,
+      download: mayAccessMedia,
+      upload: mayAccessMedia,
+      delete: mayAccessMedia,
+    },
+    assignment: assignment && mayManageAssignments && canViewAssignment(assignment, viewer) ? {
       id: assignment.id,
       assignee: assignment.assignee,
       status: assignment.status,
       startAt: assignment.startAt ?? null,
       endAt: assignment.endAt ?? null,
       exclusive: assignment.exclusive !== false,
+      recurrence: assignment.recurrence ?? "once",
+      occurrence: assignment.occurrence ?? 1,
     } : null,
     authorizedOperators: mayManageAccess ? [...operators.values()]
       .filter(operator => operator.active !== false && canAccessDevice(operator, d.id))
       .map(operator => ({ username: operator.username, role: operator.role }))
       .sort((a, b) => a.username.localeCompare(b.username)) : [],
-    monitor: monitorState(),
+    monitor: runtimeMonitorState(d.id),
     network: publicNetworkConfig(deviceNetwork.get(d.id)),
     ...networkVerifier.getStatus(d.id),
   };
@@ -703,7 +1106,7 @@ app.get("/api/devices/:deviceId/monitor", (req, res) => {
   if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
     return res.status(403).json({ error: "not authorized for this device" });
   }
-  res.json({ monitor: monitorState() });
+  res.json({ monitor: runtimeMonitorState(req.params.deviceId) });
 });
 
 // Stamps a device-scoped audit event's detail with which network egress the
@@ -729,21 +1132,14 @@ function releaseDevice(device) {
 
 // Per-device file transfer (source clips in, exports out). Isolated by
 // device id — see fileStore.js and README "Known gap" re: VA auth.
+const mediaQuota = createMediaQuotaManager({
+  mediaRoot: path.join(path.resolve(process.env.FILE_STORE_DIR || path.join(__dirname, "../../storage")), "devices"),
+  perDeviceBytes: mediaByteSetting("MEDIA_DEVICE_QUOTA_BYTES", DEFAULT_DEVICE_MEDIA_QUOTA_BYTES),
+  globalBytes: mediaByteSetting("MEDIA_GLOBAL_QUOTA_BYTES", DEFAULT_GLOBAL_MEDIA_QUOTA_BYTES),
+  minFreeBytes: mediaByteSetting("MEDIA_MIN_FREE_BYTES", DEFAULT_MEDIA_MIN_FREE_BYTES),
+});
 const upload = multer({
-  storage: multer.diskStorage({
-    destination: (req, file, cb) => {
-      const dir = ensureDeviceDir(req.params.deviceId);
-      if (!dir) return cb(new Error("invalid device id"));
-      cb(null, dir);
-    },
-    filename: (req, file, cb) => {
-      const safe = safeFilename(file.originalname);
-      if (!safe) return cb(new Error("invalid filename"));
-      // Multer may remove this file when a later multipart field is invalid.
-      // Never expose the destination to that cleanup path.
-      cb(null, `.upload-${randomUUID()}.tmp`);
-    },
-  }),
+  storage: createQuotaStorage({ ensureDeviceDir, safeFilename, quotaManager: mediaQuota }),
   limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2GB — generous for source video
 });
 
@@ -775,7 +1171,9 @@ app.post("/api/devices/:deviceId/files", (req, res, next) => {
     // Same-directory rename commits only a fully validated multipart upload.
     // A failed replacement preserves the old file; never unlink it first.
     fs.renameSync(req.file.path, path.join(req.file.destination, name));
+    mediaQuota.commit(req.file.quotaReservation);
   } catch (error) {
+    mediaQuota.abort(req.file.quotaReservation);
     fs.rmSync(req.file.path, { force: true });
     return next(error);
   }
@@ -829,6 +1227,9 @@ app.post("/api/devices/:deviceId/network-check", (req, res) => {
     return res.status(403).json({ error: "not authorized for this device" });
   }
   const configuredNetwork = deviceNetwork.get(req.params.deviceId);
+  if (isProxyEgress(configuredNetwork?.egress) && configuredNetwork?.enabled === false) {
+    return res.status(409).json({ error: "network verification is unavailable while this proxy assignment is disabled" });
+  }
   const overrideAllowed = process.env.ALLOW_NETWORK_CHECK_URL_OVERRIDE === "true";
   if (req.body?.checkUrl && !overrideAllowed) {
     return res.status(400).json({ error: "caller-supplied checkUrl is disabled" });
@@ -840,8 +1241,28 @@ app.post("/api/devices/:deviceId/network-check", (req, res) => {
   networkVerifier
     .checkDevice(req.params.deviceId, checkUrl)
     .then((result) => {
+      const access = networkDecision(req.params.deviceId);
+      if (!access.allowed) {
+        taskQueue.stopDevice(req.params.deviceId, "network_policy");
+        for (const client of wss.clients) client.releaseUnauthorizedSelection?.("network_policy");
+      } else {
+        taskQueue.tick(new Date());
+      }
+      broadcastDeviceList();
+      // A network probe may take seconds. Resolve the current account again
+      // after that await and before returning IP/region/health data or writing
+      // requester-attributed audit detail. A stale request snapshot is not
+      // authority to receive the result.
+      const current = resolveOperator(req.session?.operator);
+      if (!current) return res.status(401).json({ error: "authentication required" });
+      if (!hasCapability(current, CAPABILITIES.RUN_NETWORK_CHECK)) {
+        return res.status(403).json({ error: "network verification is not permitted for this role" });
+      }
+      if (!canAccessDevice(current, req.params.deviceId)) {
+        return res.status(403).json({ error: "not authorized for this device" });
+      }
       auditLog.logEvent({
-        operator: req.session.operator.username,
+        operator: current.username,
         type: "network_check",
         deviceId: req.params.deviceId,
         detail: withNetworkEgress(req.params.deviceId, {
@@ -851,10 +1272,35 @@ app.post("/api/devices/:deviceId/network-check", (req, res) => {
           mismatchReason: result.networkMismatchReason,
         }),
       });
-      broadcastDeviceList();
       res.json({ network: { ...(publicNetworkConfig(configuredNetwork) ?? {}), ...result } });
     })
     .catch((err) => res.status(500).json({ error: err.message }));
+});
+
+app.patch("/api/admin/devices/:deviceId/proxy", requireCapability(CAPABILITIES.MANAGE_PROXY), (req, res, next) => {
+  try {
+    if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
+    if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
+      return res.status(403).json({ error: "not authorized for this device" });
+    }
+    const network = setDeviceProxyEnabled({
+      configPath,
+      deviceId: req.params.deviceId,
+      enabled: req.body?.enabled,
+    });
+    deviceNetwork.set(req.params.deviceId, network);
+    auditLog.logEvent({
+      operator: req.currentOperator.username,
+      type: "proxy_setting_changed",
+      deviceId: req.params.deviceId,
+      detail: { enabled: network.enabled, networkEgress: network.egress },
+    });
+    broadcastDeviceList();
+    res.json({ network: publicNetworkConfig(network) });
+  } catch (error) {
+    if (error?.status) return res.status(error.status).json({ error: error.message });
+    next(error);
+  }
 });
 
 // AI research findings (the /cresearch command's output). One account =
@@ -979,7 +1425,21 @@ function taskAccessError(taskId, operator) {
   return null;
 }
 
-async function executeCommand(parsed, operator) {
+function scopeWorkspaceCommand(parsed, deviceId) {
+  if (!deviceId || parsed.error) return parsed;
+  if (["time", "cresearch", "natural_language"].includes(parsed.type)) return parsed;
+  if (parsed.type === "queue_add") return parsed;
+  if (["mode", "ai_pause", "ai_resume", "ai_stop", "device_health"].includes(parsed.type)) {
+    if (parsed.deviceId && parsed.deviceId !== deviceId) {
+      return { error: "a device workspace command cannot target another phone" };
+    }
+    return { ...parsed, deviceId };
+  }
+  return { error: "that command is not available inside a device workspace" };
+}
+
+async function executeCommand(parsed, operator, workspaceDeviceId = null) {
+  parsed = scopeWorkspaceCommand(parsed, workspaceDeviceId);
   if (parsed.error) return { error: parsed.error };
 
   switch (parsed.type) {
@@ -989,24 +1449,31 @@ async function executeCommand(parsed, operator) {
       // (docs/CODING_ROADMAP.md MS8), not this parser's.
       return {
         proposed: { goal: parsed.goal },
-        note: "Natural-language goals are proposed only — use /time or /cresearch to actually queue a task.",
+        note: "Natural-language goals are proposed only — use /cresearch to queue supported research work.",
       };
 
     case "time":
+      // The scheduler must never grant a device lease to work that has no
+      // executor. Generic /time tasks are parsed for forward compatibility,
+      // but only research tasks have a registered production worker today.
+      return {
+        error: "General scheduled tasks are not available yet. Use /cresearch for supported research work.",
+      };
+
     case "cresearch": {
-      const resolvedAccount = parsed.type === "cresearch"
-        ? resolveResearchAccountSelector(parsed.accountSelector, operator)
-        : { accountSelector: parsed.accountSelector };
+      const resolvedAccount = resolveResearchAccountSelector(parsed.accountSelector, operator);
       if (resolvedAccount.error) return resolvedAccount;
       const task = taskQueue.addTask({
-        kind: parsed.type === "cresearch" ? "research" : "generic",
+        kind: "research",
         goal: parsed.goal,
         // A restricted admin may use the queue, but the scheduler must still
         // obey that operator's device allow-list. An unrestricted operator
         // leaves this selector open exactly as before.
-        deviceSelector: operator.allowedDevices
-          ? { allowedDeviceIds: [...operator.allowedDevices] }
-          : {},
+        deviceSelector: workspaceDeviceId
+          ? { deviceId: workspaceDeviceId }
+          : operator.allowedDevices
+            ? { allowedDeviceIds: [...operator.allowedDevices] }
+            : {},
         accountSelector: resolvedAccount.accountSelector,
         earliestStart: parsed.earliestStart,
         latestEnd: parsed.latestEnd,
@@ -1021,7 +1488,7 @@ async function executeCommand(parsed, operator) {
       if (inner.type !== "time" && inner.type !== "cresearch") {
         return { error: "/queue add requires a /time or /cresearch command" };
       }
-      return executeCommand(inner, operator);
+      return executeCommand(inner, operator, workspaceDeviceId);
     }
 
     case "queue_list":
@@ -1189,8 +1656,20 @@ app.post("/api/queue/command", requireCapability(CAPABILITIES.MANAGE_QUEUE), asy
     if (typeof text !== "string" || text.trim().length === 0) {
       return res.status(400).json({ error: "text is required" });
     }
+    const workspaceDeviceId = req.body?.deviceId ?? null;
+    if (workspaceDeviceId !== null) {
+      if (typeof workspaceDeviceId !== "string" || !devices.has(workspaceDeviceId)) {
+        return res.status(400).json({ error: "a valid deviceId is required for a device workspace command" });
+      }
+      const decision = deviceWatchDecision(devices.get(workspaceDeviceId), req.currentOperator);
+      if (!decision.canWatch || decision.watchState !== "ai_read_only") {
+        auditLog.logEvent({ operator: req.currentOperator.username, type: "device_workspace_command_denied",
+          deviceId: workspaceDeviceId, detail: { reason: decision.watchState } });
+        return res.status(403).json({ error: decision.watchReason });
+      }
+    }
     const parsed = parseCommand(text);
-    const result = await executeCommand(parsed, req.currentOperator);
+    const result = await executeCommand(parsed, req.currentOperator, workspaceDeviceId);
     res.status(result.status ?? (result.error ? 400 : 200)).json(result);
   } catch (error) { next(error); }
 });
@@ -1205,18 +1684,29 @@ app.get("/api/queue", requireCapability(CAPABILITIES.MANAGE_QUEUE), (req, res) =
 app.use((err, req, res, next) => {
   if (!err) return next();
   const message = err.code === "LIMIT_FILE_SIZE" ? "file too large" : err.message || "upload failed";
-  res.status(400).json({ error: message });
+  const status = err.code === "LIMIT_FILE_SIZE" ? 413 : err.statusCode ?? 400;
+  res.status(status).json({ error: message,
+    ...(err.code?.startsWith("MEDIA_") ? { code: err.code, ...err.detail } : {}) });
 });
 
 function broadcastDeviceList() {
   for (const client of wss.clients) {
     if (client.readyState !== client.OPEN) continue;
+    client.releaseUnauthorizedWatch?.("fleet_updated");
     const operator = client.currentOperator?.();
     const visibleDevices = operator && hasCapability(operator, CAPABILITIES.VIEW_FLEET)
       ? [...devices.values()].map(device => summary(device, operator, client))
       : [];
     client.send(JSON.stringify({ type: "device_list", devices: visibleDevices }));
   }
+}
+
+function runtimeMonitorState(deviceId) {
+  const configured = deviceMonitorConfig.get(deviceId)
+    ?? { adapter: "unconfigured", physicallyValidated: false };
+  let activeViewers = 0;
+  for (const client of wss.clients) if (client.watchedDeviceId === deviceId) activeViewers++;
+  return monitorState({ ...configured, activeViewers });
 }
 
 function broadcastPresence() {
@@ -1313,6 +1803,7 @@ wss.on("connection", (ws, request) => {
   };
 
   let selected = null;
+  let watched = null;
   const releaseSelection = () => {
     if (selected && humanOwners.get(selected.id) === ws) {
       humanOwners.delete(selected.id);
@@ -1325,7 +1816,8 @@ wss.on("connection", (ws, request) => {
     && hasCapability(currentOperator(), CAPABILITIES.CONTROL_DEVICE)
     && canAccessDevice(currentOperator(), target.id)
     && humanOwners.get(target.id) === ws
-    && deviceLease.canHumanSelect(target.id);
+    && deviceLease.canHumanSelect(target.id)
+    && networkDecision(target.id).allowed;
   const revokeSelectedAccess = (action) => {
     if (!selected) return;
     const revokedId = selected.id;
@@ -1343,6 +1835,35 @@ wss.on("connection", (ws, request) => {
     if (!selected || selectedAccessActive(selected)) return false;
     revokeSelectedAccess(action);
     return true;
+  };
+  const watchAccessActive = (target = watched) => Boolean(target)
+    && deviceWatchDecision(target, currentOperator(), ws).canWatch;
+  const clearWatch = (action = "stopped", { notify = false } = {}) => {
+    if (!watched) return false;
+    const watchedId = watched.id;
+    watched = null;
+    ws.watchedDeviceId = null;
+    auditLog.logEvent({ operator: operator.username, type: "device_watch_stopped", deviceId: watchedId,
+      detail: { action } });
+    if (notify && ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: "watch_stopped", deviceId: watchedId,
+        message: "This read-only device session is no longer available." }));
+    }
+    return true;
+  };
+  ws.releaseUnauthorizedWatch = (action = "operator_updated") => {
+    if (!watched || watchAccessActive(watched)) return false;
+    return clearWatch(action, { notify: true });
+  };
+  ws.deliverWatchedFrame = async (target, frame) => {
+    if (watched !== target || ws.readyState !== ws.OPEN) return;
+    if (!await ws.validateSession()) return;
+    if (watched !== target || !watchAccessActive(target)) {
+      clearWatch("frame_delivery", { notify: true });
+      return;
+    }
+    ws.send(JSON.stringify({ type: "watch_frame", deviceId: target.id,
+      operator: humanOwners.get(target.id)?.operatorUsername ?? null, ...frame }));
   };
   const claimConflict = (target) => {
     if (!humanOwners.has(target.id) || humanOwners.get(target.id) === ws) return false;
@@ -1411,6 +1932,11 @@ wss.on("connection", (ws, request) => {
         broadcastDeviceList();
       }
       ws.send(JSON.stringify({ type: "frame", deviceId: target.id, ...frame }));
+      for (const client of wss.clients) {
+        if (client === ws) continue;
+        const delivery = client.deliverWatchedFrame?.(target, frame);
+        delivery?.catch?.(() => {});
+      }
     } catch (err) {
       reportError(`Couldn't reach ${target.label}: ${err.message}`);
     }
@@ -1429,6 +1955,7 @@ wss.on("connection", (ws, request) => {
       return;
     }
     if (claimConflict(target)) return;
+    if (watched) clearWatch("claimed_device");
     releaseSelection();
     selected = target;
     humanOwners.set(target.id, ws);
@@ -1503,6 +2030,74 @@ wss.on("connection", (ws, request) => {
         return;
       }
       await claimDevice(target);
+      return;
+    }
+
+    if (msg.type === "watch_device") {
+      const target = devices.get(msg.deviceId) || null;
+      if (!target) {
+        ws.send(JSON.stringify({ type: "error", code: "watch_denied", deviceId: msg.deviceId, message: "Unknown device." }));
+        return;
+      }
+      if (selected) {
+        ws.send(JSON.stringify({ type: "error", code: "watch_denied", deviceId: target.id,
+          message: "Release the phone you control before watching another VA." }));
+        return;
+      }
+      const decision = deviceWatchDecision(target, currentOperator(), ws);
+      if (!decision.canWatch) {
+        auditLog.logEvent({ operator: operator.username, type: "device_watch_denied", deviceId: target.id,
+          detail: { reason: decision.watchState } });
+        ws.send(JSON.stringify({ type: "error", code: "watch_denied", deviceId: target.id, message: decision.watchReason }));
+        return;
+      }
+      if (watched && watched !== target) clearWatch("switched_device");
+      watched = target;
+      ws.watchedDeviceId = target.id;
+      auditLog.logEvent({ operator: operator.username, type: "device_watch_started", deviceId: target.id,
+        detail: { activeOperator: humanOwners.get(target.id)?.operatorUsername ?? null, watchState: decision.watchState } });
+      ws.send(JSON.stringify({ type: "watch_started", deviceId: target.id,
+        operator: humanOwners.get(target.id)?.operatorUsername ?? null, watchState: decision.watchState }));
+      try {
+        const frame = await target.render();
+        if (!await ws.validateSession()) return;
+        if (watched !== target || !watchAccessActive(target)) {
+          clearWatch("initial_render", { notify: true });
+          return;
+        }
+        await ws.deliverWatchedFrame(target, frame);
+      } catch (error) {
+        clearWatch("render_failed");
+        ws.send(JSON.stringify({ type: "error", code: "watch_start_failed", deviceId: target.id,
+          message: `Could not load the live screen: ${error.message}` }));
+      }
+      return;
+    }
+
+    if (msg.type === "refresh_watch") {
+      if (!watched || msg.deviceId !== watched.id) {
+        ws.send(JSON.stringify({ type: "error", code: "watch_denied", deviceId: msg.deviceId,
+          message: "No matching live watch session is active." }));
+        return;
+      }
+      if (!watchAccessActive(watched)) {
+        clearWatch("refresh", { notify: true });
+        return;
+      }
+      const target = watched;
+      try {
+        const frame = await target.render();
+        if (!await ws.validateSession()) return;
+        await ws.deliverWatchedFrame(target, frame);
+      } catch (error) {
+        ws.send(JSON.stringify({ type: "error", code: "watch_refresh_failed", deviceId: target.id,
+          message: `Could not refresh the live screen: ${error.message}` }));
+      }
+      return;
+    }
+
+    if (msg.type === "stop_watching") {
+      if (watched && (msg.deviceId === undefined || msg.deviceId === watched.id)) clearWatch("viewer_stopped");
       return;
     }
 
@@ -1604,6 +2199,14 @@ wss.on("connection", (ws, request) => {
       taskQueue.emergencyStopDevice(msg.deviceId);
       auditLog.logEvent({ operator: operator.username, type: "emergency_stop", deviceId: msg.deviceId });
       broadcastDeviceList();
+      return;
+    }
+
+    if (["tap", "swipe", "home", "type_text", "release_device"].includes(msg.type) && watched && !selected) {
+      auditLog.logEvent({ operator: operator.username, type: "device_watch_input_denied", deviceId: msg.deviceId ?? watched.id,
+        detail: { action: msg.type } });
+      ws.send(JSON.stringify({ type: "error", code: "watch_read_only", deviceId: msg.deviceId ?? watched.id,
+        message: "Live watching is read-only." }));
       return;
     }
 
@@ -1736,6 +2339,7 @@ wss.on("connection", (ws, request) => {
 
   ws.on("close", () => {
     presenceStore.disconnect(ws.presenceConnectionId);
+    clearWatch("connection_closed");
     broadcastPresence();
     // Closure prevents queued commands from passing validateSession, but an
     // input already sent to the device cannot be cancelled by closing TCP.

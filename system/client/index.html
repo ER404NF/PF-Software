@@ -4,28 +4,87 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Phone Farm — VA Control (dev)</title>
+  <script>
+    (() => {
+      try {
+        const savedTheme = localStorage.getItem("phone-farm-theme");
+        const systemTheme = window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+        document.documentElement.dataset.theme = savedTheme === "dark" || savedTheme === "light" ? savedTheme : systemTheme;
+      } catch {
+        document.documentElement.dataset.theme = "light";
+      }
+    })();
+  </script>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <form id="login-form">
-    <h1>Phone Farm — Sign in</h1>
-    <input type="text" id="login-username" placeholder="Username" autocomplete="username" required />
-    <input type="password" id="login-password" placeholder="Password" autocomplete="current-password" required />
+    <div class="login-brand"><span class="brand-mark" aria-hidden="true">PF</span><div><strong>PHONE FARM</strong><span>Device operations</span></div></div>
+    <h1>Sign in</h1>
+    <p class="login-intro">Use your operator account to continue.</p>
+    <label class="login-field">Username<input type="text" id="login-username" autocomplete="username" required /></label>
+    <label class="login-field">Password<input type="password" id="login-password" autocomplete="current-password" required /></label>
     <button type="submit">Sign in</button>
-    <p id="login-error"></p>
+    <button type="button" id="logout-retry-button" class="secondary-auth-button" hidden>Retry session revocation</button>
+    <div class="auth-links"><button type="button" id="show-signup-button">Create account</button><button type="button" id="show-recovery-button">Recover access</button></div>
+    <p id="login-error" role="alert"></p>
+  </form>
+
+  <form id="signup-form" hidden>
+    <div class="login-brand"><span class="brand-mark" aria-hidden="true">PF</span><div><strong>PHONE FARM</strong><span>Account application</span></div></div>
+    <h1>Create account</h1>
+    <p class="login-intro">Applications require manual approval and two-factor setup.</p>
+    <label class="login-field">Full name<input id="signup-full-name" autocomplete="name" maxlength="150" required /></label>
+    <label class="login-field">Gmail address<input id="signup-email" type="email" autocomplete="email" placeholder="name@gmail.com" required /></label>
+    <label class="login-field">Username<input id="signup-username" autocomplete="username" maxlength="100" required /></label>
+    <label class="login-field">Password<input id="signup-password" type="password" autocomplete="new-password" minlength="12" required /></label>
+    <label class="login-field">Confirm password<input id="signup-password-confirmation" type="password" autocomplete="new-password" minlength="12" required /></label>
+    <button type="submit">Submit application</button>
+    <button type="button" class="secondary-auth-button" data-show-login>Back to sign in</button>
+    <p id="signup-message" role="status" aria-live="polite"></p>
+  </form>
+
+  <form id="two-factor-form" hidden>
+    <div class="login-brand"><span class="brand-mark" aria-hidden="true">PF</span><div><strong>PHONE FARM</strong><span>Protected sign in</span></div></div>
+    <h1 id="two-factor-heading">Two-factor authentication</h1>
+    <p id="two-factor-intro" class="login-intro">Enter the six-digit code from your authenticator or a recovery code.</p>
+    <div id="two-factor-setup" hidden>
+      <p>Save this setup key in your authenticator app:</p>
+      <code id="two-factor-secret"></code>
+    </div>
+    <label class="login-field">Verification code<input id="two-factor-code" inputmode="numeric" autocomplete="one-time-code" required /></label>
+    <button type="submit">Verify and continue</button>
+    <button type="button" class="secondary-auth-button" data-show-login>Cancel</button>
+    <p id="two-factor-message" role="alert"></p>
+    <div id="recovery-codes" hidden><strong>Save these one-time recovery codes now:</strong><pre></pre></div>
+  </form>
+
+  <form id="recovery-form" hidden>
+    <div class="login-brand"><span class="brand-mark" aria-hidden="true">PF</span><div><strong>PHONE FARM</strong><span>Account recovery</span></div></div>
+    <h1>Recover access</h1>
+    <p class="login-intro">Enter your username or Gmail address. Eligible accounts receive a one-time recovery message.</p>
+    <label class="login-field">Username or Gmail<input id="recovery-identifier" autocomplete="username" required /></label>
+    <button type="submit">Request recovery</button>
+    <fieldset class="recovery-complete-fields">
+      <legend>Already have a recovery token?</legend>
+      <label class="login-field">Recovery token<input id="recovery-token" autocomplete="one-time-code" /></label>
+      <label class="login-field">New password<input id="recovery-new-password" type="password" autocomplete="new-password" minlength="12" /></label>
+      <label class="login-field">Confirm new password<input id="recovery-new-password-confirmation" type="password" autocomplete="new-password" minlength="12" /></label>
+      <button type="button" id="complete-recovery-button">Set new password</button>
+    </fieldset>
+    <button type="button" class="secondary-auth-button" data-show-login>Back to sign in</button>
+    <p id="recovery-message" role="status" aria-live="polite"></p>
   </form>
 
   <div id="app" hidden>
     <header id="top-bar">
       <div id="top-bar-left">
-        <h1>Phone Farm</h1>
-        <nav id="admin-nav" hidden aria-label="Operations navigation">
-          <button type="button" id="fleet-nav-button" class="top-nav-button active">Fleet</button>
-          <button type="button" id="assignments-nav-button" class="top-nav-button">Assignments</button>
-          <button type="button" id="admin-nav-button" class="top-nav-button" hidden>Operations</button>
-        </nav>
+        <span class="brand-mark" aria-hidden="true">PF</span>
+        <div class="brand-copy"><h1>PHONE FARM</h1><span>Device operations</span></div>
       </div>
       <div id="top-bar-right">
+        <p id="connection-status" class="connection-state loading" role="status">Connecting</p>
+        <button type="button" id="theme-toggle" aria-label="Use dark mode" aria-pressed="false"><span aria-hidden="true">&#9680;</span><span id="theme-toggle-label">Dark</span></button>
         <span id="role-badge"></span>
         <span id="whoami"></span>
         <button type="button" id="research-toggle" aria-controls="research-panel" aria-expanded="false">Research</button>
@@ -33,15 +92,19 @@
       </div>
     </header>
 
-    <p id="connection-status" hidden>Disconnected — reconnecting…</p>
-
     <aside id="people-sidebar" aria-label="Staff presence">
+      <nav id="admin-nav" hidden aria-label="Workspace navigation">
+        <span class="sidebar-label">Workspace</span>
+        <button type="button" id="fleet-nav-button" class="top-nav-button active"><span aria-hidden="true">&#9638;</span> Fleet overview</button>
+        <button type="button" id="assignments-nav-button" class="top-nav-button"><span aria-hidden="true">&#10003;</span> Assignments</button>
+        <button type="button" id="admin-nav-button" class="top-nav-button" hidden><span aria-hidden="true">&#9881;</span> Operations</button>
+      </nav>
       <div id="people-heading">
         <div>
           <h2>People</h2>
           <span id="people-summary">Loading…</span>
         </div>
-        <button type="button" id="people-refresh-button" aria-label="Refresh people">&#8635;</button>
+        <button type="button" id="people-refresh-button" aria-label="Refresh people" title="Refresh people">&#8635;</button>
       </div>
       <ul id="people-list" aria-live="polite"></ul>
       <p id="people-error" role="status"></p>
@@ -71,38 +134,74 @@
     </section>
 
     <section id="detail-view" hidden>
-      <button type="button" id="back-to-fleet-button">&larr; Fleet</button>
-      <h2 id="detail-title"></h2>
+      <header id="detail-heading">
+        <div>
+          <button type="button" id="back-to-fleet-button">&larr; Fleet</button>
+          <h2 id="detail-title"></h2>
+        </div>
+        <button type="button" id="release-button" hidden>Release device</button>
+      </header>
       <p id="detail-access-note"></p>
+      <p id="detail-message" role="alert" aria-live="assertive"></p>
       <div id="detail-device-facts"></div>
       <div id="detail-ai-status"></div>
       <div id="detail-body">
         <main id="screen-panel">
+          <div id="device-control-bar" hidden>
+            <div id="swipe-controls" hidden aria-label="Swipe controls">
+              <button type="button" data-direction="left" aria-label="Swipe left">&larr;</button>
+              <button type="button" data-direction="up" aria-label="Swipe up">&uarr;</button>
+              <button type="button" data-direction="down" aria-label="Swipe down">&darr;</button>
+              <button type="button" data-direction="right" aria-label="Swipe right">&rarr;</button>
+            </div>
+            <button type="button" id="home-button" hidden>&#9673; Home</button>
+            <form id="type-form" hidden>
+              <input type="text" id="type-input" placeholder="Type on device…" maxlength="1000" />
+              <button type="submit" disabled>Send</button>
+            </form>
+          </div>
           <div id="screen-wrap">
             <div id="screen"></div>
           </div>
           <p id="hint">Select a device to begin.</p>
-          <div id="swipe-controls" hidden>
-            <button type="button" data-direction="up">&uarr;</button>
-            <div id="swipe-row">
-              <button type="button" data-direction="left">&larr;</button>
-              <button type="button" data-direction="right">&rarr;</button>
-            </div>
-            <button type="button" data-direction="down">&darr;</button>
+          <div id="watch-controls" hidden>
+            <button type="button" id="watch-refresh-button">Refresh live screen</button>
+            <button type="button" id="watch-stop-button">Stop watching</button>
           </div>
-          <button type="button" id="home-button" hidden>&#9673; Home</button>
-          <form id="type-form" hidden>
-            <input type="text" id="type-input" placeholder="Type on device…" maxlength="1000" />
-            <button type="submit">Send</button>
-          </form>
-          <button type="button" id="release-button" hidden>Release device</button>
         </main>
+        <aside id="ai-chat-panel" hidden aria-label="AI device command workspace">
+          <div class="ai-chat-heading">
+            <div>
+              <span>AI workspace</span>
+              <h3 id="ai-chat-title">Device commands</h3>
+            </div>
+            <span class="ai-chat-readonly">Screen read-only</span>
+          </div>
+          <div id="ai-chat-messages" class="ai-chat-messages" aria-live="polite"></div>
+          <div class="ai-chat-suggestions" aria-label="Suggested device commands">
+            <button type="button" data-ai-command="status">Status</button>
+            <button type="button" data-ai-prefill="/cresearch instagram 30 ">Research</button>
+            <button type="button" data-ai-command="pause" hidden>Pause</button>
+            <button type="button" data-ai-command="resume" hidden>Resume</button>
+            <button type="button" data-ai-command="stop" hidden>Stop task</button>
+            <button type="button" data-ai-command="human" hidden>Return to Human</button>
+          </div>
+          <form id="ai-chat-form">
+            <label for="ai-chat-input">Command</label>
+            <div class="ai-chat-compose">
+              <input id="ai-chat-input" type="text" maxlength="500" autocomplete="off"
+                placeholder="Try /cresearch instagram 30 Find strong posts" />
+              <button type="submit">Send</button>
+            </div>
+          </form>
+          <p class="ai-chat-footnote">Use /cresearch &lt;platform&gt; [account] &lt;minutes&gt; &lt;goal&gt; or /time &lt;start&gt;-&lt;end&gt; &lt;goal&gt;. Commands apply only to this phone. Direct screen input stays disabled while AI is in control.</p>
+        </aside>
         <aside id="files-panel">
           <h1>Files</h1>
           <p id="files-hint">Select a device to see its files.</p>
           <form id="upload-form" hidden>
             <input type="file" id="upload-input" />
-            <button type="submit">Upload</button>
+            <button type="submit" disabled>Upload</button>
           </form>
           <ul id="file-list"></ul>
         </aside>
@@ -112,8 +211,8 @@
     <section id="assignments-view" hidden>
       <header class="admin-heading">
         <div>
-          <h2>Assignments</h2>
-          <p>Your durable work list and its change history.</p>
+          <h2 id="assignments-heading">Assignments</h2>
+          <p id="assignments-description">Your durable work list and its change history.</p>
         </div>
         <button type="button" id="assignments-refresh-button">Refresh</button>
       </header>
@@ -125,6 +224,11 @@
           <label>Account ID<input id="assignment-account" maxlength="200" placeholder="Optional research account" /></label>
           <label>Starts (local)<input id="assignment-start" type="datetime-local" /></label>
           <label>Ends (local)<input id="assignment-end" type="datetime-local" /></label>
+          <label>Repeats<select id="assignment-recurrence">
+            <option value="once">Once</option>
+            <option value="daily">Every day</option>
+            <option value="weekly">Every week</option>
+          </select></label>
           <label class="assignment-checkbox"><input id="assignment-exclusive" type="checkbox" checked /> Exclusive time slot</label>
         </div>
         <label>Instructions<textarea id="assignment-instructions" maxlength="2000" required></textarea></label>
@@ -182,7 +286,7 @@
             <tbody id="queue-body"></tbody>
           </table>
         </div>
-        <p id="queue-empty" class="admin-empty" hidden>No tasks in the queue.</p>
+        <p id="queue-empty" class="admin-empty" hidden>No tasks are currently in the queue.</p>
       </section>
 
       <section class="admin-panel" id="users-panel" hidden>
@@ -194,6 +298,8 @@
           <button type="button" id="users-refresh-button">Refresh</button>
         </div>
         <form id="user-create-form" class="user-form">
+          <label>Full name<input id="user-create-full-name" maxlength="150" autocomplete="off" required /></label>
+          <label>Gmail address<input id="user-create-email" type="email" placeholder="name@gmail.com" autocomplete="off" required /></label>
           <label>Username<input id="user-create-username" maxlength="100" autocomplete="off" required /></label>
           <label>Initial password<input id="user-create-password" type="password" minlength="12" maxlength="512" autocomplete="new-password" required /></label>
           <label>Role
@@ -207,6 +313,7 @@
           </label>
           <label>Device IDs<input id="user-create-devices" placeholder="mock-1, phone-2" /></label>
           <label>Research workspaces<input id="user-create-research" placeholder="client-a, client-b" /></label>
+          <label>Team ID<input id="user-create-team" placeholder="team-a" pattern="[a-z0-9][a-z0-9_-]{0,99}" /></label>
           <label class="user-checkbox"><input id="user-create-all-devices" type="checkbox" /> All devices</label>
           <button type="submit">Create user</button>
         </form>
@@ -242,7 +349,7 @@
     </section>
     <aside id="research-panel" hidden aria-label="Research review">
       <div class="research-heading"><h2>Research</h2><button type="button" id="research-close">Close</button></div>
-      <p>Review collected findings. AI chat and automatic collection are not connected yet.</p>
+      <p>Review findings collected by authorized research tasks. AI collection requires a configured provider, account profile, eligible phone, and enabled workspace policy.</p>
       <label for="research-account">Assigned account</label>
       <select id="research-account"></select>
       <button type="button" id="research-refresh">Refresh findings</button>

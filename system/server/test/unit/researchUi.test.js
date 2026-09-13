@@ -51,6 +51,21 @@ test("research renders untrusted text literally and omits executable links", () 
   assert.equal(card.children.some((el) => el.tag === "a"), false);
 });
 
+test("research renders only same-account server evidence references as links", () => {
+  const h = harness();
+  vm.runInContext(`renderResearchRun({id:"run-1", platform:"x", createdAt:"today", overview:"safe",
+    candidates:[{id:"c", status:"pending", evidence_refs:[
+      "/api/research/account/evidence/evidence-1234abcd-abcd-abcd-abcd-123456789abc.png",
+      "/api/research/other/evidence/evidence-1234abcd-abcd-abcd-abcd-123456789abc.png",
+      "javascript:bad()"]}]}, "account", 0)`, h.context);
+  const card = h.elements.get("research-results").children[0].children[2];
+  const evidence = card.children.find(child => child.tag === "p" && child.children.some(item => item.tag === "a"));
+  const links = evidence.children.filter(child => child.tag === "a");
+  assert.equal(links.length, 1);
+  assert.equal(links[0].href, "/api/research/account/evidence/evidence-1234abcd-abcd-abcd-abcd-123456789abc.png");
+  assert.equal(links[0].rel, "noopener noreferrer");
+});
+
 test("refresh before account discovery finishes does not cancel the account response", async () => {
   let resolve;
   const h = harness(() => new Promise((r) => { resolve = r; }));

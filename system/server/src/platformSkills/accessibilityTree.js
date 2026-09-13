@@ -41,17 +41,35 @@ function jsonElements(tree) {
 
 function xmlElements(xml) {
   const elements = [];
-  const tagPattern = /<([A-Za-z][\w:.-]*)\b([^>]*)>/g;
+  const stack = [];
+  const tagPattern = /<\s*(\/?)\s*([A-Za-z][\w:.-]*)\b([^>]*)>/g;
   let tag;
   while ((tag = tagPattern.exec(xml))) {
+    const closing = tag[1] === "/";
+    const name = tag[2];
+    if (closing) {
+      const index = stack.findLastIndex(entry => entry.name === name);
+      if (index >= 0) stack.length = index;
+      continue;
+    }
     const attrs = Object.create(null);
     const attrPattern = /([\w:.-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
     let attr;
-    while ((attr = attrPattern.exec(tag[2]))) attrs[attr[1]] = decodeXml(attr[2] ?? attr[3] ?? "");
-    if (attrs.visible === "false" || attrs.enabled === "false") continue;
-    const text = [tag[1], attrs.type, attrs.name, attrs.label, attrs.value, attrs.identifier]
+    while ((attr = attrPattern.exec(tag[3]))) attrs[attr[1]] = decodeXml(attr[2] ?? attr[3] ?? "");
+    const parent = stack.at(-1) ?? null;
+    const hasGeometry = ["x", "y", "width", "height", "w", "h"].some(key => Object.hasOwn(attrs, key));
+    const frame = frameFrom(attrs);
+    const clipFrame = frame ?? parent?.clipFrame ?? null;
+    const outsideParent = Boolean(frame && parent?.clipFrame
+      && (frame.x + frame.width <= parent.clipFrame.x || frame.y + frame.height <= parent.clipFrame.y
+        || frame.x >= parent.clipFrame.x + parent.clipFrame.width
+        || frame.y >= parent.clipFrame.y + parent.clipFrame.height));
+    const blocked = Boolean(parent?.blocked || attrs.visible === "false" || attrs.enabled === "false"
+      || attrs.hidden === "true" || (hasGeometry && !frame) || outsideParent);
+    const text = [name, attrs.type, attrs.name, attrs.label, attrs.value, attrs.identifier]
       .filter(Boolean).join(" ");
-    elements.push({ text: normalizeUiText(text), frame: frameFrom(attrs), raw: attrs });
+    if (!blocked) elements.push({ text: normalizeUiText(text), frame, raw: attrs });
+    if (!/\/\s*$/.test(tag[3])) stack.push({ name, blocked, clipFrame });
   }
   return elements;
 }

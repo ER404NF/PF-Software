@@ -10,8 +10,8 @@ import { findAccessibleElement, includesAny, uiText } from "../../src/platformSk
 
 const fixtures = [
   [createInstagramSkill, "instagram", "<XCUIElementTypeApplication name=\"Instagram\" x=\"0\" y=\"0\" width=\"375\" height=\"812\"><XCUIElementTypeButton label=\"Home\" x=\"0\" y=\"760\" width=\"60\" height=\"52\"/><XCUIElementTypeCell label=\"Reel by creator\" x=\"0\" y=\"80\" width=\"375\" height=\"650\"/></XCUIElementTypeApplication>"],
-  [createRedditSkill, "reddit", "<XCUIElementTypeApplication name=\"Reddit\" x=\"0\" y=\"0\" width=\"375\" height=\"812\"><XCUIElementTypeButton label=\"Home\" x=\"0\" y=\"760\" width=\"60\" height=\"52\"/><XCUIElementTypeCell label=\"Post in subreddit\" x=\"0\" y=\"80\" width=\"375\" height=\"300\"/></XCUIElementTypeApplication>"],
-  [createXSkill, "x", "<XCUIElementTypeApplication name=\"X\" x=\"0\" y=\"0\" width=\"375\" height=\"812\"><XCUIElementTypeButton label=\"Home\" x=\"0\" y=\"760\" width=\"60\" height=\"52\"/><XCUIElementTypeCell label=\"Post views likes\" x=\"0\" y=\"80\" width=\"375\" height=\"300\"/></XCUIElementTypeApplication>"],
+  [createRedditSkill, "reddit", "<XCUIElementTypeApplication name=\"Reddit\" x=\"0\" y=\"0\" width=\"375\" height=\"812\"><XCUIElementTypeButton label=\"Home\" x=\"0\" y=\"760\" width=\"60\" height=\"52\"/><XCUIElementTypeCell label=\"Post detail in subreddit\" x=\"0\" y=\"80\" width=\"375\" height=\"300\"/></XCUIElementTypeApplication>"],
+  [createXSkill, "x", "<XCUIElementTypeApplication name=\"X\" x=\"0\" y=\"0\" width=\"375\" height=\"812\"><XCUIElementTypeButton label=\"Home\" x=\"0\" y=\"760\" width=\"60\" height=\"52\"/><XCUIElementTypeCell label=\"Post details views likes\" x=\"0\" y=\"80\" width=\"375\" height=\"300\"/></XCUIElementTypeApplication>"],
 ];
 
 for (const [builder, platform, tree] of fixtures) {
@@ -29,6 +29,26 @@ test("all profiles hand challenge screens to the passive-only state", async () =
       "security_challenge");
     assert.deepEqual(await skill.availableActions("security_challenge"),
       ["observe", "capture", "capture_screenshot", "extract_visible"]);
+  }
+});
+
+test("feed engagement text is not a detail screen and unchanged detail navigation cannot verify", async () => {
+  for (const [builder, platform, feedLabel, metricLabel, detailLabel] of [
+    [createInstagramSkill, "instagram", "Home feed", "12 likes", "Post details"],
+    [createRedditSkill, "reddit", "Reddit home", "42 upvotes", "Post detail"],
+    [createXSkill, "x", "Home timeline", "900 views 12 reposts 30 likes", "Post details"],
+  ]) {
+    const skill = builder({ appVersion: "fixture-1" });
+    const feed = { source: "ui_tree", ui_tree: { viewport: { width: 100, height: 200 }, elements: [
+      { label: feedLabel }, { label: metricLabel },
+    ] } };
+    assert.equal(await skill.detectState(feed), "feed", platform);
+
+    const unchangedDetail = { source: "ui_tree", ui_tree: { viewport: { width: 100, height: 200 }, elements: [
+      { label: detailLabel }, { label: metricLabel },
+    ] } };
+    assert.equal(await skill.verify({ action: "open_post" }, unchangedDetail,
+      { state: "feed", observationBefore: unchangedDetail }), false, platform);
   }
 });
 
@@ -138,4 +158,37 @@ test("model target text cannot redirect read-only navigation to Like", async () 
   let point;
   await skill.execute({ action: "open_profile", target: "Like" }, { state: "feed", observation: { ui_tree: tree }, device: { async tap(x, y) { point = { x, y }; } } });
   assert.ok(point.x > 0.5 && point.y > 0.5);
+});
+
+test("X opens a standalone Replies control", async () => {
+  const skill = createXSkill({ appVersion: "fixture" });
+  let tapped = null;
+  const tree = { viewport: { width: 100, height: 100 }, elements: [
+    { type: "button", label: "Replies", frame: { x: 20, y: 30, width: 20, height: 10 } },
+  ] };
+  await skill.execute({ action: "open_comments", target: "replies" }, {
+    state: "post", observation: { ui_tree: tree },
+    device: { async tap(x, y) { tapped = { x, y }; } },
+  });
+  assert.deepEqual(tapped, { x: 0.3, y: 0.35 });
+});
+
+test("X open_comments rejects reply composer and publication controls in JSON and XML", async () => {
+  const skill = createXSkill({ appVersion: "fixture" });
+  for (const tree of [
+    { viewport: { width: 100, height: 100 }, elements: [
+      { type: "button", label: "Post your reply", frame: { x: 10, y: 10, width: 20, height: 10 } },
+      { type: "button", label: "Send", frame: { x: 40, y: 10, width: 20, height: 10 } },
+    ] },
+    '<XCUIElementTypeApplication name="X" x="0" y="0" width="100" height="100">'
+      + '<XCUIElementTypeButton label="Post your reply" x="10" y="10" width="20" height="10"/>'
+      + '<XCUIElementTypeButton label="Send" x="40" y="10" width="20" height="10"/>'
+      + "</XCUIElementTypeApplication>",
+  ]) {
+    let taps = 0;
+    await assert.rejects(() => skill.execute({ action: "open_comments", target: "reply" }, {
+      state: "post", observation: { ui_tree: tree }, device: { async tap() { taps++; } },
+    }), /target was not accessible/);
+    assert.equal(taps, 0);
+  }
 });

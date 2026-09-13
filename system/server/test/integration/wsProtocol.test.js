@@ -32,6 +32,9 @@ process.env.AUDIT_LOG_PATH = path.join(tmpStorageRoot, "audit.log");
 process.env.QUEUE_STORE_PATH = path.join(tmpStorageRoot, "tasks.json");
 process.env.MODEL_SELECTION_STORE_PATH = path.join(tmpStorageRoot, "model-selections.json");
 process.env.ASSIGNMENT_STORE_PATH = path.join(tmpStorageRoot, "assignments.json");
+process.env.MEDIA_DEVICE_QUOTA_BYTES = "64";
+process.env.MEDIA_GLOBAL_QUOTA_BYTES = "128";
+process.env.MEDIA_MIN_FREE_BYTES = "0";
 
 const { server, wss, devices, deviceHealth, deviceLease, taskQueue, assignmentStore } = await import("../../src/index.js");
 const { operators, hashPassword } = await import("../../src/authStore.js");
@@ -529,17 +532,18 @@ test("people directory requires authentication", async () => {
 
 test("durable assignments enforce role, identity, resource, visibility, and immutable-history boundaries", async () => {
   const records = [
-    ["assignment-manager", "manager", ["mock-1"]],
-    ["assignment-worker", "editor", ["mock-1"]],
-    ["assignment-worker-2", "va", ["mock-1"]],
-    ["assignment-outsider", "va", ["mock-2"]],
+    ["assignment-manager", "manager", ["mock-1"], "assignment-team"],
+    ["assignment-worker", "editor", ["mock-1"], "assignment-team"],
+    ["assignment-worker-2", "va", ["mock-1"], "assignment-team"],
+    ["assignment-outsider", "va", ["mock-2"], "other-team"],
   ];
-  for (const [username, role, allowedDevices] of records) {
+  for (const [username, role, allowedDevices, teamId] of records) {
     operators.set(username, {
       username,
       role,
       allowedDevices,
       allowedResearchWorkspaces: [],
+      teamId,
       passwordHash: hashPassword(TEST_PASSWORD),
     });
   }
@@ -554,6 +558,11 @@ test("durable assignments enforce role, identity, resource, visibility, and immu
 
   try {
     assert.equal((await jsonRequest("/api/assignments", null)).status, 401);
+    const managerPeople = (await (await jsonRequest("/api/people", cookies["assignment-manager"])).json()).people;
+    assert.equal(managerPeople.find(person => person.username === "assignment-manager").canAssign, true);
+    assert.equal(managerPeople.find(person => person.username === "assignment-worker").canAssign, true);
+    assert.equal(managerPeople.find(person => person.username === "assignment-worker-2").canAssign, true);
+    assert.equal(managerPeople.find(person => person.username === "assignment-outsider").canAssign, false);
     assert.equal((await jsonRequest("/api/assignments", cookies["assignment-worker"], "POST", {
       assignee: "assignment-worker", instructions: "Unauthorized creation",
     })).status, 403);
@@ -608,6 +617,15 @@ test("durable assignments enforce role, identity, resource, visibility, and immu
     assert.equal(moved.assignee, "assignment-worker-2");
     assert.equal(moved.status, "assigned");
     assert.equal(moved.history.at(-1).action, "reassigned");
+    const vaStartedResponse = await jsonRequest(`/api/assignments/${created.id}`, cookies["assignment-worker-2"], "PATCH", {
+      status: "in_progress",
+    });
+    assert.equal(vaStartedResponse.status, 200, "the assigned VA can start their own to-do");
+    const vaCompletedResponse = await jsonRequest(`/api/assignments/${created.id}`, cookies["assignment-worker-2"], "PATCH", {
+      status: "completed",
+    });
+    assert.equal(vaCompletedResponse.status, 200, "the assigned VA can complete their own to-do");
+    assert.equal((await vaCompletedResponse.json()).assignment.status, "completed");
 
     const scheduledResponse = await jsonRequest("/api/assignments", cookies["assignment-manager"], "POST", {
       assignee: "assignment-worker", instructions: "Scheduled review", deviceId: "mock-1",
@@ -615,6 +633,15 @@ test("durable assignments enforce role, identity, resource, visibility, and immu
     });
     assert.equal(scheduledResponse.status, 201);
     const scheduled = (await scheduledResponse.json()).assignment;
+    const repeatingResponse = await jsonRequest("/api/assignments", cookies["assignment-manager"], "POST", {
+      assignee: "assignment-worker-2", instructions: "Daily review", deviceId: "mock-1",
+      startAt: "2099-01-01T10:00:00.000Z", endAt: "2099-01-01T11:00:00.000Z",
+      exclusive: false, recurrence: "daily",
+    });
+    assert.equal(repeatingResponse.status, 201);
+    const repeating = (await repeatingResponse.json()).assignment;
+    assert.equal(repeating.recurrence, "daily");
+    assert.equal(repeating.occurrence, 1);
     const overlap = await jsonRequest("/api/assignments", cookies["assignment-manager"], "POST", {
       assignee: "assignment-worker-2", instructions: "Conflicting slot", deviceId: "mock-1",
       startAt: "2099-01-01T10:30:00.000Z", endAt: "2099-01-01T11:30:00.000Z", exclusive: true,
@@ -735,7 +762,11 @@ test("monitor contract is capability/device scoped and does not claim the input 
     const response = await fetch(`${httpUrl}/api/devices/mock-1/monitor`, { headers: { Cookie: managerCookie } });
     assert.equal(response.status, 200);
     const { monitor } = await response.json();
-    assert.equal(monitor.available, false);
+    assert.equal(monitor.available, true);
+    assert.equal(monitor.adapter, "mock");
+    assert.equal(monitor.environmentLabel, "Local simulation");
+    assert.equal(monitor.physicallyValidated, false);
+    assert.equal(monitor.validationState, "not-applicable");
     assert.equal(monitor.readOnly, true);
     assert.equal(monitor.claimsInputLease, false);
     assert.equal(deviceLease.getMode("mock-1"), beforeMode);
@@ -748,6 +779,123 @@ test("monitor contract is capability/device scoped and does not claim the input 
     operators.delete(username);
   }
 
+});
+
+test("Admin and same-team Manager can watch an active VA screen without gaining input ownership", async () => {
+  const records = [
+    ["watch-va", "va", "watch-team"],
+    ["watch-manager", "manager", "watch-team"],
+    ["watch-outsider", "manager", "other-team"],
+  ];
+  for (const [username, role, teamId] of records) operators.set(username, {
+    username, role, teamId, allowedDevices: ["mock-1"], passwordHash: hashPassword(TEST_PASSWORD),
+  });
+  const owner = await openClient("watch-va");
+  const manager = await openClient("watch-manager");
+  const outsider = await openClient("watch-outsider");
+  const admin = await openClient("test-va");
+  const plainVa = await openClient("test-plain-va");
+  try {
+    owner.send({ type: "select_device", deviceId: "mock-1" });
+    await owner.waitForNext(message => message.type === "frame" && message.deviceId === "mock-1");
+
+    const managerList = await manager.waitUntil(message => message.type === "device_list"
+      && message.devices.find(device => device.id === "mock-1")?.canWatch === true);
+    assert.equal(managerList.devices.find(device => device.id === "mock-1").watchState, "va_active");
+    const outsiderList = await outsider.waitUntil(message => message.type === "device_list"
+      && message.devices.find(device => device.id === "mock-1")?.watchState === "outside_team");
+    assert.equal(outsiderList.devices.find(device => device.id === "mock-1").canWatch, false);
+
+    manager.send({ type: "watch_device", deviceId: "mock-1" });
+    await manager.waitForNext(message => message.type === "watch_started" && message.deviceId === "mock-1");
+    const managerInitial = await manager.waitForNext(message => message.type === "watch_frame" && message.deviceId === "mock-1");
+    assert.match(managerInitial.data, /<svg/);
+
+    admin.send({ type: "watch_device", deviceId: "mock-1" });
+    await admin.waitForNext(message => message.type === "watch_started" && message.deviceId === "mock-1");
+    await admin.waitForNext(message => message.type === "watch_frame" && message.deviceId === "mock-1");
+
+    outsider.send({ type: "watch_device", deviceId: "mock-1" });
+    assert.equal((await outsider.waitForNext(message => message.code === "watch_denied")).deviceId, "mock-1");
+    plainVa.send({ type: "watch_device", deviceId: "mock-1" });
+    assert.equal((await plainVa.waitForNext(message => message.code === "watch_denied")).deviceId, "mock-1");
+
+    manager.send({ type: "tap", deviceId: "mock-1", x: 0.5, y: 0.5 });
+    assert.match((await manager.waitForNext(message => message.code === "watch_read_only")).message, /read-only/);
+
+    const managerUpdate = manager.waitForNext(message => message.type === "watch_frame" && message.deviceId === "mock-1");
+    const adminUpdate = admin.waitForNext(message => message.type === "watch_frame" && message.deviceId === "mock-1");
+    owner.send({ type: "home", deviceId: "mock-1" });
+    await Promise.all([managerUpdate, adminUpdate]);
+
+    operators.get("watch-manager").teamId = "other-team";
+    const managerStopped = manager.waitForNext(message => message.type === "watch_stopped" && message.deviceId === "mock-1");
+    const adminStillWatching = admin.waitForNext(message => message.type === "watch_frame" && message.deviceId === "mock-1");
+    owner.send({ type: "home", deviceId: "mock-1" });
+    await Promise.all([managerStopped, adminStillWatching]);
+
+    const adminStopped = admin.waitForNext(message => message.type === "watch_stopped" && message.deviceId === "mock-1");
+    owner.send({ type: "release_device", deviceId: "mock-1" });
+    await adminStopped;
+    assert.equal(devices.get("mock-1").status, "idle");
+  } finally {
+    for (const [username] of records) operators.delete(username);
+    for (const client of [owner, manager, outsider, admin, plainVa]) client.close();
+  }
+});
+
+test("authorized operations users can inspect an AI-controlled phone read-only", async () => {
+  const username = "ai-watch-manager";
+  operators.set(username, {
+    username,
+    role: "manager",
+    teamId: "ai-watch-team",
+    allowedDevices: ["mock-1"],
+    passwordHash: hashPassword(TEST_PASSWORD),
+  });
+  const manager = await openClient(username);
+  const va = await openClient("test-plain-va");
+  try {
+    await Promise.all([
+      manager.waitFor(message => message.type === "device_list"),
+      va.waitFor(message => message.type === "device_list"),
+    ]);
+
+    manager.send({ type: "switch_to_ai", deviceId: "mock-1" });
+    const managerList = await manager.waitForNext(message => message.type === "device_list"
+      && message.devices.find(device => device.id === "mock-1")?.controllerMode === "AI_IDLE");
+    const managerSummary = managerList.devices.find(device => device.id === "mock-1");
+    assert.equal(managerSummary.canWatch, true);
+    assert.equal(managerSummary.watchState, "ai_read_only");
+    assert.equal(managerSummary.canOpen, false, "AI inspection must not become a human control claim");
+
+    const vaList = await va.waitUntil(message => message.type === "device_list"
+      && message.devices.find(device => device.id === "mock-1")?.controllerMode === "AI_IDLE");
+    assert.equal(vaList.devices.find(device => device.id === "mock-1").canWatch, false);
+
+    manager.send({ type: "watch_device", deviceId: "mock-1" });
+    const started = await manager.waitForNext(message => message.type === "watch_started" && message.deviceId === "mock-1");
+    assert.equal(started.watchState, "ai_read_only");
+    await manager.waitForNext(message => message.type === "watch_frame" && message.deviceId === "mock-1");
+
+    manager.send({ type: "tap", deviceId: "mock-1", x: 0.5, y: 0.5 });
+    assert.match((await manager.waitForNext(message => message.code === "watch_read_only")).message, /read-only/);
+
+    const stopped = manager.waitForNext(message => message.type === "watch_stopped" && message.deviceId === "mock-1");
+    const response = await fetch(`${httpUrl}/api/queue/command`, {
+      method: "POST",
+      headers: { Cookie: manager.cookie, "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "/mode human mock-1" }),
+    });
+    assert.equal(response.status, 200);
+    await response.json();
+    assert.match((await stopped).message, /read-only device session/);
+    assert.equal(devices.get("mock-1").status, "idle");
+  } finally {
+    operators.delete(username);
+    manager.close();
+    va.close();
+  }
 });
 
 test("manager can perform an authorized operational handoff but remains device-scoped", async () => {
@@ -937,6 +1085,39 @@ test("a durable task assignment alone never grants device access", async () => {
     assert.match(denied.message, /not assigned/);
   } finally {
     operators.delete(username);
+  }
+});
+
+test("a Manager fleet summary never exposes another team's assignment on a shared phone", async () => {
+  const manager = "summary-team-manager";
+  const outsider = "summary-other-team-va";
+  operators.set(manager, {
+    username: manager, passwordHash: hashPassword(TEST_PASSWORD), role: "manager",
+    teamId: "summary-team-a", allowedDevices: ["test-wda"],
+  });
+  operators.set(outsider, {
+    username: outsider, passwordHash: hashPassword(TEST_PASSWORD), role: "va",
+    teamId: "summary-team-b", allowedDevices: ["test-wda"],
+  });
+  const assignment = assignmentStore.create({
+    instructions: "Other team private instructions",
+    assignee: outsider,
+    createdBy: "test-va",
+    deviceId: "test-wda",
+  });
+  try {
+    const client = await openClient(manager, TEST_PASSWORD);
+    const list = await client.waitFor(message => message.type === "device_list");
+    const phone = list.devices.find(device => device.id === "test-wda");
+    assert.equal(phone.assignedToViewer, true, "the shared phone itself remains in scope");
+    assert.equal(phone.assignment, null);
+    assert.doesNotMatch(JSON.stringify(phone), new RegExp(`${outsider}|${assignment.id}|Other team private instructions`));
+    client.close();
+  } finally {
+    assignmentStore.setStatus(assignment.id, "in_progress", outsider);
+    assignmentStore.setStatus(assignment.id, "completed", outsider);
+    operators.delete(manager);
+    operators.delete(outsider);
   }
 });
 
@@ -1151,7 +1332,7 @@ test("emergency_stop cancels a real RUNNING task in the queue, instead of leavin
   taskQueue.cancelTask(next.id); // clean up — don't leave mock-1 occupied for later tests in this file
 });
 
-test("a task dispatched via the HTTP command console reaches connected WS clients with no WS action of their own", async () => {
+test("an AI-mode change via the HTTP command console reaches connected WS clients with no WS action of their own", async () => {
   // Regression guard for a real gap: broadcastDeviceList() was only ever
   // called from inside WS message handlers, so a device changing mode via
   // the command console (POST /api/queue/command) or the background queue
@@ -1166,21 +1347,21 @@ test("a task dispatched via the HTTP command console reaches connected WS client
   const res = await fetch(`${httpUrl}/api/queue/command`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Cookie: cookie },
-    body: JSON.stringify({ text: "/time 00:00-23:59 broadcast regression check" }),
+    body: JSON.stringify({ text: "/mode ai mock-1" }),
   });
-  const { task } = await res.json();
-  assert.equal(task.state, "RUNNING");
+  const result = await res.json();
+  assert.equal(result.controllerMode, "AI_IDLE");
 
   // waitFor, not waitForNext: the broadcast (fired synchronously inside the
   // HTTP handler, before its response body was even sent) has very likely
   // already arrived by the time we get here — deviceLease.reset() in
   // beforeEach rules out a stale match from an earlier test.
   const list = await client.waitFor(
-    (m) => m.type === "device_list" && m.devices.find((d) => d.id === task.deviceSelector.deviceId)?.controllerMode === "AI_RUNNING"
+    (m) => m.type === "device_list" && m.devices.find((d) => d.id === "mock-1")?.controllerMode === "AI_IDLE"
   );
   assert.ok(list, "the WS client should have received a device_list update without sending anything itself");
 
-  taskQueue.cancelTask(task.id); // clean up — don't leave the device occupied for later tests
+  deviceLease.switchToHuman("mock-1");
 });
 
 test("switch_to_ai is rejected while the device is claimed by a human", async () => {
@@ -1457,6 +1638,18 @@ test("rejected replacement upload preserves existing bytes and leaves no staging
   assert.deepEqual(fs.readdirSync(path.join(process.env.FILE_STORE_DIR, "devices", "mock-1")), ["original.txt"]);
   assert.equal(await upload("valid replacement"), 200);
   assert.equal(await (await fetch(`${endpoint}/original.txt`, { headers: { Cookie: cookie } })).text(), "valid replacement");
+});
+
+test("media quota rejects excess bytes and removes the partial staging file", async () => {
+  const cookie = await loginCookie("test-va", TEST_PASSWORD);
+  const endpoint = `${httpUrl}/api/devices/mock-2/files`;
+  const form = new FormData();
+  form.append("file", new Blob(["x".repeat(65)]), "too-large.txt");
+  const response = await fetch(endpoint, { method: "POST", headers: { Cookie: cookie }, body: form });
+  assert.equal(response.status, 413);
+  assert.deepEqual(await response.json(), { error: "device media quota exceeded", code: "MEDIA_DEVICE_QUOTA",
+    currentBytes: 65, maximumBytes: 64 });
+  assert.deepEqual(fs.readdirSync(path.join(process.env.FILE_STORE_DIR, "devices", "mock-2")), []);
 });
 
 for (const failure of [false, true]) {

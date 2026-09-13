@@ -7,11 +7,11 @@ export function createRedditSkill({ appVersion } = {}) {
     appVersion,
     appAliases: ["reddit"],
     stateRules: [
-      { state: "comments", patterns: ["comments", "add a comment", "reply"] },
+      { state: "feed", patterns: ["reddit home", "home feed", "popular feed"] },
+      { state: "comments", patterns: ["comments screen", "comments page", "add a comment", "replying to"] },
       { state: "search", patterns: ["search reddit", "search"] },
       { state: "profile", patterns: ["view profile", "karma", "profile"] },
-      { state: "post", patterns: ["post detail", "upvote", "downvote", "subreddit"] },
-      { state: "feed", patterns: ["reddit home", "popular", "home feed", "app reddit"] },
+      { state: "post", patterns: ["post detail", "post viewer"] },
     ],
     actionTargets: {
       open_feed: ["home", "popular"], search: ["search"], open_post: ["post"],

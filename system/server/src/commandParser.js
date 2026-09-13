@@ -78,12 +78,30 @@ function parseTimeArgs(rest, now) {
 // Date.now() called internally, so this stays deterministic under test).
 function parseCresearchArgs(rest, now) {
   const parts = rest.trim().split(/\s+/);
-  if (parts.length < 3) return err("usage: /cresearch <platform> [account-id] <minutes> <goal>");
+  const usage = "usage: /cresearch <platform> [account-id] <minutes> <goal> | /cresearch <platform> [--account <id>] --minutes <minutes> <goal>";
+  if (parts.length < 3) return err(usage);
   const platform = parts[0].toLowerCase();
-  const hasExplicitAccount = !Number.isFinite(Number(parts[1]));
-  const accountId = hasExplicitAccount ? parts[1] : null;
-  const minutesStr = parts[hasExplicitAccount ? 2 : 1];
-  const goalWords = parts.slice(hasExplicitAccount ? 3 : 2);
+  let accountId = null;
+  let minutesStr;
+  let goalWords;
+  if (parts[1] === "--account") {
+    if (!parts[2] || parts[3] !== "--minutes" || !parts[4]) return err(usage);
+    accountId = parts[2];
+    minutesStr = parts[4];
+    goalWords = parts.slice(5);
+  } else if (parts[1] === "--minutes") {
+    if (!parts[2]) return err(usage);
+    minutesStr = parts[2];
+    goalWords = parts.slice(3);
+  } else {
+    const hasExplicitAccount = !Number.isFinite(Number(parts[1]));
+    if (!hasExplicitAccount && Number.isFinite(Number(parts[2]))) {
+      return err(`ambiguous numeric account and duration; use --account <id> --minutes <minutes> (${usage})`);
+    }
+    accountId = hasExplicitAccount ? parts[1] : null;
+    minutesStr = parts[hasExplicitAccount ? 2 : 1];
+    goalWords = parts.slice(hasExplicitAccount ? 3 : 2);
+  }
   const minutes = Number(minutesStr);
   if (!Number.isFinite(minutes) || minutes <= 0) return err(`invalid duration in minutes: ${minutesStr}`);
   const goal = goalWords.join(" ").trim();
@@ -97,7 +115,7 @@ function parseCresearchArgs(rest, now) {
   return {
     type: "cresearch",
     goal,
-    accountSelector: { platform, ...(accountId ? { accountId } : {}) },
+    accountSelector: { platform, ...(accountId !== null ? { accountId } : {}) },
     earliestStart: start.toISOString(),
     latestEnd: end.toISOString(),
   };
@@ -106,8 +124,14 @@ function parseCresearchArgs(rest, now) {
 function parseModeArgs(rest) {
   const parts = rest.trim().split(/\s+/).filter(Boolean);
   const [mode, deviceId] = parts;
-  if (mode !== "human" && mode !== "ai") return err("usage: /mode human|ai [deviceId]");
+  if ((mode !== "human" && mode !== "ai") || parts.length > 2) return err("usage: /mode human|ai [deviceId]");
   return { type: "mode", mode, deviceId: deviceId ?? null };
+}
+
+function parseOptionalDeviceArgs(command, type, rest) {
+  const parts = rest.trim().split(/\s+/).filter(Boolean);
+  if (parts.length > 1) return err(`usage: /${command} [deviceId]`);
+  return { type, deviceId: parts[0] ?? null };
 }
 
 // `/device health [deviceId]` — read-only, so (like /audit below) it isn't
@@ -119,6 +143,7 @@ function parseDeviceArgs(rest) {
   const parts = rest.trim().split(/\s+/).filter(Boolean);
   const [sub, deviceId] = parts;
   if (sub !== "health") return err(`unknown /device subcommand: ${sub ?? "(none)"}`);
+  if (parts.length > 2) return err("usage: /device health [deviceId]");
   return { type: "device_health", deviceId: deviceId ?? null };
 }
 
@@ -169,24 +194,27 @@ function parseQueueArgs(rest) {
     case "add":
       return { type: "queue_add", commandText: args.join(" ") };
     case "list":
+      if (args.length) return err("usage: /queue list");
       return { type: "queue_list" };
     case "pause":
+      if (args.length) return err("usage: /queue pause");
       return { type: "queue_pause" };
     case "resume":
+      if (args.length) return err("usage: /queue resume");
       return { type: "queue_resume" };
     case "cancel":
-      if (!args[0]) return err("usage: /queue cancel <task_id>");
+      if (args.length !== 1) return err("usage: /queue cancel <task_id>");
       return { type: "queue_cancel", taskId: args[0] };
     case "move": {
       const [taskId, rel, targetId] = args;
-      if (!taskId || (rel !== "before" && rel !== "after") || !targetId) {
+      if (args.length !== 3 || !taskId || (rel !== "before" && rel !== "after") || !targetId) {
         return err("usage: /queue move <task_id> before|after <task_id>");
       }
       return { type: "queue_move", taskId, relation: rel, targetId };
     }
     case "priority": {
       const [taskId, priority] = args;
-      if (!taskId || !PRIORITIES.includes(priority)) {
+      if (args.length !== 2 || !taskId || !PRIORITIES.includes(priority)) {
         return err(`usage: /queue priority <task_id> ${PRIORITIES.join("|")}`);
       }
       return { type: "queue_priority", taskId, priority };
@@ -231,13 +259,13 @@ function parseCommand(text, now = new Date()) {
     case "/model":
       return parseModelArgs(rest);
     case "/pause":
-      return { type: "ai_pause", deviceId: rest.trim() || null };
+      return parseOptionalDeviceArgs("pause", "ai_pause", rest);
     case "/resume":
-      return { type: "ai_resume", deviceId: rest.trim() || null };
+      return parseOptionalDeviceArgs("resume", "ai_resume", rest);
     case "/stop":
-      return { type: "ai_stop", deviceId: rest.trim() || null };
+      return parseOptionalDeviceArgs("stop", "ai_stop", rest);
     case "/takeover":
-      return { type: "ai_takeover", deviceId: rest.trim() || null };
+      return parseOptionalDeviceArgs("takeover", "ai_takeover", rest);
     default:
       return err(`unknown command: ${cmd}`);
   }

@@ -18,6 +18,7 @@ import crypto from "crypto";
 import { fileURLToPath } from "url";
 import { validResearchId } from "./researchId.js";
 import { OPERATOR_ROLES, normalizeRole, capabilitiesForRole, hasCapability } from "./roleCapabilities.js";
+import { decryptTotpSecret, verifyRecoveryCode, verifyTotp } from "./twoFactor.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Env-overridable so a spawned relay process under test can point at a
@@ -32,6 +33,9 @@ const USERNAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/;
 const DEVICE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,99}$/;
 const PASSWORD_MIN_LENGTH = 12;
 const PASSWORD_MAX_LENGTH = 512;
+const FULL_NAME_PATTERN = /^[\p{L}\p{M}][\p{L}\p{M} .'’\-]{1,149}$/u;
+const TEAM_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,99}$/;
+const ACCOUNT_STATUSES = new Set(["pending", "approved", "rejected"]);
 const roleSet = new Set(Object.values(OPERATOR_ROLES));
 
 function accountError(message, status = 400) {
@@ -85,8 +89,7 @@ export function filterValidResearchGrants(username, raw) {
 
 function readConfig() {
   const raw = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, "utf8")) : { operators: [] };
-  if (!raw || !Array.isArray(raw.operators)) throw new Error("operators config requires an operators array");
-  return raw;
+  return validateOperatorConfig(raw);
 }
 
 function internalOperator(o) {
@@ -98,6 +101,15 @@ function internalOperator(o) {
     allowedResearchWorkspaces: filterValidResearchGrants(o.username, o.allowedResearchWorkspaces),
     active: o.active !== false,
     authVersion: Number.isSafeInteger(o.authVersion) && o.authVersion >= 0 ? o.authVersion : 0,
+    fullName: typeof o.fullName === "string" ? o.fullName : null,
+    email: typeof o.email === "string" ? o.email : null,
+    teamId: typeof o.teamId === "string" ? o.teamId : null,
+    accountStatus: ACCOUNT_STATUSES.has(o.accountStatus) ? o.accountStatus : "approved",
+    twoFactorRequired: o.twoFactorRequired === true,
+    twoFactorSecret: typeof o.twoFactorSecret === "string" ? o.twoFactorSecret : null,
+    recoveryCodeDigests: Array.isArray(o.recoveryCodeDigests) ? [...o.recoveryCodeDigests] : [],
+    recoveryTokenHash: typeof o.recoveryTokenHash === "string" ? o.recoveryTokenHash : null,
+    recoveryTokenExpiresAt: typeof o.recoveryTokenExpiresAt === "string" ? o.recoveryTokenExpiresAt : null,
   };
 }
 
@@ -107,7 +119,10 @@ function internalOperator(o) {
 export function effectiveAllowedDevices(operator) {
   if (normalizeRole(operator?.role) === OPERATOR_ROLES.VA
     && !Array.isArray(operator?.allowedDevices)) return [];
-  return operator?.allowedDevices ?? null;
+  if (operator?.allowedDevices == null) return null;
+  // Startup validation prevents this for persisted accounts, but keep the
+  // authorization primitive fail-closed for injected/runtime objects too.
+  return Array.isArray(operator.allowedDevices) ? operator.allowedDevices : [];
 }
 
 function mapConfig(raw) {
@@ -149,11 +164,39 @@ function validateUsername(username) {
   return username;
 }
 
+export function assertValidUsername(username) {
+  return validateUsername(username);
+}
+
 function validatePassword(password) {
   if (typeof password !== "string" || password.length < PASSWORD_MIN_LENGTH || password.length > PASSWORD_MAX_LENGTH) {
     throw accountError(`password must be ${PASSWORD_MIN_LENGTH}-${PASSWORD_MAX_LENGTH} characters`);
   }
   return password;
+}
+
+function validateFullName(value) {
+  if (typeof value !== "string" || !FULL_NAME_PATTERN.test(value.trim())) {
+    throw accountError("full name must be 2-150 characters and contain name characters only");
+  }
+  return value.trim().replace(/\s+/g, " ");
+}
+
+export function normalizeGmail(value) {
+  if (typeof value !== "string") throw accountError("a Gmail address is required");
+  const match = value.trim().toLowerCase().match(/^([^@]+)@gmail\.com$/);
+  if (!match) throw accountError("email must be a valid @gmail.com address");
+  const local = match[1].split("+")[0].replaceAll(".", "");
+  if (!/^[a-z0-9]{1,64}$/.test(local)) throw accountError("email must be a valid @gmail.com address");
+  return `${local}@gmail.com`;
+}
+
+function validateTeamId(value) {
+  if (value == null || value === "") return null;
+  if (typeof value !== "string" || !TEAM_ID_PATTERN.test(value)) {
+    throw accountError("teamId must be lowercase and contain only letters, numbers, underscores, or dashes");
+  }
+  return value;
 }
 
 function validateRole(role) {
@@ -180,6 +223,37 @@ function validateAllowedDevices(value) {
   return uniqueStringList(value, { field: "allowedDevices", validator: id => DEVICE_ID_PATTERN.test(id) });
 }
 
+export function validateOperatorConfig(raw) {
+  if (!raw || !Array.isArray(raw.operators)) throw new Error("operators config requires an operators array");
+  const usernames = new Set();
+  for (let index = 0; index < raw.operators.length; index += 1) {
+    const operator = raw.operators[index];
+    if (!operator || typeof operator !== "object" || Array.isArray(operator)) {
+      throw new Error(`operators.config.json: operator at index ${index} must be an object`);
+    }
+    let username;
+    try {
+      username = validateUsername(operator.username);
+    } catch {
+      throw new Error(`operators.config.json: operator at index ${index} has an invalid username`);
+    }
+    if (usernames.has(username)) throw new Error(`duplicate operator username: ${username}`);
+    usernames.add(username);
+
+    const grant = operator.allowedDevices ?? null;
+    let normalized;
+    try {
+      normalized = validateAllowedDevices(grant);
+    } catch (error) {
+      throw new Error(`operators.config.json: operator "${username}" has invalid allowedDevices: ${error.message}`);
+    }
+    if (Array.isArray(grant) && normalized.length !== grant.length) {
+      throw new Error(`operators.config.json: operator "${username}" has duplicate allowedDevices entries`);
+    }
+  }
+  return raw;
+}
+
 function validateResearchGrants(value) {
   return uniqueStringList(value, { field: "allowedResearchWorkspaces", validator: validResearchId });
 }
@@ -191,6 +265,15 @@ function publicOperatorAccount(operator) {
     active: operator.active !== false,
     allowedDevices: effectiveAllowedDevices(operator),
     allowedResearchWorkspaces: [...(operator.allowedResearchWorkspaces ?? [])],
+    ...(operator.fullName ? { fullName: operator.fullName } : {}),
+    ...(operator.email ? { email: operator.email } : {}),
+    ...(operator.teamId ? { teamId: operator.teamId } : {}),
+    ...(operator.accountStatus !== "approved" ? { accountStatus: operator.accountStatus } : {}),
+    ...(operator.twoFactorRequired ? {
+      twoFactorRequired: true,
+      twoFactorEnabled: Boolean(operator.twoFactorSecret),
+      recoveryMethods: ["authenticator", "recovery_codes", "email", "admin_assisted"],
+    } : {}),
   };
 }
 
@@ -201,7 +284,7 @@ export const operators = loadOperators();
 export function authenticate(username, password) {
   if (typeof username !== "string") return null;
   const operator = operators.get(username);
-  if (!operator || operator.active === false) return null;
+  if (!operator || operator.active === false || (operator.accountStatus ?? "approved") !== "approved") return null;
   if (!verifyPassword(password, operator.passwordHash)) return null;
   return {
     username: operator.username,
@@ -221,6 +304,9 @@ export function publicOperator(operator) {
     role: normalizeRole(operator.role),
     allowedDevices: effectiveAllowedDevices(operator),
     capabilities: capabilitiesForRole(operator.role),
+    ...(operator.fullName ? { fullName: operator.fullName } : {}),
+    ...(operator.teamId ? { teamId: operator.teamId } : {}),
+    ...(operator.twoFactorRequired ? { twoFactorRequired: true, twoFactorEnabled: Boolean(operator.twoFactorSecret) } : {}),
   };
 }
 
@@ -256,7 +342,7 @@ export function resolveOperator(sessionOperator) {
 // browser session whose authVersion can be compared.
 export function operatorByUsername(username) {
   const current = typeof username === "string" ? operators.get(username) : null;
-  return current && current.active !== false ? current : null;
+  return current && current.active !== false && (current.accountStatus ?? "approved") === "approved" ? current : null;
 }
 
 export function listOperatorAccounts() {
@@ -273,9 +359,16 @@ export function createOperatorAccount(input) {
   const allowedResearchWorkspaces = validateResearchGrants(input?.allowedResearchWorkspaces ?? []);
   const active = input?.active === undefined ? true : input.active;
   if (typeof active !== "boolean") throw accountError("active must be a boolean");
+  const fullName = input?.fullName == null ? null : validateFullName(input.fullName);
+  const email = input?.email == null ? null : normalizeGmail(input.email);
+  const teamId = validateTeamId(input?.teamId);
+  if (role === OPERATOR_ROLES.MANAGER && !teamId) throw accountError("manager accounts require a teamId");
 
   const raw = readConfig();
   if (raw.operators.some(operator => operator?.username === username)) throw accountError("username already exists", 409);
+  if (email && raw.operators.some(operator => operator?.email && normalizeGmail(operator.email) === email)) {
+    throw accountError("Gmail address already exists", 409);
+  }
   raw.operators.push({
     username,
     passwordHash: hashPassword(password),
@@ -284,6 +377,11 @@ export function createOperatorAccount(input) {
     allowedResearchWorkspaces,
     active,
     authVersion: 0,
+    ...(fullName ? { fullName } : {}),
+    ...(email ? { email } : {}),
+    ...(teamId ? { teamId } : {}),
+    accountStatus: "approved",
+    twoFactorRequired: input?.twoFactorRequired === true,
   });
   writeConfig(raw);
   replaceLiveOperators(raw);
@@ -293,7 +391,7 @@ export function createOperatorAccount(input) {
 export function updateOperatorAccount(username, patch) {
   validateUsername(username);
   if (!patch || typeof patch !== "object" || Array.isArray(patch)) throw accountError("request body must be an object");
-  const allowedKeys = new Set(["password", "role", "active", "allowedDevices", "allowedResearchWorkspaces"]);
+  const allowedKeys = new Set(["password", "role", "active", "allowedDevices", "allowedResearchWorkspaces", "fullName", "email", "teamId"]);
   const keys = Object.keys(patch);
   if (keys.length === 0) throw accountError("at least one account field is required");
   if (keys.some(key => !allowedKeys.has(key))) throw accountError("request contains an unsupported account field");
@@ -314,6 +412,18 @@ export function updateOperatorAccount(username, patch) {
     next.allowedResearchWorkspaces = validateResearchGrants(patch.allowedResearchWorkspaces);
   }
   if (Object.hasOwn(patch, "password")) next.passwordHash = hashPassword(validatePassword(patch.password));
+  if (Object.hasOwn(patch, "fullName")) next.fullName = validateFullName(patch.fullName);
+  if (Object.hasOwn(patch, "email")) {
+    const email = normalizeGmail(patch.email);
+    if (raw.operators.some((operator, operatorIndex) => operatorIndex !== index
+      && operator?.email && normalizeGmail(operator.email) === email)) throw accountError("Gmail address already exists", 409);
+    next.email = email;
+  }
+  if (Object.hasOwn(patch, "teamId")) next.teamId = validateTeamId(patch.teamId);
+
+  if (normalizeRole(next.role) === OPERATOR_ROLES.MANAGER && !next.teamId) {
+    throw accountError("manager accounts require a teamId");
+  }
 
   // Demoting an unrestricted account to VA must not carry the old null="all"
   // grant across the role boundary. Explicit arrays, including [], survive.
@@ -336,6 +446,167 @@ export function updateOperatorAccount(username, patch) {
   writeConfig(raw);
   replaceLiveOperators(raw);
   return { operator: publicOperatorAccount(operators.get(username)), invalidatesSessions };
+}
+
+export function createSignupAccount(input) {
+  if (input?.password !== input?.passwordConfirmation) throw accountError("passwords do not match");
+  const operator = createOperatorAccount({
+    username: input?.username,
+    password: input?.password,
+    fullName: input?.fullName,
+    email: input?.email,
+    role: OPERATOR_ROLES.VA,
+    allowedDevices: [],
+    allowedResearchWorkspaces: [],
+    active: false,
+    twoFactorRequired: true,
+  });
+  const raw = readConfig();
+  const index = raw.operators.findIndex(item => item?.username === operator.username);
+  raw.operators[index] = { ...raw.operators[index], accountStatus: "pending", active: false };
+  writeConfig(raw);
+  replaceLiveOperators(raw);
+  return publicOperatorAccount(operators.get(operator.username));
+}
+
+export function setOperatorAccountStatus(username, status) {
+  validateUsername(username);
+  if (!ACCOUNT_STATUSES.has(status) || status === "pending") throw accountError("status must be approved or rejected");
+  const raw = readConfig();
+  const index = raw.operators.findIndex(operator => operator?.username === username);
+  if (index < 0) throw accountError("operator not found", 404);
+  const current = internalOperator(raw.operators[index]);
+  const removesActiveAdmin = status === "rejected"
+    && current.active !== false
+    && (current.accountStatus ?? "approved") === "approved"
+    && normalizeRole(current.role) === OPERATOR_ROLES.ADMIN;
+  if (removesActiveAdmin) {
+    const hasAnother = raw.operators.some((operator, operatorIndex) => operatorIndex !== index
+      && operator?.active !== false
+      && (operator?.accountStatus ?? "approved") === "approved"
+      && normalizeRole(operator?.role) === OPERATOR_ROLES.ADMIN);
+    if (!hasAnother) throw accountError("cannot reject the last active admin", 409);
+  }
+  raw.operators[index] = {
+    ...raw.operators[index],
+    accountStatus: status,
+    active: status === "approved",
+    authVersion: current.authVersion + 1,
+  };
+  writeConfig(raw);
+  replaceLiveOperators(raw);
+  return publicOperatorAccount(operators.get(username));
+}
+
+export function renameOperatorAccount(username, nextUsername) {
+  validateUsername(username);
+  validateUsername(nextUsername);
+  if (username === nextUsername) return publicOperatorAccount(operators.get(username));
+  const raw = readConfig();
+  const index = raw.operators.findIndex(operator => operator?.username === username);
+  if (index < 0) throw accountError("operator not found", 404);
+  if (raw.operators.some(operator => operator?.username === nextUsername)) throw accountError("username already exists", 409);
+  const current = internalOperator(raw.operators[index]);
+  raw.operators[index] = { ...raw.operators[index], username: nextUsername, authVersion: current.authVersion + 1 };
+  writeConfig(raw);
+  replaceLiveOperators(raw);
+  return publicOperatorAccount(operators.get(nextUsername));
+}
+
+export function configureOperatorTwoFactor(username, encryptedSecret, recoveryCodeDigests) {
+  const raw = readConfig();
+  const index = raw.operators.findIndex(operator => operator?.username === username);
+  if (index < 0) throw accountError("operator not found", 404);
+  if (typeof encryptedSecret !== "string" || !Array.isArray(recoveryCodeDigests) || recoveryCodeDigests.length < 5) {
+    throw accountError("invalid 2FA enrollment");
+  }
+  raw.operators[index] = { ...raw.operators[index], twoFactorRequired: true, twoFactorSecret: encryptedSecret, recoveryCodeDigests };
+  writeConfig(raw);
+  replaceLiveOperators(raw);
+  return publicOperatorAccount(operators.get(username));
+}
+
+export function verifyOperatorSecondFactor(username, code, masterKey) {
+  const operator = operators.get(username);
+  if (!operator?.twoFactorSecret) return null;
+  const secret = decryptTotpSecret(operator.twoFactorSecret, masterKey);
+  if (verifyTotp(secret, code)) return { method: "authenticator" };
+  const recoveryIndex = verifyRecoveryCode(code, operator.recoveryCodeDigests);
+  if (recoveryIndex < 0) return null;
+  const raw = readConfig();
+  const index = raw.operators.findIndex(item => item?.username === username);
+  const remaining = [...(raw.operators[index].recoveryCodeDigests ?? [])];
+  remaining.splice(recoveryIndex, 1);
+  raw.operators[index] = { ...raw.operators[index], recoveryCodeDigests: remaining };
+  writeConfig(raw);
+  replaceLiveOperators(raw);
+  return { method: "recovery_code" };
+}
+
+export function createEmailRecoveryToken(identifier) {
+  const raw = readConfig();
+  let index = raw.operators.findIndex(operator => operator?.username === identifier);
+  if (index < 0) {
+    let email;
+    try { email = normalizeGmail(identifier); } catch { return null; }
+    index = raw.operators.findIndex(operator => operator?.email && normalizeGmail(operator.email) === email);
+  }
+  if (index < 0) return null;
+  const current = internalOperator(raw.operators[index]);
+  if (current.accountStatus !== "approved" || current.active === false || !current.email) return null;
+  const token = crypto.randomBytes(32).toString("base64url");
+  raw.operators[index] = {
+    ...raw.operators[index],
+    recoveryTokenHash: crypto.createHash("sha256").update(token).digest("hex"),
+    recoveryTokenExpiresAt: new Date(Date.now() + 30 * 60_000).toISOString(),
+  };
+  writeConfig(raw);
+  replaceLiveOperators(raw);
+  return { token, operator: publicOperatorAccount(operators.get(current.username)) };
+}
+
+export function completeEmailRecovery(token, password, passwordConfirmation) {
+  if (password !== passwordConfirmation) throw accountError("passwords do not match");
+  validatePassword(password);
+  const digest = crypto.createHash("sha256").update(String(token || "")).digest("hex");
+  const raw = readConfig();
+  const index = raw.operators.findIndex(operator => operator?.recoveryTokenHash === digest
+    && Date.parse(operator?.recoveryTokenExpiresAt) > Date.now());
+  if (index < 0) throw accountError("recovery token is invalid or expired", 400);
+  const current = internalOperator(raw.operators[index]);
+  raw.operators[index] = {
+    ...raw.operators[index],
+    passwordHash: hashPassword(password),
+    twoFactorSecret: null,
+    recoveryCodeDigests: [],
+    recoveryTokenHash: null,
+    recoveryTokenExpiresAt: null,
+    twoFactorRequired: true,
+    authVersion: current.authVersion + 1,
+  };
+  writeConfig(raw);
+  replaceLiveOperators(raw);
+  return publicOperatorAccount(operators.get(current.username));
+}
+
+export function resetOperatorSecondFactor(username) {
+  validateUsername(username);
+  const raw = readConfig();
+  const index = raw.operators.findIndex(operator => operator?.username === username);
+  if (index < 0) throw accountError("operator not found", 404);
+  const current = internalOperator(raw.operators[index]);
+  raw.operators[index] = {
+    ...raw.operators[index],
+    twoFactorRequired: true,
+    twoFactorSecret: null,
+    recoveryCodeDigests: [],
+    recoveryTokenHash: null,
+    recoveryTokenExpiresAt: null,
+    authVersion: current.authVersion + 1,
+  };
+  writeConfig(raw);
+  replaceLiveOperators(raw);
+  return publicOperatorAccount(operators.get(username));
 }
 
 export function invalidateOperatorSessions(username) {

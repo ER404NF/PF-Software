@@ -16,3 +16,7 @@ system/storage/**
 # credential material, not fixture data — generate it locally with
 # server/scripts/create-operator.js, never commit it.
 system/operators.config.json
+/system/tmp/
+/tmp/
+/system/test-*.txt
+/artifacts/ui-role-review/
