@@ -53,6 +53,22 @@ async function getHistory() {
   return fetch(`${BASE_URL}/debug/history`).then((r) => r.json()).then((b) => b.history);
 }
 
+test("WDA remains offline until a readiness probe succeeds and does not overwrite ownership", async () => {
+  const device = new WdaDevice("wda-1", "Test iPhone", { port: PORT });
+  assert.equal(device.status, "offline");
+  assert.equal(await device.checkReadiness(), true);
+  assert.equal(device.status, "idle");
+  assert.equal(device.readiness.ready, true);
+
+  await fetch(`${BASE_URL}/debug/ready`, { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ready: false }) });
+  assert.equal(await device.checkReadiness(), false);
+  assert.equal(device.status, "offline");
+  device.status = "in-use";
+  assert.equal(await device.checkReadiness(), false);
+  assert.equal(device.status, "in-use");
+});
+
 test("tap sends normalized coordinates scaled to the window size", async () => {
   const device = new WdaDevice("wda-1", "Test iPhone", { port: PORT });
   await device.tap(0.5, 0.25);
@@ -115,11 +131,58 @@ test("the WDA session is created once and reused across sequential calls", async
   // swipe reuses the cached window size, typeText never needs it at all.
   assert.deepEqual(history.map((h) => h.type), ["session", "window-size", "tap", "swipe", "keys"]);
 
-  // Note: this only proves ordering for calls made sequentially on one
-  // device instance. WdaDevice has no serialization of its own — concurrent
-  // calls race independent session-creation round trips. The real ordering
-  // guarantee for concurrent messages on one connection comes from
-  // index.js's per-connection action queue; see wsProtocol.test.js.
+});
+
+test("concurrent sessionless render and tap coalesce one WDA session", async () => {
+  const device = new WdaDevice("wda-1", "Test iPhone", { port: PORT });
+  await fetch(`${BASE_URL}/debug/delay`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ms: 50 }),
+  });
+
+  await Promise.all([device.render(), device.tap(0.2, 0.3)]);
+  const history = await getHistory();
+  assert.equal(history.filter(entry => entry.type === "session").length, 1);
+  assert.equal(history.filter(entry => entry.type === "screenshot").length, 1);
+  assert.equal(history.filter(entry => entry.type === "tap").length, 1);
+});
+
+test("authorization revoked during window lookup prevents the physical tap", async () => {
+  const device = new WdaDevice("wda-1", "Test iPhone", { port: PORT });
+  await device.render();
+  await fetch(`${BASE_URL}/debug/reset`, { method: "POST" });
+  await fetch(`${BASE_URL}/debug/delay`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ms: 100 }),
+  });
+
+  let authorized = true;
+  const pendingTap = device.tap(0.4, 0.4, { authorize: () => authorized });
+  while (!(await getHistory()).some(entry => entry.type === "window-size")) {
+    await new Promise(resolve => setTimeout(resolve, 5));
+  }
+  authorized = false;
+  await assert.rejects(pendingTap, error => error?.code === "DEVICE_ACCESS_REVOKED");
+  assert.equal((await getHistory()).some(entry => entry.type === "tap"), false);
+  assert.notEqual(device.sessionId, null, "authorization failure must not invalidate a healthy WDA session");
+});
+
+test("malformed WDA window dimensions are rejected before a tap", async () => {
+  const originalFetch = globalThis.fetch;
+  const device = new WdaDevice("wda-1", "Test iPhone", { port: PORT });
+  device.sessionId = "fixture-session";
+  globalThis.fetch = async url => {
+    if (String(url).endsWith("/window/size")) return { ok: true, json: async () => ({ value: { width: 0, height: "667" } }) };
+    throw new Error(`Unexpected fetch: ${url}`);
+  };
+  try {
+    await assert.rejects(() => device.tap(0.1, 0.1), /invalid dimensions/);
+    assert.equal(device.sessionId, null);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 test("pressHome invalidates a cached session on failure, same as every other action", async () => {

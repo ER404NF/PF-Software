@@ -29,7 +29,7 @@ test("navigation and privileged surfaces are hidden by default and capability-ga
   assert.match(app, /adminNavButtonEl\.hidden = !canManageOperations\(\)/);
   assert.match(app, /assignmentCreateFormEl\.hidden = !can\(UI_CAPABILITIES\.MANAGE_ASSIGNMENTS\)/);
   assert.match(app, /const mayManage = can\(UI_CAPABILITIES\.MANAGE_ASSIGNMENTS\)/);
-  assert.match(app, /mayProgressOwnVaTask = currentOperator\?\.role === "va" && assignment\.assignee === currentOperator\.username/);
+  assert.match(app, /mayProgressOwnTask = assignment\.canProgress === true/);
   assert.match(app, /nextStatuses\.filter\(value => mayManage \|\| value !== "cancelled"\)/);
   assert.match(app, /if \(!canManageOperations\(\)\) return;[\s\S]*currentView = "admin"/);
   assert.match(app, /if \(!can\(UI_CAPABILITIES\.VIEW_ASSIGNMENTS\)\) return;[\s\S]*currentView = "assignments"/);
@@ -148,4 +148,27 @@ test("fleet connectors stop at the device group and proxy switching stays capabi
   assert.match(app, /MANAGE_PROXY:\s*"proxy:manage"/);
   assert.match(app, /can\(UI_CAPABILITIES\.MANAGE_PROXY\)\s*&&\s*isProxyEgress/);
   assert.match(app, /\/api\/admin\/devices\/\$\{encodeURIComponent\(device\.id\)\}\/proxy/);
+});
+
+test("network verification is visible only through the server-issued capability", () => {
+  assert.match(app, /RUN_NETWORK_CHECK:\s*"network-health:verify"/);
+  assert.match(app, /function buildNetworkCheckButton\(device/);
+  assert.match(app, /can\(UI_CAPABILITIES\.RUN_NETWORK_CHECK\) && d\.assignedToViewer/);
+  assert.match(app, /\/api\/devices\/\$\{encodeURIComponent\(device\.id\)\}\/network-check/);
+});
+
+test("phone inputs carry request IDs and expose a dedicated screen refresh", () => {
+  assert.match(html, /id="refresh-screen-button"[^>]*>Refresh screen/);
+  assert.match(app, /function nextActionRequestId\(\)/);
+  assert.match(app, /type: "tap", deviceId: currentDeviceId, requestId: nextActionRequestId\(\)/);
+  assert.match(app, /type: "refresh_screen", deviceId: currentDeviceId, requestId: nextActionRequestId\(\)/);
+});
+
+test("AI and research mutations preserve uncertain state until reconciled", () => {
+  const research = fs.readFileSync(path.join(clientDir, "research.js"), "utf8");
+  assert.match(app, /clientRequestId === stableRequestId/);
+  assert.match(app, /const completed = await runAiWorkspaceCommand\(text\)/);
+  assert.match(app, /if \(completed && !aiChatPanelEl\.hidden\)/);
+  assert.match(research, /window\.phoneFarmRequestJson/);
+  assert.match(research, /Review result is uncertain\. Checking the saved run before retrying/);
 });

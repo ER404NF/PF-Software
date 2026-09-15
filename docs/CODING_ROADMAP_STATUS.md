@@ -1,4 +1,38 @@
-# Roadmap Status Report — updated 2026-09-12
+# Roadmap Status Report — updated 2026-09-15
+
+## 2026-09-15 — security review remediation and live-test readiness
+
+Closed the 24 findings in the 2026-09-14 code review across WDA authorization
+and session races, live-frame rate/failure isolation, upload reauthorization,
+team and audit scope, recovery-token handling, account/username transactions,
+write-first queue persistence, scheduler containment, physical-device config
+validation and readiness, DST-safe recurrence, session cleanup, and deployment
+hardening. Production startup now rejects mock fleets, weak session secrets,
+unsafe exposure, caller-controlled network-check targets, and malformed WDA
+identities. Stable public errors replace internal transport detail.
+
+Verification: **566/566 full-suite tests passed** with `npm.cmd test`; 18 changed
+JavaScript entry points passed `node --check`; focused deployment/WDA/network
+coverage passed 94/94; explicit local startup returned the expected 401 from
+`/api/me`; fail-closed startup without a strong secret exited nonzero; and
+`git diff --check` passed. Physical Mac mini/WDA control and monitor acceptance,
+live proxy routing, email delivery, model providers, research accounts, platform
+skills, and deployed HTTPS remain external gates.
+
+## 2026-09-14 — controlled WDA Live view
+
+Implemented an opt-in one-second screenshot poller for a Human-controlled WDA
+device detail view. Client and server both suppress overlapping live screenshot
+requests; browser visibility pauses/resumes polling, and leaving detail,
+release, sign-out, access loss, or three repeated failures stops it. Live frame
+requests bypass the ordered input queue, while tap/swipe/Home/type commands keep
+their existing serialized action-and-frame behavior and manual fallback.
+
+Verification: **529/529 full-suite tests passed** with `npm.cmd test`, including
+polling lifecycle, hidden-tab behavior, overlap suppression, release/sign-out
+cleanup, and a fake-WDA concurrency check proving input starts while a delayed
+live screenshot is still pending. This is screenshot polling, not video, and no
+physical Mac mini/WDA monitor acceptance is claimed.
 
 ## 2026-09-12 — restricted VA fleet
 

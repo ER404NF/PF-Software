@@ -12,6 +12,9 @@ Implemented now:
 - device list/status;
 - exclusive device selection;
 - screenshot/frame delivery;
+- optional WDA Live view polling at a conservative one-second interval while
+  the controlled device detail is visible, with overlap suppression, hidden-tab
+  pause, repeated-failure shutdown, and the manual/action frame path retained;
 - human click -> normalized coordinate -> WDA tap;
 - swipe (four directions), text/keyboard input, and the hardware Home
   button, end to end for both mock and WDA devices;
@@ -65,7 +68,8 @@ Not implemented or activated yet:
 
 - live model/account/app-version configuration and supervised real-device
   acceptance for the locally implemented Instagram, Reddit, and X research profiles;
-- continuous/high-frequency frame streaming;
+- true video/high-frequency frame streaming (the WDA Live view control is
+  bounded screenshot polling, not physical monitor validation or video);
 - automatic media ingestion into an iPhone Photos library;
 - multi-pod production orchestration;
 - the actual per-phone network hardware (SIMs, VLANs, routers, the iOS
@@ -131,14 +135,22 @@ with no device or research grants. They cannot sign in until an Admin or an
 assigned same-team Manager accepts them. An Admin must assign the team before
 the application appears to that Manager.
 
-Accepted signup accounts enroll a TOTP authenticator on first sign-in. The
-TOTP secret is encrypted at rest and ten one-time recovery codes are shown
+Accepted signup accounts and accounts created by an Admin enroll a TOTP
+authenticator on first sign-in. The CLI operator creator applies the same
+policy. The TOTP secret is encrypted at rest and ten one-time recovery codes are shown
 until the operator explicitly acknowledges saving them. Refreshing that screen
 restores the codes from a short-lived encrypted session receipt; the normal app
 session is not authenticated until acknowledgement. Only recovery-code digests
 remain in the account record afterward. Email recovery resets the password
-and requires authenticator enrollment again. Configure a stable secret before
+and requires authenticator enrollment again. Recovery requests are limited per
+normalized account and source IP, and repeated requests retain the first valid
+30-minute token rather than invalidating it. Configure a stable secret before
 accepting real users:
+
+Password and authenticator failures are rate-limited outside the browser
+session, so replacing a cookie or requesting a new challenge does not reset the
+attempt budget. Successful applications are also rate-limited and pending
+applications are capped and pruned after their configured retention period.
 
 ```powershell
 $env:TWO_FACTOR_MASTER_KEY = "use-a-long-random-secret-of-at-least-32-characters"
@@ -148,7 +160,16 @@ Approval, rejection, and recovery messages are written to the durable account
 notification outbox. Set `COMPANY_FROM_EMAIL` when the company mailbox is
 known. Until an SMTP/API delivery adapter and its credentials are configured,
 items remain `awaiting_sender_configuration`; the app does not report them as
-delivered. `ACCOUNT_NOTIFICATION_STORE_PATH` overrides the outbox path.
+delivered. Recovery message bodies are AES-256-GCM encrypted in the outbox and
+are never returned by the administrative notification API. By default the
+existing `TWO_FACTOR_MASTER_KEY` protects them; deployments may instead set a
+separate `ACCOUNT_NOTIFICATION_ENCRYPTION_KEY`. Recovery requests fail closed
+without either key. `ACCOUNT_NOTIFICATION_STORE_PATH` overrides the outbox path.
+Account approval/rejection first writes a held notification record, commits the
+account transition, and only then makes the message eligible for delivery. A
+pre-commit outbox failure leaves the account unchanged; a later delivery-state
+or audit failure cannot skip session revocation and is reported as pending
+reconciliation instead of disguising a committed account change as a failed one.
 
 Re-running the script for an existing username updates that operator's
 password, device list, and role. `operators.config.json` is gitignored — it's
@@ -159,10 +180,23 @@ the role's non-secret capability names)
 from `/api/me`; password hashes never leave the server.
 
 Sessions are cookie-based (`express-session`, file-backed — see "Persistence,
-audit & health" below) and last 24h, surviving a relay restart. Set
-`SESSION_SECRET` in the environment before running this anywhere beyond local
-dev — without it, the server logs a warning and falls back to an insecure
-default.
+audit & health" below) and last 24h, surviving a relay restart. A direct server
+start now fails unless `SESSION_SECRET` contains at least 32 characters. The
+only exception is explicit local fixture mode (`PHONE_FARM_LOCAL_DEV=true`),
+which permits the insecure fallback and the tracked mock-device configuration.
+Imports used by tests remain network-side-effect-free.
+
+The relay binds `127.0.0.1` by default. Set `HOST` to an IP address only when
+the deployment deliberately needs another interface. Any non-loopback bind
+requires secure cookies through either `PUBLIC_BASE_URL=https://...` or
+`SESSION_COOKIE_SECURE=true`; the relay then trusts one reverse-proxy hop so an
+HTTPS proxy can set the cookie correctly. Do not expose the plain Node HTTP
+listener directly to a phone or the Internet. A local mock start is therefore:
+
+```powershell
+$env:PHONE_FARM_LOCAL_DEV="true"
+npm.cmd start
+```
 
 ## Persistence, audit & health
 
@@ -174,6 +208,10 @@ default.
   consistent with that rather than introducing a database dependency (and a
   Node-version requirement — `node:sqlite` is comparatively new) for what
   doesn't need one yet.
+  Missing files are treated as signed-out sessions, while read/permission and
+  JSON-corruption failures are surfaced to the server instead of being masked
+  as ordinary logout. Expired session files and 24-hour revocation tombstones
+  are swept periodically; the in-memory revocation cache is bounded.
 - **Audit log** (`server/src/auditLog.js`) — append-only, one JSON object per
   line, at `storage/audit/events.log` (gitignored). Records logins/logouts,
   device select/release (including denied/conflicting attempts), every tap/
@@ -218,11 +256,19 @@ The server reads device definitions at startup rather than hardcoding the fleet.
 
 ### `mock`
 
-An in-memory fake screen from `server/src/mockDevice.js`. Use it for client/server work without hardware.
+An in-memory fake screen from `server/src/mockDevice.js`. Use it for
+client/server work without hardware. Direct startup rejects any mock entry
+unless `PHONE_FARM_LOCAL_DEV=true`; production and live-test runs must use an
+ignored local WDA configuration through `DEVICE_CONFIG_PATH`.
 
 ### `wda`
 
 A real authorized iOS test device controlled through WebDriverAgent via `server/src/wdaDevice.js`. `port` is the local forwarded WDA endpoint for that phone.
+Startup accepts only explicit `mock` and `wda` adapters. Each WDA entry must
+have a non-empty label, a valid UDID, a loopback host, a port from 1 to 65535,
+and an optional timeout from 500 to 60000 milliseconds. Logical IDs, WDA
+UDIDs, and forwarded ports must all be unique; invalid or duplicate physical
+identities stop startup before any fleet or lease state is published.
 
 On macOS the relay runs `idevice_id -l` and `ideviceinfo` at startup. When a
 configured WDA entry includes the matching `udid`, the fleet label is replaced
@@ -231,6 +277,12 @@ matching WDA entry are shown as detected but unavailable, so USB discovery is
 never mistaken for a configured control tunnel. Install `libimobiledevice` on
 the main Mac and restart the relay after connecting or renaming phones. Set
 `AUTO_DISCOVER_IOS_DEVICES=false` to disable discovery.
+
+Configured WDA phones also start offline and cannot be claimed until their
+loopback `/status` endpoint returns `ready: true`. The relay rechecks unowned
+WDA adapters every ten seconds and never lets a readiness probe overwrite an
+active `in-use` ownership state. This is tunnel/adapter readiness only; it does
+not validate physical monitoring or turn screenshot polling into video.
 
 Both adapters expose the same tap/swipe/typeText/render contract. As new capabilities are added, extend the adapter interface consistently rather than special-casing the browser for WDA.
 
@@ -242,8 +294,10 @@ See "Network isolation (Phase 0)" below.
 
 1. Build/install WebDriverAgent on the authorized test iPhone using Xcode.
 2. Make that phone's WDA endpoint reachable on a dedicated local port on the Mac host (for example through the existing USB forwarding approach).
-3. Add the WDA device, its UDID, and local port to `devices.config.json`. The
-   displayed name then follows the device automatically.
+3. Put the WDA device, its UDID, and local port in an ignored local config and
+   set `DEVICE_CONFIG_PATH` to its absolute path. Do not replace the tracked
+   mock fixture if developers still need it for local testing. The displayed
+   name then follows the device automatically.
 4. Restart the relay and validate one device before adding more.
 
 The exact real-hardware behavior remains unverified until bench-tested on the target Mac/phone setup.
@@ -509,6 +563,18 @@ mid-crash per its retry policy, exactly like the persistence work above
 already proved for sessions and audit history. Task admission is write-first,
 and a failed dispatch write restores both the queued task and its prior device
 lease so a disk error cannot create hidden work or a workerless `RUNNING` task.
+Cancel, pause, resume, reorder, priority, global queue state, and checkpoint
+mutations also persist a candidate snapshot before publishing live state. A
+failed write therefore leaves both memory and the device lease unchanged.
+The wall-clock scheduler catches task or assignment maintenance failures,
+records a bounded audit event, continues the other maintenance path, and
+reports `scheduler.state: "degraded"` through `GET /api/queue` until a later
+complete tick succeeds.
+
+Username changes migrate durable assignment references and every queued task's
+creator before changing the login identity. If the operator-file commit fails,
+the reference stores are rolled back; queued, scheduled, paused, retrying, and
+terminal work therefore does not retain an orphaned username.
 
 A restricted admin cannot accidentally bypass device RBAC by creating a
 generic task: task specs carry the creator's allowed-device set, and scheduler
@@ -612,10 +678,13 @@ assignment once hardware exists to have one:
   — loading never fails or invents a default for a device without one.
 
 [networkVerifier.js](server/src/networkVerifier.js) determines a device's
-*actual* observed egress IP (via `POST /api/devices/:deviceId/network-check`
-`{ checkUrl }` — the URL is supplied by the caller rather than read from
-config, since no real per-device check endpoint exists until Phase 1-3
-hardware does) and flags a mismatch specifically when two devices on
+*actual* observed egress IP through the server-configured `network.checkUrl`
+when `POST /api/devices/:deviceId/network-check` is called. Caller-supplied
+URLs are disabled in normal runs. Tests may opt in with both `NODE_ENV=test`
+and `ALLOW_NETWORK_CHECK_URL_OVERRIDE=true`, but even then only explicit
+credential-free loopback HTTP URLs with a port are accepted and redirects are
+not followed. This prevents the privileged route from becoming an SSRF path.
+The verifier flags a mismatch specifically when two devices on
 *different* assigned egress channels (different `simIccid`/`vlanId`) report
 the *same* IP — the concrete, checkable form of "isolation silently failed"
 (e.g. a modem dropped and the phone fell back to a shared network). Two
@@ -664,6 +733,11 @@ the existing authentication system:
   can Start or Complete it; reassignment, cancellation, and scheduling remain
   management-only. Completing a recurring task records that occurrence and
   advances its durable schedule.
+  Recurring assignments persist an IANA timezone supplied by the browser and
+  advance calendar days/weeks in that zone instead of adding fixed 24-hour
+  durations. Wall-clock time therefore remains stable across DST changes;
+  skipped and duplicated local times resolve deterministically. Legacy
+  recurring records without a timezone are treated as UTC.
 - **Read-only live watch**: an Admin, or a Manager assigned to the active VA's
   team, can open an in-use VA phone as a read-only screen. The server requires
   `device:monitor`, the viewer's device grant, Human mode, active VA ownership,
@@ -675,6 +749,14 @@ the existing authentication system:
   passive capture passed hardware acceptance. Set
   `monitorPhysicallyValidated: true` only on a `type: "wda"` device after that
   exact phone passes the live test; startup rejects the flag on mock devices.
+- **Controlled-device Live view**: a Human controller can enable one-second
+  screenshot polling from a real WDA device's detail toolbar. At most one live
+  screenshot request is in flight; hidden tabs pause, and leaving detail,
+  releasing, signing out, losing access, or three repeated screenshot failures
+  stops the poller. Live refreshes run outside the ordered input queue so they
+  do not disable or queue taps, swipes, Home, or typing. Action responses still
+  use the existing manual frame path as the fallback. This is screenshot
+  polling only and does not set or imply `monitorPhysicallyValidated`.
 
 The fleet view itself is a responsive grid of device cards grouped by
 `hostLabel`. Each card shows live status (`idle`/`in-use`/rendered `warning`/
@@ -714,7 +796,7 @@ are discarded instead of repopulating cleared privileged UI.
 admin-only APIs, admin access, direct VA AI-control rejection, normal VA device
 control, restricted-admin scheduler dispatch, research ownership/review, model
 adapters, observation fallback, policy enforcement and the bounded worker.
-Full suite: **490/490 passing** on 2026-09-12. A final visual pass in Chrome/Safari on the deployment
+Full suite: **566/566 passing** on 2026-09-15. A final visual pass in Chrome/Safari on the deployment
 Mac is still recommended because the repo does not run a full browser E2E
 harness.
 

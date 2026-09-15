@@ -250,6 +250,34 @@ export function validateOperatorConfig(raw) {
     if (Array.isArray(grant) && normalized.length !== grant.length) {
       throw new Error(`operators.config.json: operator "${username}" has duplicate allowedDevices entries`);
     }
+    if (Object.hasOwn(operator, "role") && !roleSet.has(operator.role)) {
+      throw new Error(`operators.config.json: operator "${username}" has an invalid role`);
+    }
+    if (Object.hasOwn(operator, "active") && typeof operator.active !== "boolean") {
+      throw new Error(`operators.config.json: operator "${username}" has invalid active state`);
+    }
+    if (Object.hasOwn(operator, "accountStatus") && !ACCOUNT_STATUSES.has(operator.accountStatus)) {
+      throw new Error(`operators.config.json: operator "${username}" has an invalid accountStatus`);
+    }
+    if (Object.hasOwn(operator, "authVersion")
+      && (!Number.isSafeInteger(operator.authVersion) || operator.authVersion < 0)) {
+      throw new Error(`operators.config.json: operator "${username}" has an invalid authVersion`);
+    }
+    if (typeof operator.passwordHash !== "string" || !/^[0-9a-f]{32}:[0-9a-f]{128}$/i.test(operator.passwordHash)) {
+      throw new Error(`operators.config.json: operator "${username}" has an invalid passwordHash`);
+    }
+    if (Object.hasOwn(operator, "twoFactorRequired") && typeof operator.twoFactorRequired !== "boolean") {
+      throw new Error(`operators.config.json: operator "${username}" has invalid twoFactorRequired state`);
+    }
+    if (Object.hasOwn(operator, "twoFactorSecret") && operator.twoFactorSecret !== null
+      && typeof operator.twoFactorSecret !== "string") {
+      throw new Error(`operators.config.json: operator "${username}" has an invalid twoFactorSecret`);
+    }
+    if (Object.hasOwn(operator, "recoveryCodeDigests")
+      && (!Array.isArray(operator.recoveryCodeDigests)
+        || operator.recoveryCodeDigests.some(value => typeof value !== "string" || !value))) {
+      throw new Error(`operators.config.json: operator "${username}" has invalid recoveryCodeDigests`);
+    }
   }
   return raw;
 }
@@ -450,23 +478,54 @@ export function updateOperatorAccount(username, patch) {
 
 export function createSignupAccount(input) {
   if (input?.password !== input?.passwordConfirmation) throw accountError("passwords do not match");
-  const operator = createOperatorAccount({
-    username: input?.username,
-    password: input?.password,
-    fullName: input?.fullName,
-    email: input?.email,
-    role: OPERATOR_ROLES.VA,
+  const username = validateUsername(input?.username);
+  const password = validatePassword(input?.password);
+  const fullName = validateFullName(input?.fullName);
+  const email = normalizeGmail(input?.email);
+  const raw = readConfig();
+  if (raw.operators.some(operator => operator?.username === username)) throw accountError("username already exists", 409);
+  if (raw.operators.some(operator => operator?.email && normalizeGmail(operator.email) === email)) {
+    throw accountError("Gmail address already exists", 409);
+  }
+  raw.operators.push({
+    username,
+    passwordHash: hashPassword(password),
     allowedDevices: [],
+    role: OPERATOR_ROLES.VA,
     allowedResearchWorkspaces: [],
     active: false,
+    authVersion: 0,
+    fullName,
+    email,
+    accountStatus: "pending",
+    signupSubmittedAt: new Date().toISOString(),
     twoFactorRequired: true,
   });
-  const raw = readConfig();
-  const index = raw.operators.findIndex(item => item?.username === operator.username);
-  raw.operators[index] = { ...raw.operators[index], accountStatus: "pending", active: false };
   writeConfig(raw);
   replaceLiveOperators(raw);
-  return publicOperatorAccount(operators.get(operator.username));
+  return publicOperatorAccount(operators.get(username));
+}
+
+export function prunePendingSignupAccounts({
+  maxAgeMs = 30 * 24 * 60 * 60_000,
+  maxPending = 500,
+  now = Date.now(),
+} = {}) {
+  if (!Number.isSafeInteger(maxAgeMs) || maxAgeMs <= 0) throw accountError("pending signup max age must be positive");
+  if (!Number.isSafeInteger(maxPending) || maxPending <= 0) throw accountError("pending signup limit must be positive");
+  const raw = readConfig();
+  const before = raw.operators.length;
+  raw.operators = raw.operators.filter(operator => {
+    if (operator?.accountStatus !== "pending") return true;
+    const submittedAt = Date.parse(operator.signupSubmittedAt);
+    return !Number.isFinite(submittedAt) || now - submittedAt < maxAgeMs;
+  });
+  const pendingCount = raw.operators.filter(operator => operator?.accountStatus === "pending").length;
+  if (raw.operators.length !== before) {
+    writeConfig(raw);
+    replaceLiveOperators(raw);
+  }
+  return { pendingCount, atCapacity: pendingCount >= maxPending, pruned: before - raw.operators.length };
 }
 
 export function setOperatorAccountStatus(username, status) {
@@ -554,6 +613,9 @@ export function createEmailRecoveryToken(identifier) {
   if (index < 0) return null;
   const current = internalOperator(raw.operators[index]);
   if (current.accountStatus !== "approved" || current.active === false || !current.email) return null;
+  if (current.recoveryTokenHash && Date.parse(current.recoveryTokenExpiresAt) > Date.now()) {
+    return { token: null, reused: true, operator: publicOperatorAccount(operators.get(current.username)) };
+  }
   const token = crypto.randomBytes(32).toString("base64url");
   raw.operators[index] = {
     ...raw.operators[index],
@@ -562,7 +624,7 @@ export function createEmailRecoveryToken(identifier) {
   };
   writeConfig(raw);
   replaceLiveOperators(raw);
-  return { token, operator: publicOperatorAccount(operators.get(current.username)) };
+  return { token, reused: false, operator: publicOperatorAccount(operators.get(current.username)) };
 }
 
 export function completeEmailRecovery(token, password, passwordConfirmation) {

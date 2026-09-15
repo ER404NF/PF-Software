@@ -83,11 +83,12 @@ test("failed server logout clears local state and leaves a persistent retry warn
   let profile = "authenticated";
   let loginShown = 0;
   let pending = false;
+  let liveViewStops = 0;
   const context = vm.createContext({
     signedOut: false, fileRequestGeneration: 0, currentDeviceId: "a", pendingDeviceId: "a",
     watchedDeviceId: "a", pendingWatchDeviceId: "a", pendingAiWorkspaceExitDeviceId: "a",
     lastDevices: [{ id: "a" }], watchRefreshTimerId: 1,
-    clearTimeout() {}, clearAiWorkspace() {}, setBusy() {},
+    clearTimeout() {}, clearAiWorkspace() {}, setBusy() {}, stopLiveView() { liveViewStops++; },
     screenEl: { replaceChildren() {} }, fileListEl: { replaceChildren() {} },
     deviceControlBarEl: {}, uploadFormEl: {}, releaseButtonEl: {},
     setOperatorProfile(value) { profile = value; }, showLogin() { loginShown++; },
@@ -103,9 +104,36 @@ test("failed server logout clears local state and leaves a persistent retry warn
   assert.equal(loginShown, 1);
   assert.equal(context.signedOut, true);
   assert.equal(context.currentDeviceId, null);
+  assert.equal(liveViewStops, 1, "sign-out must stop screenshot polling immediately");
   assert.equal(pending, true);
   assert.equal(context.logoutRetryButtonEl.hidden, false);
   assert.match(context.loginErrorEl.textContent, /server could not confirm session revocation/);
+});
+
+test("releasing a device stops live polling before clearing the control view", () => {
+  let releaseHandler;
+  let liveViewStops = 0;
+  const sent = [];
+  const context = vm.createContext({
+    currentDeviceId: "wda-1", mediaDeviceId: "wda-1", pendingDeviceId: null,
+    pendingAiWorkspaceExitDeviceId: null, fileRequestGeneration: 0,
+    stopLiveView() { liveViewStops++; },
+    screenEl: { innerHTML: "frame" }, hintEl: {}, uploadFormEl: {}, deviceControlBarEl: {},
+    swipeControlsEl: {}, homeButtonEl: {}, refreshScreenButtonEl: {}, typeFormEl: {}, releaseButtonEl: {
+      hidden: false,
+      addEventListener(name, handler) { if (name === "click") releaseHandler = handler; },
+    },
+    watchControlsEl: {}, filesPanelEl: {}, fileListEl: { innerHTML: "file" }, filesHintEl: {},
+    clearAiWorkspace() {}, setBusy() {}, showFleetView() {}, selectErrorEl: {}, detailMessageEl: {},
+    safeSend(message) { sent.push(message); return true; },
+  });
+  vm.runInContext(section("function deselect(message)", "function renderFrame(frame)"), context);
+  releaseHandler();
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].type, "release_device");
+  assert.equal(sent[0].deviceId, "wda-1");
+  assert.equal(liveViewStops, 1);
+  assert.equal(context.currentDeviceId, null);
 });
 test("task status ignores historical and queued entries", async () => {
   const context = vm.createContext({ requestJson: async () => ({ body: { tasks: [
@@ -175,7 +203,7 @@ test("tap mapping uses the uncropped image rectangle in either orientation", () 
   for (const [width, height] of [[300, 300 * 844 / 390], [300, 300 * 390 / 844]]) {
     let handler, sent;
     const context = vm.createContext({ currentDeviceId: "a", pendingDeviceId: null, busy: false,
-      detailMessageEl: {},
+      detailMessageEl: {}, nextActionRequestId: () => 1, liveViewController: { supersedePendingFrame() {} },
       screenEl: { querySelector: () => ({ getBoundingClientRect: () => ({ left: 10, top: 20, width, height }) }),
         addEventListener: (_, fn) => { handler = fn; } }, setBusy() {}, safeSend: value => { sent = value; } });
     vm.runInContext(section('screenEl.addEventListener("click"', 'swipeControlsEl.addEventListener'), context);
@@ -189,7 +217,8 @@ test("pending device switches disable old-screen input and scope later taps", ()
   const sent = [];
   const context = vm.createContext({ currentDeviceId: "a", pendingDeviceId: null, busy: false,
     UI_CAPABILITIES: { CONTROL_DEVICE: "device:control" }, can: () => true,
-    selectErrorEl: {}, detailMessageEl: {}, hintEl: {}, showDetailView() {}, setBusy(value) { context.busy = value; }, safeSend: msg => (sent.push(msg), true),
+    selectErrorEl: {}, detailMessageEl: {}, hintEl: {}, nextActionRequestId: () => 1, showDetailView() {}, stopLiveView() {}, setBusy(value) { context.busy = value; }, safeSend: msg => (sent.push(msg), true),
+    liveViewController: { supersedePendingFrame() {} },
     screenEl: { addEventListener: (_, fn) => { click = fn; }, querySelector: () => ({ getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }) }) } });
   vm.runInContext(section("function selectDevice(id)", "// The server confirmed this selection"), context);
   vm.runInContext(section('screenEl.addEventListener("click"', 'swipeControlsEl.addEventListener'), context);
@@ -250,7 +279,7 @@ test("an unwatchable fleet summary cannot request a live screen", () => {
   const context = vm.createContext({
     pendingWatchDeviceId: null, watchedDeviceId: null,
     UI_CAPABILITIES: { MONITOR_DEVICE: "device:monitor" }, can: () => true,
-    selectErrorEl: {}, detailMessageEl: {}, hintEl: {}, filesPanelEl: {}, showDetailView() {}, clearAiWorkspace() {},
+    selectErrorEl: {}, detailMessageEl: {}, hintEl: {}, filesPanelEl: {}, showDetailView() {}, clearAiWorkspace() {}, stopLiveView() {},
     safeSend: message => (sent.push(message), true),
   });
   vm.runInContext(section("function requestDeviceOpen(device)", "// Stops whatever AI control"), context);

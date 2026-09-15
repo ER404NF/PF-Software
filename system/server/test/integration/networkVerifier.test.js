@@ -165,6 +165,19 @@ test("an unreachable check endpoint is reported as unverified, not a false misma
   assert.match(result.networkMismatchReason, /network check failed/);
 });
 
+test("network verification does not follow redirects", async () => {
+  const errors = [];
+  const deviceNetwork = loadDeviceNetworkMap({ devices: [
+    { id: "d1", network: { egress: "cellular-sim", simIccid: "111", controlIface: "usb" } },
+  ] });
+  const verifier = createNetworkVerifier({ deviceNetwork, timeoutMs: 500, onError: error => errors.push(error) });
+  const result = await verifier.checkDevice("d1", `${BASE_URL}/redirect`);
+  assert.equal(result.networkVerified, false);
+  assert.equal(result.networkObservedIp, null);
+  assert.equal(result.networkMismatchReason, "network check failed");
+  assert.equal(errors.length, 1);
+});
+
 test("re-checking a device replaces its status rather than accumulating stale fields", async () => {
   const verifier = makeVerifier([{ id: "d1", network: { egress: "cellular-sim", simIccid: "111", controlIface: "usb" } }]);
   await setIp("198.51.100.40");

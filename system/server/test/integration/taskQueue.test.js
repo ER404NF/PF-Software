@@ -38,11 +38,11 @@ async function loginCookie(username, password) {
   return setCookie.split(";")[0];
 }
 
-async function command(cookie, text, deviceId = null) {
+async function command(cookie, text, deviceId = null, requestId = null) {
   const res = await fetch(`${httpUrl}/api/queue/command`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Cookie: cookie },
-    body: JSON.stringify(deviceId ? { text, deviceId } : { text }),
+    body: JSON.stringify({ text, ...(deviceId ? { deviceId } : {}), ...(requestId ? { requestId } : {}) }),
   });
   return { status: res.status, body: await res.json() };
 }
@@ -332,6 +332,16 @@ test("/device health still obeys device authorization", async () => {
   assert.match(body.error, /not authorized/);
 });
 
+test("replaying a command request ID returns the original research task", async () => {
+  const requestId = "lost-response-request-1234";
+  const first = await command(cookie, "/cresearch instagram 10 Collect posts", null, requestId);
+  const replay = await command(cookie, "/cresearch instagram 10 Collect posts", null, requestId);
+  assert.equal(first.status, 200);
+  assert.equal(replay.status, 200);
+  assert.equal(replay.body.task.id, first.body.task.id);
+  assert.equal(taskQueue.listTasks().filter(task => task.clientRequestId === requestId).length, 1);
+});
+
 test("/cresearch flags address a numeric account and ambiguous positional input queues nothing", async () => {
   researchAccounts.set("123", "queue-test");
   researchAccountDefinitions.set("123", Object.freeze({ id: "123", workspaceId: "queue-test", platform: "instagram" }));
@@ -410,7 +420,7 @@ test("task-scoped provider changes require the research workspace grant", async 
   operator.allowedResearchWorkspaces = [];
   try {
     const result = await command(restrictedCookie, `/model set queue-model task ${task.id}`);
-    assert.equal(result.status, 400);
+    assert.equal(result.status, 403);
     assert.match(result.body.error, /not authorized/);
     assert.equal(modelSelection.describe().selections.task[task.id], undefined);
   } finally { operator.allowedResearchWorkspaces = prior; taskQueue.cancelTask(task.id); }

@@ -1,6 +1,7 @@
 import fs from "fs";
 import path from "path";
 import crypto from "crypto";
+import { advanceRecurringWindow, validTimeZone } from "./zonedRecurrence.js";
 
 export const ASSIGNMENT_STATUSES = Object.freeze(["assigned", "in_progress", "completed", "cancelled", "expired"]);
 export const ASSIGNMENT_RECURRENCES = Object.freeze(["once", "daily", "weekly"]);
@@ -35,6 +36,7 @@ function validateLoadedAssignment(value) {
     || (value.recurrence !== undefined && !RECURRENCE_SET.has(value.recurrence))
     || (value.occurrence !== undefined && (!Number.isInteger(value.occurrence) || value.occurrence < 1))
     || ((value.recurrence === "daily" || value.recurrence === "weekly") && (!value.startAt || !value.endAt))
+    || (value.timezone !== undefined && value.timezone !== null && !validTimeZone(value.timezone))
     || !Array.isArray(value.history)) {
     throw new Error("assignment store contains an invalid assignment");
   }
@@ -47,7 +49,8 @@ export function createAssignmentStore({ storePath, now = () => new Date(), id = 
     const saved = JSON.parse(fs.readFileSync(storePath, "utf8"));
     if (saved?.version !== 1 || !Array.isArray(saved.assignments)) throw new Error("invalid assignment store format");
     for (const assignment of saved.assignments) validateLoadedAssignment(assignment);
-    assignments = clone(saved.assignments);
+    assignments = clone(saved.assignments).map(assignment => ({ ...assignment,
+      ...(["daily", "weekly"].includes(assignment.recurrence) && !assignment.timezone ? { timezone: "UTC" } : {}) }));
   }
 
   function timestamp() {
@@ -113,12 +116,13 @@ export function createAssignmentStore({ storePath, now = () => new Date(), id = 
   }
 
   function create({ instructions, assignee, createdBy, deviceId = null, accountId = null,
-    startAt = null, endAt = null, exclusive = true, recurrence = "once" }) {
+    startAt = null, endAt = null, exclusive = true, recurrence = "once", timezone = "UTC" }) {
     if (!validText(instructions, 2_000)) throw new Error("instructions must be 1-2000 characters");
     if (!validText(assignee, 100) || !validText(createdBy, 100)) throw new Error("assignee and creator are required");
     if (deviceId !== null && !validText(deviceId, 200)) throw new Error("deviceId must be a non-empty string or null");
     if (accountId !== null && !validText(accountId, 200)) throw new Error("accountId must be a non-empty string or null");
     if (!RECURRENCE_SET.has(recurrence)) throw new Error("recurrence must be once, daily, or weekly");
+    if (recurrence !== "once" && !validTimeZone(timezone)) throw new Error("recurring assignment requires a valid IANA timezone");
     const at = timestamp();
     const timing = schedule(startAt, endAt, exclusive);
     if (recurrence !== "once" && !timing.startAt) throw new Error("daily and weekly assignments require a schedule");
@@ -132,6 +136,7 @@ export function createAssignmentStore({ storePath, now = () => new Date(), id = 
       accountId,
       ...timing,
       recurrence,
+      timezone: recurrence === "once" ? null : timezone,
       occurrence: 1,
       status: "assigned",
       createdAt: at,
@@ -160,21 +165,14 @@ export function createAssignmentStore({ storePath, now = () => new Date(), id = 
     let updated;
     const recurrence = current.recurrence ?? "once";
     if (status === "completed" && recurrence !== "once") {
-      const intervalMs = recurrence === "daily" ? 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
-      let nextStart = Date.parse(current.startAt) + intervalMs;
-      let nextEnd = Date.parse(current.endAt) + intervalMs;
-      let advanced = 1;
-      while (nextEnd <= Date.parse(at)) {
-        nextStart += intervalMs;
-        nextEnd += intervalMs;
-        advanced += 1;
-      }
+      const advancedWindow = advanceRecurringWindow({ startAt: current.startAt, endAt: current.endAt,
+        recurrence, timeZone: current.timezone || "UTC", after: at });
       updated = {
         ...current,
         status: "assigned",
-        startAt: new Date(nextStart).toISOString(),
-        endAt: new Date(nextEnd).toISOString(),
-        occurrence: (current.occurrence ?? 1) + advanced,
+        startAt: advancedWindow.startAt,
+        endAt: advancedWindow.endAt,
+        occurrence: (current.occurrence ?? 1) + advancedWindow.advanced,
         lastCompletedAt: at,
         updatedAt: at,
         history: [...current.history, {
@@ -309,21 +307,14 @@ export function createAssignmentStore({ storePath, now = () => new Date(), id = 
         || !assignment.endAt || Date.parse(assignment.endAt) > cutoff.getTime()) return assignment;
       const recurrence = assignment.recurrence ?? "once";
       if (recurrence !== "once") {
-        const intervalMs = recurrence === "daily" ? 24 * 60 * 60 * 1000 : 7 * 24 * 60 * 60 * 1000;
-        let nextStart = Date.parse(assignment.startAt);
-        let nextEnd = Date.parse(assignment.endAt);
-        let advanced = 0;
-        while (nextEnd <= cutoff.getTime()) {
-          nextStart += intervalMs;
-          nextEnd += intervalMs;
-          advanced += 1;
-        }
+        const advancedWindow = advanceRecurringWindow({ startAt: assignment.startAt, endAt: assignment.endAt,
+          recurrence, timeZone: assignment.timezone || "UTC", after: cutoff });
         const updated = {
           ...assignment,
           status: "assigned",
-          startAt: new Date(nextStart).toISOString(),
-          endAt: new Date(nextEnd).toISOString(),
-          occurrence: (assignment.occurrence ?? 1) + advanced,
+          startAt: advancedWindow.startAt,
+          endAt: advancedWindow.endAt,
+          occurrence: (assignment.occurrence ?? 1) + advancedWindow.advanced,
           updatedAt: stamp,
           history: [...assignment.history, {
             at: stamp,
@@ -331,7 +322,7 @@ export function createAssignmentStore({ storePath, now = () => new Date(), id = 
             action: "recurrence_advanced",
             fromStatus: assignment.status,
             toStatus: "assigned",
-            skippedOccurrences: advanced,
+            skippedOccurrences: advancedWindow.advanced,
             recurrence,
           }],
         };

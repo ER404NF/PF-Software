@@ -43,14 +43,16 @@ let hanging = false;
 // responds, to create a real timing window for ordering tests without
 // relying on incidental network jitter.
 let responseDelayMs = 0;
+let ready = true;
+let failNextScreenshot = false;
 
 function record(type, extra = {}) {
   history.push({ type, at: new Date().toISOString(), ...extra });
 }
 
 async function respond(req, res, type, extra, send) {
-  if (hanging) return;
   record(type, extra);
+  if (hanging) return;
   if (responseDelayMs > 0) await new Promise((r) => setTimeout(r, responseDelayMs));
   send();
 }
@@ -60,6 +62,10 @@ app.post("/session", (req, res) => {
   const sessionId = `fake-session-${sessionCounter}`;
   console.log(`[fake-wda] session created: ${sessionId}`);
   respond(req, res, "session", {}, () => res.json({ sessionId, value: { sessionId } }));
+});
+
+app.get("/status", (req, res) => {
+  respond(req, res, "status", {}, () => res.json({ value: { ready } }));
 });
 
 app.get("/session/:id/window/size", (req, res) => {
@@ -88,7 +94,12 @@ app.post("/session/:id/wda/keys", (req, res) => {
 });
 
 app.get("/session/:id/screenshot", (req, res) => {
-  respond(req, res, "screenshot", {}, () => res.json({ value: FAKE_SCREENSHOT }));
+  respond(req, res, "screenshot", {}, () => {
+    if (failNextScreenshot) {
+      failNextScreenshot = false;
+      res.status(500).json({ value: { error: "screenshot failed" } });
+    } else res.json({ value: FAKE_SCREENSHOT });
+  });
 });
 
 app.get("/session/:id/source", (req, res) => {
@@ -119,7 +130,14 @@ app.post("/debug/reset", (req, res) => {
   sessionCounter = 0;
   hanging = false;
   responseDelayMs = 0;
+  ready = true;
+  failNextScreenshot = false;
   res.json({ ok: true });
+});
+
+app.post("/debug/ready", (req, res) => {
+  ready = req.body?.ready === true;
+  res.json({ ok: true, ready });
 });
 
 // Delays every subsequent WDA response by `ms` — lets a test create a real
@@ -140,6 +158,11 @@ app.post("/debug/hang", (req, res) => {
 
 app.post("/debug/unhang", (req, res) => {
   hanging = false;
+  res.json({ ok: true });
+});
+
+app.post("/debug/fail-next-screenshot", (req, res) => {
+  failNextScreenshot = true;
   res.json({ ok: true });
 });
 

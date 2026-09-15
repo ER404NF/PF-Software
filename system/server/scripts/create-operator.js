@@ -88,6 +88,7 @@ try {
       email,
       teamId,
       allowedResearchWorkspaces: researchWorkspaces ?? [],
+      twoFactorRequired: true,
     });
     console.log(`Created operator "${username}".`);
   }

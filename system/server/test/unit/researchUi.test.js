@@ -15,12 +15,21 @@ function harness(fetch) {
   }
   const elements = new Map();
   const events = {};
+  const browserWindow = {
+    addEventListener: (type, fn) => { events[type] = fn; },
+    phoneFarmRequestJson: async (url, options) => {
+      const response = await fetch(url, options);
+      const body = await response.json();
+      if (!response.ok) throw new Error(body?.error || `Request failed (${response.status})`);
+      return { body, response };
+    },
+  };
   const context = vm.createContext({ fetch, URL, document: {
     getElementById(id) {
       if (!elements.has(id)) elements.set(id, new Element());
       return elements.get(id);
     }, createElement: (tag) => new Element(tag),
-  }, window: { addEventListener: (type, fn) => { events[type] = fn; } } });
+  }, window: browserWindow });
   vm.runInContext(code, context);
   return { elements, events, context };
 }

@@ -72,7 +72,7 @@ test("malformed non-VA grants fail closed instead of authorizing substring devic
 });
 
 test("operator config rejects malformed or duplicate device grants before publishing accounts", () => {
-  const base = { username: "valid-user", passwordHash: "irrelevant", role: "admin" };
+  const base = { username: "valid-user", passwordHash: hashPassword("valid-test-password"), role: "admin" };
   for (const allowedDevices of ["mock-10", { id: "mock-1" }, ["mock-1", 42], ["mock-1", "mock-1"]]) {
     assert.throws(
       () => validateOperatorConfig({ operators: [{ ...base, allowedDevices }] }),
@@ -86,10 +86,17 @@ test("operator config rejects malformed or duplicate device grants before publis
 test("operator config rejects duplicate usernames before authorization and mutation can diverge", () => {
   assert.throws(() => validateOperatorConfig({
     operators: [
-      { username: "duplicate", passwordHash: "first", role: "va", allowedDevices: [] },
-      { username: "duplicate", passwordHash: "second", role: "admin", allowedDevices: null },
+      { username: "duplicate", passwordHash: hashPassword("first-test-password"), role: "va", allowedDevices: [] },
+      { username: "duplicate", passwordHash: hashPassword("another-test-password"), role: "admin", allowedDevices: null },
     ],
   }), /duplicate operator username: duplicate/);
+});
+
+test("operator config rejects malformed authorization state instead of applying permissive defaults", () => {
+  const base = { username: "strict-user", passwordHash: hashPassword("strict-test-password"), role: "va", allowedDevices: [] };
+  for (const patch of [{ active: "false" }, { accountStatus: "pendng" }, { role: "administrator" }, { authVersion: -1 }]) {
+    assert.throws(() => validateOperatorConfig({ operators: [{ ...base, ...patch }] }), /invalid/);
+  }
 });
 
 test("canAccessDevice: no operator at all is never allowed", () => {

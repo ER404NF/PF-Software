@@ -70,6 +70,7 @@ function createTaskSpec({
   dependencies = [],
   retryPolicy = {},
   createdBy,
+  clientRequestId = null,
   allowOverrun = false,
 } = {}) {
   if (typeof goal !== "string" || goal.trim().length === 0) {
@@ -93,6 +94,9 @@ function createTaskSpec({
     throw new Error("maxDurationSec must be a positive finite duration or null");
   }
   const normalizedRetryPolicy = normalizeRetryPolicy(retryPolicy);
+  if (clientRequestId !== null && (typeof clientRequestId !== "string" || !/^[A-Za-z0-9_.:-]{8,200}$/.test(clientRequestId))) {
+    throw new Error("clientRequestId must be 8-200 safe characters or null");
+  }
 
   const now = new Date().toISOString();
   return {
@@ -114,12 +118,53 @@ function createTaskSpec({
     retryNotBefore: null,
     allowOverrun,
     createdBy: createdBy ?? null,
+    clientRequestId,
     createdAt: now,
     state: earliestStart ? TASK_STATES.SCHEDULED : TASK_STATES.QUEUED,
     checkpoints: [],
     result: null,
     updatedAt: now,
   };
+}
+
+function validObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function validDateOrNull(value) {
+  return value === null || (typeof value === "string" && value.trim() && Number.isFinite(Date.parse(value)));
+}
+
+// Validate durable records before restart recovery mutates them or restores a
+// device lease. A malformed snapshot is a startup error, not trusted state.
+function validatePersistedTask(task, index = 0) {
+  const fail = field => { throw new Error(`invalid queue snapshot task[${index}].${field}`); };
+  if (!validObject(task)) fail("record");
+  if (typeof task.id !== "string" || !/^task_[A-Za-z0-9_-]{1,200}$/.test(task.id)) fail("id");
+  if (!Object.values(TASK_STATES).includes(task.state)) fail("state");
+  if (!["generic", "research"].includes(task.kind)) fail("kind");
+  if (typeof task.goal !== "string" || !task.goal.trim()) fail("goal");
+  if (!PRIORITIES.includes(task.priority)) fail("priority");
+  if (!validObject(task.deviceSelector)) fail("deviceSelector");
+  if (!validObject(task.accountSelector)) fail("accountSelector");
+  for (const field of ["criteria"]) if (!validObject(task[field])) fail(field);
+  for (const field of ["allowedActions", "requiredActions", "dependencies", "checkpoints"]) {
+    if (!Array.isArray(task[field])) fail(field);
+  }
+  if (!Number.isSafeInteger(task.retryCount) || task.retryCount < 0) fail("retryCount");
+  try { normalizeRetryPolicy(task.retryPolicy ?? {}); } catch { fail("retryPolicy"); }
+  for (const field of ["earliestStart", "latestEnd", "retryNotBefore"]) {
+    if (!validDateOrNull(task[field] ?? null)) fail(field);
+  }
+  for (const field of ["createdAt", "updatedAt"]) {
+    if (typeof task[field] !== "string" || !Number.isFinite(Date.parse(task[field]))) fail(field);
+  }
+  if (task.clientRequestId != null
+    && (typeof task.clientRequestId !== "string" || !/^[A-Za-z0-9_.:-]{8,200}$/.test(task.clientRequestId))) fail("clientRequestId");
+  if (task.result !== null && task.result !== undefined && !validObject(task.result)) fail("result");
+  if ([TASK_STATES.RUNNING, TASK_STATES.PAUSED, TASK_STATES.DISPATCHED].includes(task.state)
+    && (typeof task.deviceSelector.deviceId !== "string" || !task.deviceSelector.deviceId)) fail("deviceSelector.deviceId");
+  return task;
 }
 
 // Whether `task`'s time window (if any) is open at `now`. A task with no
@@ -137,7 +182,7 @@ function hasWindowExpired(task, now) {
   return Boolean(task.latestEnd) && now.getTime() >= new Date(task.latestEnd).getTime();
 }
 
-export { TASK_STATES, PRIORITIES, isTerminal, createTaskSpec, isWindowOpen, hasWindowExpired, normalizeRetryPolicy };
+export { TASK_STATES, PRIORITIES, isTerminal, createTaskSpec, isWindowOpen, hasWindowExpired, normalizeRetryPolicy, validatePersistedTask };
 
 // Duration is elapsed wall time per dispatch attempt, including pauses.
 // Retries start a new attempt; dispatchedAt makes the deadline durable.

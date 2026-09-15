@@ -84,8 +84,12 @@ const uploadInputEl = document.getElementById("upload-input");
 const deviceControlBarEl = document.getElementById("device-control-bar");
 const swipeControlsEl = document.getElementById("swipe-controls");
 const homeButtonEl = document.getElementById("home-button");
+const refreshScreenButtonEl = document.getElementById("refresh-screen-button");
 const typeFormEl = document.getElementById("type-form");
 const typeInputEl = document.getElementById("type-input");
+const liveViewControlsEl = document.getElementById("live-view-controls");
+const liveViewToggleEl = document.getElementById("live-view-toggle");
+const liveViewStatusEl = document.getElementById("live-view-status");
 const releaseButtonEl = document.getElementById("release-button");
 const watchControlsEl = document.getElementById("watch-controls");
 const watchRefreshButtonEl = document.getElementById("watch-refresh-button");
@@ -210,6 +214,7 @@ async function requestJson(url, options = {}, {
     clearTimeout(timeoutId);
   }
 }
+window.phoneFarmRequestJson = requestJson;
 
 function showSurfaceMessage(element, message) {
   if (element) element.textContent = message || "";
@@ -254,6 +259,7 @@ const UI_CAPABILITIES = Object.freeze({
   MANAGE_USERS: "users:manage",
   MANAGE_TEAM_MEMBERS: "team-members:manage",
   MANAGE_PROXY: "proxy:manage",
+  RUN_NETWORK_CHECK: "network-health:verify",
   MONITOR_DEVICE: "device:monitor",
   VIEW_PEOPLE: "people:view",
 });
@@ -292,6 +298,51 @@ let lastTasksByDevice = new Map();
 // connection actually controls.
 let currentView = "fleet";
 
+function liveViewEligible(deviceId) {
+  const device = lastDevices.find(candidate => candidate.id === deviceId);
+  return currentView === "detail"
+    && currentDeviceId === deviceId
+    && pendingDeviceId === null
+    && can(UI_CAPABILITIES.CONTROL_DEVICE)
+    && device?.controllerMode === "HUMAN"
+    && device?.monitor?.adapter === "wda";
+}
+
+const liveViewController = new window.LiveViewController({
+  intervalMs: 1000,
+  requestTimeoutMs: 10000,
+  maxFailures: 3,
+  isEligible: liveViewEligible,
+  isHidden: () => document.hidden,
+  isInputPending: () => busy,
+  sendRequest: message => safeSend(message, { statusEl: detailMessageEl }),
+  onStatus(label, state) {
+    liveViewStatusEl.textContent = label;
+    liveViewStatusEl.dataset.state = state;
+    liveViewStatusEl.hidden = !label;
+  },
+  onFatalError(message) {
+    liveViewToggleEl.checked = false;
+    detailMessageEl.textContent = message;
+  },
+});
+
+function stopLiveView(options) {
+  liveViewController.stop(options);
+  liveViewToggleEl.checked = false;
+}
+
+function syncLiveViewControls(device = lastDevices.find(candidate => candidate.id === currentDeviceId)) {
+  const available = currentView === "detail"
+    && currentDeviceId !== null
+    && device?.id === currentDeviceId
+    && device?.controllerMode === "HUMAN"
+    && device?.monitor?.adapter === "wda"
+    && can(UI_CAPABILITIES.CONTROL_DEVICE);
+  liveViewControlsEl.hidden = !available;
+  if (!available && liveViewController.isActiveFor(currentDeviceId)) stopLiveView();
+}
+
 function updateTopNav() {
   fleetNavButtonEl.classList.toggle("active", currentView === "fleet" || currentView === "detail");
   assignmentsNavButtonEl.classList.toggle("active", currentView === "assignments");
@@ -299,6 +350,7 @@ function updateTopNav() {
 }
 
 function showFleetView() {
+  stopLiveView();
   if (!currentDeviceId) {
     mediaDeviceId = null;
     fileRequestGeneration++;
@@ -325,10 +377,12 @@ function showDetailView(deviceId) {
   detailTitleEl.textContent = device ? device.label : "";
   detailMessageEl.textContent = "";
   renderDeviceFacts(device);
+  syncLiveViewControls(device);
 }
 
 function showAdminView() {
   if (!canManageOperations()) return;
+  stopLiveView();
   if (watchedDeviceId || pendingWatchDeviceId) stopWatching("Live watching ended.", { notifyServer: true });
   currentView = "admin";
   fleetViewEl.hidden = true;
@@ -341,6 +395,7 @@ function showAdminView() {
 
 function showAssignmentsView() {
   if (!can(UI_CAPABILITIES.VIEW_ASSIGNMENTS)) return;
+  stopLiveView();
   if (watchedDeviceId || pendingWatchDeviceId) stopWatching("Live watching ended.", { notifyServer: true });
   currentView = "assignments";
   fleetViewEl.hidden = true;
@@ -359,6 +414,12 @@ function showAssignmentsView() {
 // any frame or error clears it, since either means the action resolved.
 let busy = false;
 let busyTimeoutId = null;
+let actionRequestId = 0;
+
+function nextActionRequestId() {
+  actionRequestId = actionRequestId >= Number.MAX_SAFE_INTEGER - 1 ? 1 : actionRequestId + 1;
+  return actionRequestId;
+}
 
 // Safety net: if the server ever silently drops a message instead of
 // responding (validation failures return early with no frame/error — this
@@ -375,6 +436,7 @@ function setBusy(value, { timedOut = false } = {}) {
   screenWrapEl.classList.toggle("busy", value);
   for (const btn of swipeControlsEl.querySelectorAll("button")) btn.disabled = value;
   homeButtonEl.disabled = value;
+  refreshScreenButtonEl.disabled = value;
   typeInputEl.disabled = value;
   typeFormEl.querySelector("button").disabled = value || !typeInputEl.value.trim();
 
@@ -450,6 +512,7 @@ function showApp() {
 }
 
 function clearLocalAuthenticatedState() {
+  stopLiveView();
   signedOut = true;
   fileRequestGeneration++;
   currentDeviceId = null;
@@ -537,6 +600,7 @@ function setOperatorProfile(profile) {
   if (!can(UI_CAPABILITIES.MONITOR_DEVICE) && (watchedDeviceId || pendingWatchDeviceId)) {
     stopWatching("Live watching is no longer permitted for this role.");
   }
+  if (!can(UI_CAPABILITIES.CONTROL_DEVICE)) stopLiveView();
 }
 
 function applyLiveOperatorProfile(profile) {
@@ -1034,8 +1098,8 @@ function renderAssignments(assignments) {
     actions.className = "assignment-actions";
     const nextStatuses = assignmentNextStatuses(assignment);
     const mayManage = can(UI_CAPABILITIES.MANAGE_ASSIGNMENTS);
-    const mayProgressOwnVaTask = currentOperator?.role === "va" && assignment.assignee === currentOperator.username;
-    if (nextStatuses.length && (mayManage || mayProgressOwnVaTask)) {
+    const mayProgressOwnTask = assignment.canProgress === true;
+    if (nextStatuses.length && (mayManage || mayProgressOwnTask)) {
       for (const nextStatus of nextStatuses.filter(value => mayManage || value !== "cancelled")) {
         const button = document.createElement("button");
         button.type = "button";
@@ -1189,6 +1253,7 @@ assignmentCreateFormEl.addEventListener("submit", async (event) => {
         endAt: localInputToIso(assignmentEndEl.value),
         exclusive: assignmentExclusiveEl.checked,
         recurrence: assignmentRecurrenceEl.value,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
       }),
     });
     assignmentInstructionsEl.value = "";
@@ -1257,6 +1322,18 @@ function connect() {
         renderFrame(msg);
         setBusy(false);
       }
+    }
+
+    if (msg.type === "live_frame") {
+      if (liveViewController.acceptFrame(msg)) renderFrame(msg);
+    }
+
+    if (msg.type === "live_frame_error") {
+      liveViewController.acceptError(msg);
+    }
+
+    if (msg.type === "live_frame_delayed") {
+      liveViewController.acceptDelayed(msg);
     }
 
     if (msg.type === "watch_started" && msg.deviceId === pendingWatchDeviceId) {
@@ -1392,6 +1469,7 @@ async function renderFleetSafely(devices) {
       selectErrorEl.textContent = reason;
     }
   }
+  if (currentDeviceId) syncLiveViewControls(devices.find(device => device.id === currentDeviceId));
   const token = ++renderToken;
   const aiDevices = devices.filter((d) => d.controllerMode && d.controllerMode !== "HUMAN");
   // Queue and sensitive audit access are separate capabilities. An operations
@@ -1584,6 +1662,32 @@ function buildProxySwitch(device) {
   return wrap;
 }
 
+function buildNetworkCheckButton(device, statusEl = selectErrorEl) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "network-check-button";
+  button.textContent = "Run network check";
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    statusEl.textContent = `Checking ${device.label} network…`;
+    try {
+      const { body } = await requestJson(`/api/devices/${encodeURIComponent(device.id)}/network-check`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      }, { timeoutMs: 30_000, uncertain: true });
+      statusEl.textContent = body?.ok
+        ? `${device.label} network verified.`
+        : `${device.label} network check completed with a warning.`;
+    } catch (error) {
+      statusEl.textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
+  return button;
+}
+
 function renderDeviceFacts(device) {
   detailDeviceFactsEl.replaceChildren();
   detailAccessNoteEl.textContent = "";
@@ -1658,6 +1762,12 @@ function renderDeviceFacts(device) {
   secondaryGrid.className = "device-facts-secondary-grid";
   for (const fact of secondaryFacts) appendFact(secondaryGrid, fact);
   secondary.append(summary, secondaryGrid);
+  if (can(UI_CAPABILITIES.RUN_NETWORK_CHECK) && device.assignedToViewer) {
+    const actions = document.createElement("div");
+    actions.className = "device-fact-actions";
+    actions.append(buildNetworkCheckButton(device, detailMessageEl));
+    secondary.append(actions);
+  }
   detailDeviceFactsEl.append(primary, secondary);
 }
 
@@ -1813,6 +1923,9 @@ function renderDeviceCard(d, task, lastAction) {
 
   if (can(UI_CAPABILITIES.MANAGE_PROXY) && isProxyEgress(d.network?.egress)) {
     card.appendChild(buildProxySwitch(d));
+  }
+  if (can(UI_CAPABILITIES.RUN_NETWORK_CHECK) && d.assignedToViewer) {
+    card.appendChild(buildNetworkCheckButton(d));
   }
 
   if (d.currentOperator || d.assignment) {
@@ -1973,17 +2086,19 @@ function buildControllerModeSwitch(device, statusEl = null) {
   return row;
 }
 
-async function runAdminCommand(text, { showOutput = false, deviceId = null, statusEl = null } = {}) {
+async function runAdminCommand(text, { showOutput = false, deviceId = null, statusEl = null, requestId = null } = {}) {
   if (!canManageOperations()) return null;
   const generation = operatorProfileGeneration;
-  const payload = deviceId ? { text, deviceId } : { text };
+  const stableRequestId = requestId || (globalThis.crypto?.randomUUID?.()
+    ?? `web-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+  const payload = deviceId ? { text, deviceId, requestId: stableRequestId } : { text, requestId: stableRequestId };
   const messageEl = statusEl || (currentView === "detail" ? detailMessageEl : selectErrorEl);
   try {
     const { body } = await requestJson("/api/queue/command", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
-    });
+    }, { uncertain: true });
     if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_QUEUE)) return null;
     if (showOutput) commandOutputEl.textContent = formatCommandResult(body);
     else showSurfaceMessage(messageEl, "Command completed successfully.");
@@ -1991,6 +2106,19 @@ async function runAdminCommand(text, { showOutput = false, deviceId = null, stat
     return { ok: true, body };
   } catch (error) {
     if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_QUEUE)) return null;
+    if (["network", "timeout", "invalid-response"].includes(error.kind)) {
+      try {
+        const { body: queue } = await requestJson("/api/queue");
+        const task = queue.tasks?.find(candidate => candidate.clientRequestId === stableRequestId);
+        if (task) {
+          const body = { task, recoveredAfterUncertainResponse: true };
+          if (showOutput) commandOutputEl.textContent = `${formatCommandResult(body)}\nRecovered after the command response was lost.`;
+          else showSurfaceMessage(messageEl, "Command was saved; its response was lost, so the queue was checked before continuing.");
+          if (currentView === "admin") void refreshAdminView();
+          return { ok: true, body };
+        }
+      } catch { /* Keep the original uncertainty error when reconciliation also fails. */ }
+    }
     const body = { error: error.message };
     if (showOutput) commandOutputEl.textContent = formatCommandResult(body);
     else showSurfaceMessage(messageEl, error.message);
@@ -2171,6 +2299,7 @@ function healthSuffix(d) {
 
 function selectDevice(id) {
   if (!can(UI_CAPABILITIES.CONTROL_DEVICE)) return;
+  stopLiveView();
   pendingDeviceId = id;
   setBusy(true);
   selectErrorEl.textContent = "";
@@ -2188,6 +2317,7 @@ function openMediaWorkspace(device) {
     return false;
   }
   fileRequestGeneration++;
+  stopLiveView();
   mediaDeviceId = device.id;
   pendingDeviceId = null;
   pendingWatchDeviceId = null;
@@ -2219,6 +2349,7 @@ function requestDeviceWatch(device) {
     selectErrorEl.textContent = device?.watchReason || "This live screen cannot be watched.";
     return false;
   }
+  stopLiveView();
   pendingWatchDeviceId = device.id;
   watchedDeviceId = null;
   selectErrorEl.textContent = "";
@@ -2239,6 +2370,7 @@ function requestDeviceWatch(device) {
 // confirmSelection below handles both identically.
 function takeOverDevice(id) {
   if (!can(UI_CAPABILITIES.MANAGE_AI_CONTROLLER)) return;
+  stopLiveView();
   pendingDeviceId = id;
   setBusy(true);
   selectErrorEl.textContent = "";
@@ -2274,8 +2406,10 @@ function confirmSelection(id) {
   deviceControlBarEl.hidden = false;
   swipeControlsEl.hidden = false;
   homeButtonEl.hidden = false;
+  refreshScreenButtonEl.hidden = false;
   typeFormEl.hidden = false;
   releaseButtonEl.hidden = false;
+  syncLiveViewControls(lastDevices.find(device => device.id === id));
   watchControlsEl.hidden = true;
   filesPanelEl.hidden = false;
   clearAiWorkspace();
@@ -2286,6 +2420,7 @@ function confirmSelection(id) {
 }
 
 function confirmWatch(id, operatorName = null) {
+  stopLiveView();
   fileRequestGeneration++;
   currentDeviceId = null;
   mediaDeviceId = null;
@@ -2296,6 +2431,7 @@ function confirmWatch(id, operatorName = null) {
   deviceControlBarEl.hidden = true;
   swipeControlsEl.hidden = true;
   homeButtonEl.hidden = true;
+  refreshScreenButtonEl.hidden = true;
   typeFormEl.hidden = true;
   releaseButtonEl.hidden = true;
   watchControlsEl.hidden = false;
@@ -2349,6 +2485,7 @@ function stopWatching(message = "Live watching ended.", { notifyServer = false }
 // operator explicitly released it. Stop pretending this client still
 // controls it, and there's nothing left to show in detail view for it.
 function deselect(message) {
+  stopLiveView();
   fileRequestGeneration++;
   currentDeviceId = null;
   mediaDeviceId = null;
@@ -2360,6 +2497,7 @@ function deselect(message) {
   deviceControlBarEl.hidden = true;
   swipeControlsEl.hidden = true;
   homeButtonEl.hidden = true;
+  refreshScreenButtonEl.hidden = true;
   typeFormEl.hidden = true;
   releaseButtonEl.hidden = true;
   watchControlsEl.hidden = true;
@@ -2392,6 +2530,20 @@ function renderFrame(frame) {
   hintEl.textContent = "";
 }
 
+liveViewToggleEl.addEventListener("change", () => {
+  detailMessageEl.textContent = "";
+  if (!liveViewToggleEl.checked) {
+    stopLiveView();
+    return;
+  }
+  if (!liveViewController.start(currentDeviceId)) {
+    liveViewToggleEl.checked = false;
+    detailMessageEl.textContent = "Live view is available only while controlling a real WDA device.";
+  }
+});
+
+document.addEventListener("visibilitychange", () => liveViewController.visibilityChanged());
+
 screenEl.addEventListener("click", (e) => {
   if (!currentDeviceId || pendingDeviceId || busy) return;
   const image = screenEl.querySelector("img, svg");
@@ -2402,20 +2554,30 @@ screenEl.addEventListener("click", (e) => {
   const y = (e.clientY - rect.top) / rect.height;
   if (x < 0 || x > 1 || y < 0 || y > 1) return;
   setBusy(true);
-  if (!safeSend({ type: "tap", deviceId: currentDeviceId, x, y }, { uncertain: true, statusEl: detailMessageEl })) setBusy(false);
+  liveViewController.supersedePendingFrame();
+  if (!safeSend({ type: "tap", deviceId: currentDeviceId, requestId: nextActionRequestId(), x, y }, { uncertain: true, statusEl: detailMessageEl })) setBusy(false);
 });
 
 swipeControlsEl.addEventListener("click", (e) => {
   const direction = e.target.dataset.direction;
   if (!direction || !currentDeviceId || pendingDeviceId || busy) return;
   setBusy(true);
-  if (!safeSend({ type: "swipe", deviceId: currentDeviceId, direction }, { uncertain: true, statusEl: detailMessageEl })) setBusy(false);
+  liveViewController.supersedePendingFrame();
+  if (!safeSend({ type: "swipe", deviceId: currentDeviceId, requestId: nextActionRequestId(), direction }, { uncertain: true, statusEl: detailMessageEl })) setBusy(false);
 });
 
 homeButtonEl.addEventListener("click", () => {
   if (!currentDeviceId || pendingDeviceId || busy) return;
   setBusy(true);
-  if (!safeSend({ type: "home", deviceId: currentDeviceId }, { uncertain: true, statusEl: detailMessageEl })) setBusy(false);
+  liveViewController.supersedePendingFrame();
+  if (!safeSend({ type: "home", deviceId: currentDeviceId, requestId: nextActionRequestId() }, { uncertain: true, statusEl: detailMessageEl })) setBusy(false);
+});
+
+refreshScreenButtonEl.addEventListener("click", () => {
+  if (!currentDeviceId || pendingDeviceId || busy) return;
+  setBusy(true);
+  if (!safeSend({ type: "refresh_screen", deviceId: currentDeviceId, requestId: nextActionRequestId() },
+    { statusEl: detailMessageEl })) setBusy(false);
 });
 
 typeFormEl.addEventListener("submit", (e) => {
@@ -2427,7 +2589,8 @@ typeFormEl.addEventListener("submit", (e) => {
   }
   if (!currentDeviceId || pendingDeviceId || busy) return;
   setBusy(true);
-  if (safeSend({ type: "type_text", deviceId: currentDeviceId, text }, { uncertain: true, statusEl: detailMessageEl })) {
+  liveViewController.supersedePendingFrame();
+  if (safeSend({ type: "type_text", deviceId: currentDeviceId, requestId: nextActionRequestId(), text }, { uncertain: true, statusEl: detailMessageEl })) {
     typeInputEl.value = "";
   } else {
     setBusy(false);
@@ -3129,8 +3292,8 @@ aiChatFormEl.addEventListener("submit", async (event) => {
     appendAiChatMessage("system", "Enter a command to send.");
     return;
   }
-  await runAiWorkspaceCommand(text);
-  if (!aiChatPanelEl.hidden) {
+  const completed = await runAiWorkspaceCommand(text);
+  if (completed && !aiChatPanelEl.hidden) {
     aiChatInputEl.value = "";
     syncAiWorkspaceControls(lastDevices.find(device => device.id === watchedDeviceId), lastTasksByDevice.get(watchedDeviceId));
     aiChatInputEl.focus();

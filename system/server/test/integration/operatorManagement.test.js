@@ -1,4 +1,4 @@
-import { test } from "node:test";
+import { test, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "fs";
 import os from "os";
@@ -21,7 +21,7 @@ process.env.ACCOUNT_NOTIFICATION_STORE_PATH = path.join(root, "account-notificat
 process.env.AUTO_DISCOVER_IOS_DEVICES = "false";
 
 const auth = await import("../../src/authStore.js");
-const { totpCode } = await import("../../src/twoFactor.js");
+const { totpCode, encryptTotpSecret, generateTotpSecret } = await import("../../src/twoFactor.js");
 auth.createOperatorAccount({
   username: "admin-test",
   password: "admin-password-123",
@@ -38,7 +38,8 @@ auth.createOperatorAccount({
   allowedResearchWorkspaces: [],
 });
 
-const { server, wss } = await import("../../src/index.js");
+const { server, wss, taskQueue } = await import("../../src/index.js");
+const testTotpSecrets = new Map();
 
 async function login(baseUrl, username, password) {
   const response = await fetch(`${baseUrl}/api/login`, {
@@ -47,6 +48,16 @@ async function login(baseUrl, username, password) {
     body: JSON.stringify({ username, password }),
   });
   const body = await response.json();
+  if (response.status === 202 && body.requiresTwoFactor && testTotpSecrets.has(username)) {
+    const cookie = response.headers.get("set-cookie").split(";")[0];
+    const verified = await fetch(`${baseUrl}/api/2fa/verify`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ code: totpCode(testTotpSecrets.get(username)) }),
+    });
+    assert.equal(verified.status, 200, await verified.text());
+    return cookie;
+  }
   assert.equal(response.status, 200, JSON.stringify(body));
   return response.headers.get("set-cookie").split(";")[0];
 }
@@ -61,6 +72,24 @@ async function request(baseUrl, url, { cookie, method = "GET", body } = {}) {
     ...(body ? { body: JSON.stringify(body) } : {}),
   });
   return { status: response.status, body: await response.json() };
+}
+
+async function enrollAndLogin(baseUrl, username, password) {
+  const first = await fetch(`${baseUrl}/api/login`, {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password }),
+  });
+  assert.equal(first.status, 202);
+  assert.equal((await first.json()).requiresTwoFactorSetup, true);
+  const cookie = first.headers.get("set-cookie").split(";")[0];
+  const setup = await request(baseUrl, "/api/2fa/setup", { cookie, method: "POST" });
+  assert.equal(setup.status, 200);
+  testTotpSecrets.set(username, setup.body.secret);
+  const confirmed = await request(baseUrl, "/api/2fa/confirm", {
+    cookie, method: "POST", body: { code: totpCode(setup.body.secret) },
+  });
+  assert.equal(confirmed.status, 200);
+  assert.equal((await request(baseUrl, "/api/2fa/acknowledge-recovery", { cookie, method: "POST" })).status, 200);
+  return cookie;
 }
 
 function waitForMessage(ws, predicate, timeoutMs = 2000) {
@@ -159,6 +188,22 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
       cookie: managerCookie, method: "PATCH", body: { status: "rejected" },
     })).status, 403);
 
+    const originalNotificationRename = fs.renameSync.bind(fs);
+    const notificationFailure = mock.method(fs, "renameSync", (from, to) => {
+      if (path.resolve(to) === path.resolve(process.env.ACCOUNT_NOTIFICATION_STORE_PATH)) {
+        throw new Error("injected notification write failure");
+      }
+      return originalNotificationRename(from, to);
+    });
+    let failedReview;
+    try {
+      failedReview = await request(baseUrl, "/api/admin/users/new-assistant/status", {
+        cookie: managerCookie, method: "PATCH", body: { status: "approved" },
+      });
+    } finally { notificationFailure.mock.restore(); }
+    assert.notEqual(failedReview.status, 200);
+    assert.equal(auth.listOperatorAccounts().find(item => item.username === "new-assistant").accountStatus, "pending");
+
     const approved = await request(baseUrl, "/api/admin/users/new-assistant/status", {
       cookie: managerCookie,
       method: "PATCH",
@@ -196,6 +241,26 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
     assert.equal((await request(baseUrl, "/api/2fa/recovery-receipt", { cookie: pendingCookie })).status, 401);
     assert.equal((await request(baseUrl, "/api/me", { cookie: pendingCookie })).status, 200);
 
+    auth.createOperatorAccount({ username: "two-factor-budget", password: "two-factor-budget-password",
+      role: "va", allowedDevices: [], allowedResearchWorkspaces: [], twoFactorRequired: true });
+    auth.configureOperatorTwoFactor("two-factor-budget",
+      encryptTotpSecret(generateTotpSecret(), process.env.TWO_FACTOR_MASTER_KEY), Array(5).fill("unused-test-digest"));
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const passwordStep = await fetch(`${baseUrl}/api/login`, { method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: "two-factor-budget", password: "two-factor-budget-password" }) });
+      assert.equal(passwordStep.status, 202, `password challenge ${attempt}`);
+      const challengeCookie = passwordStep.headers.get("set-cookie").split(";")[0];
+      const rejectedCode = await request(baseUrl, "/api/2fa/verify", {
+        cookie: challengeCookie, method: "POST", body: { code: "000000" },
+      });
+      assert.equal(rejectedCode.status, attempt === 5 ? 429 : 401, JSON.stringify(rejectedCode.body));
+    }
+    const exhaustedChallenge = await fetch(`${baseUrl}/api/login`, { method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: "two-factor-budget", password: "two-factor-budget-password" }) });
+    assert.equal(exhaustedChallenge.status, 429, "a fresh password challenge cannot reset the 2FA budget");
+
     await request(baseUrl, "/api/logout", { cookie: pendingCookie, method: "POST" });
     const secondLogin = await fetch(`${baseUrl}/api/login`, {
       method: "POST",
@@ -210,10 +275,30 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
     });
     assert.equal(verified.status, 200);
 
+    const ownedTask = taskQueue.addTask({ goal: "survive username rename", createdBy: "new-assistant",
+      earliestStart: "2035-01-01T00:00:00.000Z", latestEnd: "2035-01-01T01:00:00.000Z" });
+    const originalRename = fs.renameSync.bind(fs);
+    const failedWrite = mock.method(fs, "renameSync", (from, to) => {
+      if (path.resolve(to) === path.resolve(process.env.OPERATORS_CONFIG_PATH)) {
+        throw new Error("injected operator rename write failure");
+      }
+      return originalRename(from, to);
+    });
+    let failedRename;
+    try {
+      failedRename = await request(baseUrl, "/api/admin/users/new-assistant/rename", {
+        cookie: managerCookie, method: "PATCH", body: { username: "failed-rename" },
+      });
+    } finally { failedWrite.mock.restore(); }
+    assert.notEqual(failedRename.status, 200);
+    assert.ok(auth.operatorByUsername("new-assistant"));
+    assert.equal(auth.operatorByUsername("failed-rename"), null);
+    assert.equal(taskQueue.getTask(ownedTask.id).createdBy, "new-assistant");
     const renamed = await request(baseUrl, "/api/admin/users/new-assistant/rename", {
       cookie: managerCookie, method: "PATCH", body: { username: "assistant-renamed" },
     });
     assert.equal(renamed.status, 200);
+    assert.equal(taskQueue.getTask(ownedTask.id).createdBy, "assistant-renamed");
     assert.equal((await request(baseUrl, "/api/me", { cookie: verifyCookie })).status, 401);
     assert.equal((await request(baseUrl, "/api/admin/users/manager-test/rename", {
       cookie: managerCookie, method: "PATCH", body: { username: "manager-self-renamed" },
@@ -228,8 +313,15 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
     assert.equal(notificationList.body.notifications.some(item => "body" in item), false);
     assert.equal(notificationList.body.notifications.some(item => item.kind === "account_recovery"), true);
     const notificationStore = JSON.parse(fs.readFileSync(process.env.ACCOUNT_NOTIFICATION_STORE_PATH, "utf8"));
-    const recoveryBody = notificationStore.notifications.find(item => item.kind === "account_recovery").body;
-    const recoveryToken = recoveryBody.match(/minutes: (\S+)$/)[1];
+    const persistedRecovery = notificationStore.notifications.find(item => item.kind === "account_recovery");
+    assert.equal("body" in persistedRecovery, false);
+    assert.ok(persistedRecovery.securePayload);
+    assert.doesNotMatch(fs.readFileSync(process.env.ACCOUNT_NOTIFICATION_STORE_PATH, "utf8"), /use this one-time recovery token/);
+    auth.resetOperatorSecondFactor("assistant-renamed");
+    const recoveryToken = auth.createEmailRecoveryToken("assistant-renamed").token;
+    const retainedRecovery = auth.createEmailRecoveryToken("assistant-renamed");
+    assert.equal(retainedRecovery.reused, true);
+    assert.equal(retainedRecovery.token, null);
     const recovered = await request(baseUrl, "/api/recovery/complete", {
       method: "POST",
       body: {
@@ -281,7 +373,7 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
     });
     assert.equal(vaWithoutGrant.status, 201);
     assert.deepEqual(vaWithoutGrant.body.operator.allowedDevices, []);
-    const noDeviceCookie = await login(baseUrl, "no-device-va", "no-device-va-password");
+    const noDeviceCookie = await enrollAndLogin(baseUrl, "no-device-va", "no-device-va-password");
     const noDeviceProfile = await request(baseUrl, "/api/me", { cookie: noDeviceCookie });
     assert.deepEqual(noDeviceProfile.body.allowedDevices, []);
 
@@ -335,7 +427,7 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
     });
     assert.equal(unrestrictedManager.status, 201);
     assert.equal(unrestrictedManager.body.operator.allowedDevices, null);
-    const demotionCookie = await login(baseUrl, "demotion-target", "demotion-target-password");
+    const demotionCookie = await enrollAndLogin(baseUrl, "demotion-target", "demotion-target-password");
     const demotionWs = await openSocket(address, demotionCookie);
     const demotionProfile = waitForMessage(demotionWs,
       message => message.type === "operator_profile" && message.operator?.role === "va");
@@ -370,13 +462,16 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
       active: true,
       allowedDevices: ["mock-1"],
       allowedResearchWorkspaces: [],
+      twoFactorRequired: true,
+      twoFactorEnabled: false,
+      recoveryMethods: ["authenticator", "recovery_codes", "email", "admin_assisted"],
     });
     assert.equal("passwordHash" in created.body.operator, false);
     const persisted = fs.readFileSync(process.env.OPERATORS_CONFIG_PATH, "utf8");
     assert.doesNotMatch(persisted, /new-editor-password/);
     assert.match(persisted, /"passwordHash"/);
 
-    const editorCookie = await login(baseUrl, "new-editor", "new-editor-password");
+    const editorCookie = await enrollAndLogin(baseUrl, "new-editor", "new-editor-password");
     const ws = new WebSocket(`ws://127.0.0.1:${address.port}`, { headers: { Cookie: editorCookie } });
     await new Promise((resolve, reject) => {
       ws.once("open", resolve);
@@ -476,6 +571,15 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
     assert.throws(() => auth.setOperatorAccountStatus("admin-test", "rejected"), /last active admin/);
     assert.equal((await request(baseUrl, "/api/me", { cookie: adminCookie })).status, 200,
       "last-admin rejection must leave the account and its sessions unchanged");
+
+    auth.createSignupAccount({ username: "expired-signup", password: "expired-signup-password",
+      passwordConfirmation: "expired-signup-password", fullName: "Expired Signup", email: "expired.signup@gmail.com" });
+    const signupConfig = JSON.parse(fs.readFileSync(process.env.OPERATORS_CONFIG_PATH, "utf8"));
+    signupConfig.operators.find(item => item.username === "expired-signup").signupSubmittedAt = "2020-01-01T00:00:00.000Z";
+    fs.writeFileSync(process.env.OPERATORS_CONFIG_PATH, JSON.stringify(signupConfig));
+    const pruned = auth.prunePendingSignupAccounts({ maxAgeMs: 1_000, maxPending: 500, now: Date.now() });
+    assert.ok(pruned.pruned >= 1);
+    assert.equal(auth.listOperatorAccounts().some(item => item.username === "expired-signup"), false);
 
     const listed = await request(baseUrl, "/api/admin/users", { cookie: adminCookie });
     assert.equal(listed.status, 200);

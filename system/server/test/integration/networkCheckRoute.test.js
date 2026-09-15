@@ -30,6 +30,7 @@ process.env.SESSION_STORE_DIR = path.join(tmpStorageRoot, "sessions");
 process.env.AUDIT_LOG_PATH = path.join(tmpStorageRoot, "audit.log");
 process.env.QUEUE_STORE_PATH = path.join(tmpStorageRoot, "tasks.json");
 process.env.ALLOW_NETWORK_CHECK_URL_OVERRIDE = "true";
+process.env.NODE_ENV = "test";
 
 const { server, wss, deviceLease, taskQueue } = await import("../../src/index.js");
 const { operators, hashPassword } = await import("../../src/authStore.js");

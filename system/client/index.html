@@ -148,6 +148,13 @@
       <div id="detail-body">
         <main id="screen-panel">
           <div id="device-control-bar" hidden>
+            <div id="live-view-controls" hidden>
+              <label for="live-view-toggle">
+                <input type="checkbox" id="live-view-toggle" />
+                <span>Live view</span>
+              </label>
+              <span id="live-view-status" role="status" aria-live="polite" hidden></span>
+            </div>
             <div id="swipe-controls" hidden aria-label="Swipe controls">
               <button type="button" data-direction="left" aria-label="Swipe left">&larr;</button>
               <button type="button" data-direction="up" aria-label="Swipe up">&uarr;</button>
@@ -155,6 +162,7 @@
               <button type="button" data-direction="right" aria-label="Swipe right">&rarr;</button>
             </div>
             <button type="button" id="home-button" hidden>&#9673; Home</button>
+            <button type="button" id="refresh-screen-button" hidden>Refresh screen</button>
             <form id="type-form" hidden>
               <input type="text" id="type-input" placeholder="Type on device…" maxlength="1000" />
               <button type="submit" disabled>Send</button>
@@ -298,6 +306,7 @@
           <button type="button" id="users-refresh-button">Refresh</button>
         </div>
         <form id="user-create-form" class="user-form">
+          <p class="user-form-note">New users must enroll an authenticator and save recovery codes at first sign-in.</p>
           <label>Full name<input id="user-create-full-name" maxlength="150" autocomplete="off" required /></label>
           <label>Gmail address<input id="user-create-email" type="email" placeholder="name@gmail.com" autocomplete="off" required /></label>
           <label>Username<input id="user-create-username" maxlength="100" autocomplete="off" required /></label>
@@ -357,6 +366,7 @@
       <div id="research-results"></div>
     </aside>
   </div>
+  <script src="liveViewController.js"></script>
   <script src="research.js"></script>
   <script src="app.js"></script>
 </body>

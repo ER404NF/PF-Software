@@ -34,6 +34,10 @@ app.get("/ip", async (req, res) => {
   });
 });
 
+app.get("/redirect", (req, res) => {
+  res.redirect("/ip");
+});
+
 // Not part of any real device's API — lets a test control what this fixture
 // reports, the same way fake-wda-server.js's /debug/* routes do for WDA.
 app.post("/debug/set-ip", (req, res) => {

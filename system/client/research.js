@@ -17,9 +17,11 @@ function researchReset() {
 window.addEventListener("operator-profile-changed", researchReset);
 
 async function researchFetch(url, options) {
-  const res = await fetch(url, options);
-  const body = await res.json();
-  if (!res.ok) throw new Error(body.error || `Request failed (${res.status})`);
+  if (typeof window.phoneFarmRequestJson !== "function") throw new Error("Phone Farm request service is unavailable. Refresh and try again.");
+  const { body } = await window.phoneFarmRequestJson(url, options, {
+    timeoutMs: 10_000,
+    uncertain: ["POST", "PATCH", "PUT", "DELETE"].includes(options?.method),
+  });
   return body;
 }
 
@@ -94,7 +96,23 @@ function renderResearchRun(run, account, epoch) {
           status.textContent = `Review: ${result.candidate.review_state || result.candidate.status}`;
           researchMessage.textContent = "Review saved.";
         } catch (error) {
-          if (epoch === researchEpoch) researchMessage.textContent = error.message;
+          if (epoch !== researchEpoch) return;
+          if (["network", "timeout", "invalid-response"].includes(error.kind)) {
+            researchMessage.textContent = "Review result is uncertain. Checking the saved run before retrying…";
+            try {
+              const latest = await researchFetch(`/api/research/${encodeURIComponent(account)}/runs/${encodeURIComponent(run.id)}`);
+              const saved = latest.run?.candidates?.find(item => item.id === candidate.id);
+              const savedState = saved?.review_state || saved?.status;
+              if (savedState === value) {
+                status.textContent = `Review: ${savedState}`;
+                researchMessage.textContent = "Review saved; the original response was lost.";
+              } else {
+                researchMessage.textContent = `${error.message} The saved review did not change; you can retry.`;
+              }
+            } catch {
+              researchMessage.textContent = `${error.message} Saved state could not be checked; keep this page open and retry after reconnecting.`;
+            }
+          } else researchMessage.textContent = error.message;
         } finally {
           for (const b of controls.children) b.disabled = false;
         }

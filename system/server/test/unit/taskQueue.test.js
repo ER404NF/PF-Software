@@ -68,6 +68,17 @@ function setup(deviceIds = ["dev-1", "dev-2"]) {
   return { dir, devices, deviceLease, queue };
 }
 
+function failNextQueueWrite(action) {
+  const rename = mock.method(fs, "renameSync", () => {
+    throw new Error("injected queue write failure");
+  });
+  try {
+    assert.throws(action, /injected queue write failure/);
+  } finally {
+    rename.mock.restore();
+  }
+}
+
 test("addTask with no window dispatches immediately to a free device", () => {
   const { deviceLease, queue } = setup();
   // addTask() dispatches synchronously before returning, so the returned
@@ -118,6 +129,85 @@ test("a dispatch persistence failure restores the queued task and device lease",
   queue.tick(new Date());
   assert.equal(task.state, TASK_STATES.RUNNING);
   assert.equal(deviceLease.getMode("dev-1"), "AI_RUNNING");
+});
+
+test("ordinary queue mutations publish no live state when persistence fails", () => {
+  const { dir, queue } = setup([]);
+  try {
+    const first = queue.addTask({ goal: "first" });
+    const second = queue.addTask({ goal: "second" });
+
+    failNextQueueWrite(() => queue.moveTask(second.id, "before", first.id));
+    assert.deepEqual(queue.listTasks().map(task => task.id), [first.id, second.id]);
+
+    failNextQueueWrite(() => queue.setPriority(first.id, "urgent"));
+    assert.equal(queue.getTask(first.id).priority, "normal");
+
+    failNextQueueWrite(() => queue.cancelTask(first.id));
+    assert.equal(queue.getTask(first.id).state, TASK_STATES.QUEUED);
+
+    failNextQueueWrite(() => queue.checkpoint(first.id, { step: 1 }));
+    assert.deepEqual(queue.getTask(first.id).checkpoints, []);
+
+    failNextQueueWrite(() => queue.pauseQueue());
+    assert.equal(queue.isPaused(), false);
+    queue.pauseQueue();
+    failNextQueueWrite(() => queue.resumeQueue());
+    assert.equal(queue.isPaused(), true);
+
+    const stored = JSON.parse(fs.readFileSync(path.join(dir, "tasks.json"), "utf8"));
+    assert.equal(stored.paused, true);
+    assert.deepEqual(stored.tasks.map(task => task.id), [first.id, second.id]);
+    assert.equal(stored.tasks[0].priority, "normal");
+    assert.equal(stored.tasks[0].state, TASK_STATES.QUEUED);
+    assert.deepEqual(stored.tasks[0].checkpoints, []);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("pause and resume keep task and lease aligned when persistence fails", () => {
+  const { dir, queue, deviceLease } = setup(["dev-1"]);
+  try {
+    const task = queue.addTask({ goal: "running", deviceSelector: { deviceId: "dev-1" } });
+    failNextQueueWrite(() => queue.pauseTask(task.id));
+    assert.equal(queue.getTask(task.id).state, TASK_STATES.RUNNING);
+    assert.equal(deviceLease.getMode("dev-1"), MODES.AI_RUNNING);
+
+    queue.pauseTask(task.id);
+    failNextQueueWrite(() => queue.resumeTask(task.id));
+    assert.equal(queue.getTask(task.id).state, TASK_STATES.PAUSED);
+    assert.equal(deviceLease.getMode("dev-1"), MODES.AI_PAUSED);
+    const stored = JSON.parse(fs.readFileSync(path.join(dir, "tasks.json"), "utf8"));
+    assert.equal(stored.tasks[0].state, TASK_STATES.PAUSED);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("clock-driven transitions publish no live state when persistence fails", () => {
+  const { dir, queue } = setup([]);
+  try {
+    const task = queue.addTask({ goal: "scheduled", earliestStart: "2026-09-15T10:00:00.000Z",
+      latestEnd: "2026-09-15T11:00:00.000Z" }, new Date("2026-09-15T09:00:00.000Z"));
+    assert.equal(task.state, TASK_STATES.SCHEDULED);
+    failNextQueueWrite(() => queue.tick(new Date("2026-09-15T10:00:00.000Z")));
+    assert.equal(task.state, TASK_STATES.SCHEDULED);
+    const stored = JSON.parse(fs.readFileSync(path.join(dir, "tasks.json"), "utf8"));
+    assert.equal(stored.tasks[0].state, TASK_STATES.SCHEDULED);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("renamePrincipal durably migrates task creators and is write-first", () => {
+  const { dir, queue } = setup([]);
+  try {
+    const first = queue.addTask({ goal: "first", createdBy: "old-name" });
+    const other = queue.addTask({ goal: "other", createdBy: "someone-else" });
+    failNextQueueWrite(() => queue.renamePrincipal("old-name", "new-name"));
+    assert.equal(first.createdBy, "old-name");
+    assert.deepEqual(queue.renamePrincipal("old-name", "new-name"), [first.id]);
+    assert.equal(first.createdBy, "new-name");
+    assert.equal(other.createdBy, "someone-else");
+    const restarted = createTaskQueue({ devices: makeDevices([]), deviceLease: createMockDeviceLease(),
+      auditLog: null, storePath: path.join(dir, "tasks.json") });
+    assert.equal(restarted.getTask(first.id).createdBy, "new-name");
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("a task targeting a specific device only dispatches to that device", () => {
@@ -810,4 +900,49 @@ test("rejected resume preserves paused state in memory and on disk", () => {
   assert.throws(() => queue.resumeTask(task.id), /transition/);
   assert.equal(JSON.stringify(task), before);
   assert.equal(JSON.parse(fs.readFileSync(path.join(dir, "tasks.json"))).tasks[0].state, TASK_STATES.PAUSED);
+});
+
+test("startup rejects duplicate durable task IDs before restoring leases", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-duplicate-task-"));
+  const storePath = path.join(dir, "tasks.json");
+  try {
+    const first = createTaskQueue({ devices: makeDevices([]), deviceLease: createMockDeviceLease(), storePath, dispatchOnCreate: false });
+    first.addTask({ goal: "one" });
+    const snapshot = JSON.parse(fs.readFileSync(storePath, "utf8"));
+    snapshot.tasks.push({ ...snapshot.tasks[0] });
+    fs.writeFileSync(storePath, JSON.stringify(snapshot));
+    assert.throws(() => createTaskQueue({ devices: makeDevices([]), deviceLease: createMockDeviceLease(), storePath }), /duplicate task id/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("versioned queue snapshots migrate known missing legacy fields before strict validation", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-versioned-legacy-task-"));
+  const storePath = path.join(dir, "tasks.json");
+  try {
+    const first = createTaskQueue({ devices: makeDevices([]), deviceLease: createMockDeviceLease(), storePath, dispatchOnCreate: false });
+    const task = first.addTask({ goal: "legacy task" });
+    const snapshot = JSON.parse(fs.readFileSync(storePath, "utf8"));
+    delete snapshot.tasks[0].kind;
+    delete snapshot.tasks[0].maxDurationSec;
+    fs.writeFileSync(storePath, JSON.stringify(snapshot));
+
+    const restarted = createTaskQueue({ devices: makeDevices([]), deviceLease: createMockDeviceLease(), storePath, dispatchOnCreate: false });
+    assert.equal(restarted.getTask(task.id).kind, "generic");
+    assert.equal(restarted.getTask(task.id).maxDurationSec, null);
+    const migrated = JSON.parse(fs.readFileSync(storePath, "utf8"));
+    assert.equal(migrated.tasks[0].kind, "generic");
+    assert.equal(migrated.tasks[0].maxDurationSec, null);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test("client request IDs make task admission idempotent", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-idempotent-task-"));
+  try {
+    const queue = createTaskQueue({ devices: makeDevices([]), deviceLease: createMockDeviceLease(),
+      storePath: path.join(dir, "tasks.json"), dispatchOnCreate: false });
+    const first = queue.addTask({ goal: "one", createdBy: "admin", clientRequestId: "request-12345678" });
+    const replay = queue.addTask({ goal: "one", createdBy: "admin", clientRequestId: "request-12345678" });
+    assert.equal(replay.id, first.id);
+    assert.equal(queue.listTasks().length, 1);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });

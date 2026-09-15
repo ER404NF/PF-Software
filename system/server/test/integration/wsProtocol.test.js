@@ -5,6 +5,7 @@ import { spawn } from "child_process";
 import path from "path";
 import fs from "fs";
 import os from "os";
+import { request as httpRequest } from "http";
 import { fileURLToPath } from "url";
 import { WdaDevice } from "../../src/wdaDevice.js";
 
@@ -36,7 +37,7 @@ process.env.MEDIA_DEVICE_QUOTA_BYTES = "64";
 process.env.MEDIA_GLOBAL_QUOTA_BYTES = "128";
 process.env.MEDIA_MIN_FREE_BYTES = "0";
 
-const { server, wss, devices, deviceHealth, deviceLease, taskQueue, assignmentStore } = await import("../../src/index.js");
+const { server, wss, devices, deviceHealth, deviceLease, taskQueue, assignmentStore, auditLog } = await import("../../src/index.js");
 const { operators, hashPassword } = await import("../../src/authStore.js");
 
 let relayUrl;
@@ -473,6 +474,178 @@ test("login/logout HTTP flow: wrong password, right password, then me/logout", a
   assert.equal(meAfter.status, 401);
 });
 
+test("password login is rate-limited by account outside the session cookie", async () => {
+  const username = "rate-limit-user";
+  operators.set(username, { username, passwordHash: hashPassword(TEST_PASSWORD), allowedDevices: [], role: "va" });
+  try {
+    for (let attempt = 1; attempt <= 5; attempt += 1) {
+      const response = await fetch(`${httpUrl}/api/login`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password: "wrong-password" }),
+      });
+      assert.equal(response.status, attempt === 5 ? 429 : 401);
+    }
+    const blockedCorrectPassword = await fetch(`${httpUrl}/api/login`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username, password: TEST_PASSWORD }),
+    });
+    assert.equal(blockedCorrectPassword.status, 429);
+  } finally { operators.delete(username); }
+});
+
+test("completed inputs return an action-applied receipt when only the screen refresh fails", async () => {
+  const client = await openClient();
+  await client.waitFor((m) => m.type === "device_list");
+  client.send({ type: "select_device", deviceId: "test-wda" });
+  await client.waitFor((m) => m.type === "frame" && m.deviceId === "test-wda");
+  const actions = [
+    { type: "tap", x: 0.2, y: 0.3 },
+    { type: "swipe", direction: "up" },
+    { type: "home" },
+    { type: "type_text", text: "receipt test" },
+  ];
+  for (let index = 0; index < actions.length; index += 1) {
+    await fetch(`${FAKE_WDA_URL}/debug/fail-next-screenshot`, { method: "POST" });
+    const requestId = 700 + index;
+    client.send({ ...actions[index], deviceId: "test-wda", requestId });
+    const receipt = await client.waitForNext(message => message.type === "error"
+      && message.code === "action_applied_refresh_failed" && message.requestId === requestId);
+    assert.equal(receipt.actionApplied, true);
+    assert.match(receipt.message, /reached Test WDA/);
+  }
+  const history = (await (await fetch(`${FAKE_WDA_URL}/debug/history`)).json()).history;
+  for (const type of ["tap", "swipe", "homescreen", "keys"]) assert.ok(history.some(entry => entry.type === type));
+  client.send({ type: "release_device", deviceId: "test-wda" });
+  await client.waitForNext(message => message.type === "device_list"
+    && message.devices.find(device => device.id === "test-wda")?.status === "idle");
+});
+
+test("WDA live frames reject overlap and do not queue device input behind screenshots", async () => {
+  const client = await openClient();
+  await client.waitFor((message) => message.type === "device_list");
+  client.send({ type: "select_device", deviceId: "test-wda" });
+  await client.waitFor((message) => message.type === "frame" && message.deviceId === "test-wda");
+
+  try {
+    await fetch(`${FAKE_WDA_URL}/debug/reset`, { method: "POST" });
+    await fetch(`${FAKE_WDA_URL}/debug/delay`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ms: 250 }),
+    });
+
+    client.send({ type: "refresh_live_frame", deviceId: "test-wda", requestId: 101 });
+    client.send({ type: "refresh_live_frame", deviceId: "test-wda", requestId: 102 });
+    const delayed = await client.waitForNext(message => message.type === "live_frame_delayed");
+    assert.equal(delayed.requestId, 102);
+    await client.waitForNext(message => message.type === "live_frame" && message.requestId === 101);
+    let history = await fetch(`${FAKE_WDA_URL}/debug/history`).then(response => response.json());
+    assert.equal(history.history.filter(entry => entry.type === "screenshot").length, 1,
+      "a duplicate live request must not start a second WDA screenshot");
+
+    client.send({ type: "refresh_live_frame", deviceId: "test-wda", requestId: 104 });
+    const throttled = await client.waitForNext(message => message.type === "live_frame_delayed" && message.requestId === 104);
+    assert.ok(throttled.retryAfterMs > 0 && throttled.retryAfterMs <= 1000);
+    history = await fetch(`${FAKE_WDA_URL}/debug/history`).then(response => response.json());
+    assert.equal(history.history.filter(entry => entry.type === "screenshot").length, 1,
+      "server cadence limiting must reject immediate follow-up screenshots");
+
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    await fetch(`${FAKE_WDA_URL}/debug/reset`, { method: "POST" });
+    await fetch(`${FAKE_WDA_URL}/debug/delay`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ms: 250 }),
+    });
+    client.send({ type: "refresh_live_frame", deviceId: "test-wda", requestId: 103 });
+    client.send({ type: "tap", deviceId: "test-wda", x: 0.25, y: 0.25 });
+    await new Promise(resolve => setTimeout(resolve, 80));
+    history = await fetch(`${FAKE_WDA_URL}/debug/history`).then(response => response.json());
+    assert.ok(history.history.some(entry => entry.type === "screenshot"), "live screenshot should be in flight");
+    assert.ok(history.history.some(entry => entry.type === "window-size"),
+      "tap must reach WDA while the live screenshot is still pending");
+    await Promise.all([
+      client.waitForNext(message => message.type === "live_frame" && message.requestId === 103, 3000),
+      client.waitForNext(message => message.type === "frame" && message.deviceId === "test-wda", 3000),
+    ]);
+  } finally {
+    await fetch(`${FAKE_WDA_URL}/debug/delay`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ms: 0 }),
+    });
+    client.send({ type: "release_device", deviceId: "test-wda" });
+  }
+});
+
+test("a stale live-frame failure cannot damage a released and reclaimed WDA device", async () => {
+  const client = await openClient();
+  await client.waitFor(message => message.type === "device_list");
+  client.send({ type: "select_device", deviceId: "test-wda" });
+  await client.waitFor(message => message.type === "frame" && message.deviceId === "test-wda");
+  await new Promise(resolve => setTimeout(resolve, 1000));
+
+  try {
+    await fetch(`${FAKE_WDA_URL}/debug/reset`, { method: "POST" });
+    await fetch(`${FAKE_WDA_URL}/debug/hang`, { method: "POST" });
+    client.send({ type: "refresh_live_frame", deviceId: "test-wda", requestId: 201 });
+    while (true) {
+      const { history } = await fetch(`${FAKE_WDA_URL}/debug/history`).then(response => response.json());
+      if (history.some(entry => entry.type === "screenshot")) break;
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+
+    client.send({ type: "release_device", deviceId: "test-wda" });
+    await client.waitForNext(message => message.type === "device_list"
+      && message.devices.find(device => device.id === "test-wda")?.status === "idle");
+    await fetch(`${FAKE_WDA_URL}/debug/unhang`, { method: "POST" });
+    client.send({ type: "select_device", deviceId: "test-wda" });
+    await client.waitForNext(message => message.type === "frame" && message.deviceId === "test-wda", 3000);
+    await new Promise(resolve => setTimeout(resolve, 600));
+
+    assert.equal(devices.get("test-wda").status, "in-use");
+    assert.equal(deviceHealth.get("test-wda")?.consecutiveFailures ?? 0, 0);
+    assert.equal(client.received.some(message => message.type === "live_frame_error" && message.requestId === 201), false);
+  } finally {
+    await fetch(`${FAKE_WDA_URL}/debug/unhang`, { method: "POST" });
+    client.send({ type: "release_device", deviceId: "test-wda" });
+  }
+});
+
+test("revocation during WDA window preparation prevents the physical tap", async () => {
+  const client = await openClient();
+  await client.waitFor(message => message.type === "device_list");
+  client.send({ type: "select_device", deviceId: "test-wda" });
+  await client.waitFor(message => message.type === "frame" && message.deviceId === "test-wda");
+
+  try {
+    await fetch(`${FAKE_WDA_URL}/debug/reset`, { method: "POST" });
+    await fetch(`${FAKE_WDA_URL}/debug/delay`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ms: 200 }),
+    });
+    client.send({ type: "tap", deviceId: "test-wda", x: 0.3, y: 0.3 });
+    while (true) {
+      const { history } = await fetch(`${FAKE_WDA_URL}/debug/history`).then(response => response.json());
+      if (history.some(entry => entry.type === "window-size")) break;
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    operators.get("test-va").allowedDevices = ["mock-1"];
+    await client.waitForNext(message => message.code === "device_access_revoked" && message.deviceId === "test-wda");
+    const { history } = await fetch(`${FAKE_WDA_URL}/debug/history`).then(response => response.json());
+    assert.equal(history.some(entry => entry.type === "tap"), false);
+  } finally {
+    operators.get("test-va").allowedDevices = null;
+    await fetch(`${FAKE_WDA_URL}/debug/delay`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ms: 0 }),
+    });
+    client.close();
+  }
+});
+
 test("presence API and broadcasts expose safe live status, phone activity, and logout cleanup", async () => {
   const username = "presence-va";
   operators.set(username, {
@@ -534,6 +707,7 @@ test("durable assignments enforce role, identity, resource, visibility, and immu
   const records = [
     ["assignment-manager", "manager", ["mock-1"], "assignment-team"],
     ["assignment-worker", "editor", ["mock-1"], "assignment-team"],
+    ["assignment-creator", "content_creator", ["mock-1"], "assignment-team"],
     ["assignment-worker-2", "va", ["mock-1"], "assignment-team"],
     ["assignment-outsider", "va", ["mock-2"], "other-team"],
   ];
@@ -586,7 +760,7 @@ test("durable assignments enforce role, identity, resource, visibility, and immu
     assert.equal(created.history[0].actor, "assignment-manager");
 
     const workerList = await jsonRequest("/api/assignments", cookies["assignment-worker"]);
-    assert.ok((await workerList.json()).assignments.some(item => item.id === created.id));
+    assert.equal((await workerList.json()).assignments.find(item => item.id === created.id)?.canProgress, true);
     const outsiderList = await jsonRequest("/api/assignments", cookies["assignment-outsider"]);
     assert.equal((await outsiderList.json()).assignments.some(item => item.id === created.id), false);
     assert.equal((await jsonRequest(`/api/assignments/${created.id}`, cookies["assignment-outsider"], "PATCH", {
@@ -594,9 +768,29 @@ test("durable assignments enforce role, identity, resource, visibility, and immu
     })).status, 403);
 
     const workerStatusResponse = await jsonRequest(`/api/assignments/${created.id}`, cookies["assignment-worker"], "PATCH", {
-      status: "in_progress",
+      status: "completed",
     });
-    assert.equal(workerStatusResponse.status, 403, "non-management roles cannot mutate assignment state");
+    assert.equal(workerStatusResponse.status, 403, "workers cannot skip assignment states");
+
+    const workerProgressResponse = await jsonRequest("/api/assignments", cookies["assignment-manager"], "POST", {
+      assignee: "assignment-worker", instructions: "Progress this editor task",
+    });
+    const workerProgress = (await workerProgressResponse.json()).assignment;
+    assert.equal((await jsonRequest(`/api/assignments/${workerProgress.id}`, cookies["assignment-worker"], "PATCH", {
+      status: "in_progress",
+    })).status, 200);
+    assert.equal((await jsonRequest(`/api/assignments/${workerProgress.id}`, cookies["assignment-worker"], "PATCH", {
+      status: "completed",
+    })).status, 200);
+    const creatorProgress = (await (await jsonRequest("/api/assignments", cookies["assignment-manager"], "POST", {
+      assignee: "assignment-creator", instructions: "Progress this creator task",
+    })).json()).assignment;
+    assert.equal((await jsonRequest(`/api/assignments/${creatorProgress.id}`, cookies["assignment-creator"], "PATCH", {
+      status: "in_progress",
+    })).status, 200);
+    assert.equal((await jsonRequest(`/api/assignments/${creatorProgress.id}`, cookies["assignment-creator"], "PATCH", {
+      status: "completed",
+    })).status, 200);
     const startedResponse = await jsonRequest(`/api/assignments/${created.id}`, cookies["assignment-manager"], "PATCH", {
       status: "in_progress",
     });
@@ -1130,6 +1324,106 @@ test("a restricted operator gets 403 (not 404) on a file route for a device they
   assert.equal(allowed.status, 200);
 });
 
+test("People assignment summaries do not cross team boundaries through shared device grants", async () => {
+  const viewer = "people-team-a-va";
+  const other = "people-team-b-va";
+  for (const [username, teamId] of [[viewer, "people-a"], [other, "people-b"]]) {
+    operators.set(username, { username, role: "va", teamId, allowedDevices: ["mock-1"], passwordHash: hashPassword(TEST_PASSWORD) });
+  }
+  const assignment = assignmentStore.create({
+    instructions: "Private team B work",
+    assignee: other,
+    createdBy: "test-va",
+    deviceId: "mock-1",
+    exclusive: false,
+  });
+  try {
+    const cookie = await loginCookie(viewer, TEST_PASSWORD);
+    const { people } = await fetch(`${httpUrl}/api/people`, { headers: { Cookie: cookie } }).then(response => response.json());
+    assert.equal(people.find(person => person.username === other)?.assignment, null);
+    assert.doesNotMatch(JSON.stringify(people), new RegExp(assignment.id));
+
+    const client = await openClient(viewer, TEST_PASSWORD, cookie);
+    const livePeople = await client.waitFor(message => message.type === "presence_list");
+    assert.equal(livePeople.people.find(person => person.username === other)?.assignment, null);
+    client.close();
+  } finally {
+    assignmentStore.setStatus(assignment.id, "cancelled", "test-va");
+    operators.delete(viewer);
+    operators.delete(other);
+  }
+});
+
+test("Managers cannot read or mutate another team's queue work through shared device grants", async () => {
+  const managerA = "queue-team-a-manager";
+  const managerB = "queue-team-b-manager";
+  for (const [username, teamId] of [[managerA, "queue-a"], [managerB, "queue-b"]]) {
+    operators.set(username, { username, role: "manager", teamId, allowedDevices: ["mock-1"], passwordHash: hashPassword(TEST_PASSWORD) });
+  }
+  const start = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+  const end = new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString();
+  const task = taskQueue.addTask({ goal: "Team A private queue work", createdBy: managerA,
+    deviceSelector: { deviceId: "mock-1" }, earliestStart: start, latestEnd: end });
+  try {
+    const cookieB = await loginCookie(managerB, TEST_PASSWORD);
+    const listB = await fetch(`${httpUrl}/api/queue`, { headers: { Cookie: cookieB } }).then(response => response.json());
+    assert.equal(listB.tasks.some(candidate => candidate.id === task.id), false);
+    const denied = await fetch(`${httpUrl}/api/queue/command`, {
+      method: "POST",
+      headers: { Cookie: cookieB, "Content-Type": "application/json" },
+      body: JSON.stringify({ text: `/queue cancel ${task.id}` }),
+    });
+    assert.equal(denied.status, 403);
+    assert.match((await denied.json()).error, /task's team/);
+    assert.notEqual(taskQueue.getTask(task.id).state, "CANCELLED");
+
+    const cookieA = await loginCookie(managerA, TEST_PASSWORD);
+    const listA = await fetch(`${httpUrl}/api/queue`, { headers: { Cookie: cookieA } }).then(response => response.json());
+    assert.equal(listA.tasks.some(candidate => candidate.id === task.id), true);
+  } finally {
+    taskQueue.cancelTask(task.id);
+    operators.delete(managerA);
+    operators.delete(managerB);
+  }
+});
+
+test("the audit command applies the same device filtering as the audit API", async () => {
+  auditLog.logEvent({ operator: "audit-fixture", type: "restricted-device-event", deviceId: "mock-2" });
+  const cookie = await loginCookie("test-admin-restricted", TEST_PASSWORD);
+  const commandResponse = await fetch(`${httpUrl}/api/queue/command`, {
+    method: "POST",
+    headers: { Cookie: cookie, "Content-Type": "application/json" },
+    body: JSON.stringify({ text: "/audit" }),
+  });
+  assert.equal(commandResponse.status, 200);
+  const commandEvents = (await commandResponse.json()).events;
+  assert.equal(commandEvents.some(event => event.deviceId === "mock-2"), false);
+  const apiEvents = await fetch(`${httpUrl}/api/audit`, { headers: { Cookie: cookie } }).then(response => response.json());
+  assert.deepEqual(commandEvents, apiEvents.events);
+});
+
+test("device authorization is rechecked after a long upload before commit", async () => {
+  const cookie = await loginCookie("test-va-restricted", TEST_PASSWORD);
+  const filename = "revoked-during-upload.txt";
+  try {
+    const result = await uploadWithPause({
+      cookie,
+      deviceId: "mock-1",
+      filename,
+      beforeFinish: async () => {
+        operators.get("test-va-restricted").allowedDevices = [];
+      },
+    });
+    assert.equal(result.status, 403);
+    assert.match(result.body.error, /no longer permitted/);
+  } finally {
+    operators.get("test-va-restricted").allowedDevices = ["mock-1"];
+  }
+  const response = await fetch(`${httpUrl}/api/devices/mock-1/files`, { headers: { Cookie: cookie } });
+  const { files } = await response.json();
+  assert.equal(files.some(file => file.name === filename), false);
+});
+
 test("typed text is audited by length only — the actual text never reaches the audit log", async () => {
   const SECRET_TEXT = "supersecretpassword123";
   const client = await openClient();
@@ -1422,6 +1716,40 @@ for (const action of [{ type: "tap", x: 0.2, y: 0.2 }, { type: "swipe", directio
   });
 }
 
+async function uploadWithPause({ cookie, deviceId, filename, beforeFinish }) {
+  const boundary = `phonefarm-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const prefix = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: text/plain\r\n\r\nfirst-`);
+  const suffix = Buffer.from(`second\r\n--${boundary}--\r\n`);
+  const url = new URL(`/api/devices/${deviceId}/files`, httpUrl);
+  return new Promise((resolve, reject) => {
+    const request = httpRequest(url, {
+      method: "POST",
+      headers: {
+        Cookie: cookie,
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        "Content-Length": prefix.length + suffix.length,
+      },
+    }, response => {
+      const chunks = [];
+      response.on("data", chunk => chunks.push(chunk));
+      response.on("end", () => {
+        const text = Buffer.concat(chunks).toString("utf8");
+        resolve({ status: response.statusCode, body: text ? JSON.parse(text) : null });
+      });
+    });
+    request.on("error", reject);
+    request.write(prefix);
+    setTimeout(async () => {
+      try {
+        await beforeFinish();
+        request.end(suffix);
+      } catch (error) {
+        request.destroy(error);
+      }
+    }, 75);
+  });
+}
+
 test("revocation during a pending action blocks the later render and queued input", async () => {
   const client = await openClient("test-va-restricted");
   const operator = operators.get("test-va-restricted");
@@ -1614,8 +1942,10 @@ test("rejected HTTP commands return JSON without crashing", async () => {
   try {
     const response = await fetch(`${httpUrl}/api/queue/command`, { method: "POST",
       headers: { Cookie: cookie, "Content-Type": "application/json" }, body: JSON.stringify({ text: "/takeover mock-1" }) });
-    assert.equal(response.status, 400);
-    assert.match((await response.json()).error, /handoff unavailable/);
+    assert.equal(response.status, 500);
+    const body = await response.json();
+    assert.deepEqual(body, { error: "request failed", code: "INTERNAL_ERROR" });
+    assert.equal(JSON.stringify(body).includes("handoff unavailable"), false);
   } finally { taskQueue.takeoverDevice = original; }
 });
 
@@ -1710,7 +2040,7 @@ test("restricted admins cannot cancel, prioritize or reorder inaccessible tasks"
   try {
     for (const text of [`/queue cancel ${first.id}`, `/queue priority ${first.id} high`, `/queue move ${first.id} before ${second.id}`]) {
       const response = await fetch(`${httpUrl}/api/queue/command`, { method: "POST", headers: { Cookie: cookie, "Content-Type": "application/json" }, body: JSON.stringify({ text }) });
-      assert.equal(response.status, 400);
+      assert.equal(response.status, 403);
       assert.match((await response.json()).error, /not authorized/);
     }
     assert.equal(first.state, "RUNNING");

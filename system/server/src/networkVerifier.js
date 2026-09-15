@@ -49,7 +49,8 @@ function emptyStatus() {
   };
 }
 
-function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS,
+  onError = (error) => console.error("Network verification transport failed:", error?.code || error?.name || "Error") } = {}) {
   const status = new Map(); // deviceId -> status shape above
 
   function getStatus(deviceId) {
@@ -80,7 +81,7 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS }
     let proxyHealthy = null;
     let bandwidthMbps = null;
     try {
-      const res = await fetch(checkUrl, { signal: AbortSignal.timeout(timeoutMs) });
+      const res = await fetch(checkUrl, { signal: AbortSignal.timeout(timeoutMs), redirect: "error" });
       if (!res.ok) throw new Error(`network check failed: HTTP ${res.status}`);
       const body = await res.json();
       if (typeof body.ip !== "string" || isIP(body.ip) !== 4) {
@@ -94,7 +95,9 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS }
       bandwidthMbps = Number.isFinite(body.bandwidthMbps) && body.bandwidthMbps >= 0 && body.bandwidthMbps <= 1_000_000
         ? body.bandwidthMbps : null;
     } catch (err) {
-      const entry = { ...emptyStatus(), networkCheckedAt: checkedAt(), networkVerified: false, networkMismatchReason: `network check failed: ${err.message}` };
+      onError(err);
+      const entry = { ...emptyStatus(), networkCheckedAt: checkedAt(), networkVerified: false,
+        networkMismatchReason: "network check failed" };
       status.set(deviceId, entry);
       return entry;
     }

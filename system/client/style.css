@@ -2411,6 +2411,23 @@ button:not(:disabled):active { transform: translateY(1px); }
 #type-form { flex: 1 1 250px; }
 #type-input { width: 100%; min-width: 130px; }
 
+#live-view-controls {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding-right: 8px;
+  border-right: 1px solid var(--line);
+}
+#live-view-controls[hidden] { display: none; }
+#live-view-controls label { display: inline-flex; align-items: center; gap: 5px; color: var(--ink); font-size: 11px; font-weight: 700; }
+#live-view-toggle { min-height: auto; accent-color: var(--online); }
+#live-view-status { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); font-size: 10px; white-space: nowrap; }
+#live-view-status[hidden] { display: none; }
+#live-view-status::before { width: 7px; height: 7px; border-radius: 50%; background: var(--online); content: ""; }
+#live-view-status[data-state="paused"]::before,
+#live-view-status[data-state="delayed"]::before { background: var(--loading); }
+#live-view-status[data-state="error"]::before { background: var(--offline); }
+
 #screen svg,
 #screen img {
   width: auto;
@@ -2437,4 +2454,14 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
   #device-control-bar { top: 58px; }
   #screen svg,
   #screen img { max-height: 58vh; }
+}
+/* Capability-gated operational actions share the app's soft control shape. */
+.network-check-button,
+.device-fact-actions button {
+  width: fit-content;
+  border-radius: 10px;
+}
+
+.device-fact-actions {
+  padding: 0 14px 14px;
 }

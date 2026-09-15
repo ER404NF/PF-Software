@@ -18,11 +18,18 @@ import crypto from "crypto";
 const SID_PATTERN = /^[A-Za-z0-9_-]+$/;
 
 export class FileSessionStore extends session.Store {
-  constructor(dir) {
+  constructor(dir, { now = () => Date.now(), tombstoneTtlMs = 24 * 60 * 60_000,
+    sweepIntervalMs = 5 * 60_000, maxMemoryRevocations = 10_000 } = {}) {
     super();
     this.dir = dir;
-    this.revoked = new Set();
+    this.now = now;
+    this.tombstoneTtlMs = tombstoneTtlMs;
+    this.sweepIntervalMs = sweepIntervalMs;
+    this.maxMemoryRevocations = maxMemoryRevocations;
+    this.revoked = new Map();
+    this.lastSweepAt = 0;
     fs.mkdirSync(dir, { recursive: true });
+    this.sweep();
   }
 
   _file(sid) {
@@ -31,22 +38,79 @@ export class FileSessionStore extends session.Store {
   }
 
   _isRevoked(sid) {
-    return this.revoked.has(sid) || fs.existsSync(path.join(this.dir, `.${sid}.revoked`));
+    const now = this.now();
+    const memoryExpiry = this.revoked.get(sid);
+    if (memoryExpiry > now) return true;
+    if (memoryExpiry !== undefined) this.revoked.delete(sid);
+    const tombstone = path.join(this.dir, `.${sid}.revoked`);
+    try {
+      const expiresAt = Number(fs.readFileSync(tombstone, "utf8"));
+      if (Number.isFinite(expiresAt) && expiresAt > now) return true;
+      if (!Number.isFinite(expiresAt)) {
+        return fs.statSync(tombstone).mtimeMs + this.tombstoneTtlMs > now;
+      }
+      fs.rmSync(tombstone, { force: true });
+      return false;
+    } catch (error) {
+      if (error?.code === "ENOENT") return false;
+      throw error;
+    }
+  }
+
+  _maybeSweep() {
+    if (this.now() - this.lastSweepAt >= this.sweepIntervalMs) this.sweep();
+  }
+
+  sweep() {
+    const now = this.now();
+    for (const [sid, expiresAt] of this.revoked) if (expiresAt <= now) this.revoked.delete(sid);
+    for (const name of fs.readdirSync(this.dir)) {
+      const target = path.join(this.dir, name);
+      const tombstone = name.match(/^\.([A-Za-z0-9_-]+)\.revoked$/);
+      if (tombstone) {
+        try {
+          const expiresAt = Number(fs.readFileSync(target, "utf8"));
+          const expired = Number.isFinite(expiresAt)
+            ? expiresAt <= now
+            : fs.statSync(target).mtimeMs + this.tombstoneTtlMs <= now;
+          if (expired) fs.rmSync(target, { force: true });
+        } catch (error) { if (error?.code !== "ENOENT") throw error; }
+        continue;
+      }
+      if (!SID_PATTERN.test(name.replace(/\.json$/, "")) || !name.endsWith(".json")) continue;
+      try {
+        const parsed = JSON.parse(fs.readFileSync(target, "utf8"));
+        if (parsed?.expires && Date.parse(parsed.expires) <= now) fs.rmSync(target, { force: true });
+      } catch (error) {
+        if (error?.code === "ENOENT") continue;
+        // Corrupt or unreadable sessions are operational failures, not
+        // disposable missing sessions. get() will surface the same error.
+      }
+    }
+    this.lastSweepAt = now;
   }
 
   get(sid, cb) {
     const file = this._file(sid);
-    if (!file || this._isRevoked(sid)) return cb(null, null);
+    try {
+      this._maybeSweep();
+      if (!file || this._isRevoked(sid)) return cb(null, null);
+    } catch (error) { return cb(error); }
     fs.readFile(file, "utf8", (err, data) => {
-      if (err || this._isRevoked(sid)) return cb(null, null); // ENOENT (no session yet) is not an error here
+      if (err) return err.code === "ENOENT" ? cb(null, null) : cb(err);
+      try { if (this._isRevoked(sid)) return cb(null, null); }
+      catch (error) { return cb(error); }
       let parsed;
       try {
         parsed = JSON.parse(data);
-      } catch {
-        return cb(null, null);
+      } catch (error) {
+        return cb(error);
       }
-      if (parsed.expires && new Date(parsed.expires) < new Date()) {
-        return this.destroy(sid, () => cb(null, null));
+      if (!parsed || typeof parsed !== "object" || !parsed.session || typeof parsed.session !== "object") {
+        return cb(new Error("invalid session record"));
+      }
+      if (parsed.expires && Date.parse(parsed.expires) < this.now()) {
+        return fs.unlink(file, error => error && error.code !== "ENOENT" ? cb(error) : cb(null, null));
       }
       cb(null, parsed.session);
     });
@@ -70,14 +134,24 @@ export class FileSessionStore extends session.Store {
   set(sid, sessionData, cb) {
     const file = this._file(sid);
     if (!file) return cb(new Error("invalid session id"));
-    if (this._isRevoked(sid)) return cb(null);
+    try {
+      this._maybeSweep();
+      if (this._isRevoked(sid)) return cb(null);
+    } catch (error) { return cb(error); }
     const expires = sessionData.cookie?.expires || null;
     const tmpFile = path.join(this.dir, `.${sid}.${crypto.randomUUID()}.tmp`);
     fs.writeFile(tmpFile, JSON.stringify({ session: sessionData, expires }), (writeErr) => {
       if (writeErr) return cb(writeErr);
-      if (this._isRevoked(sid)) return fs.unlink(tmpFile, () => cb(null));
+      try {
+        if (this._isRevoked(sid)) return fs.unlink(tmpFile, () => cb(null));
+      } catch (error) {
+        return fs.unlink(tmpFile, () => cb(error));
+      }
       this._renameWithRetry(tmpFile, file, (renameErr) => {
-        if (this._isRevoked(sid)) {
+        let revoked;
+        try { revoked = this._isRevoked(sid); }
+        catch (error) { return fs.unlink(tmpFile, () => cb(error)); }
+        if (revoked) {
           fs.unlink(tmpFile, () => {});
           return fs.unlink(file, () => cb(null));
         }
@@ -107,11 +181,13 @@ export class FileSessionStore extends session.Store {
   destroy(sid, cb) {
     const file = this._file(sid);
     if (!file) return cb();
-    this.revoked.add(sid);
+    const expiresAt = this.now() + this.tombstoneTtlMs;
+    this.revoked.set(sid, expiresAt);
+    while (this.revoked.size > this.maxMemoryRevocations) this.revoked.delete(this.revoked.keys().next().value);
     try {
       // IDs are never reused. This tombstone also blocks stale writes/reads
       // across store instances or a relay restart.
-      fs.writeFileSync(path.join(this.dir, `.${sid}.revoked`), "revoked\n");
+      fs.writeFileSync(path.join(this.dir, `.${sid}.revoked`), `${expiresAt}\n`, { mode: 0o600 });
     } catch (error) { return cb(error); }
     fs.unlink(file, (err) => {
       if (err && err.code !== "ENOENT") return cb(err);

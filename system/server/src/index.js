@@ -7,7 +7,6 @@ import path from "path";
 import fs from "fs";
 import { randomUUID } from "crypto";
 import { fileURLToPath, pathToFileURL } from "url";
-import { MockDevice } from "./mockDevice.js";
 import { WdaDevice } from "./wdaDevice.js";
 import { ensureDeviceDir, listFiles, resolveFile, deleteFile, safeFilename, safeDeviceId, assertMediaStorageIsolated } from "./fileStore.js";
 import { listRuns, getRun, createRun, setCandidateStatus } from "./researchStore.js";
@@ -18,6 +17,7 @@ import {
   configureOperatorTwoFactor, verifyOperatorSecondFactor, createEmailRecoveryToken, completeEmailRecovery,
   assertValidUsername,
   resetOperatorSecondFactor,
+  prunePendingSignupAccounts,
 } from "./authStore.js";
 import { CAPABILITIES } from "./roleCapabilities.js";
 import { researchWorkspaceFor, researchAccounts, researchAccountDefinitions, researchActionPolicies } from "./researchAccess.js";
@@ -29,6 +29,8 @@ import { parseCommand } from "./commandParser.js";
 import { loadDeviceNetworkMap, publicNetworkConfig } from "./deviceNetworkConfig.js";
 import { isProxyEgress, setDeviceProxyEnabled } from "./deviceNetworkStore.js";
 import { createNetworkVerifier } from "./networkVerifier.js";
+import { resolveNetworkCheckTarget } from "./networkCheckTarget.js";
+import { resolveDeploymentConfig } from "./deploymentConfig.js";
 import { networkAccessDecision, networkVerificationMaxAge } from "./networkPolicy.js";
 import { providers, defaultProviderName, getProvider } from "./providerRegistry.js";
 import { getPlatformSkill } from "./platformSkillRegistry.js";
@@ -40,8 +42,11 @@ import { createAssignmentStore, ASSIGNMENT_STATUSES } from "./assignmentStore.js
 import { OPERATOR_ROLES } from "./roleCapabilities.js";
 import { monitorState } from "./monitorContract.js";
 import { createAccountNotificationStore } from "./accountNotificationStore.js";
+import { createAuthenticationThrottle, createRecoveryThrottle } from "./recoveryThrottle.js";
+import { createSchedulerGuard } from "./schedulerGuard.js";
 import { decryptTotpSecret, encryptTotpSecret, generateRecoveryCodes, generateTotpSecret, otpauthUri, recoveryCodeDigest, verifyTotp } from "./twoFactor.js";
-import { discoverIosDevices, DiscoveredIosDevice } from "./deviceDiscovery.js";
+import { discoverIosDevices } from "./deviceDiscovery.js";
+import { loadDevices } from "./deviceRegistry.js";
 import {
   createMediaQuotaManager, createQuotaStorage, mediaByteSetting,
   DEFAULT_DEVICE_MEDIA_QUOTA_BYTES, DEFAULT_GLOBAL_MEDIA_QUOTA_BYTES, DEFAULT_MEDIA_MIN_FREE_BYTES,
@@ -52,8 +57,14 @@ const clientDir = path.join(__dirname, "../../client");
 const configPath = process.env.DEVICE_CONFIG_PATH || path.join(__dirname, "../../devices.config.json");
 const rawDeviceConfig = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, "utf8")) : { devices: [] };
 const discoveredIosDevices = process.env.AUTO_DISCOVER_IOS_DEVICES === "false" ? [] : discoverIosDevices();
+const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+const deployment = resolveDeploymentConfig(process.env, {
+  enforceStartup: Boolean(isMain),
+  hasMockDevices: rawDeviceConfig.devices?.some(device => device?.type === "mock"),
+});
 
 const app = express();
+if (deployment.trustProxy) app.set("trust proxy", 1);
 app.use(express.static(clientDir));
 app.use(express.json());
 
@@ -71,14 +82,25 @@ assertMediaStorageIsolated([
   process.env.RESEARCH_EVIDENCE_DIR || path.join(__dirname, "../../storage/research-evidence"),
 ]);
 const auditLog = createAuditLog(auditLogPath);
+const twoFactorMasterKey = process.env.TWO_FACTOR_MASTER_KEY || null;
 const accountNotificationStore = createAccountNotificationStore({
   storePath: process.env.ACCOUNT_NOTIFICATION_STORE_PATH || path.join(__dirname, "../../storage/notifications/accounts.json"),
   companyEmail: process.env.COMPANY_FROM_EMAIL || null,
+  encryptionKey: process.env.ACCOUNT_NOTIFICATION_ENCRYPTION_KEY || twoFactorMasterKey,
 });
-const twoFactorMasterKey = process.env.TWO_FACTOR_MASTER_KEY || null;
+const recoveryThrottle = createRecoveryThrottle();
+const passwordLoginThrottle = createAuthenticationThrottle({ accountLimit: 5, ipLimit: 25 });
+const secondFactorThrottle = createAuthenticationThrottle({ accountLimit: 5, ipLimit: 25 });
+const signupThrottle = createAuthenticationThrottle({ windowMs: 60 * 60_000, accountLimit: 2, ipLimit: 10 });
+function positiveIntegerSetting(value, fallback) {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+const maxPendingSignups = positiveIntegerSetting(process.env.MAX_PENDING_SIGNUPS, 500);
+const pendingSignupMaxAgeMs = positiveIntegerSetting(process.env.PENDING_SIGNUP_MAX_AGE_MS, 30 * 24 * 60 * 60_000);
 
-const SESSION_SECRET = process.env.SESSION_SECRET || "dev-only-insecure-secret-change-me";
-if (!process.env.SESSION_SECRET) {
+const SESSION_SECRET = deployment.sessionSecret;
+if (!process.env.SESSION_SECRET && !isMain) {
   console.warn("SESSION_SECRET not set — using an insecure default. Set it before running beyond local dev.");
 }
 const sessionStore = new FileSessionStore(sessionStoreDir);
@@ -90,7 +112,7 @@ const sessionParser = session({
   saveUninitialized: false,
   // 24h, not a browser-session cookie: now that sessions survive a relay
   // restart, there's no reason to also force a re-login on every browser close.
-  cookie: { httpOnly: true, sameSite: "lax", maxAge: 24 * 60 * 60 * 1000 },
+  cookie: { httpOnly: true, sameSite: "lax", secure: deployment.secureCookies, maxAge: 24 * 60 * 60 * 1000 },
 });
 app.use(sessionParser);
 
@@ -105,7 +127,16 @@ function completeLogin(req, res, operator, { secondFactor = null } = {}) {
     expiresAt: req.session.cookie.expires,
   });
   auditLog.logEvent({ operator: operator.username, type: "login_success", detail: secondFactor ? { secondFactor } : {} });
+  passwordLoginThrottle.succeed({ identifier: operator.username });
+  secondFactorThrottle.succeed({ identifier: operator.username });
   res.json(publicOperator(operator));
+}
+
+function saveSessionThenRespond(req, res, next, status, body) {
+  req.session.save(error => {
+    if (error) return next(error);
+    res.status(status).json(body);
+  });
 }
 
 function pendingAuthOperator(req) {
@@ -120,18 +151,26 @@ function pendingAuthOperator(req) {
 function rejectSecondFactorAttempt(req, res, message) {
   const challenge = req.session?.pendingAuth;
   if (!challenge) return res.status(401).json({ error: "password verification has expired" });
-  challenge.failedAttempts = (Number(challenge.failedAttempts) || 0) + 1;
-  if (challenge.failedAttempts >= 5) {
+  const blocked = secondFactorThrottle.fail({ identifier: challenge.username, ip: req.ip });
+  if (blocked) {
     delete req.session.pendingAuth;
     delete req.session.twoFactorEnrollmentSecret;
-    return res.status(429).json({ error: "too many two-factor attempts; sign in again" });
+    auditLog.logEvent({ operator: challenge.username, type: "two_factor_rate_limited" });
+    return res.status(429).json({ error: "too many two-factor attempts; try again later" });
   }
   return res.status(401).json({ error: message });
 }
 
 app.post("/api/signup", (req, res, next) => {
   try {
+    const identifier = req.body?.email || req.body?.username;
+    if (signupThrottle.blocked({ identifier, ip: req.ip })) {
+      return res.status(429).json({ error: "too many account applications; try again later" });
+    }
+    const capacity = prunePendingSignupAccounts({ maxAgeMs: pendingSignupMaxAgeMs, maxPending: maxPendingSignups });
+    if (capacity.atCapacity) return res.status(503).json({ error: "account applications are temporarily closed" });
     const operator = createSignupAccount(req.body);
+    signupThrottle.fail({ identifier, ip: req.ip });
     auditLog.logEvent({ operator: operator.username, type: "signup_submitted" });
     res.status(201).json({
       status: "pending",
@@ -144,41 +183,52 @@ app.post("/api/signup", (req, res, next) => {
   }
 });
 
-app.post("/api/login", (req, res) => {
+app.post("/api/login", (req, res, next) => {
   const { username, password } = req.body || {};
   if (typeof username !== "string" || typeof password !== "string" || username.length > 100) {
     return res.status(400).json({ error: "username and password are required" });
   }
+  if (passwordLoginThrottle.blocked({ identifier: username, ip: req.ip })) {
+    auditLog.logEvent({ operator: username, type: "login_rate_limited" });
+    return res.status(429).json({ error: "too many sign-in attempts; try again later" });
+  }
   const operator = operators.get(username);
   if (!operator || !verifyPassword(password, operator.passwordHash)) {
     auditLog.logEvent({ operator: username, type: "login_failed" });
+    if (passwordLoginThrottle.fail({ identifier: username, ip: req.ip })) {
+      return res.status(429).json({ error: "too many sign-in attempts; try again later" });
+    }
     return res.status(401).json({ error: "invalid credentials" });
   }
+  passwordLoginThrottle.succeed({ identifier: username });
   if (operator.accountStatus === "pending") return res.status(403).json({ code: "approval_pending", error: "account approval is pending" });
   if (operator.accountStatus === "rejected") return res.status(403).json({ code: "account_rejected", error: "account application was not accepted" });
   if (operator.active === false) return res.status(401).json({ error: "invalid credentials" });
   if (operator.twoFactorRequired) {
+    if (secondFactorThrottle.blocked({ identifier: operator.username, ip: req.ip })) {
+      return res.status(429).json({ error: "too many two-factor attempts; try again later" });
+    }
     req.session.pendingAuth = {
       username: operator.username,
       authVersion: operator.authVersion ?? 0,
-      failedAttempts: 0,
       expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
     };
-    return res.status(202).json(operator.twoFactorSecret
+    return saveSessionThenRespond(req, res, next, 202, operator.twoFactorSecret
       ? { requiresTwoFactor: true }
       : { requiresTwoFactorSetup: true });
   }
   completeLogin(req, res, operator);
 });
 
-app.post("/api/2fa/setup", (req, res) => {
+app.post("/api/2fa/setup", (req, res, next) => {
   const operator = pendingAuthOperator(req);
   if (!operator) return res.status(401).json({ error: "password verification has expired" });
   if (operator.twoFactorSecret) return res.status(409).json({ error: "2FA is already configured" });
   if (!twoFactorMasterKey) return res.status(503).json({ error: "2FA enrollment is unavailable until TWO_FACTOR_MASTER_KEY is configured" });
   const secret = generateTotpSecret();
   req.session.twoFactorEnrollmentSecret = secret;
-  res.json({ secret, otpauthUri: otpauthUri({ secret, email: operator.email || operator.username }) });
+  saveSessionThenRespond(req, res, next, 200,
+    { secret, otpauthUri: otpauthUri({ secret, email: operator.email || operator.username }) });
 });
 
 app.post("/api/2fa/confirm", (req, res, next) => {
@@ -197,7 +247,7 @@ app.post("/api/2fa/confirm", (req, res, next) => {
     const current = operators.get(operator.username);
     req.session.twoFactorRecoveryReceipt = encryptTotpSecret(JSON.stringify(recoveryCodes), twoFactorMasterKey);
     delete req.session.twoFactorEnrollmentSecret;
-    res.json({ operator: publicOperator(current), recoveryCodes });
+    saveSessionThenRespond(req, res, next, 200, { operator: publicOperator(current), recoveryCodes });
   } catch (error) {
     if (error?.status) return res.status(error.status).json({ error: error.message });
     next(error);
@@ -240,8 +290,12 @@ app.post("/api/2fa/verify", (req, res, next) => {
 });
 
 app.post("/api/recovery/request", (req, res) => {
-  const recovery = createEmailRecoveryToken(req.body?.identifier);
-  if (recovery) accountNotificationStore.queue({
+  const identifier = req.body?.identifier;
+  const allowed = recoveryThrottle.allow({ identifier, ip: req.ip });
+  const recovery = allowed && accountNotificationStore.canSecureRecovery()
+    ? createEmailRecoveryToken(identifier)
+    : null;
+  if (recovery?.token) accountNotificationStore.queue({
     to: recovery.operator.email,
     fullName: recovery.operator.fullName || recovery.operator.username,
     username: recovery.operator.username,
@@ -302,6 +356,17 @@ function requireAuth(req, res, next) {
   next();
 }
 
+function currentStoredOperator(req) {
+  return new Promise((resolve, reject) => {
+    if (!req.sessionID) return resolve(null);
+    sessionStore.get(req.sessionID, (error, stored) => {
+      if (error) return reject(error);
+      if (!stored?.operator || stored.operator.username !== req.session?.operator?.username) return resolve(null);
+      resolve(resolveOperator(stored.operator));
+    });
+  });
+}
+
 // Feature-role authorization is separate from device RBAC. A route protected
 // here may still perform canAccessDevice() checks when it acts on a specific
 // phone. Missing/legacy roles normalize to VA in authStore.js, so old session
@@ -351,20 +416,24 @@ app.use("/api/research", requireAuth);
 
 // Raw audit history is an admin/dev oversight surface. VAs still generate
 // audit events through normal device work but cannot read the global log.
+function authorizedAuditEvents(operator, { operator: operatorFilter, deviceId, limit = 200 } = {}) {
+  const boundedLimit = Math.min(Number(limit) || 200, 1000);
+  return auditLog.listEvents({
+    operator: typeof operatorFilter === "string" ? operatorFilter : undefined,
+    deviceId: typeof deviceId === "string" ? deviceId : undefined,
+    limit: 1000,
+  }).filter(event => !event.deviceId || canAccessDevice(operator, event.deviceId)).slice(0, boundedLimit);
+}
+
 app.get("/api/audit", requireCapability(CAPABILITIES.VIEW_AUDIT), (req, res) => {
   const { operator, deviceId, limit } = req.query;
-  const requestedLimit = limit ? Math.min(Number(limit) || 200, 1000) : 200;
-  res.json({
-    events: auditLog.listEvents({
-      operator: typeof operator === "string" ? operator : undefined,
-      deviceId: typeof deviceId === "string" ? deviceId : undefined,
-      limit: 1000,
-    }).filter(event => !event.deviceId || canAccessDevice(req.currentOperator, event.deviceId)).slice(0, requestedLimit),
-  });
+  res.json({ events: authorizedAuditEvents(req.currentOperator, { operator, deviceId, limit }) });
 });
 
 function publicPeople(viewer = null) {
-  const visibleAssignments = assignmentStore.list().filter(item => !viewer || assignmentScopeAllowed(item, viewer));
+  const visibleAssignments = viewer
+    ? assignmentStore.list().filter(item => canViewAssignment(item, viewer))
+    : [];
   return presenceStore.listPeople(operators.values()).map(person => {
     const assignment = visibleAssignments.find(item => item.assignee === person.username
       && ["assigned", "in_progress"].includes(item.status)) ?? null;
@@ -422,29 +491,6 @@ server.on("upgrade", (request, socket, head) => {
     });
   });
 });
-
-// Bench devices, loaded from devices.config.json so plugging in real
-// hardware is editing that file, not this one. Each entry becomes either a
-// MockDevice or a WdaDevice — both expose the same
-// {id, label, status, tap(), render()} contract, so nothing else here
-// (or in the client) needs to know which kind of device it's talking to.
-function loadDevices(raw, discoveries = []) {
-  const map = new Map();
-  const discoveryByUdid = new Map(discoveries.map(device => [device.udid, device]));
-  for (const d of raw.devices) {
-    if (!safeDeviceId(d.id)) throw new Error(`Invalid or reserved device id: ${d.id}`);
-    const discovered = typeof d.udid === "string" ? discoveryByUdid.get(d.udid) : null;
-    const label = discovered?.label || d.label;
-    if (d.type === "wda") {
-      map.set(d.id, new WdaDevice(d.id, label, { host: d.host, port: d.port, timeoutMs: d.timeoutMs }));
-    } else {
-      map.set(d.id, new MockDevice(d.id, label));
-    }
-    if (discovered) discoveryByUdid.delete(d.udid);
-  }
-  for (const discovered of discoveryByUdid.values()) map.set(discovered.id, new DiscoveredIosDevice(discovered));
-  return map;
-}
 
 const devices = loadDevices(rawDeviceConfig, discoveredIosDevices);
 const deviceMonitorConfig = new Map();
@@ -545,21 +591,33 @@ app.patch("/api/admin/users/:username/status", requireAnyCapability(CAPABILITIES
     }
     const target = operators.get(req.params.username);
     if (!target?.email) return res.status(409).json({ error: "account must have a Gmail address before review" });
-    const operator = setOperatorAccountStatus(req.params.username, req.body?.status);
     const notification = accountNotificationStore.queue({
-      to: operator.email,
-      fullName: operator.fullName || operator.username,
-      username: operator.username,
+      to: target.email,
+      fullName: target.fullName || target.username,
+      username: target.username,
       status: req.body.status,
+      holdForCommit: true,
     });
-    auditLog.logEvent({
-      operator: req.currentOperator.username,
-      type: `operator_${req.body.status}`,
-      detail: { target: operator.username, teamId: operator.teamId || null, notificationState: notification.deliveryState },
-    });
+    let operator;
+    try { operator = setOperatorAccountStatus(req.params.username, req.body?.status); }
+    catch (error) {
+      try { accountNotificationStore.markAborted(notification.id); }
+      catch (abortError) { console.error("Account review outbox abort failed:", abortError); }
+      throw error;
+    }
+    let notificationState;
+    try { notificationState = accountNotificationStore.markCommitted(notification.id)?.deliveryState; }
+    catch (error) {
+      notificationState = "pending_reconciliation";
+      console.error("Account review outbox commit failed:", error);
+    }
     revokeLiveOperatorSessions(operator.username);
     broadcastPresence();
-    res.json({ operator, notification: { deliveryState: notification.deliveryState } });
+    try {
+      auditLog.logEvent({ operator: req.currentOperator.username, type: `operator_${req.body.status}`,
+        detail: { target: operator.username, teamId: operator.teamId || null, notificationState } });
+    } catch (error) { console.error("Account review audit failed:", error); }
+    res.json({ operator, notification: { deliveryState: notificationState } });
   } catch (error) {
     if (error?.status) return res.status(error.status).json({ error: error.message });
     next(error);
@@ -568,6 +626,22 @@ app.patch("/api/admin/users/:username/status", requireAnyCapability(CAPABILITIES
 
 app.patch("/api/admin/users/:username/rename", requireAnyCapability(CAPABILITIES.MANAGE_USERS, CAPABILITIES.MANAGE_TEAM_MEMBERS), (req, res, next) => {
   const previousUsername = req.params.username;
+  const nextUsername = req.body?.username;
+  let tasksMigrated = false;
+  let assignmentsMigrated = false;
+  let accountMigrated = false;
+  const rollbackReferences = () => {
+    const failures = [];
+    if (assignmentsMigrated) {
+      try { assignmentStore.renamePrincipal(nextUsername, previousUsername, req.currentOperator.username); }
+      catch (error) { failures.push(error); }
+    }
+    if (tasksMigrated) {
+      try { taskQueue.renamePrincipal(nextUsername, previousUsername); }
+      catch (error) { failures.push(error); }
+    }
+    if (failures.length) throw new AggregateError(failures, "username migration rollback failed");
+  };
   try {
     if (!canManagePerson(req.currentOperator, previousUsername)) {
       return res.status(403).json({ error: "not authorized to rename this account" });
@@ -575,20 +649,27 @@ app.patch("/api/admin/users/:username/rename", requireAnyCapability(CAPABILITIES
     if (req.currentOperator.role === OPERATOR_ROLES.MANAGER && previousUsername === req.currentOperator.username) {
       return res.status(403).json({ error: "a manager cannot rename their own account" });
     }
-    assertValidUsername(req.body?.username);
-    if (operators.has(req.body?.username)) return res.status(409).json({ error: "username already exists" });
-    assignmentStore.renamePrincipal(previousUsername, req.body?.username, req.currentOperator.username);
-    const operator = renameOperatorAccount(previousUsername, req.body?.username);
-    auditLog.logEvent({
-      operator: req.currentOperator.username,
-      type: "operator_renamed",
-      detail: { previousUsername, username: operator.username },
-    });
+    assertValidUsername(nextUsername);
+    if (operators.has(nextUsername)) return res.status(409).json({ error: "username already exists" });
+    taskQueue.renamePrincipal(previousUsername, nextUsername);
+    tasksMigrated = true;
+    assignmentStore.renamePrincipal(previousUsername, nextUsername, req.currentOperator.username);
+    assignmentsMigrated = true;
+    const operator = renameOperatorAccount(previousUsername, nextUsername);
+    accountMigrated = true;
+    try {
+      auditLog.logEvent({ operator: req.currentOperator.username, type: "operator_renamed",
+        detail: { previousUsername, username: operator.username } });
+    } catch (error) { console.error("Operator rename audit failed:", error); }
     revokeLiveOperatorSessions(previousUsername);
     broadcastPresence();
     broadcastDeviceList();
     res.json({ operator });
   } catch (error) {
+    if (!accountMigrated && (assignmentsMigrated || tasksMigrated)) {
+      try { rollbackReferences(); }
+      catch (rollbackError) { return next(new AggregateError([error, rollbackError], "username migration rollback failed")); }
+    }
     if (error?.status) return res.status(error.status).json({ error: error.message });
     if (/username|required/.test(error.message)) return res.status(400).json({ error: error.message });
     next(error);
@@ -611,7 +692,7 @@ app.post("/api/admin/users", requireCapability(CAPABILITIES.MANAGE_USERS), (req,
   try {
     const resourceError = validateOperatorResources(req.body);
     if (resourceError) return res.status(400).json({ error: resourceError });
-    const operator = createOperatorAccount(req.body);
+    const operator = createOperatorAccount({ ...req.body, twoFactorRequired: true });
     auditLog.logEvent({
       operator: req.currentOperator.username,
       type: "operator_created",
@@ -754,7 +835,14 @@ function expireAssignments(at = new Date()) {
   return expired;
 }
 
+const schedulerGuard = createSchedulerGuard({ taskQueue, expireAssignments, auditLog });
+
 const MANAGER_ASSIGNABLE_ROLES = new Set([
+  OPERATOR_ROLES.VA,
+  OPERATOR_ROLES.CONTENT_CREATOR,
+  OPERATOR_ROLES.EDITOR,
+]);
+const SELF_PROGRESS_ROLES = new Set([
   OPERATOR_ROLES.VA,
   OPERATOR_ROLES.CONTENT_CREATOR,
   OPERATOR_ROLES.EDITOR,
@@ -790,6 +878,13 @@ function canViewAssignment(assignment, operator) {
     && assignmentScopeAllowed(assignment, operator);
 }
 
+function publicAssignmentFor(assignment, operator) {
+  const canProgress = SELF_PROGRESS_ROLES.has(operator.role)
+    && assignment.assignee === operator.username
+    && ((assignment.status === "assigned") || (assignment.status === "in_progress"));
+  return { ...assignment, canProgress };
+}
+
 function validateAssignmentScope(body, operator) {
   const deviceId = body.deviceId ?? null;
   const accountId = body.accountId ?? null;
@@ -806,7 +901,8 @@ function validateAssignmentScope(body, operator) {
 
 app.get("/api/assignments", requireCapability(CAPABILITIES.VIEW_ASSIGNMENTS), (req, res) => {
   expireAssignments();
-  res.json({ assignments: assignmentStore.list().filter(item => canViewAssignment(item, req.currentOperator)) });
+  res.json({ assignments: assignmentStore.list().filter(item => canViewAssignment(item, req.currentOperator))
+    .map(item => publicAssignmentFor(item, req.currentOperator)) });
 });
 
 app.post("/api/assignments", requireCapability(CAPABILITIES.MANAGE_ASSIGNMENTS), (req, res, next) => {
@@ -830,6 +926,7 @@ app.post("/api/assignments", requireCapability(CAPABILITIES.MANAGE_ASSIGNMENTS),
       endAt: req.body?.endAt ?? null,
       exclusive: req.body?.exclusive ?? true,
       recurrence: req.body?.recurrence ?? "once",
+      timezone: req.body?.timezone ?? "UTC",
     });
     auditLog.logEvent({ operator: req.currentOperator.username, type: "assignment_created",
       deviceId: assignment.deviceId, detail: {
@@ -875,11 +972,11 @@ app.patch("/api/assignments/:assignmentId", requireCapability(CAPABILITIES.VIEW_
       assignment = assignmentStore.reassign(current.id, req.body.assignee, req.currentOperator.username);
     } else if (wantsStatus) {
       if (!ASSIGNMENT_STATUSES.includes(req.body.status)) return res.status(400).json({ error: "invalid assignment status" });
-      const ownVaProgress = req.currentOperator.role === OPERATOR_ROLES.VA
+      const ownWorkerProgress = SELF_PROGRESS_ROLES.has(req.currentOperator.role)
         && current.assignee === req.currentOperator.username
         && ((current.status === "assigned" && req.body.status === "in_progress")
           || (current.status === "in_progress" && req.body.status === "completed"));
-      if (!hasManage && !ownVaProgress) return res.status(403).json({ error: "assignment management capability required" });
+      if (!hasManage && !ownWorkerProgress) return res.status(403).json({ error: "assignment management capability required" });
       assignment = assignmentStore.setStatus(current.id, req.body.status, req.currentOperator.username);
     } else {
       if (!hasManage) return res.status(403).json({ error: "assignment management capability required" });
@@ -893,7 +990,7 @@ app.patch("/api/assignments/:assignmentId", requireCapability(CAPABILITIES.VIEW_
       deviceId: assignment.deviceId, detail: { assignmentId: assignment.id, assignee: assignment.assignee, status: assignment.status } });
     broadcastDeviceList();
     broadcastPresence();
-    res.json({ assignment });
+    res.json({ assignment: publicAssignmentFor(assignment, req.currentOperator) });
   } catch (error) {
     if (/cannot move|cannot start|in-progress|terminal|invalid assignment|overlaps/.test(error.message)) return res.status(409).json({ error: error.message });
     if (/schedule|startAt|endAt|exclusive|recurrence/.test(error.message)) return res.status(400).json({ error: error.message });
@@ -938,6 +1035,11 @@ const deviceHealth = new Map(); // deviceId -> { lastSeenAt, consecutiveFailures
 // offline and alarm every other VA watching the device list — only a run of
 // failures in a row means something is actually wrong.
 const OFFLINE_AFTER_FAILURES = 3;
+const LIVE_FRAME_MIN_INTERVAL_MS = 1000;
+const MAX_CONCURRENT_LIVE_FRAMES = 4;
+const liveFrameNextByDevice = new Map();
+const liveFrameNextByOperator = new Map();
+let activeLiveFrames = 0;
 
 function getHealth(deviceId) {
   if (!deviceHealth.has(deviceId)) deviceHealth.set(deviceId, { lastSeenAt: null, consecutiveFailures: 0 });
@@ -1163,22 +1265,36 @@ app.post("/api/devices/:deviceId/files", (req, res, next) => {
     return res.status(403).json({ error: "not authorized for this device" });
   }
   next();
-}, upload.single("file"), (req, res, next) => {
+}, upload.single("file"), async (req, res, next) => {
   if (!req.file) return res.status(400).json({ error: "no file, or invalid filename" });
   const name = safeFilename(req.file.originalname);
+  const discardStagedUpload = () => {
+    mediaQuota.abort(req.file.quotaReservation);
+    fs.rmSync(req.file.path, { force: true });
+  };
   try {
     if (!name) throw new Error("invalid filename");
+    const current = await currentStoredOperator(req);
+    if (!current) {
+      discardStagedUpload();
+      return res.status(401).json({ error: "not logged in" });
+    }
+    if (!hasCapability(current, CAPABILITIES.ACCESS_MEDIA)
+      || !canAccessDevice(current, req.params.deviceId)) {
+      discardStagedUpload();
+      return res.status(403).json({ error: "media access is no longer permitted for this device" });
+    }
+    req.currentOperator = current;
     // Same-directory rename commits only a fully validated multipart upload.
     // A failed replacement preserves the old file; never unlink it first.
     fs.renameSync(req.file.path, path.join(req.file.destination, name));
     mediaQuota.commit(req.file.quotaReservation);
   } catch (error) {
-    mediaQuota.abort(req.file.quotaReservation);
-    fs.rmSync(req.file.path, { force: true });
+    discardStagedUpload();
     return next(error);
   }
   auditLog.logEvent({
-    operator: req.session.operator.username,
+    operator: req.currentOperator.username,
     type: "file_uploaded",
     deviceId: req.params.deviceId,
     detail: withNetworkEgress(req.params.deviceId, { name, size: req.file.size }),
@@ -1230,11 +1346,15 @@ app.post("/api/devices/:deviceId/network-check", (req, res) => {
   if (isProxyEgress(configuredNetwork?.egress) && configuredNetwork?.enabled === false) {
     return res.status(409).json({ error: "network verification is unavailable while this proxy assignment is disabled" });
   }
-  const overrideAllowed = process.env.ALLOW_NETWORK_CHECK_URL_OVERRIDE === "true";
-  if (req.body?.checkUrl && !overrideAllowed) {
-    return res.status(400).json({ error: "caller-supplied checkUrl is disabled" });
+  let checkUrl;
+  try {
+    checkUrl = resolveNetworkCheckTarget({
+      configuredUrl: configuredNetwork?.checkUrl,
+      requestedUrl: req.body?.checkUrl,
+    });
+  } catch (error) {
+    return res.status(error.status ?? 400).json({ error: error.message });
   }
-  const checkUrl = overrideAllowed && req.body?.checkUrl ? req.body.checkUrl : configuredNetwork?.checkUrl;
   if (typeof checkUrl !== "string" || checkUrl.length === 0) {
     return res.status(409).json({ error: "network verification endpoint is not configured" });
   }
@@ -1274,7 +1394,10 @@ app.post("/api/devices/:deviceId/network-check", (req, res) => {
       });
       res.json({ network: { ...(publicNetworkConfig(configuredNetwork) ?? {}), ...result } });
     })
-    .catch((err) => res.status(500).json({ error: err.message }));
+    .catch((error) => {
+      console.error("Network verification failed:", error?.code || error?.name || "Error");
+      res.status(502).json({ error: "network verification failed", code: "NETWORK_CHECK_FAILED" });
+    });
 });
 
 app.patch("/api/admin/devices/:deviceId/proxy", requireCapability(CAPABILITIES.MANAGE_PROXY), (req, res, next) => {
@@ -1413,6 +1536,13 @@ function resolveResearchAccountSelector(selector, operator) {
 function taskAccessError(taskId, operator) {
   const task = taskQueue.getTask(taskId);
   if (!task) return "unknown task";
+  if (operator.role !== OPERATOR_ROLES.ADMIN && task.createdBy !== operator.username) {
+    const creator = operatorByUsername(task.createdBy);
+    if (operator.role !== OPERATOR_ROLES.MANAGER || !operator.teamId
+      || !creator?.teamId || creator.teamId !== operator.teamId) {
+      return "not authorized for that task's team";
+    }
+  }
   const id = task.deviceSelector?.deviceId;
   const allowed = task.deviceSelector?.allowedDeviceIds;
   if (id ? !canAccessDevice(operator, id)
@@ -1423,6 +1553,16 @@ function taskAccessError(taskId, operator) {
   const account = task.accountSelector?.accountId;
   if (account && !researchWorkspaceFor(operator, account)) return "not authorized for that research account";
   return null;
+}
+
+function taskAccessResult(error) {
+  return { error, status: error === "unknown task" ? 400 : 403 };
+}
+
+function activeDeviceTaskAccessError(deviceId, operator) {
+  const task = taskQueue.listTasks().find(candidate => candidate.assignedDeviceId === deviceId
+    && ["RUNNING", "PAUSED"].includes(candidate.state));
+  return task ? taskAccessError(task.id, operator) : null;
 }
 
 function scopeWorkspaceCommand(parsed, deviceId) {
@@ -1438,7 +1578,7 @@ function scopeWorkspaceCommand(parsed, deviceId) {
   return { error: "that command is not available inside a device workspace" };
 }
 
-async function executeCommand(parsed, operator, workspaceDeviceId = null) {
+async function executeCommand(parsed, operator, workspaceDeviceId = null, clientRequestId = null) {
   parsed = scopeWorkspaceCommand(parsed, workspaceDeviceId);
   if (parsed.error) return { error: parsed.error };
 
@@ -1478,6 +1618,7 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null) {
         earliestStart: parsed.earliestStart,
         latestEnd: parsed.latestEnd,
         createdBy: operator.username,
+        clientRequestId,
       });
       return { task };
     }
@@ -1488,7 +1629,7 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null) {
       if (inner.type !== "time" && inner.type !== "cresearch") {
         return { error: "/queue add requires a /time or /cresearch command" };
       }
-      return executeCommand(inner, operator, workspaceDeviceId);
+      return executeCommand(inner, operator, workspaceDeviceId, clientRequestId);
     }
 
     case "queue_list":
@@ -1510,23 +1651,23 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null) {
 
     case "queue_cancel": {
       const denied = taskAccessError(parsed.taskId, operator);
-      if (denied) return { error: denied };
+      if (denied) return taskAccessResult(denied);
       const task = taskQueue.cancelTask(parsed.taskId);
       return task ? { task } : { error: "unknown task" };
     }
 
     case "queue_move": {
       const denied = taskAccessError(parsed.taskId, operator);
-      if (denied) return { error: denied };
+      if (denied) return taskAccessResult(denied);
       const targetDenied = taskAccessError(parsed.targetId, operator);
-      if (targetDenied) return { error: targetDenied };
+      if (targetDenied) return taskAccessResult(targetDenied);
       const ok = taskQueue.moveTask(parsed.taskId, parsed.relation, parsed.targetId);
       return ok ? { ok: true } : { error: "unknown task id(s)" };
     }
 
     case "queue_priority": {
       const denied = taskAccessError(parsed.taskId, operator);
-      if (denied) return { error: denied };
+      if (denied) return taskAccessResult(denied);
       const task = taskQueue.setPriority(parsed.taskId, parsed.priority);
       return task ? { task } : { error: "unknown task" };
     }
@@ -1548,7 +1689,7 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null) {
       }
       if (parsed.scope === "task") {
         const denied = taskAccessError(parsed.scopeId, operator);
-        if (denied) return { error: denied };
+        if (denied) return taskAccessResult(denied);
       }
       try {
         const selection = modelSelection.set(parsed.providerName, { scope: parsed.scope, scopeId: parsed.scopeId });
@@ -1575,7 +1716,7 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null) {
       if (!hasCapability(operator, CAPABILITIES.VIEW_AUDIT)) {
         return { error: "sensitive audit access requires an administrator", status: 403 };
       }
-      const events = auditLog.listEvents({
+      const events = authorizedAuditEvents(operator, {
         deviceId: parsed.filterType === "device" ? parsed.value : undefined,
         operator: parsed.filterType === "operator" ? parsed.value : undefined,
         limit: parsed.limit ?? undefined,
@@ -1599,6 +1740,8 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null) {
         }
         auditLog.logEvent({ operator: operator.username, type: "switched_to_ai", deviceId: parsed.deviceId });
       } else {
+        const taskDenied = activeDeviceTaskAccessError(parsed.deviceId, operator);
+        if (taskDenied) return taskAccessResult(taskDenied);
         await taskQueue.takeoverDevice(parsed.deviceId);
         auditLog.logEvent({ operator: operator.username, type: "takeover", deviceId: parsed.deviceId });
       }
@@ -1614,6 +1757,8 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null) {
     case "ai_pause": {
       const denied = deviceAccessError(parsed.deviceId, operator);
       if (denied) return { error: denied };
+      const taskDenied = activeDeviceTaskAccessError(parsed.deviceId, operator);
+      if (taskDenied) return taskAccessResult(taskDenied);
       const task = taskQueue.pauseDevice(parsed.deviceId);
       if (task) broadcastDeviceList();
       return task ? { task } : { error: "no running task on that device" };
@@ -1622,6 +1767,8 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null) {
     case "ai_resume": {
       const denied = deviceAccessError(parsed.deviceId, operator);
       if (denied) return { error: denied };
+      const taskDenied = activeDeviceTaskAccessError(parsed.deviceId, operator);
+      if (taskDenied) return taskAccessResult(taskDenied);
       const task = taskQueue.resumeDevice(parsed.deviceId);
       if (task) broadcastDeviceList();
       return task ? { task } : { error: "no paused task on that device" };
@@ -1630,6 +1777,8 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null) {
     case "ai_stop": {
       const denied = deviceAccessError(parsed.deviceId, operator);
       if (denied) return { error: denied };
+      const taskDenied = activeDeviceTaskAccessError(parsed.deviceId, operator);
+      if (taskDenied) return taskAccessResult(taskDenied);
       const task = taskQueue.stopDevice(parsed.deviceId);
       auditLog.logEvent({ operator: operator.username, type: "ai_stop", deviceId: parsed.deviceId });
       broadcastDeviceList();
@@ -1639,6 +1788,8 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null) {
     case "ai_takeover": {
       const denied = deviceAccessError(parsed.deviceId, operator);
       if (denied) return { error: denied };
+      const taskDenied = activeDeviceTaskAccessError(parsed.deviceId, operator);
+      if (taskDenied) return taskAccessResult(taskDenied);
       const task = await taskQueue.takeoverDevice(parsed.deviceId);
       auditLog.logEvent({ operator: operator.username, type: "takeover", deviceId: parsed.deviceId });
       broadcastDeviceList();
@@ -1656,6 +1807,11 @@ app.post("/api/queue/command", requireCapability(CAPABILITIES.MANAGE_QUEUE), asy
     if (typeof text !== "string" || text.trim().length === 0) {
       return res.status(400).json({ error: "text is required" });
     }
+    const clientRequestId = req.body?.requestId ?? null;
+    if (clientRequestId !== null
+      && (typeof clientRequestId !== "string" || !/^[A-Za-z0-9_.:-]{8,200}$/.test(clientRequestId))) {
+      return res.status(400).json({ error: "requestId must be 8-200 safe characters" });
+    }
     const workspaceDeviceId = req.body?.deviceId ?? null;
     if (workspaceDeviceId !== null) {
       if (typeof workspaceDeviceId !== "string" || !devices.has(workspaceDeviceId)) {
@@ -1669,13 +1825,14 @@ app.post("/api/queue/command", requireCapability(CAPABILITIES.MANAGE_QUEUE), asy
       }
     }
     const parsed = parseCommand(text);
-    const result = await executeCommand(parsed, req.currentOperator, workspaceDeviceId);
+    const result = await executeCommand(parsed, req.currentOperator, workspaceDeviceId, clientRequestId);
     res.status(result.status ?? (result.error ? 400 : 200)).json(result);
   } catch (error) { next(error); }
 });
 
 app.get("/api/queue", requireCapability(CAPABILITIES.MANAGE_QUEUE), (req, res) => {
-  res.json({ tasks: taskQueue.listTasks().filter(task => !taskAccessError(task.id, req.currentOperator)), paused: taskQueue.isPaused() });
+  res.json({ tasks: taskQueue.listTasks().filter(task => !taskAccessError(task.id, req.currentOperator)),
+    paused: taskQueue.isPaused(), scheduler: schedulerGuard.status() });
 });
 
 // Without this, a multer failure (oversized file, invalid filename/device id
@@ -1683,10 +1840,15 @@ app.get("/api/queue", requireCapability(CAPABILITIES.MANAGE_QUEUE), (req, res) =
 // page instead of the JSON the client expects.
 app.use((err, req, res, next) => {
   if (!err) return next();
-  const message = err.code === "LIMIT_FILE_SIZE" ? "file too large" : err.message || "upload failed";
-  const status = err.code === "LIMIT_FILE_SIZE" ? 413 : err.statusCode ?? 400;
-  res.status(status).json({ error: message,
-    ...(err.code?.startsWith("MEDIA_") ? { code: err.code, ...err.detail } : {}) });
+  if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: "file too large" });
+  if (err.code?.startsWith("MEDIA_")) {
+    return res.status(err.statusCode ?? 400).json({ error: err.message, code: err.code, ...err.detail });
+  }
+  if (err.name === "MulterError" || new Set(["invalid filename", "invalid device id"]).has(err.message)) {
+    return res.status(400).json({ error: "invalid upload" });
+  }
+  console.error("Request failed:", err?.code || err?.name || "Error");
+  res.status(500).json({ error: "request failed", code: "INTERNAL_ERROR" });
 });
 
 function broadcastDeviceList() {
@@ -1699,6 +1861,13 @@ function broadcastDeviceList() {
       : [];
     client.send(JSON.stringify({ type: "device_list", devices: visibleDevices }));
   }
+}
+
+async function refreshWdaReadiness() {
+  const candidates = [...devices.values()].filter(device => device instanceof WdaDevice && device.status !== "in-use");
+  const previous = new Map(candidates.map(device => [device.id, device.status]));
+  await Promise.all(candidates.map(device => device.checkReadiness()));
+  if (candidates.some(device => previous.get(device.id) !== device.status)) broadcastDeviceList();
 }
 
 function runtimeMonitorState(deviceId) {
@@ -1733,6 +1902,10 @@ const heartbeatTimer = setInterval(() => {
   }
   if (presenceStore.cleanup()) broadcastPresence();
 }, HEARTBEAT_INTERVAL_MS);
+// The listening HTTP server is the process-lifetime authority. Keeping this
+// maintenance timer referenced makes import-based tools and tests hang if a
+// WebSocketServer close event is delayed or never emitted.
+heartbeatTimer.unref?.();
 wss.on("close", () => clearInterval(heartbeatTimer));
 
 wss.on("connection", (ws, request) => {
@@ -1804,12 +1977,16 @@ wss.on("connection", (ws, request) => {
 
   let selected = null;
   let watched = null;
+  let liveFramePending = false;
+  let selectionGeneration = 0;
   const releaseSelection = () => {
+    const hadSelection = Boolean(selected);
     if (selected && humanOwners.get(selected.id) === ws) {
       humanOwners.delete(selected.id);
       releaseDevice(selected);
     }
     selected = null;
+    if (hadSelection) selectionGeneration += 1;
     presenceStore.setDevice(ws.presenceConnectionId, null);
   };
   const selectedAccessActive = (target = selected) => Boolean(target)
@@ -1818,8 +1995,10 @@ wss.on("connection", (ws, request) => {
     && humanOwners.get(target.id) === ws
     && deviceLease.canHumanSelect(target.id)
     && networkDecision(target.id).allowed;
-  const revokeSelectedAccess = (action) => {
-    if (!selected) return;
+  const selectionAccessActive = (target, generation) => selected === target
+    && selectionGeneration === generation && selectedAccessActive(target);
+  const revokeSelectedAccess = (action, target = selected, generation = selectionGeneration) => {
+    if (!selected || selected !== target || selectionGeneration !== generation) return false;
     const revokedId = selected.id;
     auditLog.logEvent({ operator: operator.username, type: "device_access_revoked", deviceId: revokedId,
       detail: { action } });
@@ -1830,6 +2009,7 @@ wss.on("connection", (ws, request) => {
       ws.send(JSON.stringify({ type: "error", code: "device_access_revoked", deviceId: revokedId,
         message: "Your access to this phone is no longer active. It has been released." }));
     }
+    return true;
   };
   ws.releaseUnauthorizedSelection = (action = "operator_updated") => {
     if (!selected || selectedAccessActive(selected)) return false;
@@ -1890,35 +2070,44 @@ wss.on("connection", (ws, request) => {
   // offline (which is what other VAs see in their device list) after a run
   // of consecutive failures, not one blip. This is the single funnel for
   // every failure below — success is recorded separately, in sendFrame.
-  const reportError = (message) => {
-    ws.send(JSON.stringify({ type: "error", deviceId: selected?.id, message }));
-    if (selected) {
-      const failures = recordFailure(selected.id);
-      if (failures >= OFFLINE_AFTER_FAILURES && selected.status !== "offline") {
-        const offlineId = selected.id;
-        selected.status = "offline";
+  const reportError = (message, target = selected, generation = selectionGeneration) => {
+    if (!target || selected !== target || selectionGeneration !== generation) return;
+    if (!selectedAccessActive(target)) {
+      revokeSelectedAccess("device_error", target, generation);
+      return;
+    }
+    ws.send(JSON.stringify({ type: "error", deviceId: target.id, message }));
+    const failures = recordFailure(target.id);
+    if (failures >= OFFLINE_AFTER_FAILURES && target.status !== "offline") {
+        const offlineId = target.id;
+        target.status = "offline";
         auditLog.logEvent({ operator: operator.username, type: "device_became_offline", deviceId: offlineId,
           detail: { consecutiveFailures: failures } });
         releaseSelection();
         broadcastDeviceList();
         broadcastPresence();
-      }
     }
   };
+  const reportTransportError = (error, target, generation) => {
+    console.error(`Device transport failed for ${target.id}:`, error?.code || error?.name || "Error");
+    reportError(`Couldn't reach ${target.label}.`, target, generation);
+  };
 
-  const sendFrame = async () => {
+  const sendFrame = async ({ appliedAction = null, requestId = null } = {}) => {
     if (!selected || ws.readyState !== ws.OPEN) return;
     const target = selected;
+    const generation = selectionGeneration;
+    const authorize = () => selectionAccessActive(target, generation);
     if (!await ws.validateSession()) return;
-    if (selected !== target || !selectedAccessActive(target)) {
-      revokeSelectedAccess("render");
+    if (!authorize()) {
+      revokeSelectedAccess("render", target, generation);
       return;
     }
     try {
-      const frame = await target.render();
+      const frame = await target.render({ authorize });
       if (!await ws.validateSession()) return;
-      if (selected !== target || !selectedAccessActive(target)) {
-        revokeSelectedAccess("render_result");
+      if (!authorize()) {
+        revokeSelectedAccess("render_result", target, generation);
         return;
       }
       const recovered = recordSuccess(target.id);
@@ -1938,7 +2127,90 @@ wss.on("connection", (ws, request) => {
         delivery?.catch?.(() => {});
       }
     } catch (err) {
-      reportError(`Couldn't reach ${target.label}: ${err.message}`);
+      if (err?.code === "DEVICE_ACCESS_REVOKED") {
+        revokeSelectedAccess("render", target, generation);
+        return;
+      }
+      if (appliedAction) {
+        console.error(`Screen refresh failed after ${appliedAction} for ${target.id}:`, err?.code || err?.name || "Error");
+        ws.send(JSON.stringify({ type: "error", code: "action_applied_refresh_failed",
+          deviceId: target.id, requestId, action: appliedAction, actionApplied: true,
+          message: `${appliedAction} reached ${target.label}, but the updated screen could not be loaded. Refresh the screen before deciding whether to repeat it.` }));
+        const failures = recordFailure(target.id);
+        if (failures >= OFFLINE_AFTER_FAILURES && target.status !== "offline") {
+          target.status = "offline";
+          releaseSelection();
+          broadcastDeviceList();
+          broadcastPresence();
+        }
+      } else reportTransportError(err, target, generation);
+    }
+  };
+
+  // Live view is intentionally outside the per-connection input queue. A
+  // slow WDA screenshot must not sit in front of a tap, swipe, Home, or text
+  // command. The client also suppresses overlapping polls, but this guard is
+  // required at the trust boundary in case a stale or custom client sends
+  // another refresh while the first one is still running.
+  const handleLiveFrame = async (msg) => {
+    const requestId = Number.isSafeInteger(msg.requestId) && msg.requestId > 0 ? msg.requestId : null;
+    if (requestId === null) return;
+    if (!await ws.validateSession()) return;
+    if (!selected || msg.deviceId !== selected.id) {
+      ws.send(JSON.stringify({ type: "live_frame_error", code: "live_view_inactive",
+        deviceId: msg.deviceId, requestId, message: "No matching controlled device is active." }));
+      return;
+    }
+    const target = selected;
+    if (!(target instanceof WdaDevice)) {
+      ws.send(JSON.stringify({ type: "live_frame_error", code: "live_view_unsupported",
+        deviceId: target.id, requestId, message: "Live view is available only for WDA devices." }));
+      return;
+    }
+    const generation = selectionGeneration;
+    const authorize = () => selectionAccessActive(target, generation);
+    if (!authorize()) {
+      revokeSelectedAccess("refresh_live_frame", target, generation);
+      return;
+    }
+
+    const now = Date.now();
+    const nextAllowedAt = Math.max(
+      liveFrameNextByDevice.get(target.id) ?? 0,
+      liveFrameNextByOperator.get(operator.username) ?? 0
+    );
+    if (now < nextAllowedAt || activeLiveFrames >= MAX_CONCURRENT_LIVE_FRAMES) {
+      ws.send(JSON.stringify({ type: "live_frame_delayed", deviceId: target.id, requestId,
+        retryAfterMs: Math.max(1, nextAllowedAt - now) }));
+      return;
+    }
+    liveFrameNextByDevice.set(target.id, now + LIVE_FRAME_MIN_INTERVAL_MS);
+    liveFrameNextByOperator.set(operator.username, now + LIVE_FRAME_MIN_INTERVAL_MS);
+    activeLiveFrames += 1;
+    try {
+      const frame = await target.render({ authorize });
+      if (!await ws.validateSession()) return;
+      if (!authorize()) {
+        revokeSelectedAccess("live_frame_result", target, generation);
+        return;
+      }
+      ws.send(JSON.stringify({ type: "live_frame", deviceId: target.id, requestId, ...frame }));
+      for (const client of wss.clients) {
+        if (client === ws) continue;
+        const delivery = client.deliverWatchedFrame?.(target, frame);
+        delivery?.catch?.(() => {});
+      }
+    } catch (error) {
+      if (!await ws.validateSession()) return;
+      if (!authorize()) {
+        revokeSelectedAccess("live_frame_failure", target, generation);
+        return;
+      }
+      console.error(`Live frame capture failed for ${target.id}:`, error?.code || error?.name || "Error");
+      ws.send(JSON.stringify({ type: "live_frame_error", code: "live_frame_failed",
+        deviceId: target.id, requestId, message: "Could not refresh the live screen. Manual controls remain available." }));
+    } finally {
+      activeLiveFrames -= 1;
     }
   };
 
@@ -1958,6 +2230,7 @@ wss.on("connection", (ws, request) => {
     if (watched) clearWatch("claimed_device");
     releaseSelection();
     selected = target;
+    selectionGeneration += 1;
     humanOwners.set(target.id, ws);
     presenceStore.setDevice(ws.presenceConnectionId, target.id);
     selected.status = "in-use";
@@ -2068,8 +2341,9 @@ wss.on("connection", (ws, request) => {
         await ws.deliverWatchedFrame(target, frame);
       } catch (error) {
         clearWatch("render_failed");
+        console.error("Initial watch render failed:", error?.code || error?.name || "Error");
         ws.send(JSON.stringify({ type: "error", code: "watch_start_failed", deviceId: target.id,
-          message: `Could not load the live screen: ${error.message}` }));
+          message: "Could not load the live screen." }));
       }
       return;
     }
@@ -2090,8 +2364,9 @@ wss.on("connection", (ws, request) => {
         if (!await ws.validateSession()) return;
         await ws.deliverWatchedFrame(target, frame);
       } catch (error) {
+        console.error("Watch refresh failed:", error?.code || error?.name || "Error");
         ws.send(JSON.stringify({ type: "error", code: "watch_refresh_failed", deviceId: target.id,
-          message: `Could not refresh the live screen: ${error.message}` }));
+          message: "Could not refresh the live screen." }));
       }
       return;
     }
@@ -2158,6 +2433,12 @@ wss.on("connection", (ws, request) => {
         }));
         return;
       }
+      const taskDenied = activeDeviceTaskAccessError(msg.deviceId, currentOperator());
+      if (taskDenied) {
+        ws.send(JSON.stringify({ type: "error", code: "task_scope_denied", deviceId: msg.deviceId,
+          message: taskDenied }));
+        return;
+      }
       // taskQueue.takeoverDevice, not a bare deviceLease.switchToHuman: if an
       // AI task is actively running on this device, it must be cancelled
       // here too — otherwise it would keep believing it holds a device that
@@ -2190,6 +2471,12 @@ wss.on("connection", (ws, request) => {
         }));
         return;
       }
+      const taskDenied = activeDeviceTaskAccessError(msg.deviceId, currentOperator());
+      if (taskDenied) {
+        ws.send(JSON.stringify({ type: "error", code: "task_scope_denied", deviceId: msg.deviceId,
+          message: taskDenied }));
+        return;
+      }
       // Goes through the queue (which itself calls deviceLease.emergencyStop
       // synchronously — see its own comment) rather than deviceLease
       // directly, so a RUNNING task doesn't get left behind believing it
@@ -2210,17 +2497,20 @@ wss.on("connection", (ws, request) => {
       return;
     }
 
-    if (["tap", "swipe", "home", "type_text"].includes(msg.type) && selected) {
+    if (["tap", "swipe", "home", "type_text", "refresh_screen"].includes(msg.type) && selected) {
       if (msg.deviceId !== undefined && msg.deviceId !== selected.id) {
         ws.send(JSON.stringify({ type: "error", deviceId: msg.deviceId, message: "Stale device input rejected." }));
         return;
       }
-      if (!hasCapability(currentOperator(), CAPABILITIES.CONTROL_DEVICE)
-        || !canAccessDevice(currentOperator(), selected.id)
-        || humanOwners.get(selected.id) !== ws || !deviceLease.canHumanSelect(selected.id)) {
+      if (!selectedAccessActive(selected)) {
         revokeSelectedAccess(msg.type);
         return;
       }
+    }
+
+    if (msg.type === "refresh_screen" && selected) {
+      await sendFrame({ requestId: Number.isSafeInteger(msg.requestId) ? msg.requestId : null });
+      return;
     }
 
     if (msg.type === "tap" && selected) {
@@ -2231,17 +2521,27 @@ wss.on("connection", (ws, request) => {
       const isUnitCoord = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1;
       if (!isUnitCoord(msg.x) || !isUnitCoord(msg.y)) return;
 
+      const target = selected;
+      const generation = selectionGeneration;
+      const authorize = () => selectionAccessActive(target, generation);
       try {
-        await selected.tap(msg.x, msg.y);
+        await target.tap(msg.x, msg.y, { authorize });
+        if (!await ws.validateSession()) return;
+        if (!authorize()) {
+          revokeSelectedAccess("tap_result", target, generation);
+          return;
+        }
         auditLog.logEvent({
           operator: operator.username,
           type: "action_tap",
-          deviceId: selected.id,
-          detail: withNetworkEgress(selected.id, { x: msg.x, y: msg.y }),
+          deviceId: target.id,
+          detail: withNetworkEgress(target.id, { x: msg.x, y: msg.y }),
         });
-        await sendFrame();
+        recordSuccess(target.id);
+        await sendFrame({ appliedAction: "Tap", requestId: Number.isSafeInteger(msg.requestId) ? msg.requestId : null });
       } catch (err) {
-        reportError(`Couldn't reach ${selected.label}: ${err.message}`);
+        if (err?.code === "DEVICE_ACCESS_REVOKED") revokeSelectedAccess("tap", target, generation);
+        else reportTransportError(err, target, generation);
       }
       return;
     }
@@ -2250,33 +2550,53 @@ wss.on("connection", (ws, request) => {
       const directions = ["up", "down", "left", "right"];
       if (!directions.includes(msg.direction)) return;
 
+      const target = selected;
+      const generation = selectionGeneration;
+      const authorize = () => selectionAccessActive(target, generation);
       try {
-        await selected.swipe(msg.direction);
+        await target.swipe(msg.direction, { authorize });
+        if (!await ws.validateSession()) return;
+        if (!authorize()) {
+          revokeSelectedAccess("swipe_result", target, generation);
+          return;
+        }
         auditLog.logEvent({
           operator: operator.username,
           type: "action_swipe",
-          deviceId: selected.id,
-          detail: withNetworkEgress(selected.id, { direction: msg.direction }),
+          deviceId: target.id,
+          detail: withNetworkEgress(target.id, { direction: msg.direction }),
         });
-        await sendFrame();
+        recordSuccess(target.id);
+        await sendFrame({ appliedAction: "Swipe", requestId: Number.isSafeInteger(msg.requestId) ? msg.requestId : null });
       } catch (err) {
-        reportError(`Couldn't reach ${selected.label}: ${err.message}`);
+        if (err?.code === "DEVICE_ACCESS_REVOKED") revokeSelectedAccess("swipe", target, generation);
+        else reportTransportError(err, target, generation);
       }
       return;
     }
 
     if (msg.type === "home" && selected) {
+      const target = selected;
+      const generation = selectionGeneration;
+      const authorize = () => selectionAccessActive(target, generation);
       try {
-        await selected.pressHome();
+        await target.pressHome({ authorize });
+        if (!await ws.validateSession()) return;
+        if (!authorize()) {
+          revokeSelectedAccess("home_result", target, generation);
+          return;
+        }
         auditLog.logEvent({
           operator: operator.username,
           type: "action_home",
-          deviceId: selected.id,
-          detail: withNetworkEgress(selected.id),
+          deviceId: target.id,
+          detail: withNetworkEgress(target.id),
         });
-        await sendFrame();
+        recordSuccess(target.id);
+        await sendFrame({ appliedAction: "Home", requestId: Number.isSafeInteger(msg.requestId) ? msg.requestId : null });
       } catch (err) {
-        reportError(`Couldn't reach ${selected.label}: ${err.message}`);
+        if (err?.code === "DEVICE_ACCESS_REVOKED") revokeSelectedAccess("home", target, generation);
+        else reportTransportError(err, target, generation);
       }
       return;
     }
@@ -2286,19 +2606,29 @@ wss.on("connection", (ws, request) => {
       // no reason to accept an unbounded payload.
       if (typeof msg.text !== "string" || msg.text.length === 0 || msg.text.length > 1000) return;
 
+      const target = selected;
+      const generation = selectionGeneration;
+      const authorize = () => selectionAccessActive(target, generation);
       try {
-        await selected.typeText(msg.text);
+        await target.typeText(msg.text, { authorize });
+        if (!await ws.validateSession()) return;
+        if (!authorize()) {
+          revokeSelectedAccess("type_text_result", target, generation);
+          return;
+        }
         // Length only, never the text itself — this goes straight to a
         // real keyboard and the audit log isn't the place to retain that.
         auditLog.logEvent({
           operator: operator.username,
           type: "action_type_text",
-          deviceId: selected.id,
-          detail: withNetworkEgress(selected.id, { length: msg.text.length }),
+          deviceId: target.id,
+          detail: withNetworkEgress(target.id, { length: msg.text.length }),
         });
-        await sendFrame();
+        recordSuccess(target.id);
+        await sendFrame({ appliedAction: "Text input", requestId: Number.isSafeInteger(msg.requestId) ? msg.requestId : null });
       } catch (err) {
-        reportError(`Couldn't reach ${selected.label}: ${err.message}`);
+        if (err?.code === "DEVICE_ACCESS_REVOKED") revokeSelectedAccess("type_text", target, generation);
+        else reportTransportError(err, target, generation);
       }
       return;
     }
@@ -2329,8 +2659,23 @@ wss.on("connection", (ws, request) => {
     }
   };
   ws.on("message", raw => {
-    let emergency = false;
-    try { emergency = JSON.parse(raw.toString())?.type === "emergency_stop"; } catch { return; }
+    let parsed;
+    try { parsed = JSON.parse(raw.toString()); } catch { return; }
+    const messageType = parsed?.type;
+    if (messageType === "refresh_live_frame") {
+      const requestId = Number.isSafeInteger(parsed.requestId) && parsed.requestId > 0 ? parsed.requestId : null;
+      if (liveFramePending) {
+        if (requestId !== null) ws.send(JSON.stringify({ type: "live_frame_delayed",
+          deviceId: parsed.deviceId, requestId }));
+        return;
+      }
+      liveFramePending = true;
+      void handleLiveFrame(parsed)
+        .catch(error => console.error("Live frame refresh failed:", error))
+        .finally(() => { liveFramePending = false; });
+      return;
+    }
+    const emergency = messageType === "emergency_stop";
     if (emergency) void handleMessage(raw).catch(error => {
       console.error("Emergency control failed:", error);
     });
@@ -2357,20 +2702,21 @@ wss.on("connection", (ws, request) => {
 // Guarded so integration tests can `import` this module (to get `server` and
 // start it on an ephemeral port) without also triggering a real listen on the
 // default port — importing must be side-effect-free with respect to networking.
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 let queueTickTimer;
+let wdaReadinessTimer;
 if (isMain) {
   researchTaskRunner.start();
   // Dispatch only after the worker and UI listeners exist. Dispatching from
   // createTaskQueue() would emit recovered work before either subscriber can
   // see it, leaving a restarted research task RUNNING with no consumer.
-  taskQueue.tick(new Date());
-  expireAssignments();
+  schedulerGuard.run(new Date());
+  void refreshWdaReadiness();
   const PORT = process.env.PORT || 4173;
-  server.listen(PORT, () => {
+  server.listen(PORT, deployment.host, () => {
     // server.address().port (not the raw PORT var) so this is still correct
     // when PORT=0 asks the OS for an ephemeral port.
-    console.log(`Phone Farm control server running at http://localhost:${server.address().port}`);
+    const displayHost = deployment.host.includes(":") ? `[${deployment.host}]` : deployment.host;
+    console.log(`Phone Farm control server running at http://${displayHost}:${server.address().port}`);
   });
   // Only when actually running as the server, not on import — tests drive
   // taskQueue.tick() explicitly with controlled timestamps, and a real
@@ -2378,10 +2724,12 @@ if (isMain) {
   // make window-timing assertions nondeterministic.
   const QUEUE_TICK_INTERVAL_MS = 5000;
   queueTickTimer = setInterval(() => {
-    const now = new Date();
-    taskQueue.tick(now);
-    expireAssignments(now);
+    schedulerGuard.run(new Date());
   }, QUEUE_TICK_INTERVAL_MS);
+  const WDA_READINESS_INTERVAL_MS = 10_000;
+  wdaReadinessTimer = setInterval(() => {
+    void refreshWdaReadiness().catch(error => console.error("WDA readiness refresh failed:", error));
+  }, WDA_READINESS_INTERVAL_MS);
 }
 
 export {
@@ -2402,4 +2750,6 @@ export {
   modelSelection,
   presenceStore,
   assignmentStore,
+  schedulerGuard,
+  wdaReadinessTimer,
 };

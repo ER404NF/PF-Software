@@ -20,6 +20,7 @@ import {
   hasWindowExpired,
   normalizeRetryPolicy,
   hasExecutionExpired,
+  validatePersistedTask,
 } from "./taskSpec.js";
 
 const PRIORITY_ORDER = { urgent: 0, high: 1, normal: 2, low: 3 };
@@ -60,12 +61,23 @@ function loadQueueSnapshot(storePath) {
     throw new Error("invalid queue snapshot");
   }
   const tasks = isLegacyArray ? stored : stored.tasks;
+  const taskIds = new Set();
+  for (let index = 0; index < tasks.length; index += 1) {
+    const taskId = tasks[index]?.id;
+    if (typeof taskId !== "string" || !taskId) throw new Error(`invalid queue snapshot task[${index}].id`);
+    if (taskIds.has(taskId)) throw new Error(`invalid queue snapshot: duplicate task id ${taskId}`);
+    taskIds.add(taskId);
+  }
   const paused = isLegacyArray ? false : stored.paused === true;
   const humanHolds = new Set(isLegacyArray || !Array.isArray(stored.humanHolds)
     ? []
     : stored.humanHolds.filter((deviceId) => typeof deviceId === "string" && deviceId));
   let changed = isLegacyArray || stored.version !== 2 || !Array.isArray(stored.humanHolds);
   for (const task of tasks) {
+    // Legacy array snapshots predate these fields. Migrate only known absent
+    // fields; malformed present values are rejected below.
+    if (!("kind" in task)) { task.kind = "generic"; changed = true; }
+    if (!("maxDurationSec" in task)) { task.maxDurationSec = null; changed = true; }
     // Migrate snapshots written before retry timing became durable. Keeping
     // the normalized policy on every loaded task also prevents old files
     // with an omitted policy from crashing during recovery/reporting.
@@ -76,6 +88,7 @@ function loadQueueSnapshot(storePath) {
       task.retryNotBefore = null;
       changed = true;
     }
+    validatePersistedTask(task, tasks.indexOf(task));
     // The process that was running this was killed or crashed — there is no
     // way to know whether the last action actually completed, so this is
     // never silently resumed or silently dropped. The 13 states in
@@ -149,6 +162,11 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
   }
 
   function addTask(input, now = new Date()) {
+    if (input?.clientRequestId) {
+      const existing = tasks.find(candidate => candidate.clientRequestId === input.clientRequestId
+        && candidate.createdBy === (input.createdBy ?? null));
+      if (existing) return existing;
+    }
     const task = createTaskSpec(input);
     // Admit the task durably before exposing it to the live scheduler. If
     // storage is unavailable, callers receive an error and no hidden task is
@@ -194,10 +212,10 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     if (!task || isTerminal(task.state)) return task ?? null;
     const deviceId = task.deviceSelector?.deviceId;
     const wasHoldingDevice = task.state === TASK_STATES.RUNNING || task.state === TASK_STATES.PAUSED;
-    task.state = TASK_STATES.CANCELLED;
-    task.updatedAt = new Date().toISOString();
+    const nextTask = { ...task, state: TASK_STATES.CANCELLED, updatedAt: new Date().toISOString() };
+    writeQueueSnapshot(storePath, tasks.map(candidate => candidate === task ? nextTask : candidate), paused, humanHolds);
+    Object.assign(task, nextTask);
     if (wasHoldingDevice && deviceId) releaseDevice(deviceId);
-    persist();
     auditLog?.logEvent({ type: "task_cancelled", detail: { taskId } });
     if (wasHoldingDevice) tryDispatch(new Date());
     return task;
@@ -212,10 +230,15 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     const task = getTask(taskId);
     if (!task || task.state !== TASK_STATES.RUNNING) return null;
     const deviceId = task.deviceSelector?.deviceId;
-    if (deviceId) deviceLease.applyEvent(deviceId, "PAUSE_TASK");
-    task.state = TASK_STATES.PAUSED;
-    task.updatedAt = new Date().toISOString();
-    persist();
+    const nextTask = { ...task, state: TASK_STATES.PAUSED, updatedAt: new Date().toISOString() };
+    writeQueueSnapshot(storePath, tasks.map(candidate => candidate === task ? nextTask : candidate), paused, humanHolds);
+    try {
+      if (deviceId) deviceLease.applyEvent(deviceId, "PAUSE_TASK");
+    } catch (error) {
+      writeQueueSnapshot(storePath, tasks, paused, humanHolds);
+      throw error;
+    }
+    Object.assign(task, nextTask);
     auditLog?.logEvent({ type: "task_paused", deviceId, detail: { taskId } });
     return task;
   }
@@ -224,10 +247,15 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     const task = getTask(taskId);
     if (!task || task.state !== TASK_STATES.PAUSED) return null;
     const deviceId = task.deviceSelector?.deviceId;
-    if (deviceId) deviceLease.applyEvent(deviceId, "RESUME_TASK");
-    task.state = TASK_STATES.RUNNING;
-    task.updatedAt = new Date().toISOString();
-    persist();
+    const nextTask = { ...task, state: TASK_STATES.RUNNING, updatedAt: new Date().toISOString() };
+    writeQueueSnapshot(storePath, tasks.map(candidate => candidate === task ? nextTask : candidate), paused, humanHolds);
+    try {
+      if (deviceId) deviceLease.applyEvent(deviceId, "RESUME_TASK");
+    } catch (error) {
+      writeQueueSnapshot(storePath, tasks, paused, humanHolds);
+      throw error;
+    }
+    Object.assign(task, nextTask);
     auditLog?.logEvent({ type: "task_resumed", deviceId, detail: { taskId } });
     // Starts a recovered worker; the runner coalesces an already active one.
     emit("dispatched", { task, deviceId });
@@ -344,31 +372,33 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     const idx = tasks.findIndex((t) => t.id === taskId);
     const targetIdx = tasks.findIndex((t) => t.id === targetId);
     if (idx === -1 || targetIdx === -1 || taskId === targetId) return false;
-    const [task] = tasks.splice(idx, 1);
-    const newTargetIdx = tasks.findIndex((t) => t.id === targetId);
-    tasks.splice(relation === "before" ? newTargetIdx : newTargetIdx + 1, 0, task);
-    persist();
+    const nextTasks = [...tasks];
+    const [task] = nextTasks.splice(idx, 1);
+    const newTargetIdx = nextTasks.findIndex((t) => t.id === targetId);
+    nextTasks.splice(relation === "before" ? newTargetIdx : newTargetIdx + 1, 0, task);
+    writeQueueSnapshot(storePath, nextTasks, paused, humanHolds);
+    tasks.splice(0, tasks.length, ...nextTasks);
     return true;
   }
 
   function setPriority(taskId, priority) {
     const task = getTask(taskId);
     if (!task) return null;
-    task.priority = priority;
-    task.updatedAt = new Date().toISOString();
-    persist();
+    const nextTask = { ...task, priority, updatedAt: new Date().toISOString() };
+    writeQueueSnapshot(storePath, tasks.map(candidate => candidate === task ? nextTask : candidate), paused, humanHolds);
+    Object.assign(task, nextTask);
     return task;
   }
 
   function pauseQueue() {
     if (paused) return;
+    writeQueueSnapshot(storePath, tasks, true, humanHolds);
     paused = true;
-    persist();
   }
   function resumeQueue() {
     if (!paused) return;
+    writeQueueSnapshot(storePath, tasks, false, humanHolds);
     paused = false;
-    persist();
   }
   function isPaused() {
     return paused;
@@ -378,9 +408,9 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     const task = getTask(taskId);
     if (!task) throw new Error(`unknown task: ${taskId}`);
     const entry = { at: new Date().toISOString(), data };
-    task.checkpoints.push(entry);
-    task.updatedAt = entry.at;
-    persist();
+    const nextTask = { ...task, checkpoints: [...task.checkpoints, entry], updatedAt: entry.at };
+    writeQueueSnapshot(storePath, tasks.map(candidate => candidate === task ? nextTask : candidate), paused, humanHolds);
+    Object.assign(task, nextTask);
     auditLog?.logEvent({
       operator: task.createdBy,
       type: "task_checkpoint",
@@ -388,6 +418,23 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
       detail: { taskId, data },
     });
     return entry;
+  }
+
+  function renamePrincipal(previousUsername, username) {
+    if (typeof previousUsername !== "string" || !previousUsername.trim()
+      || typeof username !== "string" || !username.trim()) {
+      throw new Error("previous username and username are required");
+    }
+    const previous = previousUsername.trim();
+    const nextUsername = username.trim();
+    const changed = tasks.filter(task => task.createdBy === previous);
+    if (!changed.length || previous === nextUsername) return [];
+    const nextTasks = tasks.map(task => task.createdBy === previous ? { ...task, createdBy: nextUsername } : task);
+    writeQueueSnapshot(storePath, nextTasks, paused, humanHolds);
+    for (let index = 0; index < tasks.length; index += 1) {
+      if (nextTasks[index] !== tasks[index]) Object.assign(tasks[index], nextTasks[index]);
+    }
+    return changed.map(task => task.id);
   }
 
   // Eligibility (COMMAND_QUEUE_SPEC.md §6): window open, dependencies
@@ -493,22 +540,13 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     return dispatched;
   }
 
-  function finishRunningTaskAtWindowEnd(task, now) {
-    const deviceId = task.deviceSelector?.deviceId;
+  function taskAtWindowEnd(task, now) {
     // A task that recorded at least one checkpoint made real progress —
     // PARTIAL, not EXPIRED (§7): the distinction future review depends on.
-    task.state = task.checkpoints.length > 0 ? TASK_STATES.PARTIAL : TASK_STATES.EXPIRED;
-    task.updatedAt = now.toISOString();
-    task.result = { outcome: task.state, detail: task.maxDurationSec && new Date(task.dispatchedAt).getTime() + task.maxDurationSec * 1000 <= now.getTime()
-      ? "task duration limit reached" : "time window closed", at: now.toISOString() };
-    if (deviceId) releaseDevice(deviceId);
-    persist();
-    auditLog?.logEvent({
-      operator: task.createdBy,
-      type: "task_window_closed",
-      deviceId,
-      detail: { taskId: task.id, finalState: task.state },
-    });
+    const state = task.checkpoints.length > 0 ? TASK_STATES.PARTIAL : TASK_STATES.EXPIRED;
+    return { ...task, state, updatedAt: now.toISOString(), result: { outcome: state,
+      detail: task.maxDurationSec && new Date(task.dispatchedAt).getTime() + task.maxDurationSec * 1000 <= now.getTime()
+      ? "task duration limit reached" : "time window closed", at: now.toISOString() } };
   }
 
   // The clock-driven half of the scheduler — window open/close transitions
@@ -516,27 +554,35 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
   // explicit parameter, never read from Date.now() internally, so tests can
   // simulate time passing without real delays.
   function tick(now = new Date()) {
-    let changed = false;
-    for (const task of tasks) {
+    const transitions = [];
+    const nextTasks = tasks.map(task => {
+      let nextTask = task;
       if (task.state === TASK_STATES.SCHEDULED && isWindowOpen(task, now)) {
-        task.state = TASK_STATES.QUEUED;
-        task.updatedAt = now.toISOString();
-        changed = true;
+        nextTask = { ...task, state: TASK_STATES.QUEUED, updatedAt: now.toISOString() };
       } else if (
         (task.state === TASK_STATES.SCHEDULED || task.state === TASK_STATES.QUEUED) &&
         hasWindowExpired(task, now)
       ) {
-        task.state = TASK_STATES.EXPIRED;
-        task.result = { outcome: TASK_STATES.EXPIRED, detail: "window closed before it ever ran", at: now.toISOString() };
-        task.updatedAt = now.toISOString();
-        changed = true;
+        nextTask = { ...task, state: TASK_STATES.EXPIRED, updatedAt: now.toISOString(),
+          result: { outcome: TASK_STATES.EXPIRED, detail: "window closed before it ever ran", at: now.toISOString() } };
       } else if ([TASK_STATES.RUNNING, TASK_STATES.PAUSED].includes(task.state)
         && hasExecutionExpired(task, now)) {
-        finishRunningTaskAtWindowEnd(task, now);
-        changed = true;
+        nextTask = taskAtWindowEnd(task, now);
+      }
+      if (nextTask !== task) transitions.push({ task, nextTask });
+      return nextTask;
+    });
+    if (transitions.length) writeQueueSnapshot(storePath, nextTasks, paused, humanHolds);
+    for (const { task, nextTask } of transitions) {
+      const wasHolding = [TASK_STATES.RUNNING, TASK_STATES.PAUSED].includes(task.state);
+      const deviceId = task.deviceSelector?.deviceId;
+      Object.assign(task, nextTask);
+      if (wasHolding && deviceId) {
+        releaseDevice(deviceId);
+        auditLog?.logEvent({ operator: task.createdBy, type: "task_window_closed", deviceId,
+          detail: { taskId: task.id, finalState: task.state } });
       }
     }
-    if (changed) persist();
     tryDispatch(now);
   }
 
@@ -600,6 +646,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     resumeQueue,
     isPaused,
     checkpoint,
+    renamePrincipal,
     tick,
     reportResult,
     pauseTask,
