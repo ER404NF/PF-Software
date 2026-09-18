@@ -21,3 +21,19 @@ test("discovery is empty away from macOS or when libimobiledevice is unavailable
   assert.deepEqual(discoverIosDevices({ platform: "win32", execFile: () => { throw new Error("must not run"); } }), []);
   assert.deepEqual(discoverIosDevices({ platform: "darwin", execFile: () => { throw new Error("missing"); } }), []);
 });
+
+test("discovery uses resolved absolute libimobiledevice binaries", () => {
+  const calls = [];
+  const devices = discoverIosDevices({
+    platform: "darwin",
+    ideviceIdBin: "/opt/homebrew/bin/idevice_id",
+    ideviceInfoBin: "/opt/homebrew/bin/ideviceinfo",
+    execFile: (command, args) => {
+      calls.push([command, args]);
+      return args[0] === "-l" ? "UDID-00000001\n" : "Phone\n";
+    },
+  });
+  assert.equal(devices.length, 1);
+  assert.equal(calls[0][0], "/opt/homebrew/bin/idevice_id");
+  assert.equal(calls[1][0], "/opt/homebrew/bin/ideviceinfo");
+});

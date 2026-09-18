@@ -10,6 +10,8 @@ function fakeExecFile(responses) {
       if (result instanceof Error) throw result;
       return result;
     }
+    if (key === "xcodebuild -version") return "Xcode 16.0\n";
+    if (key === "ideviceinfo --version") return "1.3.0\n";
     throw Object.assign(new Error(`unexpected command: ${key}`), { code: "ENOENT" });
   };
 }
@@ -103,4 +105,48 @@ test("preflight reports a clear message when WDA_REPO_PATH is unset", () => {
   const wdaRepo = result.checks.find(c => c.id === "wda-repo");
   assert.equal(wdaRepo.ok, false);
   assert.match(wdaRepo.message, /WDA_REPO_PATH is not set/);
+});
+
+test("preflight uses resolved absolute binary paths supplied by the desktop host", () => {
+  const calls = [];
+  const execFile = (command, args) => {
+    calls.push(`${command} ${args.join(" ")}`);
+    if (command === "/usr/bin/xcode-select") return "/Applications/Xcode.app/Contents/Developer\n";
+    return "available\n";
+  };
+  const result = runHostPreflight({
+    platform: "darwin",
+    execFile,
+    existsSync: () => true,
+    wdaRepoPath: "/Users/va/WebDriverAgent",
+    xcodeSelectBin: "/usr/bin/xcode-select",
+    xcodebuildBin: "/usr/bin/xcodebuild",
+    ideviceIdBin: "/opt/homebrew/bin/idevice_id",
+    ideviceInfoBin: "/opt/homebrew/bin/ideviceinfo",
+    iproxyBin: "/opt/homebrew/bin/iproxy",
+  });
+  assert.equal(result.ok, true);
+  assert.ok(calls.includes("/usr/bin/xcodebuild -version"));
+  assert.ok(calls.includes("/opt/homebrew/bin/idevice_id -l"));
+  assert.ok(calls.includes("/opt/homebrew/bin/ideviceinfo --version"));
+  assert.ok(calls.includes("/opt/homebrew/bin/iproxy "));
+});
+
+test("preflight fails when ideviceinfo or xcodebuild is missing", () => {
+  const missing = Object.assign(new Error("missing"), { code: "ENOENT" });
+  const result = runHostPreflight({
+    platform: "darwin",
+    execFile: fakeExecFile({
+      "xcode-select -p": "/Applications/Xcode.app/Contents/Developer\n",
+      "xcodebuild -version": missing,
+      "idevice_id -l": "",
+      "ideviceinfo --version": missing,
+      "iproxy": "",
+    }),
+    existsSync: () => true,
+    wdaRepoPath: "/Users/va/WebDriverAgent",
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.checks.find(check => check.id === "xcodebuild").ok, false);
+  assert.equal(result.checks.find(check => check.id === "ideviceinfo").ok, false);
 });

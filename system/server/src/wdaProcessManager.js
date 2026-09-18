@@ -6,8 +6,9 @@ import { SupervisedProcessGroup } from "./processSupervisor.js";
 // E-XCODEBUILD-003/004) and a derived-data path unique to this device (§4.2:
 // "never share a derivedDataPath between simultaneous devices").
 export class WdaProcessManager {
-  constructor({ spawn = nodeSpawn, wdaRepoPath, restartBackoffMs } = {}) {
+  constructor({ spawn = nodeSpawn, wdaRepoPath, xcodebuildBin = process.env.XCODEBUILD_BIN || "xcodebuild", restartBackoffMs } = {}) {
     this.wdaRepoPath = wdaRepoPath;
+    this.xcodebuildBin = xcodebuildBin;
     this.group = new SupervisedProcessGroup({ spawn, restartBackoffMs, logRingSize: 200 });
   }
 
@@ -27,6 +28,6 @@ export class WdaProcessManager {
       "-derivedDataPath", derivedDataPath,
       "test",
     ];
-    this.group.start(udid, "xcodebuild", args);
+    this.group.start(udid, this.xcodebuildBin, args);
   }
 }

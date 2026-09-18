@@ -13,6 +13,7 @@ test("classifyWdaFailure recognizes known manual-prerequisite failures", () => {
   assert.match(classifyWdaFailure("Developer Mode is disabled"), /Enable Developer Mode/);
   assert.match(classifyWdaFailure("Untrusted Developer"), /Trust the developer certificate/);
   assert.match(classifyWdaFailure("Your maximum App ID limit has been reached"), /App ID creation limit/);
+  assert.match(classifyWdaFailure("Signing for WebDriverAgentRunner requires a development team"), /configured once in Xcode/);
 });
 
 test("classifyWdaFailure returns null for an unrecognized error", () => {
@@ -86,6 +87,30 @@ test("polling again for the same attached UDID does not start a second process",
   await provisioner.pollOnce();
   assert.equal(wdaProcessManager.starts.length, 1);
   assert.equal(iproxyManager.starts.length, 1);
+});
+
+test("two attached iPhones get isolated WDA builds and scoped tunnels, and one detach leaves the other running", async () => {
+  const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner();
+  state.attached = [
+    { id: "a", udid: "UDID-00000001", label: "Phone A" },
+    { id: "b", udid: "UDID-00000002", label: "Phone B" },
+  ];
+  await provisioner.pollOnce();
+
+  assert.equal(devices.size, 2);
+  assert.deepEqual(wdaProcessManager.starts.map(start => start.udid), ["UDID-00000001", "UDID-00000002"]);
+  assert.equal(new Set(wdaProcessManager.starts.map(start => start.derivedDataPath)).size, 2);
+  assert.deepEqual(iproxyManager.starts.map(start => [start.udid, start.localPort]), [
+    ["UDID-00000001", 9000],
+    ["UDID-00000002", 9001],
+  ]);
+
+  state.attached = [{ id: "b", udid: "UDID-00000002", label: "Phone B" }];
+  await provisioner.pollOnce();
+  assert.ok(wdaProcessManager.stops.includes("UDID-00000001"));
+  assert.ok(iproxyManager.stops.includes("UDID-00000001"));
+  assert.equal(wdaProcessManager.running.has("UDID-00000002"), true);
+  assert.equal(iproxyManager.running.has("UDID-00000002"), true);
 });
 
 test("clears the provisioning banner once the existing WDA readiness loop marks the device ready", async () => {

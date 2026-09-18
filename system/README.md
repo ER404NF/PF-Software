@@ -350,6 +350,38 @@ on the fleet card (Admin-only, `device:provision` capability) that calls
 See "Shared proxy pool" and "Proxy tunnel routing" below for Phase B, which
 this feeds into.
 
+### Installed macOS desktop host
+
+The Electron host enables this pipeline automatically when **Set up a new
+host** is selected. It does not rely on Finder inheriting a shell `PATH`: the
+desktop resolver searches the current path plus `/opt/homebrew/bin`,
+`/usr/local/bin`, `/usr/bin`, `/bin`, `/usr/sbin`, and `/sbin`, then passes
+absolute `XCODEBUILD_BIN`, `XCODE_SELECT_BIN`, `IDEVICE_ID_BIN`,
+`IDEVICEINFO_BIN`, and `IPROXY_BIN` values to the bundled server. It accepts a
+WDA checkout only when `WebDriverAgent.xcodeproj` exists, checking an explicit
+`WDA_REPO_PATH`, the previously persisted desktop path, then
+`~/WebDriverAgent`.
+
+Fresh desktop hosts do not create or pass an empty `DEVICE_CONFIG_PATH`.
+Connected trusted phones are therefore eligible for automatic provisioning
+without hand-writing `devices.config.json`; an existing explicit manual config
+path remains an advanced/debug override. `DESKTOP_AUTO_DEVICE_MODE=true` keeps
+the source checkout's example config from leaking into desktop host mode while
+still allowing that explicit override. Runtime provisioning records and WDA
+derived data live under Electron's per-user application data directory, not in
+the read-only installed app bundle.
+
+Missing prerequisites are shown in the local setup screen before the server is
+opened: full Xcode, `libimobiledevice`, `iproxy`, and the WDA checkout each get
+an actionable status. Known device-side/signing failures become
+`user_action_required` on that phone and stop the retry loop until an admin
+retries. This automation does not remove the one-time Apple signing, trust, or
+Developer Mode requirements.
+
+`tun2proxy`/`tun2proxy-bin` is also discovered, but proxy routing, automatic
+network enrollment, and Internet Sharing remain opt-in through their existing
+settings. Opening the desktop app does not enable privileged routing.
+
 ## Shared proxy pool (Phase B, part 1 — credentials and assignment)
 
 An Admin enters a proxy provider's credentials once (`proxyPool.js`), and

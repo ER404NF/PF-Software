@@ -51,6 +51,7 @@ import { createAuthenticationThrottle, createRecoveryThrottle } from "./recovery
 import { createSchedulerGuard } from "./schedulerGuard.js";
 import { decryptTotpSecret, encryptTotpSecret, generateRecoveryCodes, generateTotpSecret, otpauthUri, recoveryCodeDigest, verifyTotp } from "./twoFactor.js";
 import { discoverIosDevices } from "./deviceDiscovery.js";
+import { loadDeviceConfig } from "./deviceConfigLoader.js";
 import { loadDevices } from "./deviceRegistry.js";
 import { runHostPreflight } from "./hostPreflight.js";
 import { resolvePortRange } from "./portAllocator.js";
@@ -73,7 +74,7 @@ import {
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const clientDir = path.join(__dirname, "../../client");
 const configPath = process.env.DEVICE_CONFIG_PATH || path.join(__dirname, "../../devices.config.json");
-const rawDeviceConfig = fs.existsSync(configPath) ? JSON.parse(fs.readFileSync(configPath, "utf8")) : { devices: [] };
+const rawDeviceConfig = loadDeviceConfig({ env: process.env, defaultPath: configPath });
 const discoveredIosDevices = process.env.AUTO_DISCOVER_IOS_DEVICES === "false" ? [] : discoverIosDevices();
 const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 const deployment = resolveDeploymentConfig(process.env, {
@@ -3210,7 +3211,10 @@ if (isMain) {
         devices,
         discoverIosDevices,
         manualUdids: manualWdaUdids,
-        wdaProcessManager: new WdaProcessManager({ wdaRepoPath: process.env.WDA_REPO_PATH }),
+        wdaProcessManager: new WdaProcessManager({
+          wdaRepoPath: process.env.WDA_REPO_PATH,
+          xcodebuildBin: process.env.XCODEBUILD_BIN,
+        }),
         iproxyManager: new IProxyManager(),
         provisioningStorePath: process.env.DEVICE_PROVISIONING_STORE_PATH
           || path.join(__dirname, "../../storage/device-provisioning.json"),

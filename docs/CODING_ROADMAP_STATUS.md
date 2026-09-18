@@ -1,5 +1,43 @@
 # Roadmap Status Report — updated 2026-09-18
 
+## 2026-09-18 — macOS installed-host automatic WDA startup and Electron isolation
+
+The installed desktop host now resolves its Mac toolchain before starting the
+server, including Finder-safe Apple Silicon/Intel Homebrew paths, full-Xcode
+selection, `idevice_id`, `ideviceinfo`, `iproxy`, both `tun2proxy` binary names,
+and a validated WebDriverAgent checkout from an explicit, persisted, or
+per-user home path. Host mode supplies absolute tool paths plus
+`AUTO_PROVISION_WDA=true` and `AUTO_DISCOVER_IOS_DEVICES=true` to the server's
+existing `DeviceProvisioner`; it uses the Electron runtime, per-user
+provisioning/derived-data storage, and no fresh empty manual device config.
+
+The setup page now shows actionable prerequisite rows instead of falling
+through to an empty fleet. Existing per-device provisioning reports WDA/tunnel
+startup, readiness, unplug/replug, and human-action-required failures; signing
+and provisioning errors now join trust, Developer Mode, certificate, and App
+ID-limit errors in the bounded/manual-retry path.
+
+The Electron privilege boundary was split: only the packaged local setup file
+gets the IPC preload, every privileged call validates its sender window and
+exact frame URL, and the HTTP(S) Phone Farm window has no preload. Both window
+types deny popups and unexpected navigation; client URLs with embedded
+credentials are rejected.
+
+Direct `desktop/npm run dist:mac` now installs and verifies the production
+`system` runtime before electron-builder copies it as `extraResources`.
+Automated desktop and server tests cover both Homebrew layouts, WDA/tool
+failure paths, environment construction, navigation/origin restrictions,
+preload isolation, absolute binary use, and two-phone process/port isolation.
+Validation on the Windows development host: desktop **12/12**, complete system
+suite **800/800**, production dependency audit **0 vulnerabilities**, runtime
+packaging preflight passed, changed JavaScript entry points passed
+`node --check`, and `git diff --check` passed. `npm run dist:mac` reached
+electron-builder after successfully preparing the bundled runtime, then exited
+with its expected platform guard: macOS builds are supported only on macOS.
+Therefore no DMG was produced here and the real two-iPhone flow remains
+unverified; use `docs/MAC_INSTALLER_ACCEPTANCE.md` on the Mac mini before
+changing that status.
+
 ## 2026-09-18 — downloadable desktop app: bootstrap lockout, account action
 ## menu, real email delivery, Electron host/client wrapper
 

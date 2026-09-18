@@ -6,8 +6,10 @@
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "dist:win": "electron-builder --win",
-    "dist:mac": "electron-builder --mac"
+    "test": "node --test test/*.test.js",
+    "prepare:runtime": "node scripts/prepare-runtime.cjs",
+    "dist:win": "npm run prepare:runtime && electron-builder --win",
+    "dist:mac": "npm run prepare:runtime && electron-builder --mac"
   },
   "devDependencies": {
     "electron": "^33.0.0",

@@ -1,15 +1,17 @@
 # Phone Farm — Dual-Mode Human VA / Future AI VA Control System
 
-## Download and build the desktop installer
+## Build the desktop installer from a checkout
 
-The repository root contains the downloader so it is visible immediately after
-cloning or pulling the repository:
+The repository root contains a developer/local builder so it is visible
+immediately after cloning or pulling the repository:
 
 - macOS: open `DOWNLOAD_PHONE_FARM.command`, or run
   `zsh ./DOWNLOAD_PHONE_FARM.command` from Terminal.
 - Windows: open `DOWNLOAD_PHONE_FARM.cmd`.
 
-The downloader installs the exact dependencies recorded in both lock files,
+Despite its historical `DOWNLOAD_...` filename, this script does **not** fetch a
+ready-made Phone Farm application. It installs the exact dependencies recorded
+in both lock files,
 runs the complete server test suite, and builds the local desktop installer in
 `desktop/dist/`. It never downloads credentials, operator accounts, device
 configuration, or runtime storage. The build computer needs Node.js 20 or newer;
@@ -19,6 +21,14 @@ rebuilding an already-validated revision.
 
 Installers produced locally are unsigned until Apple/Windows signing credentials
 are configured, so the operating system may show a security warning.
+
+The intended operator distribution is a prebuilt `Phone-Farm-x.x.x.dmg`:
+open the DMG, drag Phone Farm to Applications, then open it normally. The
+installed app carries its own server runtime and does not require Node.js or
+Terminal. On a macOS host, choosing **Set up a new host** discovers Finder-safe
+Xcode/Homebrew tool paths and `~/WebDriverAgent`, then enables automatic iPhone
+discovery, per-phone WDA, and per-phone `iproxy -u <UDID>` tunnels. See
+`docs/MAC_INSTALLER_ACCEPTANCE.md` for the still-required real-Mac acceptance.
 
 ## Product goal
 

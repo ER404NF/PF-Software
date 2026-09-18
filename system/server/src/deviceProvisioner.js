@@ -16,6 +16,7 @@ const KNOWN_FAILURES = [
   { pattern: /developer mode/i, message: "Enable Developer Mode on the phone (Settings > Privacy & Security), then click Retry." },
   { pattern: /untrusted developer|verify.{0,20}app|trust.{0,20}certificate/i, message: "Trust the developer certificate on the phone (Settings > General > VPN & Device Management), then click Retry." },
   { pattern: /maximum app id limit/i, message: "Apple's App ID creation limit was hit for this signing account. Reuse an existing bundle id instead of generating a new one." },
+  { pattern: /requires a provisioning profile|no profiles for|provisioning profile .* (?:doesn't include|not found)|signing for .* requires a development team|code signing is required/i, message: "WDA signing needs to be configured once in Xcode. Open WebDriverAgent.xcodeproj, select a development team for WebDriverAgentRunner, run it once, then click Retry." },
 ];
 
 export function classifyWdaFailure(logText) {
@@ -127,7 +128,7 @@ export class DeviceProvisioner {
       this.devices.set(logicalId, wdaDevice);
     }
     wdaDevice.discoveryState = "provisioning";
-    wdaDevice.discoveryStateMessage = "Starting WDA and the device tunnel automatically. This can take a minute.";
+    wdaDevice.discoveryStateMessage = "Starting WDA. Starting the USB tunnel. Waiting for device readiness. This can take a minute.";
     wdaDevice.status = "offline";
     this.runtime.set(udid, { logicalId, wdaDevice, port, derivedDataPath });
     this.udidByLogicalId.set(logicalId, udid);

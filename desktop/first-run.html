@@ -2,10 +2,11 @@
 <html>
 <head>
 <meta charset="utf-8" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'" />
 <title>Phone Farm setup</title>
 <style>
   body { font-family: -apple-system, "Segoe UI", sans-serif; background: #111; color: #eee; margin: 0; padding: 48px; }
-  .card { max-width: 460px; margin: 0 auto; }
+  .card { max-width: 560px; margin: 0 auto; }
   h1 { font-size: 20px; margin-bottom: 4px; }
   p.sub { color: #999; margin-top: 0; font-size: 13px; }
   button.choice { display: block; width: 100%; padding: 14px 16px; margin: 10px 0; border-radius: 8px; border: 1px solid #333; background: #1c1c1c; color: #eee; text-align: left; cursor: pointer; font-size: 14px; }
@@ -17,6 +18,13 @@
   .primary { margin-top: 16px; width: 100%; padding: 10px; border-radius: 6px; border: none; background: #eee; color: #111; font-weight: 700; cursor: pointer; }
   .back { background: none; border: none; color: #999; cursor: pointer; margin-bottom: 12px; }
   .error { color: #ff8080; font-size: 12px; margin-top: 8px; min-height: 16px; }
+  .status-list { margin: 18px 0; border: 1px solid #333; border-radius: 8px; overflow: hidden; }
+  .status-row { display: grid; grid-template-columns: 1fr auto; gap: 16px; padding: 11px 13px; border-bottom: 1px solid #2b2b2b; }
+  .status-row:last-child { border-bottom: 0; }
+  .status-label { font-size: 13px; font-weight: 650; }
+  .status-value { font-size: 12px; color: #9bd6a4; }
+  .status-row.problem .status-value { color: #ff9a9a; }
+  .status-message { grid-column: 1 / -1; color: #aaa; font-size: 11px; line-height: 1.45; }
 </style>
 </head>
 <body>
@@ -32,6 +40,16 @@
         Connect to an existing Phone Farm host
         <small>Sign in or apply for access on a host that's already running elsewhere.</small>
       </button>
+    </div>
+
+    <div id="host-setup-view" hidden>
+      <button class="back" id="host-back">&larr; Back</button>
+      <h1>Host setup</h1>
+      <p class="sub">Phone Farm is checking the local tools needed to detect and control connected iPhones automatically.</p>
+      <div class="status-list" id="host-status-list"></div>
+      <p class="error" id="host-error"></p>
+      <button class="primary" id="host-retry" hidden>Check again</button>
+      <button class="primary" id="host-continue" hidden>Create the first admin</button>
     </div>
 
     <div id="create-admin-view" hidden>
@@ -65,23 +83,57 @@
   const choiceView = document.getElementById("choice-view");
   const adminView = document.getElementById("create-admin-view");
   const connectView = document.getElementById("connect-view");
-  let hostPort = null;
+  const hostSetupView = document.getElementById("host-setup-view");
 
   function show(view) {
     choiceView.hidden = view !== choiceView;
     adminView.hidden = view !== adminView;
     connectView.hidden = view !== connectView;
+    hostSetupView.hidden = view !== hostSetupView;
   }
 
-  document.getElementById("host-choice").addEventListener("click", async () => {
+  function renderPreflight(preflight, pending = false) {
+    const list = document.getElementById("host-status-list");
+    const checks = preflight?.checks || [
+      { label: "Mac host tools", ok: false, message: pending ? "Checking…" : "Not checked yet." },
+    ];
+    list.replaceChildren(...checks.map(check => {
+      const row = document.createElement("div");
+      row.className = `status-row${check.ok || check.optional ? "" : " problem"}`;
+      const label = document.createElement("span");
+      label.className = "status-label";
+      label.textContent = check.label || check.id;
+      const value = document.createElement("span");
+      value.className = "status-value";
+      value.textContent = pending ? "Checking" : check.ok ? "Ready" : check.optional ? "Not applicable" : "Needs attention";
+      const message = document.createElement("span");
+      message.className = "status-message";
+      message.textContent = check.message || "";
+      row.append(label, value, message);
+      return row;
+    }));
+  }
+
+  async function beginHostSetup() {
+    show(hostSetupView);
+    renderPreflight(null, true);
+    document.getElementById("host-error").textContent = "";
+    document.getElementById("host-retry").hidden = true;
+    document.getElementById("host-continue").hidden = true;
     const result = await window.desktopApi.startHostSetup();
+    renderPreflight(result.preflight);
     if (!result.ok) {
-      alert(`Could not start the host server: ${result.error}`);
+      document.getElementById("host-error").textContent = result.error;
+      document.getElementById("host-retry").hidden = false;
       return;
     }
-    hostPort = result.port;
-    show(adminView);
-  });
+    if (!result.alreadyConfigured) document.getElementById("host-continue").hidden = false;
+  }
+
+  document.getElementById("host-choice").addEventListener("click", beginHostSetup);
+  document.getElementById("host-retry").addEventListener("click", beginHostSetup);
+  document.getElementById("host-continue").addEventListener("click", () => show(adminView));
+  document.getElementById("host-back").addEventListener("click", () => show(choiceView));
 
   document.getElementById("client-choice").addEventListener("click", () => show(connectView));
   document.getElementById("admin-back").addEventListener("click", () => show(choiceView));
@@ -91,14 +143,13 @@
     const errorEl = document.getElementById("admin-error");
     errorEl.textContent = "";
     const result = await window.desktopApi.createAdmin({
-      port: hostPort,
       username: document.getElementById("admin-username").value,
       password: document.getElementById("admin-password").value,
       fullName: document.getElementById("admin-full-name").value,
       email: document.getElementById("admin-email").value,
     });
     if (!result.ok) errorEl.textContent = result.error;
-    // On success the main process navigates this window to the server URL.
+    // On success the main process opens a separate, unprivileged app window.
   });
 
   document.getElementById("connect-submit").addEventListener("click", async () => {
@@ -106,6 +157,14 @@
     errorEl.textContent = "";
     const result = await window.desktopApi.connectToHost(document.getElementById("host-url").value);
     if (!result.ok) errorEl.textContent = result.error;
+  });
+
+  window.desktopApi.getStartupState().then(state => {
+    if (!state?.ok || state.mode !== "host" || !state.error) return;
+    show(hostSetupView);
+    renderPreflight(state.preflight);
+    document.getElementById("host-error").textContent = state.error;
+    document.getElementById("host-retry").hidden = false;
   });
 </script>
 </body>

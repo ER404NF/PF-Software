@@ -4,7 +4,7 @@ cd /d "%~dp0"
 
 where node >nul 2>nul
 if errorlevel 1 (
-  echo Phone Farm downloader needs Node.js 20 or newer. Install Node.js, then run this file again.
+  echo Phone Farm local installer builder needs Node.js 20 or newer. Install Node.js, then run this file again.
   set "PF_EXIT=1"
 ) else (
   node "%~dp0DOWNLOAD_PHONE_FARM.mjs" %*

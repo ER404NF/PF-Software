@@ -45,3 +45,14 @@ test("two devices never share a derivedDataPath argument", () => {
   assert.deepEqual(new Set(derivedPaths), new Set(["/tmp/derived/a", "/tmp/derived/b"]));
   assert.notEqual(derivedPaths[0], derivedPaths[1]);
 });
+
+test("start() uses the absolute xcodebuild path resolved by the desktop host", () => {
+  const calls = [];
+  const manager = new WdaProcessManager({
+    spawn: (bin, args) => { calls.push({ bin, args }); return fakeChild(); },
+    wdaRepoPath: "/repo",
+    xcodebuildBin: "/usr/bin/xcodebuild",
+  });
+  manager.start({ udid: "udid-a", derivedDataPath: "/tmp/derived/a" });
+  assert.equal(calls[0].bin, "/usr/bin/xcodebuild");
+});

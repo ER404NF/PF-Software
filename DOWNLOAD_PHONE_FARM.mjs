@@ -14,7 +14,7 @@ const dryRun = args.has("--dry-run");
 const skipTests = args.has("--skip-tests");
 
 function usage() {
-  console.log(`Phone Farm downloader and installer builder
+  console.log(`Phone Farm local installer builder
 
 Usage:
   node DOWNLOAD_PHONE_FARM.mjs [--dry-run] [--skip-tests]
@@ -29,7 +29,7 @@ operator accounts, device configuration, or runtime storage are downloaded.`);
 }
 
 function fail(message) {
-  console.error(`\nDownloader stopped: ${message}`);
+  console.error(`\nInstaller builder stopped: ${message}`);
   process.exit(1);
 }
 
@@ -88,7 +88,7 @@ requireFile(path.join(desktopDir, "package-lock.json"));
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 const buildScript = process.platform === "darwin" ? "dist:mac" : "dist:win";
 
-console.log("Phone Farm downloader");
+console.log("Phone Farm local installer builder");
 console.log(`Repository: ${repoRoot}`);
 console.log(`Target: ${process.platform === "darwin" ? "macOS DMG" : "Windows installer"}`);
 console.log("This uses the committed lock files and does not download local configuration or secrets.");

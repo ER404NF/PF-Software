@@ -1,14 +1,6 @@
-// Phone Farm desktop wrapper — one download, two first-run modes:
-//   "host"   — spawns the real system/server on this machine and shows the
-//              one-time local create-admin screen (POST /api/setup/create-admin,
-//              see system/server/src/index.js) before handing off to the
-//              normal login page.
-//   "client" — just a window pointed at an existing host's URL; no server
-//              code ever runs on this machine.
-// system/client and system/server are reused unchanged — this is a shell,
-// not a rewrite. The spawned "Node" process is actually this Electron
-// binary running with ELECTRON_RUN_AS_NODE=1, so a host machine does not
-// need a separate system Node.js install.
+// Phone Farm desktop wrapper. Local setup is intentionally isolated from
+// server/client web content: only the packaged first-run page receives the
+// privileged preload API. The normal Phone Farm window has no preload.
 
 const { app, BrowserWindow, ipcMain } = require("electron");
 const { spawn } = require("child_process");
@@ -16,19 +8,26 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const http = require("http");
+const { buildHostEnvironment, resolveMacHostDependencies } = require("./hostEnvironment");
+const {
+  appWebPreferences,
+  isAllowedAppNavigation,
+  isAllowedSetupNavigation,
+  isTrustedSetupSender,
+  normalizedOrigin,
+  setupWebPreferences,
+} = require("./windowSecurity");
 
 const configPath = path.join(app.getPath("userData"), "desktop-config.json");
 const storageRoot = path.join(app.getPath("userData"), "host-storage");
+const setupFilePath = path.join(__dirname, "first-run.html");
 
-let mainWindow = null;
+let setupWindow = null;
+let appWindow = null;
 let serverProcess = null;
-// Set once by startHostServer() and reused by the create-admin handler below
-// — generating secrets a second time here would persist a DIFFERENT
-// sessionSecret/twoFactorMasterKey than the one the already-running server
-// process was actually launched with, silently breaking 2FA decryption
-// (twoFactor.js) for the very admin this flow just created on the next
-// restart.
 let activeHostSecrets = null;
+let activeHostResolution = null;
+let startupState = { mode: "choice", preflight: null, error: null };
 
 function readConfig() {
   try { return JSON.parse(fs.readFileSync(configPath, "utf8")); }
@@ -37,7 +36,9 @@ function readConfig() {
 
 function writeConfig(next) {
   fs.mkdirSync(path.dirname(configPath), { recursive: true });
-  fs.writeFileSync(configPath, JSON.stringify(next, null, 2));
+  const temporary = `${configPath}.tmp`;
+  fs.writeFileSync(temporary, JSON.stringify(next, null, 2), { mode: 0o600 });
+  fs.renameSync(temporary, configPath);
 }
 
 function resolveServerEntry() {
@@ -46,9 +47,6 @@ function resolveServerEntry() {
     : path.join(__dirname, "..", "system", "server", "src", "index.js");
 }
 
-// Persisted once on first host setup and reused on every later launch —
-// sessions and 2FA secrets must survive a restart of this app, exactly like
-// a normal server restart already needs to (see fileSessionStore.js).
 function hostSecrets() {
   const existing = readConfig();
   if (existing?.mode === "host" && existing.sessionSecret && existing.twoFactorMasterKey) return existing;
@@ -63,6 +61,7 @@ function waitForServerReady(port, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolve, reject) => {
     (function poll() {
+      if (!serverProcess) return reject(new Error("Phone Farm server exited during startup"));
       const req = http.get({ host: "127.0.0.1", port, path: "/api/me", timeout: 1500 }, res => {
         res.resume();
         resolve(true);
@@ -76,12 +75,24 @@ function waitForServerReady(port, timeoutMs = 20_000) {
   });
 }
 
-async function startHostServer() {
-  if (serverProcess) return { port: activeHostSecrets.port, secrets: activeHostSecrets };
-  const secrets = hostSecrets();
-  activeHostSecrets = secrets;
-  const env = {
-    ...process.env,
+function publicPreflight(resolution) {
+  if (!resolution) return null;
+  return {
+    ok: resolution.ok,
+    autoProvision: resolution.autoProvision,
+    checks: resolution.checks.map(({ id, label, ok, optional, message }) => ({
+      id, label, ok, optional: Boolean(optional), message,
+    })),
+  };
+}
+
+function resolveHostSetup(config) {
+  const routingEnabled = config?.autoRouteProxyTunnels === true || process.env.AUTO_ROUTE_PROXY_TUNNELS === "true";
+  return resolveMacHostDependencies({ persistedWdaPath: config?.wdaRepoPath, routingEnabled });
+}
+
+function hostStorageEnvironment(secrets) {
+  return {
     ELECTRON_RUN_AS_NODE: "1",
     PORT: String(secrets.port),
     HOST: "127.0.0.1",
@@ -97,31 +108,141 @@ async function startHostServer() {
     RESEARCH_EVIDENCE_DIR: path.join(storageRoot, "evidence"),
     FILE_STORE_DIR: path.join(storageRoot, "files"),
     ACCOUNT_NOTIFICATION_STORE_PATH: path.join(storageRoot, "notifications.json"),
-    DEVICE_CONFIG_PATH: path.join(storageRoot, "devices.config.json"),
+    DEVICE_PROVISIONING_STORE_PATH: path.join(storageRoot, "device-provisioning.json"),
+    WDA_DERIVED_DATA_ROOT: path.join(storageRoot, "wda-derived-data"),
+    PROXY_POOL_STORE_PATH: path.join(storageRoot, "proxy-pool.json"),
+    USB_NETWORK_STORE_PATH: path.join(storageRoot, "usb-network.json"),
   };
-  serverProcess = spawn(process.execPath, [resolveServerEntry()], { env, stdio: "pipe" });
-  serverProcess.stdout.on("data", chunk => console.log(`[phone-farm-server] ${chunk}`));
-  serverProcess.stderr.on("data", chunk => console.error(`[phone-farm-server] ${chunk}`));
-  serverProcess.on("exit", code => {
-    console.error(`[phone-farm-server] exited with code ${code}`);
-    serverProcess = null;
-  });
-  app.on("before-quit", () => { if (serverProcess) serverProcess.kill(); });
-  await waitForServerReady(secrets.port);
-  return { port: secrets.port, secrets };
 }
 
-ipcMain.handle("desktop:start-host-setup", async () => {
+async function startHostServer() {
+  if (serverProcess) return { port: activeHostSecrets.port, preflight: publicPreflight(activeHostResolution) };
+  const config = readConfig();
+  const resolution = resolveHostSetup(config);
+  activeHostResolution = resolution;
+  if (!resolution.ok) {
+    const error = new Error("Host prerequisites need attention before automatic iPhone setup can start.");
+    error.preflight = publicPreflight(resolution);
+    throw error;
+  }
+
+  const secrets = hostSecrets();
+  activeHostSecrets = secrets;
+  const env = buildHostEnvironment({
+    ...process.env,
+    ...hostStorageEnvironment(secrets),
+  }, resolution);
+  // A fresh desktop install intentionally has no DEVICE_CONFIG_PATH. Auto
+  // discovery is independent of manual pinned-device configuration. An
+  // advanced operator can still opt in with an existing explicit path.
+  if (config?.manualDeviceConfigPath && fs.existsSync(config.manualDeviceConfigPath)) {
+    env.DEVICE_CONFIG_PATH = config.manualDeviceConfigPath;
+  } else if (!process.env.DEVICE_CONFIG_PATH) {
+    delete env.DEVICE_CONFIG_PATH;
+  }
+
+  const child = spawn(process.execPath, [resolveServerEntry()], { env, stdio: "pipe" });
+  serverProcess = child;
+  child.stdout.on("data", chunk => console.log(`[phone-farm-server] ${chunk}`));
+  child.stderr.on("data", chunk => console.error(`[phone-farm-server] ${chunk}`));
+  child.on("error", error => {
+    console.error("[phone-farm-server] failed to start:", error);
+    if (serverProcess === child) serverProcess = null;
+  });
+  child.on("exit", code => {
+    if (code !== 0 && code !== null) console.error(`[phone-farm-server] exited with code ${code}`);
+    if (serverProcess === child) serverProcess = null;
+  });
   try {
-    const { port, secrets } = await startHostServer();
-    return { ok: true, port, alreadyConfigured: readConfig()?.mode === "host" };
+    await waitForServerReady(secrets.port);
   } catch (error) {
-    return { ok: false, error: error.message };
+    if (serverProcess === child) serverProcess = null;
+    child.kill();
+    throw error;
+  }
+  return { port: secrets.port, preflight: publicPreflight(resolution) };
+}
+
+function protectWindowNavigation(window, isAllowed) {
+  const guard = (event, targetUrl) => {
+    if (!isAllowed(targetUrl)) event.preventDefault();
+  };
+  window.webContents.on("will-navigate", guard);
+  window.webContents.on("will-redirect", guard);
+  window.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+}
+
+async function createSetupWindow() {
+  if (setupWindow && !setupWindow.isDestroyed()) {
+    setupWindow.focus();
+    return setupWindow;
+  }
+  const window = new BrowserWindow({
+    width: 760,
+    height: 760,
+    webPreferences: setupWebPreferences(path.join(__dirname, "preload.js")),
+  });
+  setupWindow = window;
+  protectWindowNavigation(window, url => isAllowedSetupNavigation(url, setupFilePath));
+  window.on("closed", () => { if (setupWindow === window) setupWindow = null; });
+  await window.loadFile(setupFilePath);
+  return window;
+}
+
+async function openAppWindow(rawUrl) {
+  const allowedOrigin = normalizedOrigin(rawUrl);
+  if (!allowedOrigin) throw new Error("host URL must be http or https and must not contain credentials");
+  if (appWindow && !appWindow.isDestroyed()) appWindow.close();
+  const window = new BrowserWindow({
+    width: 1180,
+    height: 820,
+    webPreferences: appWebPreferences(),
+  });
+  appWindow = window;
+  protectWindowNavigation(window, url => isAllowedAppNavigation(url, allowedOrigin));
+  window.on("closed", () => { if (appWindow === window) appWindow = null; });
+  try {
+    await window.loadURL(rawUrl);
+  } catch (error) {
+    if (!window.isDestroyed()) window.close();
+    throw error;
+  }
+  if (setupWindow && !setupWindow.isDestroyed()) setupWindow.close();
+  return window;
+}
+
+function authorizedSetupRequest(event) {
+  return isTrustedSetupSender(event, setupWindow, setupFilePath);
+}
+
+function unauthorizedResult() {
+  return { ok: false, error: "Unauthorized desktop setup request." };
+}
+
+ipcMain.handle("desktop:get-startup-state", event => {
+  if (!authorizedSetupRequest(event)) return unauthorizedResult();
+  return { ok: true, ...startupState };
+});
+
+ipcMain.handle("desktop:start-host-setup", async event => {
+  if (!authorizedSetupRequest(event)) return unauthorizedResult();
+  try {
+    const { port, preflight } = await startHostServer();
+    const alreadyConfigured = readConfig()?.mode === "host";
+    startupState = { mode: "host", preflight, error: null };
+    if (alreadyConfigured) setImmediate(() => { void openAppWindow(`http://127.0.0.1:${port}`); });
+    return { ok: true, port, alreadyConfigured, preflight };
+  } catch (error) {
+    startupState = { mode: "host", preflight: error.preflight || publicPreflight(activeHostResolution), error: error.message };
+    return { ok: false, error: error.message, preflight: startupState.preflight };
   }
 });
 
-ipcMain.handle("desktop:create-admin", async (_event, { port, username, password, fullName, email }) => {
+ipcMain.handle("desktop:create-admin", async (event, { username, password, fullName, email } = {}) => {
+  if (!authorizedSetupRequest(event)) return unauthorizedResult();
   try {
+    if (!serverProcess || !activeHostSecrets) throw new Error("The local host server is not running.");
+    const port = activeHostSecrets.port;
     const body = JSON.stringify({ username, password, fullName: fullName || undefined, email: email || undefined });
     const response = await fetch(`http://127.0.0.1:${port}/api/setup/create-admin`, {
       method: "POST",
@@ -131,23 +252,32 @@ ipcMain.handle("desktop:create-admin", async (_event, { port, username, password
     const payload = await response.json();
     if (!response.ok) return { ok: false, error: payload?.error || `HTTP ${response.status}` };
     writeConfig({
-      mode: "host", port,
+      ...readConfig(),
+      mode: "host",
+      port,
       sessionSecret: activeHostSecrets.sessionSecret,
       twoFactorMasterKey: activeHostSecrets.twoFactorMasterKey,
+      wdaRepoPath: activeHostResolution?.wdaRepoPath,
     });
-    await mainWindow.loadURL(`http://127.0.0.1:${port}`);
+    await openAppWindow(`http://127.0.0.1:${port}`);
     return { ok: true };
   } catch (error) {
     return { ok: false, error: error.message };
   }
 });
 
-ipcMain.handle("desktop:connect-to-host", async (_event, { url }) => {
+ipcMain.handle("desktop:connect-to-host", async (event, { url } = {}) => {
+  if (!authorizedSetupRequest(event)) return unauthorizedResult();
   try {
     const parsed = new URL(url);
-    if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("host URL must be http or https");
+    if (!normalizedOrigin(parsed.toString())) throw new Error("host URL must be http or https and must not contain credentials");
+    if (serverProcess) {
+      const child = serverProcess;
+      serverProcess = null;
+      child.kill();
+    }
     writeConfig({ mode: "client", serverUrl: parsed.toString() });
-    await mainWindow.loadURL(parsed.toString());
+    await openAppWindow(parsed.toString());
     return { ok: true };
   } catch (error) {
     return { ok: false, error: error.message };
@@ -155,31 +285,29 @@ ipcMain.handle("desktop:connect-to-host", async (_event, { url }) => {
 });
 
 async function launch() {
-  mainWindow = new BrowserWindow({
-    width: 1180,
-    height: 820,
-    webPreferences: { preload: path.join(__dirname, "preload.js"), contextIsolation: true, nodeIntegration: false },
-  });
-
   const existing = readConfig();
   if (existing?.mode === "client" && existing.serverUrl) {
-    await mainWindow.loadURL(existing.serverUrl);
-    return;
+    try {
+      await openAppWindow(existing.serverUrl);
+      return;
+    } catch (error) {
+      startupState = { mode: "client", preflight: null, error: error.message };
+    }
   }
   if (existing?.mode === "host") {
     try {
       const { port } = await startHostServer();
-      await mainWindow.loadURL(`http://127.0.0.1:${port}`);
+      await openAppWindow(`http://127.0.0.1:${port}`);
       return;
     } catch (error) {
-      console.error("Failed to restart host server:", error);
-      // Fall through to first-run so the operator sees a clear error state
-      // instead of a blank window.
+      startupState = { mode: "host", preflight: error.preflight || publicPreflight(activeHostResolution), error: error.message };
+      console.error("Failed to restart host server:", error.message);
     }
   }
-  await mainWindow.loadFile(path.join(__dirname, "first-run.html"));
+  await createSetupWindow();
 }
 
 app.whenReady().then(launch);
+app.on("before-quit", () => { if (serverProcess) serverProcess.kill(); });
 app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(); });
-app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) launch(); });
+app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) void launch(); });
