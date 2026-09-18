@@ -63,6 +63,14 @@ bootstrap endpoint above before handing off to the normal web login;
 URL — no server code ever runs on that machine. `system/client` and
 `system/server` are reused unchanged.
 
+**Root downloader.** `DOWNLOAD_PHONE_FARM.command` (macOS) and
+`DOWNLOAD_PHONE_FARM.cmd` (Windows) are deliberately placed at repository
+root, backed by `DOWNLOAD_PHONE_FARM.mjs`. After a clone or pull, they install
+the exact locked server/desktop dependencies, run the full suite, and build the
+local installer into ignored `desktop/dist/`. They do not download or generate
+credentials, operators, device configuration, or runtime storage. Dry-run and
+explicit skip-tests modes are available for validation and deliberate rebuilds.
+
 Verification: **792/792 full-suite tests passed** (`npm test`, up from 756
 at session start), including new coverage for `isLoopbackAddress`,
 `flagAndDeactivateOperator`, the bootstrap-then-lockout sequence, both

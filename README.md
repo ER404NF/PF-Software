@@ -1,5 +1,25 @@
 # Phone Farm — Dual-Mode Human VA / Future AI VA Control System
 
+## Download and build the desktop installer
+
+The repository root contains the downloader so it is visible immediately after
+cloning or pulling the repository:
+
+- macOS: open `DOWNLOAD_PHONE_FARM.command`, or run
+  `zsh ./DOWNLOAD_PHONE_FARM.command` from Terminal.
+- Windows: open `DOWNLOAD_PHONE_FARM.cmd`.
+
+The downloader installs the exact dependencies recorded in both lock files,
+runs the complete server test suite, and builds the local desktop installer in
+`desktop/dist/`. It never downloads credentials, operator accounts, device
+configuration, or runtime storage. The build computer needs Node.js 20 or newer;
+the installed Electron app carries its own runtime. Use `--dry-run` to show the
+commands without changing anything, or `--skip-tests` only when intentionally
+rebuilding an already-validated revision.
+
+Installers produced locally are unsigned until Apple/Windows signing credentials
+are configured, so the operating system may show a security warning.
+
 ## Product goal
 
 Build a private control plane for organization-owned or otherwise authorized phones.
