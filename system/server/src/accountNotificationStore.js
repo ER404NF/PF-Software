@@ -112,12 +112,28 @@ export function createAccountNotificationStore({ storePath, companyEmail = null,
     return safeItem(next);
   }
 
+  // Only advances a "queued" item — a sender racing a status this store has
+  // since moved past (e.g. it was already marked sent by a retry) leaves it
+  // alone rather than clobbering a later, more-accurate state.
+  function setDeliveryOutcome(id, state) {
+    const notifications = read();
+    const index = notifications.findIndex(item => item?.id === id);
+    if (index < 0) return null;
+    if (notifications[index].deliveryState !== "queued") return safeItem(notifications[index]);
+    const next = { ...notifications[index], deliveryState: state };
+    notifications[index] = next;
+    write(notifications);
+    return safeItem(next);
+  }
+
   return {
     queue,
     list,
     deliveryContent,
     markCommitted: id => setCommitState(id, true),
     markAborted: id => setCommitState(id, false),
+    markSent: id => setDeliveryOutcome(id, "sent"),
+    markFailed: id => setDeliveryOutcome(id, "failed"),
     canSecureRecovery: () => typeof encryptionKey === "string" && Boolean(encryptionKey),
   };
 }

@@ -1,4 +1,333 @@
-# Roadmap Status Report — updated 2026-09-15
+# Roadmap Status Report — updated 2026-09-18
+
+## 2026-09-18 — downloadable desktop app: bootstrap lockout, account action
+## menu, real email delivery, Electron host/client wrapper
+
+Requested as "make this a downloadable app with an installer." Investigation
+first found that most of the account/signup/approval backend and a first
+edit-form UI already existed in the working tree from recent sessions
+(`createSignupAccount`, `setOperatorAccountStatus`, the Users panel) but
+undocumented here — this entry covers only what was actually new.
+
+**Bootstrap + self-escalation lockout.** New `POST /api/setup/create-admin`
+(`index.js`) creates the very first admin — loopback-only (`req.socket.
+remoteAddress`) and permanently 404s once any approved admin exists, same
+response shape as a route that never existed. `create-operator.js` (the CLI
+path) is untouched. New `authStore.js#flagAndDeactivateOperator(username,
+reason)` force-deactivates, force-signs-out (reuses the existing
+`authVersion` bump), and records `securityFlagReason`/`securityFlaggedAt`.
+Wired into two places: hitting the bootstrap endpoint after lockout while
+authenticated as a non-admin, and any authenticated operator failing an
+admin-only account-management route while targeting their *own* account
+(`requireCapability`/`requireAnyCapability` gained an opt-in
+`flagSelfEscalation` option — applied only to the two routes where
+self-targeting is a real escalation vector, not blanket-applied to every
+403). Every flag also writes a normal audit event.
+
+**Kick / Change-role action menu** (`client/app.js`, `renderUsers()`).
+"Kick" reuses the existing `PATCH .../users/:username {active:false}` path
+unchanged (deactivation was already wired to force sign-out via
+`authVersion`) — no new backend needed. "Change role" opens a click-to-open
+side panel (not CSS `:hover`, matching `buildProxyPoolPicker`'s existing
+accessibility rationale) listing the 5 roles, 3 visible with scroll for the
+rest; picking Admin specifically shows "Are you sure you want to assign
+admin role to {name}?" before applying. Verified live via the browser
+preview against a disposable local instance: menu open/close, role list
+scroll, the admin confirm/cancel path, a server-side validation error
+(manager-without-teamId) surfacing without closing the panel, and Kick's
+full deactivate-and-signal-inactive result.
+
+**Real email delivery.** `accountNotificationStore.js` already built and
+queued acceptance/rejection/recovery email content with nowhere to send
+it — `deliveryState` just sat at `"queued"` forever. New
+`mailSender.js` (nodemailer/SMTP, config via `SMTP_HOST`/`PORT`/`USER`/
+`PASS`/`SECURE`, unconfigured ⇒ no-op with a logged reason like every other
+optional integration here) plus `markSent`/`markFailed` on the
+notification store. The account-status route awaits delivery and reports
+the real outcome; the password-recovery route fires-and-forgets deliberately
+(awaiting a real SMTP round-trip there would make a matching identifier's
+response measurably slower than a non-matching one — an enumeration timing
+side channel this endpoint's identical response message already guards
+against).
+
+**Desktop wrapper** (new top-level `desktop/`, sibling to `system/`).
+One Electron app, two first-run modes: "Set up a new host on this machine"
+spawns the unmodified `system/server/src/index.js` as a child process
+(via `process.execPath` with `ELECTRON_RUN_AS_NODE=1` — the app's own
+bundled Node runtime, so a host machine does not need a separate system
+Node.js install) with persisted per-install `SESSION_SECRET`/
+`TWO_FACTOR_MASTER_KEY` and its own storage root under Electron's
+`userData`, then shows a one-time native create-admin form calling the
+bootstrap endpoint above before handing off to the normal web login;
+"Connect to an existing Phone Farm host" just opens a window at a given
+URL — no server code ever runs on that machine. `system/client` and
+`system/server` are reused unchanged.
+
+Verification: **792/792 full-suite tests passed** (`npm test`, up from 756
+at session start), including new coverage for `isLoopbackAddress`,
+`flagAndDeactivateOperator`, the bootstrap-then-lockout sequence, both
+self-escalation triggers (and confirming a non-self-targeting 403 is
+*not* flagged), `mailSender.js` against a mocked SMTP transport, and a
+full queue→send→`"sent"`/`"failed"` integration pass. `npm audit
+--omit=dev` on `system/`: 0 vulnerabilities. The desktop app: `electron`/
+`electron-builder` installed and the real Electron binary downloaded in
+this environment; a dev-mode launch was smoke-tested (process starts,
+loads `first-run.html`, no console errors) but the interactive host-setup
+and connect-to-host click-through was **not** driven end-to-end — this
+environment has no native-GUI automation tool wired up for a real Electron
+window, only the browser preview used for the client UI above. Packaging:
+the Windows `nsis` target is buildable and runnable on this machine; the
+macOS `dmg` target is defined but unbuilt/unverified (non-macOS dev
+machine, same hardware gate as every other Mac-only item in this doc).
+Code-signing/notarization for either platform is explicitly out of scope
+until the user decides on an Apple Developer / Windows code-signing
+credential — unsigned builds work for local testing but trigger OS security
+warnings on install.
+
+## 2026-09-17 — MS17: fully automatic network enrollment
+
+Closed the last manual gap in the automation pipeline: plugging in a phone
+no longer requires clicking through network enrollment/IP discovery at
+all, and Internet Sharing itself can now be turned on by the app.
+
+Built `internetSharingManager.js` — enables Internet Sharing via the same
+undocumented mechanism System Settings itself is known to use
+(`com.apple.nat.plist` via `PlistBuddy`, restarting the
+`com.apple.InternetSharing` launchd job, both through `sudo -n`), with the
+primary interface auto-detected from `route get default`. Apple publishes
+no schema for this plist, so this is explicitly best-effort — every call
+site treats a failure as "log clear manual-fallback guidance and move on,"
+never as something to retry blindly, and this is flagged as the single
+piece of the whole project most likely to need adjustment once tested
+against a real macOS version.
+
+Built `autoNetworkEnrollment.js` — the continuous background version of
+MS16.4's manual enrollment/discover-ip routes. Every poll tick it
+statelessly recomputes which discovered UDIDs have no persisted `usbIface`
+yet and which bridge members no device has already claimed, auto-pairing
+only when exactly one of each is pending (otherwise flagging `"ambiguous"`
+and waiting — the same "never guess" rule the manual flow already
+enforced). Once enrolled, it attempts USB-IP discovery on a cooldown
+without blocking other devices, and once an IP resolves for a device that
+already has a pool proxy assigned, it calls
+`networkRoutingOrchestrator.startRouting()` automatically —
+`startRouting` is injected as a plain function rather than importing the
+orchestrator directly, keeping the two modules decoupled.
+
+Wired into `index.js` behind two independent flags
+(`AUTO_ENABLE_INTERNET_SHARING`, `AUTO_NETWORK_ENROLLMENT`), both nested
+under the existing `AUTO_ROUTE_PROXY_TUNNELS` gate. A new `autoEnrollment`
+`device_list` field surfaces the loop's live per-device status
+(`pending`/`ambiguous`/`discovering_ip`/`ready`/`routing` plus a
+human-readable note) on the fleet card, informationally alongside the
+existing manual controls, which remain a full fallback/override — e.g. to
+unstick an `ambiguous` device without physically unplugging everything
+else.
+
+Combined with MS16, this closes the loop end to end as originally asked:
+plug in a phone with `AUTO_PROVISION_WDA`, `AUTO_ROUTE_PROXY_TUNNELS`,
+`AUTO_ENABLE_INTERNET_SHARING`, and `AUTO_NETWORK_ENROLLMENT` all set, and
+— once verified on real hardware — it comes online, gets network-mapped,
+gets its IP discovered, and starts routing through its already-assigned
+pool proxy with no clicks. Assigning *which* proxy to a device remains a
+deliberate one-click admin action, by design.
+
+Verification: **780/780 full-suite tests passed** (`npm test`), including
+new coverage for the PlistBuddy/launchctl argv construction and
+rule-injection validation, default-route parsing, and
+`autoNetworkEnrollment.js`'s full reconciliation logic (clean pairing,
+ambiguity on either side, manual-UDID and already-claimed-member
+exclusion, IP-discovery cooldown/struggling messaging, auto-routing vs.
+stopping at "ready," and the timer lifecycle) — all against injected
+fakes. Smoke-tested server boot on this non-macOS dev machine with every
+new flag enabled: `detectPrimaryInterface()` correctly failed closed with
+clear manual-fallback guidance (Windows has no `route get default`
+equivalent) while the rest of the server stayed fully healthy — exactly
+the intended degradation. Real `PlistBuddy`/`launchctl`/`route` behavior
+and the NAT plist schema itself remain unverified until run on the Mac
+mini.
+
+## 2026-09-16 (final for the session) — MS16.6/16.7: routing fleet-card UI and health-check loop
+
+Closed the last two documented gaps in Phase B part 2. MS16.6: a "Network
+Routing" panel on every fleet card (gated by the new `routing:manage`
+capability) showing enrollment/IP/routing status via one progressive-
+disclosure button that always matches the next valid step — "Start network
+enrollment" → "Confirm enrollment" → "Discover IP" → "Start routing" →
+"Stop routing" — instead of several simultaneous buttons for steps that
+aren't reachable yet. A `route_lost`/`tun_error`/`pf_syntax_error` state
+correctly falls through to offering a retry rather than a stuck disabled
+button (caught and fixed while writing this — the state list the client
+checked against didn't yet include the new `route_lost` state below).
+
+MS16.7: `networkRoutingOrchestrator.js` gained `checkHealth()` plus
+`startHealthChecks()`/`stopHealthChecks()` (every `ROUTING_HEALTH_CHECK_
+INTERVAL_MS`, default 30s, once at least one device is routed). For every
+`ROUTED` device it confirms the tunnel process is alive and the device's PF
+rule is still loaded (`pfctl -vvs rules`, parsed by the new
+`parsePfCounters()` in `pfRuleGenerator.js`, which sums packet counts
+across a device's several rules). Either check failing outside of a
+deliberate `stopRouting()` call flips the device to a new `ROUTE_LOST`
+state — distinct from the setup-time `TUN_ERROR`/`PF_SYNTAX_ERROR` — so a
+tunnel that silently died or an externally-flushed anchor doesn't go
+unnoticed. Deliberately not a "did packets increase" pass/fail signal
+(a legitimately idle device isn't broken); the raw counter is recorded on
+the route as informational data instead. A transient `inspectRules()`
+failure skips only that tick's PF check rather than failing every routed
+device. Wired into `index.js`: `startHealthChecks()` runs automatically
+whenever `AUTO_ROUTE_PROXY_TUNNELS` is enabled.
+
+Verification: **749/749 full-suite tests passed** (`npm test`), including
+3 new `parsePfCounters()` unit tests and 8 new orchestrator tests (healthy
+recording, tunnel-death detection, vanished-PF-rule detection, transient-
+failure tolerance, multi-device single-inspect-per-tick batching, and the
+health-check timer's own start/immediate-check/interval/stop lifecycle).
+Smoke-tested server boot successfully with the flag on. This closes out
+Phase A and both parts of Phase B as functionally complete pending real
+Mac mini hardware verification — see `system/README.md` for the full
+picture of what remains hardware-gated versus what's genuinely done.
+
+## 2026-09-16 (latest, continued) — MS16.4: network enrollment and USB-IP discovery routes
+
+Extended MS16 with the admin-triggered actions for the two remaining manual
+inputs `start-routing` needed: `POST /api/admin/devices/:deviceId/
+network-enrollment/start`/`confirm` (bridge-member before/after diffing via
+`usbNetworkMapper.js`, persisted per device in the new `usbNetworkStore.js`)
+and `POST .../discover-ip` (tcpdump-based capture via `usbIpDiscovery.js`,
+now correctly routed through `sudo -n` like every other privileged
+operation — it previously shelled directly to `tcpdump`, which would have
+failed with a permission error on a real Mac since packet capture needs
+root). `start-routing`'s `usbIp` now falls back to whatever `discover-ip`
+already resolved when the caller omits it. Both enrollment and discovery
+still refuse with 409 rather than ever guessing when the result is
+ambiguous, matching the architecture guide's own philosophy for this
+human-paced process.
+
+Verification: **737/737 full-suite tests passed** (`npm test`), including
+new coverage for the persisted enrollment/discovery store, the Mac's-own-
+bridge-IP parser (`parseInterfaceIp`, distinct from `tunManager.js`'s
+point-to-point `parseTunPeer` — same "inet" keyword, different line shape),
+and tcpdump's corrected `sudo -n` argv; plus 8 integration tests for the
+three new routes' auth/RBAC/disabled-state fallback against the real
+server. Smoke-tested server boot successfully. Not yet built, as noted in
+`system/README.md`: any fleet-card/admin UI for these or the routing
+routes (API-only so far), and a periodic health-check loop for an
+already-routed tunnel.
+
+## 2026-09-16 (latest) — MS16: proxy tunnel routing (Phase B, part 2)
+
+Built the remaining pieces of automated tunnel routing and wired them into
+the live server behind a new opt-in flag: `pfRuleGenerator.js` (PF ruleset
+text with strict interface-name/IPv4 validation — every interpolated field
+is rejected outright if it doesn't match, not sanitized, since this is the
+actual rule-injection boundary given `pfctl -nf` faithfully parses whatever
+text comes out), `privilegedOps.js` (the narrow `sudo -n` boundary, scoped
+to `pfctl` and this app's private anchor only — documents the exact
+`/etc/sudoers.d` line a human configures out-of-band, never `-F all` on the
+main ruleset), `tunManager.js` (per-device supervised `tun2proxy`, `utunN`
+allocation, peer discovery via `ifconfig`, and credential redaction on
+every log line it exposes — tun2proxy's own stdout can echo the
+authenticated proxy URL back out), `usbNetworkMapper.js`/`usbIpDiscovery.js`
+(the bridge-diffing and tcpdump-parsing logic the guide's enrollment
+strategy needs — pure logic only, not yet wired to an HTTP action), and
+`networkRoutingOrchestrator.js` (the `PROXY_LEASED -> TUN_STARTING ->
+PF_APPLYING -> ROUTED` state machine, `TUN_ERROR`/`PF_SYNTAX_ERROR` instead
+of ever guessing past a failure, full-replace PF regeneration across every
+routed device).
+
+Wired into `index.js` behind `AUTO_ROUTE_PROXY_TUNNELS=true` (also needs
+`SHARED_BRIDGE_IFACE` and an encryption key; fails closed with a logged
+reason otherwise) — `POST /api/admin/devices/:deviceId/start-routing`/
+`stop-routing`, gated by a new `routing:manage` capability (Admin-only,
+deliberately a higher bar than `proxy:assign`, since this starts privileged
+processes and changes firewall rules). `start-routing` still takes the
+device's USB-side IP as an admin-supplied input — network enrollment and IP
+discovery remain manual per the architecture guide's own human-paced
+enrollment strategy (§4.4/§4.5); MS16.4's parsing/diffing logic exists but
+isn't yet exposed through a route or UI, and there is no periodic
+health-check loop yet for an already-routed tunnel.
+
+Verification: **722/722 full-suite tests passed** (`npm test`), including
+new unit coverage for PF rule-injection resistance (malicious interface
+names/IPs explicitly rejected, including a newline-smuggling attempt),
+every sudo-wrapper argv shape, credential redaction, bridge/utun diffing,
+tcpdump/ifconfig parsing, and the orchestrator's full state machine (happy
+path, both error states, multi-device full-replace regeneration, stop/
+last-device-clears-anchor semantics, retry/interface-reuse) — all against
+injected fakes, no real `sudo`/`pfctl`/`tun2proxy`/`tcpdump` invoked.
+Integration-tested the live HTTP routes' auth, admin-only RBAC, and the
+"not enabled" 409 fallback against the real server. Manually smoke-tested
+server boot with the flag on and off on this non-macOS dev machine
+(correctly no-ops with a logged reason when `SHARED_BRIDGE_IFACE` is
+unset). Real `pfctl`/`tun2proxy` behavior, the sudoers configuration
+itself, and the architecture guide's AT-05/AT-06 leak/routing acceptance
+tests remain unverified until run on the Mac mini.
+
+## 2026-09-16 (later) — MS15: shared proxy pool (Phase B, part 1)
+
+Built `proxyPool.js` (encrypted-at-rest credential storage reusing
+`twoFactor.js`'s AES-256-GCM helpers directly, CRUD, and the exclusive
+`AVAILABLE -> LEASED(deviceId) -> RELEASED` lease state machine), the
+`POST`/`GET`/`DELETE /api/admin/proxies` and
+`PATCH /api/admin/devices/:deviceId/proxy-assignment` routes behind two new
+capabilities (`proxy:view-pool`, `proxy:assign` — Admin + Manager, kept
+separate from the existing Admin-only `proxy:manage`), a `poolProxy` field
+on `device_list` (visible only to `proxy:view-pool` holders), and the client
+side: a "Proxy Pool" admin panel (add/list/delete) and a proxy-assignment
+`<select>` on every fleet card. No route or list response ever returns
+host, port, username, or password — only `id`, `provider`, `protocol`,
+`country`, a derived flag emoji, `label`, and `leasedToDeviceId`.
+
+This is credential storage and exclusive assignment only. Actually starting
+a tunnel for a leased proxy (TUN/PF automation, Phase B part 2) is not
+built and not started.
+
+Verification: **651/651 full-suite tests passed** (`npm test`), including
+13 new `proxyPool.js` unit tests and 10 new integration tests against the
+real running server/RBAC (auth, capability gating across view/assign/manage,
+cross-device lease exclusivity, `device_list` visibility scoped correctly,
+audit trail, and an explicit assertion that the plaintext password never
+appears in any response or audit record). Confirmed the client changes load
+without any console error (every new `getElementById` reference resolves —
+also proven statically by `clientBoundaries.test.js`) before authentication,
+on this non-macOS dev machine; a full authenticated click-through on the Mac
+mini is still recommended.
+
+## 2026-09-16 — MS14: automated WDA/iproxy device provisioning (Phase A)
+
+Built the opt-in (`AUTO_PROVISION_WDA=true`) provisioning pipeline described
+in `Phone_Farm_Automation_Architecture.md` Phase A: `hostPreflight.js`,
+`portAllocator.js`, `deviceProvisioningStore.js`, `processSupervisor.js` +
+`wdaProcessManager.js` + `iproxyManager.js`, and the `deviceProvisioner.js`
+orchestrator. A UDID with no explicit `devices.config.json` entry now gets
+its WDA process and `iproxy` tunnel launched automatically, reuses a
+persisted port/derived-data path across restarts and replugs, and surfaces
+known manual-prerequisite failures (untrusted cert, Developer Mode, App ID
+limit) as an actionable `user_action_required` banner instead of looping
+retries — with a "Retry automatic setup" admin action
+(`POST /api/admin/devices/:deviceId/retry-provisioning`, new
+`device:provision` capability) for both that state and a hard
+`provisioning_error`. Manually pinned `devices.config.json` WDA entries (the
+MS5 hardware-validation path) are explicitly skipped by the provisioner, so
+existing single-device bench-testing is unaffected. The existing 10-second
+WDA-readiness loop is reused as-is to detect actual readiness; this feature
+does not add a second `/status` poller.
+
+Not built yet (tracked as Phase B, not part of MS14): the shared proxy pool,
+per-device proxy assignment UI, and TUN/PF tunnel-routing automation.
+
+Verification: **628/628 full-suite tests passed** (`npm test`), including 50
+new unit tests covering port allocation, atomic provisioning-record
+persistence, host preflight (including the ENOENT-vs-nonzero-exit
+distinction), both process managers' argv construction (the mandatory
+`iproxy -u`, unique per-device derived-data paths), and the provisioner's
+full attach/detach/replug/failure-classification/retry state machine
+against injected fakes — no real `xcodebuild`/`iproxy`/`idevice_id` was
+invoked. Manually smoke-tested server boot with the flag on and off on this
+non-macOS dev machine (correctly no-ops with a logged reason when
+`platform !== "darwin"`). Real `xcodebuild`/`iproxy` process behavior, Xcode
+trust-prompt flows, and physical USB attach/detach reconciliation remain
+unverified until run on the Mac mini.
 
 ## 2026-09-15 — security review remediation and live-test readiness
 

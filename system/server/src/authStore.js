@@ -105,6 +105,8 @@ function internalOperator(o) {
     email: typeof o.email === "string" ? o.email : null,
     teamId: typeof o.teamId === "string" ? o.teamId : null,
     accountStatus: ACCOUNT_STATUSES.has(o.accountStatus) ? o.accountStatus : "approved",
+    securityFlagReason: typeof o.securityFlagReason === "string" ? o.securityFlagReason : null,
+    securityFlaggedAt: typeof o.securityFlaggedAt === "string" ? o.securityFlaggedAt : null,
     twoFactorRequired: o.twoFactorRequired === true,
     twoFactorSecret: typeof o.twoFactorSecret === "string" ? o.twoFactorSecret : null,
     recoveryCodeDigests: Array.isArray(o.recoveryCodeDigests) ? [...o.recoveryCodeDigests] : [],
@@ -301,6 +303,10 @@ function publicOperatorAccount(operator) {
       twoFactorRequired: true,
       twoFactorEnabled: Boolean(operator.twoFactorSecret),
       recoveryMethods: ["authenticator", "recovery_codes", "email", "admin_assisted"],
+    } : {}),
+    ...(operator.securityFlagReason ? {
+      securityFlagReason: operator.securityFlagReason,
+      securityFlaggedAt: operator.securityFlaggedAt,
     } : {}),
   };
 }
@@ -550,6 +556,34 @@ export function setOperatorAccountStatus(username, status) {
     ...raw.operators[index],
     accountStatus: status,
     active: status === "approved",
+    authVersion: current.authVersion + 1,
+  };
+  writeConfig(raw);
+  replaceLiveOperators(raw);
+  return publicOperatorAccount(operators.get(username));
+}
+
+// A harder response than a normal 403: used when an operator is caught
+// attempting something structurally reserved for the pre-admin bootstrap
+// window or another operator's privileges (see index.js's self-escalation
+// checks and the /api/setup/create-admin lockout). Force-deactivates and
+// force-signs-out (via the same authVersion bump every other account change
+// already uses) and records why, so a host/admin sees it in the Users panel
+// instead of the attempt disappearing into an audit-log line no one reads.
+// Silent on an unknown username — nothing to flag if the account doesn't
+// exist (e.g. a request with no session yet).
+export function flagAndDeactivateOperator(username, reason) {
+  if (typeof username !== "string" || !operators.has(username)) return null;
+  if (typeof reason !== "string" || !reason.trim()) throw accountError("a flag reason is required");
+  const raw = readConfig();
+  const index = raw.operators.findIndex(operator => operator?.username === username);
+  if (index < 0) return null;
+  const current = internalOperator(raw.operators[index]);
+  raw.operators[index] = {
+    ...raw.operators[index],
+    active: false,
+    securityFlagReason: reason,
+    securityFlaggedAt: new Date().toISOString(),
     authVersion: current.authVersion + 1,
   };
   writeConfig(raw);

@@ -37,7 +37,7 @@ process.env.MEDIA_DEVICE_QUOTA_BYTES = "64";
 process.env.MEDIA_GLOBAL_QUOTA_BYTES = "128";
 process.env.MEDIA_MIN_FREE_BYTES = "0";
 
-const { server, wss, devices, deviceHealth, deviceLease, taskQueue, assignmentStore, auditLog } = await import("../../src/index.js");
+const { server, wss, devices, deviceHealth, deviceLease, taskQueue, assignmentStore, auditLog, publicPeople } = await import("../../src/index.js");
 const { operators, hashPassword } = await import("../../src/authStore.js");
 
 let relayUrl;
@@ -684,6 +684,14 @@ test("presence API and broadcasts expose safe live status, phone activity, and l
       "device-control"
     );
 
+    // publicPeople(null) must fail closed on device visibility exactly like a
+    // real unauthenticated/deactivated-operator call would — a viewer-scoped
+    // caller (observer, above) legitimately sees this person's claimed
+    // device, but a null viewer must never see any device, not every device.
+    const nullViewerPerson = publicPeople(null).find(person => person.username === username);
+    assert.deepEqual(nullViewerPerson.currentDeviceIds, []);
+    assert.deepEqual(nullViewerPerson.currentPhones, []);
+
     const logout = await fetch(`${httpUrl}/api/logout`, { method: "POST", headers: { Cookie: cookie } });
     assert.equal(logout.status, 200);
     const offline = await observer.waitForNext((message) => message.type === "presence_list"
@@ -1047,15 +1055,22 @@ test("authorized operations users can inspect an AI-controlled phone read-only",
     allowedDevices: ["mock-1"],
     passwordHash: hashPassword(TEST_PASSWORD),
   });
+  // Only an admin can move a device into AI mode (CLAUDE.md §4) — the manager
+  // under test here is exercising read-only inspection of that AI-controlled
+  // phone, not the mode switch itself.
+  const admin = await openClient("test-va");
   const manager = await openClient(username);
   const va = await openClient("test-plain-va");
   try {
     await Promise.all([
+      admin.waitFor(message => message.type === "device_list"),
       manager.waitFor(message => message.type === "device_list"),
       va.waitFor(message => message.type === "device_list"),
     ]);
 
-    manager.send({ type: "switch_to_ai", deviceId: "mock-1" });
+    admin.send({ type: "switch_to_ai", deviceId: "mock-1" });
+    await admin.waitForNext(message => message.type === "device_list"
+      && message.devices.find(device => device.id === "mock-1")?.controllerMode === "AI_IDLE");
     const managerList = await manager.waitForNext(message => message.type === "device_list"
       && message.devices.find(device => device.id === "mock-1")?.controllerMode === "AI_IDLE");
     const managerSummary = managerList.devices.find(device => device.id === "mock-1");
@@ -1075,10 +1090,18 @@ test("authorized operations users can inspect an AI-controlled phone read-only",
     manager.send({ type: "tap", deviceId: "mock-1", x: 0.5, y: 0.5 });
     assert.match((await manager.waitForNext(message => message.code === "watch_read_only")).message, /read-only/);
 
+    // Read-only watch is all a manager gets — they cannot hand the device
+    // back to Human mode themselves; only an admin can.
+    manager.send({ type: "takeover", deviceId: "mock-1" });
+    assert.match(
+      (await manager.waitForNext(message => message.type === "error" && message.deviceId === "mock-1")).message,
+      /AI-controller management capability required/
+    );
+
     const stopped = manager.waitForNext(message => message.type === "watch_stopped" && message.deviceId === "mock-1");
     const response = await fetch(`${httpUrl}/api/queue/command`, {
       method: "POST",
-      headers: { Cookie: manager.cookie, "Content-Type": "application/json" },
+      headers: { Cookie: admin.cookie, "Content-Type": "application/json" },
       body: JSON.stringify({ text: "/mode human mock-1" }),
     });
     assert.equal(response.status, 200);
@@ -1087,27 +1110,36 @@ test("authorized operations users can inspect an AI-controlled phone read-only",
     assert.equal(devices.get("mock-1").status, "idle");
   } finally {
     operators.delete(username);
+    admin.close();
     manager.close();
     va.close();
   }
 });
 
-test("manager can perform an authorized operational handoff but remains device-scoped", async () => {
+test("a manager cannot perform AI-controller actions on any device, over WS or the command console", async () => {
+  // CLAUDE.md §4: switch_to_ai/takeover/emergency_stop are admin-only: a
+  // manager's device access (mock-1 is on this operator's allow list) must
+  // not matter here — the capability gate has to deny it before device RBAC
+  // is even consulted.
   const operator = operators.get("test-plain-va");
   operator.role = "manager";
   const client = await openClient("test-plain-va", TEST_PASSWORD);
   try {
     await client.waitFor((m) => m.type === "device_list");
-    client.send({ type: "switch_to_ai", deviceId: "mock-1" });
-    await client.waitForNext((m) => m.type === "device_list"
-      && m.devices.find((d) => d.id === "mock-1")?.controllerMode === "AI_IDLE");
-    client.send({ type: "emergency_stop", deviceId: "mock-1" });
-    await client.waitForNext((m) => m.type === "device_list"
-      && m.devices.find((d) => d.id === "mock-1")?.controllerMode === "HUMAN");
 
-    client.send({ type: "switch_to_ai", deviceId: "mock-2" });
-    const denied = await client.waitForNext((m) => m.type === "error" && m.deviceId === "mock-2");
-    assert.match(denied.message, /not authorized/);
+    client.send({ type: "switch_to_ai", deviceId: "mock-1" });
+    const wsDenied = await client.waitForNext((m) => m.type === "error" && m.deviceId === "mock-1");
+    assert.match(wsDenied.message, /AI-controller management capability required/);
+    assert.equal(deviceLease.getMode("mock-1"), "HUMAN", "a denied switch must not have touched the device");
+
+    const consoleDenied = await fetch(`${httpUrl}/api/queue/command`, {
+      method: "POST",
+      headers: { Cookie: client.cookie, "Content-Type": "application/json" },
+      body: JSON.stringify({ text: "/mode ai mock-1" }),
+    });
+    assert.equal(consoleDenied.status, 403);
+    assert.match((await consoleDenied.json()).error, /AI-controller management capability required/);
+    assert.equal(deviceLease.getMode("mock-1"), "HUMAN", "the command console must not bypass the same gate");
   } finally {
     operator.role = "va";
     client.ws.close();

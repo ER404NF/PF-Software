@@ -1815,6 +1815,75 @@ textarea:disabled { opacity: 0.48; cursor: not-allowed; }
 .user-state.pending::before { background: var(--loading); }
 .user-state.rejected::before,
 .user-state.inactive::before { background: var(--offline); }
+.user-security-flag {
+  margin: 4px 0;
+  padding: 4px 8px;
+  border: 1px solid var(--offline);
+  border-radius: 5px;
+  background: var(--soft);
+  color: var(--ink);
+  font-size: 12px;
+}
+
+.user-actions-menu { position: relative; display: inline-block; margin: 6px 0; }
+.user-actions-trigger {
+  min-width: 32px;
+  padding: 3px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink);
+  font-weight: 700;
+  cursor: pointer;
+}
+.user-actions-panel {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 150px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  box-shadow: 0 6px 18px rgba(17, 17, 17, 0.12);
+}
+.user-actions-panel button { border: 1px solid var(--ink); border-radius: 5px; background: var(--ink); color: var(--surface); padding: 5px 10px; }
+.user-actions-panel button.danger { border-color: var(--line-strong); background: var(--surface); color: var(--ink); }
+.role-panel {
+  position: absolute;
+  top: 0;
+  left: calc(100% + 6px);
+  z-index: 6;
+  min-width: 150px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--surface);
+  box-shadow: 0 6px 18px rgba(17, 17, 17, 0.12);
+}
+.role-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 108px;
+  overflow-y: auto;
+}
+.role-list button.role-option {
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 5px 8px;
+  text-align: left;
+}
+.role-list button.role-option[aria-current="true"] { border-color: var(--ink); font-weight: 700; opacity: 0.6; }
+.role-confirm { display: flex; flex-direction: column; gap: 6px; max-width: 180px; }
+.role-confirm p { margin: 0; color: var(--ink); font-size: 12px; }
+.role-confirm button { border: 1px solid var(--ink); border-radius: 5px; background: var(--ink); color: var(--surface); padding: 5px 10px; }
 
 #research-panel {
   top: 76px;

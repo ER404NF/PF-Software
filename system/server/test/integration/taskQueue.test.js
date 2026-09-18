@@ -293,6 +293,80 @@ test("device-targeting commands are blocked by RBAC for a restricted operator", 
   await command(restrictedCookie, "/takeover mock-1"); // clean up back to HUMAN
 });
 
+test("device-workspace commands on another team's running task are blocked by the admin-only AI-controller gate", async () => {
+  operators.set("queue-test-outsider", {
+    username: "queue-test-outsider",
+    passwordHash: hashPassword(TEST_PASSWORD),
+    allowedDevices: ["mock-2"],
+    allowedResearchWorkspaces: ["queue-test"],
+    // manager (not va) so the operator actually clears the MANAGE_QUEUE
+    // capability gate on the route itself.
+    role: "manager",
+  });
+  const outsiderCookie = await loginCookie("queue-test-outsider", TEST_PASSWORD);
+  try {
+    await command(cookie, "/mode ai mock-2");
+    const task = taskQueue.addTask({
+      goal: "owned by queue-test-va", createdBy: "queue-test-va", deviceSelector: { deviceId: "mock-2" },
+    });
+    assert.equal(taskQueue.getTask(task.id).state, "RUNNING");
+
+    // queue-test-outsider has plain device access to mock-2, but
+    // switch_to_ai/takeover/pause/resume/stop are admin-only (CLAUDE.md §4)
+    // regardless of team — a manager is denied here before the team-ownership
+    // check (activeDeviceTaskAccessError) even runs.
+    for (const text of ["/mode human mock-2", "/pause mock-2", "/resume mock-2", "/stop mock-2", "/takeover mock-2"]) {
+      const { status, body } = await command(outsiderCookie, text);
+      assert.equal(status, 403, text);
+      assert.match(body.error, /AI-controller management capability required/, text);
+    }
+    assert.equal(taskQueue.getTask(task.id).state, "RUNNING", "a denied command must not have touched the task");
+
+    // The actual creator (an admin) can still act on the same device/task.
+    const ownerPause = await command(cookie, "/pause mock-2");
+    assert.equal(ownerPause.status, 200);
+    assert.equal(ownerPause.body.task.state, "PAUSED");
+  } finally {
+    operators.delete("queue-test-outsider");
+  }
+});
+
+test("queue management alone does not authorize interrupting another team's task", async () => {
+  // /queue cancel|priority|move only require MANAGE_QUEUE at the route and
+  // are not gated by the admin-only AI-controller capability — they are the
+  // paths where the activeDeviceTaskAccessError/taskAccessError team-ownership
+  // check is still actually reachable by a non-admin, non-creator operator.
+  operators.set("queue-test-outsider", {
+    username: "queue-test-outsider",
+    passwordHash: hashPassword(TEST_PASSWORD),
+    allowedDevices: ["mock-2"],
+    allowedResearchWorkspaces: ["queue-test"],
+    role: "manager",
+  });
+  const outsiderCookie = await loginCookie("queue-test-outsider", TEST_PASSWORD);
+  try {
+    const task = (await command(cookie, "/cresearch instagram queue-instagram 30 owned by queue-test-va")).body.task;
+
+    // queue-test-va (the creator) has no teamId, so the manager-same-team
+    // exception can never apply.
+    const cancelDenied = await command(outsiderCookie, `/queue cancel ${task.id}`);
+    assert.equal(cancelDenied.status, 403);
+    assert.match(cancelDenied.body.error, /not authorized for that task's team/);
+
+    const priorityDenied = await command(outsiderCookie, `/queue priority ${task.id} urgent`);
+    assert.equal(priorityDenied.status, 403);
+    assert.match(priorityDenied.body.error, /not authorized for that task's team/);
+    assert.equal(taskQueue.getTask(task.id).priority, "normal", "a denied command must not have touched the task");
+
+    // The actual creator can still act on it.
+    const ownerCancel = await command(cookie, `/queue cancel ${task.id}`);
+    assert.equal(ownerCancel.status, 200);
+    assert.equal(ownerCancel.body.task.state, "CANCELLED");
+  } finally {
+    operators.delete("queue-test-outsider");
+  }
+});
+
 test("commands require authentication like every other route", async () => {
   const res = await fetch(`${httpUrl}/api/queue/command`, {
     method: "POST",

@@ -127,6 +127,20 @@ const usersEmptyEl = document.getElementById("users-empty");
 const auditRefreshButtonEl = document.getElementById("audit-refresh-button");
 const auditBodyEl = document.getElementById("audit-body");
 const auditEmptyEl = document.getElementById("audit-empty");
+const proxyPoolPanelEl = document.getElementById("proxy-pool-panel");
+const proxyPoolRefreshButtonEl = document.getElementById("proxy-pool-refresh-button");
+const proxyPoolCreateFormEl = document.getElementById("proxy-pool-create-form");
+const proxyPoolProviderEl = document.getElementById("proxy-pool-provider");
+const proxyPoolProtocolEl = document.getElementById("proxy-pool-protocol");
+const proxyPoolHostEl = document.getElementById("proxy-pool-host");
+const proxyPoolPortEl = document.getElementById("proxy-pool-port");
+const proxyPoolUsernameEl = document.getElementById("proxy-pool-username");
+const proxyPoolPasswordEl = document.getElementById("proxy-pool-password");
+const proxyPoolCountryEl = document.getElementById("proxy-pool-country");
+const proxyPoolLabelEl = document.getElementById("proxy-pool-label");
+const proxyPoolMessageEl = document.getElementById("proxy-pool-message");
+const proxyPoolListEl = document.getElementById("proxy-pool-list");
+const proxyPoolEmptyEl = document.getElementById("proxy-pool-empty");
 
 // currentDeviceId is only ever set once the server has confirmed a
 // selection (a "frame" arrives for it) — never optimistically. Otherwise a
@@ -259,6 +273,10 @@ const UI_CAPABILITIES = Object.freeze({
   MANAGE_USERS: "users:manage",
   MANAGE_TEAM_MEMBERS: "team-members:manage",
   MANAGE_PROXY: "proxy:manage",
+  VIEW_PROXY_POOL: "proxy:view-pool",
+  ASSIGN_PROXY: "proxy:assign",
+  MANAGE_DEVICES: "device:provision",
+  MANAGE_ROUTING: "routing:manage",
   RUN_NETWORK_CHECK: "network-health:verify",
   MONITOR_DEVICE: "device:monitor",
   VIEW_PEOPLE: "people:view",
@@ -581,6 +599,8 @@ function setOperatorProfile(profile) {
   document.getElementById("audit-panel").hidden = !can(UI_CAPABILITIES.VIEW_AUDIT);
   usersPanelEl.hidden = !canManagePeople();
   userCreateFormEl.hidden = !can(UI_CAPABILITIES.MANAGE_USERS);
+  proxyPoolPanelEl.hidden = !can(UI_CAPABILITIES.VIEW_PROXY_POOL);
+  proxyPoolCreateFormEl.hidden = !can(UI_CAPABILITIES.MANAGE_PROXY);
   assignmentCreateFormEl.hidden = !can(UI_CAPABILITIES.MANAGE_ASSIGNMENTS);
   const managesAssignments = can(UI_CAPABILITIES.MANAGE_ASSIGNMENTS);
   assignmentsHeadingEl.textContent = isVa ? "My to-do list" : managesAssignments ? "Team tasks" : "My assignments";
@@ -650,6 +670,19 @@ function applyLiveOperatorProfile(profile) {
     usersMessageEl.textContent = "";
     usersEmptyEl.hidden = false;
     usersEmptyEl.textContent = "User management is not available for this role.";
+  }
+  // Re-fetched below under the new capability set, not merely hidden —
+  // stale lease/exclusivity data must not survive a demotion.
+  lastProxyPool = [];
+  proxyPoolLoaded = false;
+  if (!can(UI_CAPABILITIES.VIEW_PROXY_POOL)) {
+    proxyPoolCreateFormEl.reset();
+    proxyPoolListEl.replaceChildren();
+    proxyPoolMessageEl.textContent = "";
+    proxyPoolEmptyEl.hidden = false;
+    proxyPoolEmptyEl.textContent = "The proxy pool is not available for this role.";
+  } else {
+    void refreshProxyPool();
   }
 }
 
@@ -1453,6 +1486,10 @@ let renderToken = 0;
 
 async function renderFleetSafely(devices) {
   lastDevices = devices;
+  // Lazy, once-per-login load: the picker needs the full pool (to compute
+  // exclusivity across devices), not just what device_list carries for one
+  // device. refreshProxyPool() itself re-invokes this function once loaded.
+  if (can(UI_CAPABILITIES.VIEW_PROXY_POOL) && !proxyPoolLoaded) void refreshProxyPool();
   if (watchedDeviceId) {
     const watchedSummary = devices.find(device => device.id === watchedDeviceId);
     if (!watchedSummary || !watchedSummary.canWatch) {
@@ -1688,6 +1725,207 @@ function buildNetworkCheckButton(device, statusEl = selectErrorEl) {
   return button;
 }
 
+function buildRetryProvisioningButton(device) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "network-check-button";
+  button.textContent = "Retry automatic setup";
+  button.addEventListener("click", async () => {
+    button.disabled = true;
+    selectErrorEl.textContent = `Retrying setup for ${device.label}…`;
+    try {
+      await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/retry-provisioning`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      selectErrorEl.textContent = `Retrying automatic setup for ${device.label}.`;
+    } catch (error) {
+      selectErrorEl.textContent = error.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
+  return button;
+}
+
+// Phase B assignment control on the fleet card ("the hover button on each
+// phone should let admins/managers choose the proxies"). A <select> rather
+// than a literal CSS-hover popover — same information, keyboard-accessible,
+// and consistent with every other card control (buildProxySwitch etc.)
+// being an always-present element rather than a hover-only affordance.
+// Options are every pool proxy not currently leased to a DIFFERENT device
+// (Architecture guide §4.6 exclusivity), built from the separately-fetched
+// lastProxyPool — device.poolProxy alone only tells us this device's own
+// assignment, not the pool-wide lease state needed to grey out the rest.
+function buildProxyPoolPicker(device) {
+  const wrap = document.createElement("label");
+  wrap.className = "proxy-pool-picker";
+  wrap.textContent = "Proxy: ";
+
+  const select = document.createElement("select");
+  select.setAttribute("aria-label", `Assign a pool proxy to ${device.label}`);
+  const none = new Option("— None —", "");
+  none.selected = !device.poolProxy;
+  select.appendChild(none);
+  for (const proxy of lastProxyPool) {
+    if (proxy.leasedToDeviceId && proxy.leasedToDeviceId !== device.id) continue; // leased elsewhere — not selectable here
+    const option = new Option(`${proxy.flag ? `${proxy.flag} ` : ""}${proxy.country} · ${proxy.provider} · ${proxy.label}`, proxy.id);
+    option.selected = proxy.id === device.poolProxy?.id;
+    select.appendChild(option);
+  }
+
+  select.addEventListener("change", async () => {
+    const requested = select.value || null;
+    select.disabled = true;
+    selectErrorEl.textContent = "";
+    try {
+      await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/proxy-assignment`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ proxyId: requested }),
+      });
+      selectErrorEl.textContent = requested ? `Proxy assigned to ${device.label}.` : `Proxy released from ${device.label}.`;
+      await refreshProxyPool(); // re-renders the fleet, restoring select.disabled
+    } catch (error) {
+      selectErrorEl.textContent = error.message;
+      select.disabled = false;
+      select.value = device.poolProxy?.id || "";
+    }
+  });
+
+  wrap.appendChild(select);
+  return wrap;
+}
+
+// Phase B part 2: network enrollment -> IP discovery -> start/stop routing.
+// Tracks which devices this browser tab has started (but not yet
+// confirmed) enrollment for — the server's own before-snapshot is
+// similarly ephemeral (in-memory, not persisted; see index.js's comment),
+// so losing this on reload just means clicking "Start" again, which is
+// safe and idempotent.
+const enrollmentPendingDeviceIds = new Set();
+
+// One state machine, one primary button — matches the server's own
+// sequencing (enrollment -> discovery -> routing) instead of showing up to
+// four buttons at once. `device.usbNetwork`/`device.routing` are both
+// null for any viewer without MANAGE_ROUTING (server-scoped, not a client
+// check) and also simply absent until AUTO_ROUTE_PROXY_TUNNELS is enabled.
+// tun_error/pf_syntax_error (setup-time failures) and route_lost (a
+// regression after a previous success — see networkRoutingOrchestrator.js's
+// health check) all fall through to offering a retry ("Start routing")
+// rather than showing a stuck disabled button.
+const ROUTING_TERMINAL_ERROR_STATES = new Set(["tun_error", "pf_syntax_error", "route_lost"]);
+
+function networkRoutingNextAction(device) {
+  const routingState = device.routing?.state;
+  if (routingState === "routed") return { label: "Stop routing", action: "stop-routing", kind: "stop" };
+  if (routingState && !ROUTING_TERMINAL_ERROR_STATES.has(routingState)) {
+    return { label: "Routing…", action: null, disabled: true };
+  }
+  if (device.usbNetwork?.usbIp) return { label: "Start routing", action: "start-routing" };
+  if (device.usbNetwork?.usbIface) return { label: "Discover IP", action: "discover-ip" };
+  if (enrollmentPendingDeviceIds.has(device.id)) return { label: "Confirm enrollment", action: "network-enrollment/confirm" };
+  return { label: "Start network enrollment", action: "network-enrollment/start" };
+}
+
+function networkRoutingStatusText(device) {
+  const parts = [];
+  // Informational only — the auto-enrollment background loop (when
+  // enabled) drives usbNetwork/routing on its own; the manual buttons
+  // below remain available as a fallback/override regardless, e.g. if
+  // auto-enrollment is stuck ambiguous on a device.
+  if (device.autoEnrollment?.state) parts.push(`Auto: ${device.autoEnrollment.state.replaceAll("_", " ")}`);
+  if (device.autoEnrollment?.note) parts.push(device.autoEnrollment.note);
+  if (device.usbNetwork?.usbIface) parts.push(`Enrolled: ${device.usbNetwork.usbIface}`);
+  if (device.usbNetwork?.usbIp) parts.push(`IP: ${device.usbNetwork.usbIp}`);
+  if (device.routing?.state) parts.push(`Routing: ${device.routing.state.replaceAll("_", " ")}`);
+  if (device.routing?.lastError) parts.push(`Error: ${device.routing.lastError}`);
+  return parts.length ? parts.join(" · ") : "Not enrolled";
+}
+
+async function triggerRoutingAction(device, action, button) {
+  button.disabled = true;
+  selectErrorEl.textContent = "";
+  try {
+    const { body } = await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/${action}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    if (action === "network-enrollment/start") {
+      enrollmentPendingDeviceIds.add(device.id);
+      selectErrorEl.textContent = `Now enable Internet Sharing for ${device.label} in System Preferences, then click Confirm enrollment.`;
+    } else {
+      if (action === "network-enrollment/confirm") enrollmentPendingDeviceIds.delete(device.id);
+      selectErrorEl.textContent = body?.network?.usbIp
+        ? `${device.label}: IP discovered (${body.network.usbIp}).`
+        : body?.network?.usbIface
+          ? `${device.label}: enrolled as ${body.network.usbIface}.`
+          : body?.routing?.state
+            ? `${device.label}: ${body.routing.state.replaceAll("_", " ")}.`
+            : `${device.label}: done.`;
+    }
+    broadcastLocalFleetRefresh();
+  } catch (error) {
+    selectErrorEl.textContent = error.message;
+    button.disabled = false;
+  }
+}
+
+function buildNetworkRoutingPanel(device) {
+  const wrap = document.createElement("div");
+  wrap.className = "network-routing-panel";
+
+  const status = document.createElement("span");
+  status.className = "network-routing-status";
+  status.textContent = networkRoutingStatusText(device);
+  wrap.appendChild(status);
+
+  const next = networkRoutingNextAction(device);
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = next.kind === "stop" ? "network-check-button stop" : "network-check-button";
+  button.textContent = next.label;
+  button.disabled = Boolean(next.disabled);
+  if (next.action) {
+    button.addEventListener("click", () => triggerRoutingAction(device, next.action, button));
+  }
+  wrap.appendChild(button);
+
+  // Escape hatch: once enrolled, the primary button progresses on to
+  // "Discover IP"/"Start routing"/"Stop routing" and never comes back to
+  // "Start network enrollment" — but the persisted usbIface can go stale
+  // (the phone moved to a different USB port). This offers a way back in
+  // without disrupting the normal progressive-disclosure flow above.
+  // Hidden once routing is actually active — the server refuses to change
+  // network identity until routing is stopped, so this would just 409.
+  if (device.usbNetwork?.usbIface && next.action !== "network-enrollment/start" && next.kind !== "stop") {
+    const reEnroll = document.createElement("button");
+    reEnroll.type = "button";
+    reEnroll.className = "network-check-button secondary";
+    reEnroll.textContent = "Re-enroll network";
+    reEnroll.title = "Use this if the phone moved to a different USB port.";
+    reEnroll.addEventListener("click", () => triggerRoutingAction(device, "network-enrollment/start", reEnroll));
+    wrap.appendChild(reEnroll);
+  }
+
+  return wrap;
+}
+
+// network-enrollment/start has no persisted, summary()-visible side effect
+// (only the ephemeral before-snapshot, tracked purely client-side via
+// enrollmentPendingDeviceIds), so it never triggers a server broadcast —
+// this local re-render is the only thing that updates its button label.
+// confirm/discover-ip/start-routing/stop-routing all DO call
+// broadcastDeviceList() server-side; calling this here too for those is
+// harmless (renderFleetSafely is idempotent) and keeps this browser's own
+// panel responsive immediately, without waiting on the real broadcast that
+// follows shortly after.
+function broadcastLocalFleetRefresh() {
+  if (lastDevices.length) void renderFleetSafely(lastDevices);
+}
+
 function renderDeviceFacts(device) {
   detailDeviceFactsEl.replaceChildren();
   detailAccessNoteEl.textContent = "";
@@ -1801,6 +2039,28 @@ function phoneStatePresentation(device) {
       : readOnly
         ? "This phone is connected but not ready."
         : "This phone is connected but not ready. Configure its WDA tunnel before opening it.",
+  };
+  if (device.accessState === "wda_provisioning") return {
+    label: "Setting up",
+    message: role === "va"
+      ? "This phone is being set up automatically. Try again shortly."
+      : device.discoveryStateMessage || "Setting up WDA and the device tunnel automatically.",
+  };
+  if (device.accessState === "wda_user_action_required") return {
+    label: "Needs action on phone",
+    message: role === "va"
+      ? "This phone needs an action on the device itself. Contact your manager."
+      : device.discoveryStateMessage || "This phone needs a manual action before it can come online.",
+  };
+  if (device.accessState === "wda_provisioning_error") return {
+    label: "Setup failed",
+    message: role === "va"
+      ? "Automatic setup failed for this phone. Contact your manager."
+      : device.discoveryStateMessage || "Automatic setup failed for this phone. An admin can retry.",
+  };
+  if (device.accessState === "disconnected") return {
+    label: "Unplugged",
+    message: device.discoveryStateMessage || "Unplugged. Reconnect the cable to resume automatic setup.",
   };
   if (isAiMode) {
     if (role === "va") return {
@@ -1926,6 +2186,16 @@ function renderDeviceCard(d, task, lastAction) {
   }
   if (can(UI_CAPABILITIES.RUN_NETWORK_CHECK) && d.assignedToViewer) {
     card.appendChild(buildNetworkCheckButton(d));
+  }
+  if (can(UI_CAPABILITIES.MANAGE_DEVICES)
+    && (d.accessState === "wda_user_action_required" || d.accessState === "wda_provisioning_error")) {
+    card.appendChild(buildRetryProvisioningButton(d));
+  }
+  if (can(UI_CAPABILITIES.ASSIGN_PROXY)) {
+    card.appendChild(buildProxyPoolPicker(d));
+  }
+  if (can(UI_CAPABILITIES.MANAGE_ROUTING)) {
+    card.appendChild(buildNetworkRoutingPanel(d));
   }
 
   if (d.currentOperator || d.assignment) {
@@ -2876,6 +3146,149 @@ function describeUserChanges(user, change) {
   return changes;
 }
 
+// Compact per-user action menu: Kick (sign out + deactivate) and Change role.
+// Click-to-open rather than a literal CSS :hover popover — same "opens
+// beside the row" affordance as buildProxyPoolPicker's picker, but
+// keyboard-reachable (that function's own comment explains why this
+// codebase avoids hover-only controls). Visibility matches the existing
+// edit form's gate; the server is the real enforcement boundary (an
+// unauthorized attempt is force-signed-out and flagged, not just 403'd —
+// see index.js's flagSelfEscalationIfTargeted).
+function buildUserActionsMenu(user) {
+  const wrap = document.createElement("div");
+  wrap.className = "user-actions-menu";
+  wrap.hidden = !can(UI_CAPABILITIES.MANAGE_USERS);
+
+  const trigger = document.createElement("button");
+  trigger.type = "button";
+  trigger.className = "user-actions-trigger";
+  trigger.setAttribute("aria-haspopup", "true");
+  trigger.setAttribute("aria-expanded", "false");
+  trigger.setAttribute("aria-label", `Actions for ${user.username}`);
+  trigger.textContent = "⋮";
+
+  const actionsPanel = document.createElement("div");
+  actionsPanel.className = "user-actions-panel";
+  actionsPanel.hidden = true;
+
+  const kickButton = document.createElement("button");
+  kickButton.type = "button";
+  kickButton.className = "danger";
+  kickButton.textContent = "Kick";
+  kickButton.addEventListener("click", async () => {
+    if (kickButton.disabled) return;
+    if (!window.confirm(`Kick ${user.username}? They'll be signed out everywhere and won't be able to sign back in until reactivated.`)) return;
+    kickButton.disabled = true;
+    usersMessageEl.textContent = "";
+    try {
+      await requestJson(`/api/admin/users/${encodeURIComponent(user.username)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ active: false }),
+      });
+      usersMessageEl.textContent = `${user.username} kicked — signed out and deactivated.`;
+      await refreshUsers();
+    } catch (error) {
+      usersMessageEl.textContent = error.message;
+    } finally {
+      kickButton.disabled = false;
+    }
+  });
+
+  const changeRoleButton = document.createElement("button");
+  changeRoleButton.type = "button";
+  changeRoleButton.textContent = "Change role";
+
+  const rolePanel = document.createElement("div");
+  rolePanel.className = "role-panel";
+  rolePanel.hidden = true;
+
+  const roleList = document.createElement("div");
+  roleList.className = "role-list";
+
+  const confirmView = document.createElement("div");
+  confirmView.className = "role-confirm";
+  confirmView.hidden = true;
+
+  async function applyRole(role) {
+    usersMessageEl.textContent = "";
+    try {
+      await requestJson(`/api/admin/users/${encodeURIComponent(user.username)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ role }),
+      });
+      usersMessageEl.textContent = `${user.username} is now ${displayRole(role)}.`;
+      rolePanel.hidden = true;
+      actionsPanel.hidden = true;
+      trigger.setAttribute("aria-expanded", "false");
+      await refreshUsers();
+    } catch (error) {
+      usersMessageEl.textContent = error.message;
+    }
+  }
+
+  for (const [value, label] of USER_ROLES) {
+    const roleButton = document.createElement("button");
+    roleButton.type = "button";
+    roleButton.className = "role-option";
+    roleButton.textContent = label;
+    roleButton.disabled = value === user.role;
+    if (value === user.role) roleButton.setAttribute("aria-current", "true");
+    roleButton.addEventListener("click", () => {
+      if (value === "admin") {
+        confirmView.replaceChildren();
+        const prompt = document.createElement("p");
+        prompt.textContent = `Are you sure you want to assign admin role to ${user.username}?`;
+        const yes = document.createElement("button");
+        yes.type = "button";
+        yes.textContent = "Yes";
+        yes.addEventListener("click", () => applyRole("admin"));
+        const no = document.createElement("button");
+        no.type = "button";
+        no.textContent = "No";
+        no.addEventListener("click", () => {
+          confirmView.hidden = true;
+          roleList.hidden = false;
+        });
+        confirmView.append(prompt, yes, no);
+        roleList.hidden = true;
+        confirmView.hidden = false;
+      } else {
+        applyRole(value);
+      }
+    });
+    roleList.append(roleButton);
+  }
+
+  rolePanel.append(roleList, confirmView);
+
+  changeRoleButton.addEventListener("click", () => {
+    const opening = rolePanel.hidden;
+    rolePanel.hidden = !opening;
+    if (opening) {
+      roleList.hidden = false;
+      confirmView.hidden = true;
+    }
+  });
+
+  actionsPanel.append(kickButton, changeRoleButton, rolePanel);
+
+  trigger.addEventListener("click", () => {
+    const opening = actionsPanel.hidden;
+    actionsPanel.hidden = !opening;
+    trigger.setAttribute("aria-expanded", String(opening));
+    if (!opening) {
+      rolePanel.hidden = true;
+      confirmView.hidden = true;
+      roleList.hidden = false;
+    }
+  });
+
+  wrap.append(trigger, actionsPanel);
+  return wrap;
+}
+
 function renderUsers(users) {
   usersListEl.replaceChildren();
   usersEmptyEl.hidden = users.length !== 0;
@@ -2907,6 +3320,15 @@ function renderUsers(users) {
     presence.textContent = `${live} · ${sessions} active session${sessions === 1 ? "" : "s"}`
       + (phones ? ` · Using ${phones}` : "")
       + (!user.presence?.online && user.presence?.lastSeenAt ? ` · ${formatLastSeen(user.presence.lastSeenAt)}` : "");
+
+    let securityFlag = null;
+    if (user.securityFlagReason) {
+      securityFlag = document.createElement("p");
+      securityFlag.className = "user-security-flag";
+      securityFlag.textContent = `Auto-kicked ${formatDate(user.securityFlaggedAt)} — ${user.securityFlagReason}`;
+    }
+
+    const actionsMenu = buildUserActionsMenu(user);
 
     const form = document.createElement("form");
     form.className = "user-form user-edit-form";
@@ -3139,10 +3561,115 @@ function renderUsers(users) {
     if (assignments.length) activity.append(assignmentList);
     if (recentAudit.length) activity.append(auditList);
 
-    card.append(heading, identity, presence, accountActions, form, activity);
+    card.append(heading, ...(securityFlag ? [securityFlag] : []), identity, presence, actionsMenu, accountActions, form, activity);
     usersListEl.append(card);
   }
 }
+
+// Phase B shared proxy pool (Architecture guide §4.6). `lastProxyPool`
+// backs both this admin list and buildProxyPoolPicker() on every fleet
+// card — a device's own `poolProxy` field (in `device_list`) only carries
+// its own assignment, not which OTHER proxies are free, so the picker
+// needs this separately-fetched full list to compute exclusivity.
+let lastProxyPool = [];
+let proxyPoolLoaded = false;
+
+function renderProxyPool(proxies) {
+  lastProxyPool = proxies;
+  proxyPoolListEl.replaceChildren();
+  proxyPoolEmptyEl.hidden = proxies.length !== 0;
+  const mayManage = can(UI_CAPABILITIES.MANAGE_PROXY);
+  for (const proxy of proxies) {
+    const card = document.createElement("article");
+    card.className = "user-card";
+
+    const heading = document.createElement("div");
+    heading.className = "user-card-heading";
+    const label = document.createElement("strong");
+    label.textContent = `${proxy.flag ? `${proxy.flag} ` : ""}${proxy.label}`;
+    const state = document.createElement("span");
+    state.className = `user-state ${proxy.leasedToDeviceId ? "approved" : "inactive"}`;
+    state.textContent = proxy.leasedToDeviceId ? `Assigned to ${proxy.leasedToDeviceId}` : "Available";
+    heading.append(label, state);
+
+    const identity = document.createElement("p");
+    identity.className = "user-identity";
+    identity.textContent = [proxy.provider, proxy.protocol, proxy.country].filter(Boolean).join(" · ");
+
+    card.append(heading, identity);
+
+    if (mayManage) {
+      const deleteButton = document.createElement("button");
+      deleteButton.type = "button";
+      deleteButton.textContent = "Delete";
+      deleteButton.disabled = Boolean(proxy.leasedToDeviceId);
+      deleteButton.title = proxy.leasedToDeviceId ? "Release it from its assigned device first." : "";
+      deleteButton.addEventListener("click", async () => {
+        deleteButton.disabled = true;
+        try {
+          await requestJson(`/api/admin/proxies/${encodeURIComponent(proxy.id)}`, { method: "DELETE" });
+          await refreshProxyPool();
+        } catch (error) {
+          proxyPoolMessageEl.textContent = error.message;
+          deleteButton.disabled = Boolean(proxy.leasedToDeviceId);
+        }
+      });
+      card.appendChild(deleteButton);
+    }
+    proxyPoolListEl.appendChild(card);
+  }
+}
+
+async function refreshProxyPool() {
+  if (!can(UI_CAPABILITIES.VIEW_PROXY_POOL)) return;
+  const generation = operatorProfileGeneration;
+  try {
+    const { body } = await requestJson("/api/admin/proxies");
+    if (!profileRequestActive(generation, UI_CAPABILITIES.VIEW_PROXY_POOL)) return;
+    renderProxyPool(Array.isArray(body.proxies) ? body.proxies : []);
+    proxyPoolLoaded = true;
+    // Pickers on every fleet card read lastProxyPool directly — refresh
+    // them now rather than waiting for the next unrelated device_list.
+    if (lastDevices.length) void renderFleetSafely(lastDevices);
+  } catch (error) {
+    if (!profileRequestActive(generation, UI_CAPABILITIES.VIEW_PROXY_POOL)) return;
+    proxyPoolListEl.replaceChildren();
+    proxyPoolEmptyEl.hidden = false;
+    proxyPoolEmptyEl.textContent = `Could not load the proxy pool: ${error.message}`;
+  }
+}
+
+proxyPoolCreateFormEl.addEventListener("submit", async event => {
+  event.preventDefault();
+  proxyPoolMessageEl.textContent = "";
+  const submit = proxyPoolCreateFormEl.querySelector("button[type=submit]");
+  submit.disabled = true;
+  try {
+    const { body } = await requestJson("/api/admin/proxies", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider: proxyPoolProviderEl.value,
+        protocol: proxyPoolProtocolEl.value,
+        host: proxyPoolHostEl.value,
+        port: Number(proxyPoolPortEl.value),
+        username: proxyPoolUsernameEl.value,
+        password: proxyPoolPasswordEl.value,
+        country: proxyPoolCountryEl.value,
+        label: proxyPoolLabelEl.value,
+      }),
+    });
+    proxyPoolMessageEl.textContent = `${body.proxy.label} added.`;
+    proxyPoolCreateFormEl.reset();
+    await refreshProxyPool();
+  } catch (error) {
+    proxyPoolMessageEl.textContent = error.message;
+  } finally {
+    submit.disabled = false;
+  }
+});
+
+proxyPoolRefreshButtonEl.addEventListener("click", refreshProxyPool);
 
 async function refreshUsers() {
   if (!can(UI_CAPABILITIES.MANAGE_USERS) && !can(UI_CAPABILITIES.MANAGE_TEAM_MEMBERS)) return;
@@ -3219,6 +3746,7 @@ async function refreshAdminView() {
     refreshQueueViewer(),
     can(UI_CAPABILITIES.VIEW_AUDIT) ? refreshAuditViewer() : Promise.resolve(),
     canManagePeople() ? refreshUsers() : Promise.resolve(),
+    can(UI_CAPABILITIES.VIEW_PROXY_POOL) ? refreshProxyPool() : Promise.resolve(),
   ]);
 }
 

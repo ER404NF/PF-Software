@@ -20,3 +20,7 @@ system/operators.config.json
 /tmp/
 /system/test-*.txt
 /artifacts/ui-role-review/
+
+# electron-builder output (installers/unpacked builds) — regenerate with
+# `npm run dist:win`/`dist:mac` inside desktop/, never commit the binary.
+/desktop/dist/

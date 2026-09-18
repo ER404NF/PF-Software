@@ -30,6 +30,10 @@ export const CAPABILITIES = Object.freeze({
   MANAGE_TEAM_MEMBERS: "team-members:manage",
   MANAGE_ACCESS: "access:manage",
   MANAGE_PROXY: "proxy:manage",
+  VIEW_PROXY_POOL: "proxy:view-pool",
+  ASSIGN_PROXY: "proxy:assign",
+  MANAGE_DEVICES: "device:provision",
+  MANAGE_ROUTING: "routing:manage",
   MANAGE_SECURITY: "security:manage",
   MONITOR_DEVICE: "device:monitor",
 });
@@ -52,10 +56,11 @@ export const ROLE_CAPABILITIES = Object.freeze({
     CAPABILITIES.REVIEW_RESEARCH,
     CAPABILITIES.MANAGE_ASSIGNMENTS,
     CAPABILITIES.MANAGE_QUEUE,
-    CAPABILITIES.MANAGE_AI_CONTROLLER,
     CAPABILITIES.RUN_NETWORK_CHECK,
     CAPABILITIES.MONITOR_DEVICE,
     CAPABILITIES.MANAGE_TEAM_MEMBERS,
+    CAPABILITIES.VIEW_PROXY_POOL,
+    CAPABILITIES.ASSIGN_PROXY,
   ]),
   [OPERATOR_ROLES.VA]: Object.freeze([
     ...lowerOperational,

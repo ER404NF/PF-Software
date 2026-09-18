@@ -1,0 +1,112 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>Phone Farm setup</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", sans-serif; background: #111; color: #eee; margin: 0; padding: 48px; }
+  .card { max-width: 460px; margin: 0 auto; }
+  h1 { font-size: 20px; margin-bottom: 4px; }
+  p.sub { color: #999; margin-top: 0; font-size: 13px; }
+  button.choice { display: block; width: 100%; padding: 14px 16px; margin: 10px 0; border-radius: 8px; border: 1px solid #333; background: #1c1c1c; color: #eee; text-align: left; cursor: pointer; font-size: 14px; }
+  button.choice:hover { border-color: #666; }
+  button.choice small { display: block; color: #999; font-weight: 400; margin-top: 4px; }
+  [hidden] { display: none !important; }
+  label { display: block; margin: 10px 0 4px; font-size: 12px; color: #aaa; }
+  input { width: 100%; box-sizing: border-box; padding: 8px 10px; border-radius: 5px; border: 1px solid #333; background: #1c1c1c; color: #eee; }
+  .primary { margin-top: 16px; width: 100%; padding: 10px; border-radius: 6px; border: none; background: #eee; color: #111; font-weight: 700; cursor: pointer; }
+  .back { background: none; border: none; color: #999; cursor: pointer; margin-bottom: 12px; }
+  .error { color: #ff8080; font-size: 12px; margin-top: 8px; min-height: 16px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div id="choice-view">
+      <h1>Set up Phone Farm</h1>
+      <p class="sub">Choose how this machine is being used.</p>
+      <button class="choice" id="host-choice">
+        Set up a new host on this machine
+        <small>This machine will run the Phone Farm server and control the connected phones.</small>
+      </button>
+      <button class="choice" id="client-choice">
+        Connect to an existing Phone Farm host
+        <small>Sign in or apply for access on a host that's already running elsewhere.</small>
+      </button>
+    </div>
+
+    <div id="create-admin-view" hidden>
+      <button class="back" id="admin-back">&larr; Back</button>
+      <h1>Create your admin account</h1>
+      <p class="sub">This is a one-time setup step. Once created, this screen never appears again on this machine.</p>
+      <label>Full name</label>
+      <input id="admin-full-name" autocomplete="name" />
+      <label>Gmail address</label>
+      <input id="admin-email" type="email" placeholder="name@gmail.com" />
+      <label>Username</label>
+      <input id="admin-username" autocomplete="username" />
+      <label>Password (12+ characters)</label>
+      <input id="admin-password" type="password" autocomplete="new-password" minlength="12" />
+      <button class="primary" id="admin-submit">Create admin & continue</button>
+      <p class="error" id="admin-error"></p>
+    </div>
+
+    <div id="connect-view" hidden>
+      <button class="back" id="connect-back">&larr; Back</button>
+      <h1>Connect to a host</h1>
+      <p class="sub">Enter the address your host operator gave you.</p>
+      <label>Host address</label>
+      <input id="host-url" placeholder="https://phonefarm.example.com" />
+      <button class="primary" id="connect-submit">Connect</button>
+      <p class="error" id="connect-error"></p>
+    </div>
+  </div>
+
+<script>
+  const choiceView = document.getElementById("choice-view");
+  const adminView = document.getElementById("create-admin-view");
+  const connectView = document.getElementById("connect-view");
+  let hostPort = null;
+
+  function show(view) {
+    choiceView.hidden = view !== choiceView;
+    adminView.hidden = view !== adminView;
+    connectView.hidden = view !== connectView;
+  }
+
+  document.getElementById("host-choice").addEventListener("click", async () => {
+    const result = await window.desktopApi.startHostSetup();
+    if (!result.ok) {
+      alert(`Could not start the host server: ${result.error}`);
+      return;
+    }
+    hostPort = result.port;
+    show(adminView);
+  });
+
+  document.getElementById("client-choice").addEventListener("click", () => show(connectView));
+  document.getElementById("admin-back").addEventListener("click", () => show(choiceView));
+  document.getElementById("connect-back").addEventListener("click", () => show(choiceView));
+
+  document.getElementById("admin-submit").addEventListener("click", async () => {
+    const errorEl = document.getElementById("admin-error");
+    errorEl.textContent = "";
+    const result = await window.desktopApi.createAdmin({
+      port: hostPort,
+      username: document.getElementById("admin-username").value,
+      password: document.getElementById("admin-password").value,
+      fullName: document.getElementById("admin-full-name").value,
+      email: document.getElementById("admin-email").value,
+    });
+    if (!result.ok) errorEl.textContent = result.error;
+    // On success the main process navigates this window to the server URL.
+  });
+
+  document.getElementById("connect-submit").addEventListener("click", async () => {
+    const errorEl = document.getElementById("connect-error");
+    errorEl.textContent = "";
+    const result = await window.desktopApi.connectToHost(document.getElementById("host-url").value);
+    if (!result.ok) errorEl.textContent = result.error;
+  });
+</script>
+</body>
+</html>

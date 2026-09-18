@@ -229,3 +229,59 @@ test("missed recurring windows advance to the next future occurrence", () => {
     assert.equal(advanced[0].history.at(-1).skippedOccurrences, 2);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+
+test("a recurring assignment's overlap conflict does not wedge the rest of the expiry batch", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-assignment-recur-conflict-"));
+  let sequence = 0;
+  const store = createAssignmentStore({
+    storePath: path.join(root, "assignments.json"),
+    now: () => new Date("2026-09-11T09:00:00.000Z"), id: () => `conflict-${++sequence}`,
+  });
+  try {
+    const recurring = store.create({
+      instructions: "Daily phone check", assignee: "va", createdBy: "manager", recurrence: "daily",
+      startAt: "2026-09-11T10:00:00.000Z", endAt: "2026-09-11T11:00:00.000Z",
+    });
+    // Same assignee, overlapping tomorrow's 10:00-11:00 slot the recurring
+    // assignment above is about to advance into — unrelated at creation
+    // time (different day), it only collides once expireDue tries to move
+    // the recurring assignment's window forward.
+    store.create({
+      instructions: "Conflicting one-off", assignee: "va", createdBy: "manager",
+      startAt: "2026-09-12T10:30:00.000Z", endAt: "2026-09-12T10:45:00.000Z",
+    });
+    const unrelated = store.create({
+      instructions: "Unrelated timed work", assignee: "someone-else", createdBy: "manager",
+      startAt: "2026-09-11T10:00:00.000Z", endAt: "2026-09-11T10:30:00.000Z",
+    });
+
+    const results = store.expireDue("2026-09-11T12:00:00.000Z");
+
+    // The unrelated assignment must still expire even though the recurring
+    // one hit an unresolvable overlap in the same batch — this is the crux
+    // of the original bug: the throw used to abort the whole .map() before
+    // commit() ever ran, so nothing in the batch persisted, not just the
+    // conflicting item.
+    const expiredUnrelated = results.find(item => item.id === unrelated.id);
+    assert.equal(expiredUnrelated.status, "expired");
+
+    // The conflicting recurring assignment must not have silently advanced
+    // into (or past) the slot it collides with — it stays exactly where it
+    // was, with the conflict recorded, so an operator can reschedule it.
+    const conflicted = results.find(item => item.id === recurring.id);
+    assert.equal(conflicted.status, "assigned");
+    assert.equal(conflicted.startAt, "2026-09-11T10:00:00.000Z");
+    assert.equal(conflicted.endAt, "2026-09-11T11:00:00.000Z");
+    assert.equal(conflicted.occurrence ?? 1, 1);
+    assert.equal(conflicted.history.at(-1).action, "recurrence_conflict");
+    assert.match(conflicted.history.at(-1).reason, /overlaps active assignment/);
+
+    // And it must actually be persisted, not just returned in memory.
+    const reloaded = createAssignmentStore({
+      storePath: path.join(root, "assignments.json"), now: () => new Date(), id: () => "unused",
+    });
+    assert.equal(reloaded.get(unrelated.id).status, "expired");
+    assert.equal(reloaded.get(recurring.id).status, "assigned");
+    assert.equal(reloaded.get(recurring.id).history.at(-1).action, "recurrence_conflict");
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});

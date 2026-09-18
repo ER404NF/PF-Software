@@ -18,6 +18,7 @@ import {
   assertValidUsername,
   resetOperatorSecondFactor,
   prunePendingSignupAccounts,
+  flagAndDeactivateOperator,
 } from "./authStore.js";
 import { CAPABILITIES } from "./roleCapabilities.js";
 import { researchWorkspaceFor, researchAccounts, researchAccountDefinitions, researchActionPolicies } from "./researchAccess.js";
@@ -28,6 +29,9 @@ import { createTaskQueue } from "./taskQueue.js";
 import { parseCommand } from "./commandParser.js";
 import { loadDeviceNetworkMap, publicNetworkConfig } from "./deviceNetworkConfig.js";
 import { isProxyEgress, setDeviceProxyEnabled } from "./deviceNetworkStore.js";
+import {
+  createProxy, deleteProxy, assignProxyToDevice, publicProxy, publicProxies,
+} from "./proxyPool.js";
 import { createNetworkVerifier } from "./networkVerifier.js";
 import { resolveNetworkCheckTarget } from "./networkCheckTarget.js";
 import { resolveDeploymentConfig } from "./deploymentConfig.js";
@@ -42,11 +46,25 @@ import { createAssignmentStore, ASSIGNMENT_STATUSES } from "./assignmentStore.js
 import { OPERATOR_ROLES } from "./roleCapabilities.js";
 import { monitorState } from "./monitorContract.js";
 import { createAccountNotificationStore } from "./accountNotificationStore.js";
+import { createMailSender } from "./mailSender.js";
 import { createAuthenticationThrottle, createRecoveryThrottle } from "./recoveryThrottle.js";
 import { createSchedulerGuard } from "./schedulerGuard.js";
 import { decryptTotpSecret, encryptTotpSecret, generateRecoveryCodes, generateTotpSecret, otpauthUri, recoveryCodeDigest, verifyTotp } from "./twoFactor.js";
 import { discoverIosDevices } from "./deviceDiscovery.js";
 import { loadDevices } from "./deviceRegistry.js";
+import { runHostPreflight } from "./hostPreflight.js";
+import { resolvePortRange } from "./portAllocator.js";
+import { WdaProcessManager } from "./wdaProcessManager.js";
+import { IProxyManager } from "./iproxyManager.js";
+import { DeviceProvisioner } from "./deviceProvisioner.js";
+import { TunManager } from "./tunManager.js";
+import { PrivilegedOps } from "./privilegedOps.js";
+import { NetworkRoutingOrchestrator } from "./networkRoutingOrchestrator.js";
+import { listBridgeMembers, diffBridgeMembers, discoverBridgeOwnIp } from "./usbNetworkMapper.js";
+import { captureDeviceTraffic, discoverDeviceIp } from "./usbIpDiscovery.js";
+import { getUsbNetworkRecord, setUsbIface, setUsbIp, loadUsbNetworkRecords } from "./usbNetworkStore.js";
+import { enableInternetSharing, detectPrimaryInterface } from "./internetSharingManager.js";
+import { AutoNetworkEnrollment } from "./autoNetworkEnrollment.js";
 import {
   createMediaQuotaManager, createQuotaStorage, mediaByteSetting,
   DEFAULT_DEVICE_MEDIA_QUOTA_BYTES, DEFAULT_GLOBAL_MEDIA_QUOTA_BYTES, DEFAULT_MEDIA_MIN_FREE_BYTES,
@@ -88,6 +106,59 @@ const accountNotificationStore = createAccountNotificationStore({
   companyEmail: process.env.COMPANY_FROM_EMAIL || null,
   encryptionKey: process.env.ACCOUNT_NOTIFICATION_ENCRYPTION_KEY || twoFactorMasterKey,
 });
+const mailSender = createMailSender({
+  host: process.env.SMTP_HOST || null,
+  port: process.env.SMTP_PORT || null,
+  user: process.env.SMTP_USER || null,
+  pass: process.env.SMTP_PASS || null,
+  secure: process.env.SMTP_SECURE === "true",
+});
+if (isMain && !mailSender.isConfigured()) {
+  console.warn("SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS not fully set — account notification emails will stay queued, not sent.");
+}
+// Sends one already-queued notification and advances its deliveryState to
+// "sent"/"failed". A failed send is swallowed here (logged, not thrown) —
+// the account action that triggered the notification (approve/reject,
+// recovery request) must never fail because outbound mail did.
+async function deliverAccountNotification(id) {
+  if (!mailSender.isConfigured()) return null;
+  try {
+    const content = accountNotificationStore.deliveryContent(id);
+    if (!content || content.deliveryState !== "queued") return content;
+    await mailSender.send({ to: content.to, from: content.from, subject: content.subject, body: content.body });
+    return accountNotificationStore.markSent(id);
+  } catch (error) {
+    console.error("Account notification email send failed:", error);
+    return accountNotificationStore.markFailed(id);
+  }
+}
+// Same "default to the shared 2FA master key, allow a dedicated override"
+// convention as accountNotificationStore above.
+const proxyPoolStorePath = process.env.PROXY_POOL_STORE_PATH || path.join(__dirname, "../../storage/proxy-pool.json");
+const proxyCredentialEncryptionKey = process.env.PROXY_CREDENTIAL_ENCRYPTION_KEY || twoFactorMasterKey;
+// Cached like `deviceNetwork` below, not re-read from disk on every
+// summary() call — refreshed explicitly after each pool mutation route.
+let proxyPoolCache = publicProxies(proxyPoolStorePath);
+function refreshProxyPoolCache() { proxyPoolCache = publicProxies(proxyPoolStorePath); }
+function poolProxyForDevice(deviceId) { return proxyPoolCache.find(p => p.leasedToDeviceId === deviceId) ?? null; }
+const usbNetworkStorePath = process.env.USB_NETWORK_STORE_PATH || path.join(__dirname, "../../storage/usb-network.json");
+// Ephemeral, not persisted: the "before" bridge-member snapshot only needs
+// to survive the short window between an admin starting enrollment and
+// confirming it (after manually enabling Internet Sharing for that phone
+// in between) — a relay restart mid-enrollment just means starting over,
+// which is fine and matches the guide's own "stop for a human, never
+// guess" philosophy for this inherently manual step.
+const networkEnrollmentSnapshots = new Map(); // deviceId -> string[] (bridge members before)
+// Same "cache in memory, refresh explicitly after mutation" convention as
+// proxyPoolCache above — summary() would otherwise do a synchronous disk
+// read per device per connected client on every device_list broadcast.
+// Pre-populated from disk once at startup (unlike proxyPoolCache's
+// find-scan shape, this is a direct per-device lookup, so a Map is the
+// natural fit) so already-persisted enrollment/IP data isn't lost until
+// the first mutation after a relay restart.
+const usbNetworkCache = new Map(Object.entries(loadUsbNetworkRecords(usbNetworkStorePath)));
+function refreshUsbNetworkCache(deviceId) { usbNetworkCache.set(deviceId, getUsbNetworkRecord(usbNetworkStorePath, deviceId)); }
+function usbNetworkForDevice(deviceId) { return usbNetworkCache.get(deviceId) ?? null; }
 const recoveryThrottle = createRecoveryThrottle();
 const passwordLoginThrottle = createAuthenticationThrottle({ accountLimit: 5, ipLimit: 25 });
 const secondFactorThrottle = createAuthenticationThrottle({ accountLimit: 5, ipLimit: 25 });
@@ -177,6 +248,65 @@ app.post("/api/signup", (req, res, next) => {
       message: "Application received. An administrator must accept it before sign-in.",
       operator,
     });
+  } catch (error) {
+    if (error?.status) return res.status(error.status).json({ error: error.message });
+    next(error);
+  }
+});
+
+// Loopback-only, self-disabling host bootstrap: creates the very first admin
+// account for a freshly-set-up host (the desktop app's "set up a new host"
+// first-run screen calls this). Deliberately not behind requireAuth — there
+// is no admin yet to authenticate as. Two independent locks keep this from
+// ever being a real remote attack surface: (1) req.socket.remoteAddress must
+// be loopback, so no network client — however the requester's own app
+// behaves — can ever reach it; (2) it permanently refuses once any approved
+// admin exists, with the exact same 404 shape as a route that never existed,
+// so there's nothing to probe for. If an already-authenticated non-admin
+// operator hits it after that lockout, that's a self-escalation attempt —
+// flag and force them out via the same mechanism as the account-management
+// routes above, rather than just a quiet 404.
+function isLoopbackAddress(address) {
+  if (typeof address !== "string") return false;
+  const normalized = address.replace(/^::ffff:/, "");
+  return normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost";
+}
+
+app.post("/api/setup/create-admin", (req, res, next) => {
+  try {
+    if (!isLoopbackAddress(req.socket?.remoteAddress)) {
+      return res.status(404).json({ error: "not found" });
+    }
+    const hasApprovedAdmin = listOperatorAccounts().some(user => user.role === OPERATOR_ROLES.ADMIN
+      && user.active !== false && (user.accountStatus ?? "approved") === "approved");
+    if (hasApprovedAdmin) {
+      const current = req.session?.operator ? resolveOperator(req.session.operator) : null;
+      if (current && current.role !== OPERATOR_ROLES.ADMIN) {
+        const flagged = flagAndDeactivateOperator(
+          current.username,
+          "attempted the host bootstrap endpoint after an admin already existed"
+        );
+        if (flagged) {
+          auditLog.logEvent({
+            operator: current.username,
+            type: "self_escalation_attempt_blocked",
+            detail: { method: req.method, path: req.path },
+          });
+        }
+      }
+      return res.status(404).json({ error: "not found" });
+    }
+    const operator = createOperatorAccount({
+      username: req.body?.username,
+      password: req.body?.password,
+      role: OPERATOR_ROLES.ADMIN,
+      allowedDevices: null,
+      fullName: req.body?.fullName ?? null,
+      email: req.body?.email ?? null,
+      twoFactorRequired: true,
+    });
+    auditLog.logEvent({ operator: operator.username, type: "host_bootstrap_admin_created" });
+    res.status(201).json({ operator });
   } catch (error) {
     if (error?.status) return res.status(error.status).json({ error: error.message });
     next(error);
@@ -295,13 +425,21 @@ app.post("/api/recovery/request", (req, res) => {
   const recovery = allowed && accountNotificationStore.canSecureRecovery()
     ? createEmailRecoveryToken(identifier)
     : null;
-  if (recovery?.token) accountNotificationStore.queue({
-    to: recovery.operator.email,
-    fullName: recovery.operator.fullName || recovery.operator.username,
-    username: recovery.operator.username,
-    status: "recovery",
-    recoveryToken: recovery.token,
-  });
+  if (recovery?.token) {
+    const item = accountNotificationStore.queue({
+      to: recovery.operator.email,
+      fullName: recovery.operator.fullName || recovery.operator.username,
+      username: recovery.operator.username,
+      status: "recovery",
+      recoveryToken: recovery.token,
+    });
+    // Deliberately not awaited: awaiting a real SMTP round-trip here would
+    // make a matching identifier's response measurably slower than a
+    // non-matching one, turning this endpoint's identical response message
+    // into an account-enumeration timing side channel. deliverAccountNotification
+    // never rejects (its own try/catch marks the notification failed instead).
+    deliverAccountNotification(item.id);
+  }
   res.json({ ok: true, message: "If the account is eligible, recovery instructions have been queued." });
 });
 
@@ -367,11 +505,31 @@ function currentStoredOperator(req) {
   });
 }
 
+// A capability-gated route whose :username param can equal the caller's own
+// username is a self-privilege-escalation vector (e.g. a VA trying to PATCH
+// their own role to admin), not an ordinary permission failure. Routes that
+// carry this risk opt in via { flagSelfEscalation: true } below; everything
+// else (a denied /api/audit request, etc.) stays a plain 403.
+function flagSelfEscalationIfTargeted(req, current, label) {
+  if (req.params?.username !== current.username) return;
+  const flagged = flagAndDeactivateOperator(
+    current.username,
+    `attempted to modify their own account via an admin-only route (${label})`
+  );
+  if (flagged) {
+    auditLog.logEvent({
+      operator: current.username,
+      type: "self_escalation_attempt_blocked",
+      detail: { method: req.method, path: req.path, capability: label },
+    });
+  }
+}
+
 // Feature-role authorization is separate from device RBAC. A route protected
 // here may still perform canAccessDevice() checks when it acts on a specific
 // phone. Missing/legacy roles normalize to VA in authStore.js, so old session
 // data never gains admin rights by accident.
-function requireCapability(capability) {
+function requireCapability(capability, { flagSelfEscalation = false } = {}) {
   return (req, res, next) => {
     if (!req.session?.operator) return res.status(401).json({ error: "not logged in" });
     const current = resolveOperator(req.session.operator);
@@ -383,6 +541,7 @@ function requireCapability(capability) {
         type: "capability_access_denied",
         detail: { method: req.method, path: req.path, capability },
       });
+      if (flagSelfEscalation) flagSelfEscalationIfTargeted(req, current, capability);
       return res.status(403).json({ error: `${capability} capability required` });
     }
     presenceStore.touchSession({ sessionId: req.sessionID, username: current.username, expiresAt: req.session.cookie.expires });
@@ -390,7 +549,10 @@ function requireCapability(capability) {
   };
 }
 
-function requireAnyCapability(...capabilities) {
+function requireAnyCapability(...args) {
+  const flagSelfEscalation = args.length && typeof args[args.length - 1] === "object" && args[args.length - 1] !== null;
+  const capabilities = flagSelfEscalation ? args.slice(0, -1) : args;
+  const options = flagSelfEscalation ? args[args.length - 1] : {};
   return (req, res, next) => {
     if (!req.session?.operator) return res.status(401).json({ error: "not logged in" });
     const current = resolveOperator(req.session.operator);
@@ -402,6 +564,7 @@ function requireAnyCapability(...capabilities) {
         type: "capability_access_denied",
         detail: { method: req.method, path: req.path, capabilities },
       });
+      if (options.flagSelfEscalation) flagSelfEscalationIfTargeted(req, current, capabilities.join("|"));
       return res.status(403).json({ error: "user-management capability required" });
     }
     presenceStore.touchSession({ sessionId: req.sessionID, username: current.username, expiresAt: req.session.cookie.expires });
@@ -441,9 +604,9 @@ function publicPeople(viewer = null) {
       ...person,
       canAssign: Boolean(viewer && hasCapability(viewer, CAPABILITIES.MANAGE_ASSIGNMENTS)
         && canManagePerson(viewer, person.username)),
-      currentDeviceIds: person.currentDeviceIds.filter(id => !viewer || canAccessDevice(viewer, id)),
+      currentDeviceIds: person.currentDeviceIds.filter(id => viewer && canAccessDevice(viewer, id)),
       currentPhones: person.currentDeviceIds
-        .filter(id => !viewer || canAccessDevice(viewer, id))
+        .filter(id => viewer && canAccessDevice(viewer, id))
         .map(id => ({ id, label: devices.get(id)?.label ?? id })),
       assignment: assignment ? {
         id: assignment.id,
@@ -493,6 +656,23 @@ server.on("upgrade", (request, socket, head) => {
 });
 
 const devices = loadDevices(rawDeviceConfig, discoveredIosDevices);
+// Populated below, inside the `isMain` startup gate, only when
+// AUTO_PROVISION_WDA is enabled and the host preflight passes. Declared
+// here (not inside that gate) so the retry-provisioning route below can
+// close over it before it's assigned — by the time any request arrives,
+// startup has already finished.
+let deviceProvisioner;
+// Same reasoning as deviceProvisioner above — populated inside `isMain`
+// only when AUTO_ROUTE_PROXY_TUNNELS is enabled, declared here so the
+// start/stop-routing routes below can close over it.
+let networkRoutingOrchestrator;
+// Populated only when AUTO_NETWORK_ENROLLMENT is also enabled — automates
+// the network-enrollment/discover-ip routes above instead of requiring an
+// admin to click through them.
+let autoNetworkEnrollment;
+const manualWdaUdids = new Set(
+  (rawDeviceConfig.devices ?? []).filter(device => device?.type === "wda" && device?.udid).map(device => device.udid)
+);
 const deviceMonitorConfig = new Map();
 for (const configured of rawDeviceConfig.devices ?? []) {
   if (configured.monitorPhysicallyValidated !== undefined
@@ -578,7 +758,7 @@ app.get("/api/admin/users", requireAnyCapability(CAPABILITIES.MANAGE_USERS, CAPA
   })) });
 });
 
-app.patch("/api/admin/users/:username/status", requireAnyCapability(CAPABILITIES.MANAGE_USERS, CAPABILITIES.MANAGE_TEAM_MEMBERS), (req, res, next) => {
+app.patch("/api/admin/users/:username/status", requireAnyCapability(CAPABILITIES.MANAGE_USERS, CAPABILITIES.MANAGE_TEAM_MEMBERS, { flagSelfEscalation: true }), async (req, res, next) => {
   try {
     if (!canManagePerson(req.currentOperator, req.params.username)) {
       return res.status(403).json({ error: "not authorized to review this account" });
@@ -610,6 +790,9 @@ app.patch("/api/admin/users/:username/status", requireAnyCapability(CAPABILITIES
     catch (error) {
       notificationState = "pending_reconciliation";
       console.error("Account review outbox commit failed:", error);
+    }
+    if (notificationState === "queued") {
+      notificationState = (await deliverAccountNotification(notification.id))?.deliveryState ?? notificationState;
     }
     revokeLiveOperatorSessions(operator.username);
     broadcastPresence();
@@ -707,7 +890,7 @@ app.post("/api/admin/users", requireCapability(CAPABILITIES.MANAGE_USERS), (req,
   }
 });
 
-app.patch("/api/admin/users/:username", requireCapability(CAPABILITIES.MANAGE_USERS), (req, res, next) => {
+app.patch("/api/admin/users/:username", requireCapability(CAPABILITIES.MANAGE_USERS, { flagSelfEscalation: true }), (req, res, next) => {
   try {
     const resourceError = validateOperatorResources(req.body);
     if (resourceError) return res.status(400).json({ error: resourceError });
@@ -816,9 +999,11 @@ const assignmentStore = createAssignmentStore({ storePath: assignmentStorePath }
 function expireAssignments(at = new Date()) {
   const expired = assignmentStore.expireDue(at);
   for (const assignment of expired) {
+    const lastAction = assignment.history.at(-1)?.action;
     auditLog.logEvent({
       operator: "system",
-      type: assignment.status === "expired" ? "assignment_expired" : "assignment_recurrence_advanced",
+      type: lastAction === "recurrence_conflict" ? "assignment_recurrence_conflict"
+        : assignment.status === "expired" ? "assignment_expired" : "assignment_recurrence_advanced",
       deviceId: assignment.deviceId,
       detail: {
         assignmentId: assignment.id,
@@ -1089,6 +1274,18 @@ function deviceOpenDecision(d, viewer, viewerSocket = null) {
   if (d.discoveryState === "detected_unconfigured") {
     return { assignedToViewer: true, canOpen: false, accessState: "wda_unconfigured", openReason: "Detected on this Mac. Configure its WDA tunnel before opening it." };
   }
+  if (d.discoveryState === "provisioning") {
+    return { assignedToViewer: true, canOpen: false, accessState: "wda_provisioning", openReason: d.discoveryStateMessage || "Setting up WDA and the device tunnel automatically." };
+  }
+  if (d.discoveryState === "user_action_required") {
+    return { assignedToViewer: true, canOpen: false, accessState: "wda_user_action_required", openReason: d.discoveryStateMessage || "This phone needs a manual action before it can come online." };
+  }
+  if (d.discoveryState === "provisioning_error") {
+    return { assignedToViewer: true, canOpen: false, accessState: "wda_provisioning_error", openReason: d.discoveryStateMessage || "Automatic setup failed for this phone. An admin can retry." };
+  }
+  if (d.discoveryState === "disconnected") {
+    return { assignedToViewer: true, canOpen: false, accessState: "disconnected", openReason: d.discoveryStateMessage || "Unplugged." };
+  }
   if (d.status === "offline") {
     return { assignedToViewer: true, canOpen: false, accessState: "offline", openReason: "This assigned phone is offline." };
   }
@@ -1131,7 +1328,11 @@ function deviceWatchDecision(d, viewer, viewerSocket = null) {
   }
   const controllerMode = deviceLease.getMode(d.id);
   if (controllerMode !== "HUMAN") {
-    if (!hasCapability(viewer, CAPABILITIES.MANAGE_AI_CONTROLLER)) {
+    // Read-only AI-phone inspection only needs the same monitor capability as
+    // watching a human-controlled screen below — MANAGE_AI_CONTROLLER gates
+    // acting on the device (switch_to_ai/takeover/emergency_stop), which is
+    // deliberately admin-only and must not also decide who can merely look.
+    if (!hasCapability(viewer, CAPABILITIES.MONITOR_DEVICE)) {
       return { canWatch: false, watchState: "ai_not_permitted", watchReason: "AI device inspection is not permitted for this role." };
     }
     if (d.status === "offline") {
@@ -1167,6 +1368,7 @@ const summary = (d, viewer = null, viewerSocket = null) => {
     label: d.label,
     status: d.status,
     discoveryState: d.discoveryState ?? null,
+    discoveryStateMessage: d.discoveryStateMessage ?? null,
     hostLabel: deviceHost.get(d.id) ?? DEFAULT_HOST_LABEL,
     ...getHealth(d.id),
     controllerMode: deviceLease.getMode(d.id),
@@ -1195,6 +1397,10 @@ const summary = (d, viewer = null, viewerSocket = null) => {
       .sort((a, b) => a.username.localeCompare(b.username)) : [],
     monitor: runtimeMonitorState(d.id),
     network: publicNetworkConfig(deviceNetwork.get(d.id)),
+    poolProxy: hasCapability(viewer, CAPABILITIES.VIEW_PROXY_POOL) ? poolProxyForDevice(d.id) : null,
+    routing: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? (networkRoutingOrchestrator?.getRoute(d.id) ?? null) : null,
+    usbNetwork: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? usbNetworkForDevice(d.id) : null,
+    autoEnrollment: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? (autoNetworkEnrollment?.getStatus(d.id) ?? null) : null,
     ...networkVerifier.getStatus(d.id),
   };
 };
@@ -1426,6 +1632,243 @@ app.patch("/api/admin/devices/:deviceId/proxy", requireCapability(CAPABILITIES.M
   }
 });
 
+// Manual recovery for a device stuck in `user_action_required` (e.g. a
+// trust/developer-certificate prompt was just resolved on the phone) or
+// `provisioning_error` (WDA/iproxy exhausted its restart budget). No-op
+// route (409) when automatic provisioning isn't enabled on this relay.
+app.post("/api/admin/devices/:deviceId/retry-provisioning", requireCapability(CAPABILITIES.MANAGE_DEVICES), (req, res) => {
+  if (!deviceProvisioner) return res.status(409).json({ error: "automatic device provisioning is not enabled on this relay" });
+  if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
+  if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
+    return res.status(403).json({ error: "not authorized for this device" });
+  }
+  const ok = deviceProvisioner.retryDevice(req.params.deviceId);
+  if (!ok) return res.status(409).json({ error: "this device is not currently managed by automatic provisioning" });
+  auditLog.logEvent({
+    operator: req.currentOperator.username,
+    type: "provisioning_retry",
+    deviceId: req.params.deviceId,
+  });
+  res.json({ ok: true });
+});
+
+// Shared proxy pool (Phase B, Phone_Farm_Automation_Architecture.md §4.6):
+// an Admin enters provider credentials once; assigning a pool entry to a
+// device is a separate, lighter action Admin and Manager can both do from
+// the fleet card. Credentials are encrypted at rest (proxyPool.js) and
+// publicProxy()/publicProxies() strictly never return host/port/username/
+// password to the browser. Actually starting a tunnel for a leased proxy
+// (TUN/PF) is a later step and does not exist yet — this is the pool and
+// exclusive per-device lease only.
+app.get("/api/admin/proxies", requireCapability(CAPABILITIES.VIEW_PROXY_POOL), (req, res) => {
+  res.json({ proxies: proxyPoolCache });
+});
+
+app.post("/api/admin/proxies", requireCapability(CAPABILITIES.MANAGE_PROXY), (req, res) => {
+  if (!proxyCredentialEncryptionKey) {
+    return res.status(503).json({ error: "the proxy pool is unavailable until TWO_FACTOR_MASTER_KEY (or PROXY_CREDENTIAL_ENCRYPTION_KEY) is configured" });
+  }
+  try {
+    const record = createProxy(proxyPoolStorePath, {
+      provider: req.body?.provider,
+      protocol: req.body?.protocol,
+      host: req.body?.host,
+      port: req.body?.port,
+      username: req.body?.username,
+      password: req.body?.password,
+      country: req.body?.country,
+      label: req.body?.label,
+    }, proxyCredentialEncryptionKey);
+    refreshProxyPoolCache();
+    auditLog.logEvent({
+      operator: req.currentOperator.username,
+      type: "proxy_pool_created",
+      detail: { proxyId: record.id, provider: record.provider, country: record.country },
+    });
+    res.status(201).json({ proxy: publicProxy(record) });
+  } catch (error) {
+    if (error?.status) return res.status(error.status).json({ error: error.message });
+    throw error;
+  }
+});
+
+app.delete("/api/admin/proxies/:proxyId", requireCapability(CAPABILITIES.MANAGE_PROXY), (req, res) => {
+  try {
+    const deleted = deleteProxy(proxyPoolStorePath, req.params.proxyId);
+    if (!deleted) return res.status(404).json({ error: "unknown proxy" });
+    refreshProxyPoolCache();
+    auditLog.logEvent({
+      operator: req.currentOperator.username,
+      type: "proxy_pool_deleted",
+      detail: { proxyId: req.params.proxyId },
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    if (error?.status) return res.status(error.status).json({ error: error.message });
+    throw error;
+  }
+});
+
+app.patch("/api/admin/devices/:deviceId/proxy-assignment", requireCapability(CAPABILITIES.ASSIGN_PROXY), (req, res) => {
+  if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
+  if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
+    return res.status(403).json({ error: "not authorized for this device" });
+  }
+  const proxyId = req.body?.proxyId;
+  if (proxyId !== null && typeof proxyId !== "string") {
+    return res.status(400).json({ error: "proxyId must be a string or null" });
+  }
+  try {
+    assignProxyToDevice(proxyPoolStorePath, { deviceId: req.params.deviceId, proxyId });
+    refreshProxyPoolCache();
+    auditLog.logEvent({
+      operator: req.currentOperator.username,
+      type: "proxy_pool_assignment_changed",
+      deviceId: req.params.deviceId,
+      detail: { proxyId },
+    });
+    broadcastDeviceList();
+    res.json({ proxy: poolProxyForDevice(req.params.deviceId) });
+  } catch (error) {
+    if (error?.status) return res.status(error.status).json({ error: error.message });
+    throw error;
+  }
+});
+
+// Network enrollment (Automation Architecture guide §4.4): binding this
+// device's UDID to its transient USB Internet-Sharing bridge member. This
+// is inherently a two-step, human-paced action — the admin enables
+// Internet Sharing for ONE phone at a time BETWEEN these two calls — never
+// something a continuous background loop could safely do (guide §7:
+// enrollment is sequential per phone precisely so the diff is
+// unambiguous). All three enrollment/discovery routes share the routing
+// feature's gate (`networkRoutingOrchestrator` existing) since their
+// output only matters once that feature is actually configured.
+app.post("/api/admin/devices/:deviceId/network-enrollment/start", requireCapability(CAPABILITIES.MANAGE_ROUTING), async (req, res) => {
+  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "automatic proxy tunnel routing is not enabled on this relay" });
+  if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
+  if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
+    return res.status(403).json({ error: "not authorized for this device" });
+  }
+  try {
+    const before = await listBridgeMembers({ bridgeIface: networkRoutingOrchestrator.bridgeIface });
+    networkEnrollmentSnapshots.set(req.params.deviceId, before);
+    res.json({ ok: true, before });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post("/api/admin/devices/:deviceId/network-enrollment/confirm", requireCapability(CAPABILITIES.MANAGE_ROUTING), async (req, res) => {
+  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "automatic proxy tunnel routing is not enabled on this relay" });
+  if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
+  if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
+    return res.status(403).json({ error: "not authorized for this device" });
+  }
+  if (networkRoutingOrchestrator.getRoute(req.params.deviceId)) {
+    return res.status(409).json({ error: "stop routing for this device before changing its network identity" });
+  }
+  const before = networkEnrollmentSnapshots.get(req.params.deviceId);
+  if (!before) return res.status(409).json({ error: "call network-enrollment/start first, then enable Internet Sharing for this phone" });
+  try {
+    const after = await listBridgeMembers({ bridgeIface: networkRoutingOrchestrator.bridgeIface });
+    const diff = diffBridgeMembers(before, after);
+    if (diff.state !== "assigned") return res.status(409).json({ error: diff.reason, newMembers: diff.newMembers });
+    const record = setUsbIface(usbNetworkStorePath, req.params.deviceId, diff.iface);
+    refreshUsbNetworkCache(req.params.deviceId);
+    networkEnrollmentSnapshots.delete(req.params.deviceId);
+    auditLog.logEvent({
+      operator: req.currentOperator.username, type: "network_enrollment_confirmed",
+      deviceId: req.params.deviceId, detail: { usbIface: diff.iface },
+    });
+    broadcastDeviceList();
+    res.json({ network: record });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+app.post("/api/admin/devices/:deviceId/discover-ip", requireCapability(CAPABILITIES.MANAGE_ROUTING), async (req, res) => {
+  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "automatic proxy tunnel routing is not enabled on this relay" });
+  if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
+  if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
+    return res.status(403).json({ error: "not authorized for this device" });
+  }
+  if (networkRoutingOrchestrator.getRoute(req.params.deviceId)) {
+    return res.status(409).json({ error: "stop routing for this device before changing its network identity" });
+  }
+  const enrolled = getUsbNetworkRecord(usbNetworkStorePath, req.params.deviceId);
+  if (!enrolled) return res.status(409).json({ error: "complete network enrollment for this device first" });
+  try {
+    const ownIp = await discoverBridgeOwnIp({ bridgeIface: networkRoutingOrchestrator.bridgeIface });
+    const capture = await captureDeviceTraffic({ iface: enrolled.usbIface });
+    const result = discoverDeviceIp(capture, { excludeIps: [ownIp] });
+    if (result.state !== "resolved") return res.status(409).json({ error: result.reason, state: result.state, candidates: result.candidates });
+    const record = setUsbIp(usbNetworkStorePath, req.params.deviceId, result.ip);
+    refreshUsbNetworkCache(req.params.deviceId);
+    auditLog.logEvent({
+      operator: req.currentOperator.username, type: "usb_ip_discovered",
+      deviceId: req.params.deviceId, detail: { usbIp: result.ip },
+    });
+    broadcastDeviceList();
+    res.json({ network: record });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
+// The admin supplies the device's already-discovered USB-side IPv4 (or, if
+// omitted, this falls back to whatever network-enrollment/discover-ip
+// already resolved and persisted above). This route just drives the
+// already-built PROXY_LEASED -> TUN_STARTING -> PF_APPLYING -> ROUTED
+// state machine for a device that already has a pool proxy leased.
+app.post("/api/admin/devices/:deviceId/start-routing", requireCapability(CAPABILITIES.MANAGE_ROUTING), async (req, res) => {
+  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "automatic proxy tunnel routing is not enabled on this relay" });
+  if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
+  if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
+    return res.status(403).json({ error: "not authorized for this device" });
+  }
+  const usbIp = req.body?.usbIp || getUsbNetworkRecord(usbNetworkStorePath, req.params.deviceId)?.usbIp;
+  if (typeof usbIp !== "string" || !usbIp) {
+    return res.status(400).json({ error: "usbIp is required (supply it, or run network enrollment + IP discovery for this device first)" });
+  }
+  try {
+    const route = await networkRoutingOrchestrator.startRouting(req.params.deviceId, { usbIp });
+    auditLog.logEvent({
+      operator: req.currentOperator.username,
+      type: "routing_started",
+      deviceId: req.params.deviceId,
+      detail: { state: route.state, tunIface: route.tunIface },
+    });
+    broadcastDeviceList();
+    res.json({ routing: route });
+  } catch (error) {
+    auditLog.logEvent({
+      operator: req.currentOperator.username,
+      type: "routing_start_failed",
+      deviceId: req.params.deviceId,
+      detail: { error: error.message },
+    });
+    res.status(error.status || 502).json({ error: error.message });
+  }
+});
+
+app.post("/api/admin/devices/:deviceId/stop-routing", requireCapability(CAPABILITIES.MANAGE_ROUTING), async (req, res) => {
+  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "automatic proxy tunnel routing is not enabled on this relay" });
+  if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
+  if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
+    return res.status(403).json({ error: "not authorized for this device" });
+  }
+  try {
+    await networkRoutingOrchestrator.stopRouting(req.params.deviceId);
+    auditLog.logEvent({ operator: req.currentOperator.username, type: "routing_stopped", deviceId: req.params.deviceId });
+    broadcastDeviceList();
+    res.json({ ok: true });
+  } catch (error) {
+    res.status(502).json({ error: error.message });
+  }
+});
+
 // AI research findings (the /cresearch command's output). One account =
 // one model's content research history. No screenshots — url + metadata,
 // per direction. The candidate list is what a VA reviews afterward:
@@ -1559,8 +2002,20 @@ function taskAccessResult(error) {
   return { error, status: error === "unknown task" ? 400 : 403 };
 }
 
+// The direct WebSocket actions (switch_to_ai/takeover/emergency_stop) already
+// gate on this via requireAiManagerWs; the command-console equivalents below
+// (mode/ai_pause/ai_resume/ai_stop/ai_takeover) must enforce the same
+// capability themselves — the route only requires MANAGE_QUEUE, which is not
+// the same grant, so without this a manager could reach every AI-controller
+// action through the console even though the client hides those controls.
+function aiControllerCapabilityError(operator) {
+  return hasCapability(operator, CAPABILITIES.MANAGE_AI_CONTROLLER)
+    ? null
+    : { error: "AI-controller management capability required.", status: 403 };
+}
+
 function activeDeviceTaskAccessError(deviceId, operator) {
-  const task = taskQueue.listTasks().find(candidate => candidate.assignedDeviceId === deviceId
+  const task = taskQueue.listTasks().find(candidate => candidate.deviceSelector?.deviceId === deviceId
     && ["RUNNING", "PAUSED"].includes(candidate.state));
   return task ? taskAccessError(task.id, operator) : null;
 }
@@ -1727,6 +2182,8 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null, client
     case "mode": {
       const denied = deviceAccessError(parsed.deviceId, operator);
       if (denied) return { error: denied };
+      const capabilityDenied = aiControllerCapabilityError(operator);
+      if (capabilityDenied) return capabilityDenied;
       if (parsed.mode === "ai") {
         const target = devices.get(parsed.deviceId);
         if (humanOwners.has(target.id) || target.status !== "idle") {
@@ -1757,6 +2214,8 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null, client
     case "ai_pause": {
       const denied = deviceAccessError(parsed.deviceId, operator);
       if (denied) return { error: denied };
+      const capabilityDenied = aiControllerCapabilityError(operator);
+      if (capabilityDenied) return capabilityDenied;
       const taskDenied = activeDeviceTaskAccessError(parsed.deviceId, operator);
       if (taskDenied) return taskAccessResult(taskDenied);
       const task = taskQueue.pauseDevice(parsed.deviceId);
@@ -1767,6 +2226,8 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null, client
     case "ai_resume": {
       const denied = deviceAccessError(parsed.deviceId, operator);
       if (denied) return { error: denied };
+      const capabilityDenied = aiControllerCapabilityError(operator);
+      if (capabilityDenied) return capabilityDenied;
       const taskDenied = activeDeviceTaskAccessError(parsed.deviceId, operator);
       if (taskDenied) return taskAccessResult(taskDenied);
       const task = taskQueue.resumeDevice(parsed.deviceId);
@@ -1777,6 +2238,8 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null, client
     case "ai_stop": {
       const denied = deviceAccessError(parsed.deviceId, operator);
       if (denied) return { error: denied };
+      const capabilityDenied = aiControllerCapabilityError(operator);
+      if (capabilityDenied) return capabilityDenied;
       const taskDenied = activeDeviceTaskAccessError(parsed.deviceId, operator);
       if (taskDenied) return taskAccessResult(taskDenied);
       const task = taskQueue.stopDevice(parsed.deviceId);
@@ -1788,6 +2251,8 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null, client
     case "ai_takeover": {
       const denied = deviceAccessError(parsed.deviceId, operator);
       if (denied) return { error: denied };
+      const capabilityDenied = aiControllerCapabilityError(operator);
+      if (capabilityDenied) return capabilityDenied;
       const taskDenied = activeDeviceTaskAccessError(parsed.deviceId, operator);
       if (taskDenied) return taskAccessResult(taskDenied);
       const task = await taskQueue.takeoverDevice(parsed.deviceId);
@@ -2730,6 +3195,98 @@ if (isMain) {
   wdaReadinessTimer = setInterval(() => {
     void refreshWdaReadiness().catch(error => console.error("WDA readiness refresh failed:", error));
   }, WDA_READINESS_INTERVAL_MS);
+
+  // Opt-in: off by default until Phase A has been bench-tested on real
+  // hardware. Manually pinned devices.config.json WDA entries (the existing
+  // MS5 hardware-validation path) are left untouched — only UDIDs with no
+  // explicit config entry are auto-provisioned.
+  if (process.env.AUTO_PROVISION_WDA === "true") {
+    const preflight = runHostPreflight();
+    if (!preflight.ok) {
+      console.error("Automatic WDA provisioning is disabled — host preflight failed:");
+      for (const check of preflight.checks) if (!check.ok) console.error(`  [${check.id}] ${check.message}`);
+    } else {
+      deviceProvisioner = new DeviceProvisioner({
+        devices,
+        discoverIosDevices,
+        manualUdids: manualWdaUdids,
+        wdaProcessManager: new WdaProcessManager({ wdaRepoPath: process.env.WDA_REPO_PATH }),
+        iproxyManager: new IProxyManager(),
+        provisioningStorePath: process.env.DEVICE_PROVISIONING_STORE_PATH
+          || path.join(__dirname, "../../storage/device-provisioning.json"),
+        derivedDataRoot: process.env.WDA_DERIVED_DATA_ROOT
+          || path.join(__dirname, "../../storage/wda-derived-data"),
+        portRange: resolvePortRange(process.env),
+        pollIntervalMs: Number(process.env.PROVISION_POLL_INTERVAL_MS) || undefined,
+        onDeviceListChanged: broadcastDeviceList,
+      });
+      deviceProvisioner.start();
+    }
+  }
+
+  // Opt-in, independent of AUTO_PROVISION_WDA above (a device can be
+  // manually configured in devices.config.json and still get automatic
+  // proxy routing). Requires TWO_FACTOR_MASTER_KEY (or
+  // PROXY_CREDENTIAL_ENCRYPTION_KEY) for pool credential decryption and
+  // SHARED_BRIDGE_IFACE naming the Mac's Internet-Sharing bridge — neither
+  // has a safe default, so both are required explicitly rather than
+  // guessed.
+  if (process.env.AUTO_ROUTE_PROXY_TUNNELS === "true") {
+    const bridgeIface = process.env.SHARED_BRIDGE_IFACE;
+    if (!bridgeIface) {
+      console.error("Automatic proxy tunnel routing is disabled — SHARED_BRIDGE_IFACE is not configured.");
+    } else if (!proxyCredentialEncryptionKey) {
+      console.error("Automatic proxy tunnel routing is disabled — TWO_FACTOR_MASTER_KEY (or PROXY_CREDENTIAL_ENCRYPTION_KEY) is not configured.");
+    } else {
+      try {
+        networkRoutingOrchestrator = new NetworkRoutingOrchestrator({
+          proxyPoolStorePath,
+          proxyCredentialEncryptionKey,
+          tunManager: new TunManager(),
+          privilegedOps: new PrivilegedOps({ anchor: process.env.PF_ANCHOR || "com.apple/phonefarm" }),
+          bridgeIface,
+          onStateChanged: () => broadcastDeviceList(),
+        });
+        networkRoutingOrchestrator.startHealthChecks({
+          intervalMs: Number(process.env.ROUTING_HEALTH_CHECK_INTERVAL_MS) || undefined,
+        });
+
+        // Opt-in and independent of each other: an admin can enable
+        // auto-pairing (AUTO_NETWORK_ENROLLMENT) while still flipping
+        // Internet Sharing on themselves, or enable the automatic toggle
+        // (AUTO_ENABLE_INTERNET_SHARING) while keeping enrollment manual.
+        // Neither blocks the other — the enrollment loop below just waits
+        // for evidence of a shared bridge either way, matching the
+        // "verify, never guess" rule this whole feature already follows.
+        if (process.env.AUTO_ENABLE_INTERNET_SHARING === "true") {
+          void (async () => {
+            try {
+              const primaryInterface = process.env.INTERNET_SHARING_PRIMARY_INTERFACE || await detectPrimaryInterface();
+              await enableInternetSharing({ primaryInterface });
+              console.log(`Internet Sharing enabled automatically (${primaryInterface} -> USB). This uses an undocumented macOS mechanism — verify it actually worked via the fleet UI's network enrollment status.`);
+            } catch (error) {
+              console.error("Automatic Internet Sharing setup failed — enable it manually in System Settings > General > Sharing > Internet Sharing:", error.message);
+            }
+          })();
+        }
+
+        if (process.env.AUTO_NETWORK_ENROLLMENT === "true") {
+          autoNetworkEnrollment = new AutoNetworkEnrollment({
+            bridgeIface,
+            usbNetworkStorePath,
+            proxyPoolStorePath,
+            manualUdids: manualWdaUdids,
+            startRouting: (deviceId, opts) => networkRoutingOrchestrator.startRouting(deviceId, opts),
+            pollIntervalMs: Number(process.env.NETWORK_ENROLLMENT_POLL_INTERVAL_MS) || undefined,
+            onStatusChanged: () => broadcastDeviceList(),
+          });
+          autoNetworkEnrollment.start();
+        }
+      } catch (error) {
+        console.error("Automatic proxy tunnel routing is disabled:", error.message);
+      }
+    }
+  }
 }
 
 export {
@@ -2752,4 +3309,9 @@ export {
   assignmentStore,
   schedulerGuard,
   wdaReadinessTimer,
+  deviceProvisioner,
+  networkRoutingOrchestrator,
+  autoNetworkEnrollment,
+  publicPeople,
+  isLoopbackAddress,
 };

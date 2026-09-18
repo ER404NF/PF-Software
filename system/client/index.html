@@ -331,6 +331,36 @@
         <p id="users-empty" class="admin-empty" hidden>No users configured.</p>
       </section>
 
+      <section class="admin-panel" id="proxy-pool-panel" hidden>
+        <div class="admin-panel-heading">
+          <div>
+            <h3>Proxy Pool</h3>
+            <span>Add provider credentials once; assign them to phones from each fleet card.</span>
+          </div>
+          <button type="button" id="proxy-pool-refresh-button">Refresh</button>
+        </div>
+        <form id="proxy-pool-create-form" class="user-form" hidden>
+          <label>Provider<input id="proxy-pool-provider" maxlength="100" autocomplete="off" required /></label>
+          <label>Protocol
+            <select id="proxy-pool-protocol">
+              <option value="socks5">socks5</option>
+              <option value="http">http</option>
+              <option value="https">https</option>
+            </select>
+          </label>
+          <label>Host<input id="proxy-pool-host" maxlength="255" autocomplete="off" required /></label>
+          <label>Port<input id="proxy-pool-port" type="number" min="1" max="65535" required /></label>
+          <label>Username<input id="proxy-pool-username" maxlength="200" autocomplete="off" required /></label>
+          <label>Password<input id="proxy-pool-password" type="password" maxlength="512" autocomplete="new-password" required /></label>
+          <label>Country (2-letter code)<input id="proxy-pool-country" maxlength="2" pattern="[A-Za-z]{2}" placeholder="US" required /></label>
+          <label>Label (optional)<input id="proxy-pool-label" maxlength="100" placeholder="US pool 1" /></label>
+          <button type="submit">Add proxy</button>
+        </form>
+        <p id="proxy-pool-message" role="status" aria-live="polite"></p>
+        <div id="proxy-pool-list" class="users-list"></div>
+        <p id="proxy-pool-empty" class="admin-empty" hidden>No proxies configured.</p>
+      </section>
+
       <section class="admin-panel" id="audit-panel">
         <div class="admin-panel-heading">
           <div>

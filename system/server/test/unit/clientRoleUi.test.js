@@ -157,6 +157,18 @@ test("network verification is visible only through the server-issued capability"
   assert.match(app, /\/api\/devices\/\$\{encodeURIComponent\(device\.id\)\}\/network-check/);
 });
 
+test("proxy tunnel routing controls are visible only through the server-issued routing:manage capability", () => {
+  assert.match(app, /MANAGE_ROUTING:\s*"routing:manage"/);
+  assert.match(app, /function buildNetworkRoutingPanel\(device\)/);
+  assert.match(app, /can\(UI_CAPABILITIES\.MANAGE_ROUTING\)/);
+  assert.match(app, /function networkRoutingNextAction\(device\)/);
+  // Every action the panel can trigger goes through one of the five
+  // server routes wired this session — never a client-invented path.
+  for (const action of ["network-enrollment/start", "network-enrollment/confirm", "discover-ip", "start-routing", "stop-routing"]) {
+    assert.match(app, new RegExp(action.replace("/", "\\/")), `missing reference to ${action}`);
+  }
+});
+
 test("phone inputs carry request IDs and expose a dedicated screen refresh", () => {
   assert.match(html, /id="refresh-screen-button"[^>]*>Refresh screen/);
   assert.match(app, /function nextActionRequestId\(\)/);

@@ -326,7 +326,29 @@ export function createAssignmentStore({ storePath, now = () => new Date(), id = 
             recurrence,
           }],
         };
-        assertNoOverlap(updated, assignment.id);
+        try {
+          assertNoOverlap(updated, assignment.id);
+        } catch (error) {
+          // A collision with another active assignment must stay isolated to
+          // this one assignment — letting it throw here would abort the whole
+          // .map() and drop every other due assignment's expiry/advance in
+          // this tick, wedging the subsystem until an operator intervenes.
+          // Leave status/schedule untouched so it's picked up and retried on
+          // the next tick, and record the conflict so it's not silent.
+          const conflicted = {
+            ...assignment,
+            updatedAt: stamp,
+            history: [...assignment.history, {
+              at: stamp,
+              actor: "system",
+              action: "recurrence_conflict",
+              recurrence,
+              reason: error.message,
+            }],
+          };
+          expired.push(clone(conflicted));
+          return conflicted;
+        }
         expired.push(clone(updated));
         return updated;
       }

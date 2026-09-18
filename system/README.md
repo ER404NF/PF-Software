@@ -63,6 +63,29 @@ Implemented now:
 - a fleet-style client UI — a device grid grouped by host Mac, with drill-in
   to a per-device control view, plus a role-gated admin/dev workspace; see
   "Fleet UI" below.
+- opt-in automatic WDA/iproxy provisioning (`AUTO_PROVISION_WDA=true`) —
+  plugging in an unconfigured phone launches its WDA process and iproxy
+  tunnel and brings it online with no manual `xcodebuild`/`iproxy` typing or
+  `devices.config.json` editing; see "Automatic WDA/iproxy provisioning"
+  below.
+- a shared proxy pool with encrypted-at-rest credentials and exclusive
+  per-device assignment from the fleet card — see "Shared proxy pool"
+  below.
+- opt-in proxy tunnel routing (`AUTO_ROUTE_PROXY_TUNNELS=true`) — starts a
+  supervised `tun2proxy` for a device's leased pool proxy, generates/loads
+  the matching PF firewall rules in the app's private anchor, and
+  periodically health-checks every routed device (tunnel process liveness,
+  PF rule presence); see "Proxy tunnel routing" below.
+- opt-in fully-automatic network enrollment (`AUTO_NETWORK_ENROLLMENT=true`)
+  — a background loop pairs a newly plugged-in phone with its USB network
+  interface and discovers its IP with no admin clicks, the same "only act
+  when unambiguous, otherwise ask" rule as the manual routes just running
+  continuously instead. Combined with opt-in automatic Internet Sharing
+  (`AUTO_ENABLE_INTERNET_SHARING=true`, since Apple has no supported API
+  for this — see "Proxy tunnel routing" below for the mechanism and its
+  caveats) and a proxy already assigned from the pool, this closes the
+  loop end to end: plug in a phone, it comes online, gets network-mapped,
+  and starts routing on its own.
 
 Not implemented or activated yet:
 
@@ -286,6 +309,209 @@ not validate physical monitoring or turn screenshot polling into video.
 
 Both adapters expose the same tap/swipe/typeText/render contract. As new capabilities are added, extend the adapter interface consistently rather than special-casing the browser for WDA.
 
+## Automatic WDA/iproxy provisioning (opt-in, `AUTO_PROVISION_WDA`)
+
+Everything above this point still describes the manual path: build WDA in
+Xcode, forward it with `iproxy`, hand-edit `devices.config.json`. Set
+`AUTO_PROVISION_WDA=true` to have the relay do that itself for any connected
+UDID that has **no** explicit `devices.config.json` entry — manually pinned
+WDA entries (the MS5 hardware-validation path above) are never touched by
+this.
+
+At startup the relay runs `hostPreflight.js` (Xcode path, `idevice_id`,
+`iproxy`, and `WDA_REPO_PATH` must point at a real WebDriverAgent checkout)
+and disables provisioning with a logged reason if any check fails, rather
+than looping broken launches. When it passes, `deviceProvisioner.js` polls
+`idevice_id -l` continuously (not just at startup), and for each newly seen
+UDID:
+
+- allocates a stable local WDA port (`WDA_PORT_RANGE_START`/`_END`, default
+  8100-8199), persisted per-UDID in `storage/device-provisioning.json` so a
+  replug or relay restart reuses the same port and derived-data directory;
+- launches `xcodebuild ... WebDriverAgentRunner` (`wdaProcessManager.js`)
+  with a derived-data directory unique to that device
+  (`WDA_DERIVED_DATA_ROOT`, default `storage/wda-derived-data/<id>/`) and
+  `iproxy -u <udid> <port>:8100` (`iproxyManager.js`), each supervised with
+  bounded restart/backoff;
+- registers the device into the live fleet immediately, in the existing
+  `offline` state, with `discoveryState: "provisioning"` — the **existing**
+  10-second WDA-readiness loop above is what actually flips it to `idle`
+  once `/status` reports ready; provisioning never polls `/status` itself.
+
+A device whose WDA process exits with a recognized manual-prerequisite
+message (an untrusted developer certificate, Developer Mode disabled, "Trust
+This Computer") surfaces as `discoveryState: "user_action_required"` with a
+plain-language instruction, and stops retrying rather than looping against
+an unresolved prompt. Exhausting the restart budget surfaces
+`"provisioning_error"` instead. Both show a "Retry automatic setup" button
+on the fleet card (Admin-only, `device:provision` capability) that calls
+`POST /api/admin/devices/:deviceId/retry-provisioning`.
+
+See "Shared proxy pool" and "Proxy tunnel routing" below for Phase B, which
+this feeds into.
+
+## Shared proxy pool (Phase B, part 1 — credentials and assignment)
+
+An Admin enters a proxy provider's credentials once (`proxyPool.js`), and
+any Admin or Manager can then assign that pool entry to a phone from the
+fleet card, without re-entering anything — the "ask for information once,
+then automate" flow. This is credential storage and exclusive per-device
+leasing only; see "Proxy tunnel routing" below for what actually starts a
+tunnel for the leased proxy.
+
+- `POST /api/admin/proxies` (Admin-only, `proxy:manage`) — provider,
+  protocol, host, port, username, password, a 2-letter country code, and an
+  optional display label. The password is encrypted at rest with the same
+  AES-256-GCM helpers `twoFactor.js` uses for TOTP secrets
+  (`PROXY_CREDENTIAL_ENCRYPTION_KEY`, defaulting to `TWO_FACTOR_MASTER_KEY`
+  — the same "shared master key, overridable" convention
+  `ACCOUNT_NOTIFICATION_ENCRYPTION_KEY` already uses). No route, and no
+  `GET`/list response, ever returns host, port, username, or password —
+  only `id`, `provider`, `protocol`, `country`, a derived flag emoji,
+  `label`, and `leasedToDeviceId`.
+- `GET /api/admin/proxies` (`proxy:view-pool`, Admin + Manager) — the safe
+  list above.
+- `DELETE /api/admin/proxies/:proxyId` (Admin-only) — refused with 409
+  while the proxy is still leased to a device.
+- `PATCH /api/admin/devices/:deviceId/proxy-assignment` (`proxy:assign`,
+  Admin + Manager, plus the normal device grant) — `{ proxyId }` leases a
+  pool entry to that device, or `{ proxyId: null }` releases it. A proxy
+  already leased to a different device is refused with 409 — the dropdown
+  on every other device's card excludes it, matching the architecture
+  guide's exclusivity rule.
+- Fleet card: a "Proxy" `<select>` next to the existing proxy-routing
+  switch, visible to `proxy:assign` holders, listing every pool entry not
+  currently leased elsewhere. The Admin workspace also gets a "Proxy Pool"
+  panel (add/list/delete) under Operations.
+
+This is unrelated to, and does not replace, the older Phase 0 per-device
+`network` config block below (`egress`/`enabled`, env-var-referenced
+credentials) — that mechanism predates the pool and still applies to
+manually configured `devices.config.json` proxy assignments.
+
+## Proxy tunnel routing (opt-in, `AUTO_ROUTE_PROXY_TUNNELS` — Phase B, part 2)
+
+Set `AUTO_ROUTE_PROXY_TUNNELS=true`, plus `SHARED_BRIDGE_IFACE` (the Mac's
+USB Internet-Sharing bridge, e.g. `bridge100`) and an encryption key (see
+"Shared proxy pool" above), to actually start a tunnel for a device's
+leased pool proxy: `networkRoutingOrchestrator.js` drives
+`PROXY_LEASED -> TUN_STARTING -> PF_APPLYING -> ROUTED`
+(`TUN_ERROR`/`PF_SYNTAX_ERROR` on failure — a ruleset that fails
+`pfctl -nf` is never loaded).
+
+- **Network enrollment** — binding a UDID to its transient USB bridge
+  member (Architecture guide §4.4). Two ways to do this now:
+  - **Manual** (always available): `POST .../network-enrollment/start`
+    snapshots the bridge's current members; the admin then manually enables
+    USB Internet Sharing for **that one phone** in System Preferences;
+    `POST .../network-enrollment/confirm` snapshots again and diffs
+    (`usbNetworkMapper.js`) — exactly one new member is recorded as that
+    device's `usbIface` (`usbNetworkStore.js`), zero or several is refused
+    with 409 rather than guessed.
+  - **Automatic** (opt-in, `AUTO_NETWORK_ENROLLMENT=true`) —
+    `autoNetworkEnrollment.js` runs the identical rule as a continuous
+    background loop instead of a click sequence: every poll tick it
+    recomputes, from scratch, which discovered UDIDs have no `usbIface`
+    yet and which bridge members no persisted device has already claimed.
+    Exactly one of each pairs them automatically; more than one on either
+    side is left alone and flagged `"ambiguous"` — it never guesses, same
+    as the manual flow, it just doesn't need a human to click through the
+    happy path. Statelessly recomputed each tick (not incremental diff
+    tracking), so it self-heals as devices get enrolled and naturally drop
+    out of the pending set.
+- **USB-IP discovery** — capturing live traffic to resolve a phone's
+  private IPv4 (guide §4.5). `POST .../discover-ip` (manual, requires
+  enrollment first) or, under `AUTO_NETWORK_ENROLLMENT=true`, the same
+  background loop attempts it automatically once a device is enrolled,
+  retrying on a cooldown (`captureDeviceTraffic` via `tcpdump`, through the
+  same `sudo -n` boundary as everything privileged — needs a third sudoers
+  entry, see `privilegedOps.js`'s comment) and excluding the Mac's own
+  bridge address (`usbIpDiscovery.js`). More than one candidate address is
+  refused/left pending rather than guessed, exactly like the manual route;
+  if no traffic is seen after a few attempts the status note asks for the
+  phone to be used (open any app) rather than giving up.
+- **Turning on Internet Sharing itself** (opt-in,
+  `AUTO_ENABLE_INTERNET_SHARING=true`) — Apple has no supported API for
+  this at all (not even `networksetup`), so `internetSharingManager.js`
+  uses the same undocumented mechanism System Settings itself is known to
+  drive: writing `/Library/Preferences/SystemConfiguration/com.apple.nat.plist`
+  via `PlistBuddy` (not hand-written XML — a wrong key path fails loudly
+  instead of corrupting the file) and restarting the
+  `com.apple.InternetSharing` launchd job, all through `sudo -n` (a fourth
+  sudoers entry). The primary (internet-facing) interface is
+  auto-detected from the default route (`route get default`) unless
+  `INTERNET_SHARING_PRIMARY_INTERFACE` overrides it. Attempted once at
+  startup; a failure is logged with the manual System Settings fallback
+  and does not block anything else — the auto-enrollment loop above works
+  identically whether sharing was turned on by this or by a human,
+  since it only ever reacts to evidence (an actual new bridge member), not
+  to who flipped the switch. **Because this schema was reconstructed from
+  long-standing community documentation, not an Apple spec, it is the
+  single most likely piece in this whole project to need adjustment once
+  tested against your specific macOS version** — verify it actually worked
+  via the fleet card's enrollment status, and fall back to the manual
+  toggle if it didn't.
+- Together, `AUTO_ROUTE_PROXY_TUNNELS` + `AUTO_ENABLE_INTERNET_SHARING` +
+  `AUTO_NETWORK_ENROLLMENT` + a proxy already assigned from the pool close
+  the entire loop your CLAUDE.md-level ask described: plug in a phone, and
+  — once verified on real hardware — it comes online, gets network-mapped,
+  gets its IP discovered, and starts routing through its assigned proxy
+  with nobody touching System Settings or a terminal. Assigning *which*
+  proxy to a device remains a deliberate admin action (one click on the
+  pool picker) — that's a decision this app won't guess for you.
+- `POST /api/admin/devices/:deviceId/start-routing` / `.../stop-routing`
+  (Admin-only, `routing:manage` — a higher bar than `proxy:assign`, since
+  this starts privileged processes and changes firewall rules) —
+  `start-routing` takes an optional `{ usbIp }`; omit it and the route
+  falls back to whatever `discover-ip` already resolved and persisted for
+  that device.
+- Fleet card: a "Network Routing" panel (visible to `routing:manage`
+  holders) shows enrollment/IP/routing status — including the automatic
+  loop's own live status (`"pending"`/`"ambiguous"`/`"discovering_ip"`/
+  `"ready"`/`"routing"` plus a human-readable note) when
+  `AUTO_NETWORK_ENROLLMENT` is on — and one progressive-disclosure button
+  that always matches the next valid manual step — "Start network
+  enrollment" → "Confirm enrollment" → "Discover IP" → "Start routing" →
+  "Stop routing" — rather than several buttons for steps that aren't
+  reachable yet. The manual buttons stay available as a fallback/override
+  even while the automatic loop is running (e.g. to unstick an `ambiguous`
+  device without unplugging everything else).
+- Every privileged OS operation goes through `privilegedOps.js`'s narrow
+  `sudo -n` boundary (`pfctl` only, scoped to this app's private anchor —
+  `PF_ANCHOR`, default `com.apple/phonefarm` — never the main ruleset) and
+  `tunManager.js` (`tun2proxy`, never `--setup`, per-device supervised).
+  The main server process never runs as root; see `privilegedOps.js`'s
+  module comment for the exact `/etc/sudoers.d` line the host needs
+  (configured out-of-band by a human, never by this app).
+- tun2proxy's own output can echo the authenticated proxy URL back out —
+  `tunManager.js` redacts every log line/event it exposes before anything
+  (a caller, a future UI) ever sees it.
+- A device's routing state (`proxy_leased`/`tun_starting`/`pf_applying`/
+  `routed`/`tun_error`/`pf_syntax_error`) is visible in `device_list` only
+  to `routing:manage` holders (Admin), same visibility scoping as
+  `poolProxy`.
+- Regenerating the PF ruleset is always a full replace across every
+  currently-routed device (guide §6), never an incremental append; stopping
+  the last routed device clears the whole anchor (`pfctl -a <anchor> -F
+  all`) rather than loading an empty ruleset.
+- **Health checks** (guide §4.10, every `ROUTING_HEALTH_CHECK_INTERVAL_MS`
+  — default 30s — once at least one device is routed): for every `ROUTED`
+  device, confirms the `tun2proxy` process is still alive and that its PF
+  rule is still loaded in the anchor (`pfctl -vvs rules`, parsed by
+  `parsePfCounters()`). Either failing — without ever going through
+  `stopRouting()` — flips the device to a new `route_lost` state, distinct
+  from the setup-time `tun_error`/`pf_syntax_error`, and the fleet card
+  offers "Start routing" again to recover it. Deliberately **not** a
+  pass/fail signal on "did packet counters increase" — a legitimately idle
+  device would false-positive as unhealthy — so the raw packet count is
+  just recorded on the route as informational data instead.
+
+Unverified until run on the Mac mini: real `pfctl`/`tun2proxy` behavior,
+actual firewall routing/leak testing (Architecture guide's AT-05/AT-06
+acceptance tests), and the sudoers configuration itself. Every state
+transition and error path is covered by
+`networkRoutingOrchestrator.test.js` against fakes.
+
 ### `network` (optional, Phase 0 of per-phone network isolation)
 
 See "Network isolation (Phase 0)" below.
@@ -391,11 +617,11 @@ Client -> server:
   Back control, which only works from screens that have one)
 - `type_text`: `{ text }`, 1-1000 characters
 - `release_device`
-- `switch_to_ai`: `{ deviceId }` — Manager/Admin; moves an authorized idle device into
+- `switch_to_ai`: `{ deviceId }` — Admin-only; moves an authorized idle device into
   `AI_IDLE`; rejected if it is claimed by a human
-- `takeover`: `{ deviceId }` — Manager/Admin; stops AI control (gracefully)
+- `takeover`: `{ deviceId }` — Admin-only; stops AI control (gracefully)
   and claims the device for the caller, in one step
-- `emergency_stop`: `{ deviceId }` — Manager/Admin; stops AI control
+- `emergency_stop`: `{ deviceId }` — Admin-only; stops AI control
   immediately, without waiting on anything; does not claim the device
 
 Every message is processed strictly in the order it was sent, per connection

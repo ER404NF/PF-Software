@@ -331,6 +331,8 @@ test("live role updates clear privileged DOM before safe data is reloaded", () =
     auditBodyEl: cleared(), auditEmptyEl: {},
     userCreateFormEl: { resetCalled: false, reset() { this.resetCalled = true; } },
     usersListEl: cleared(), usersMessageEl: { textContent: "private" }, usersEmptyEl: {},
+    proxyPoolCreateFormEl: { resetCalled: false, reset() { this.resetCalled = true; } },
+    proxyPoolListEl: cleared(), proxyPoolMessageEl: { textContent: "private" }, proxyPoolEmptyEl: {},
   });
   vm.runInContext(section("function applyLiveOperatorProfile(profile)", "// Every route below"), context);
   vm.runInContext(`applyLiveOperatorProfile({ username: "operator", role: "va", allowedDevices: [],
@@ -347,6 +349,8 @@ test("live role updates clear privileged DOM before safe data is reloaded", () =
   assert.deepEqual(context.usersListEl.children, []);
   assert.equal(context.userCreateFormEl.resetCalled, true);
   assert.equal(context.assignmentInstructionsEl.value, "");
+  assert.equal(context.proxyPoolCreateFormEl.resetCalled, true);
+  assert.deepEqual(context.proxyPoolListEl.children, []);
 });
 
 test("a privileged response already in flight cannot repopulate UI after demotion", async () => {
@@ -372,4 +376,54 @@ test("a privileged response already in flight cannot repopulate UI after demotio
   resolveRequest({ body: { users: [{ username: "private" }] } });
   await pending;
   assert.equal(rendered, 0);
+});
+
+test("networkRoutingNextAction offers a retry for every terminal routing error, never a permanently stuck disabled button", () => {
+  const context = vm.createContext({ enrollmentPendingDeviceIds: new Set() });
+  vm.runInContext(section("const ROUTING_TERMINAL_ERROR_STATES", "function networkRoutingStatusText"), context);
+  for (const state of ["tun_error", "pf_syntax_error", "route_lost"]) {
+    const action = vm.runInContext(
+      `networkRoutingNextAction({ id: "mock-1", routing: { state: "${state}" }, usbNetwork: null })`, context
+    );
+    assert.equal(action.action, "network-enrollment/start", `${state} must offer a retry, not a stuck button`);
+    assert.equal(action.disabled, undefined);
+  }
+  // A genuinely in-progress state (not a terminal error, not routed) is
+  // correctly the disabled "Routing…" case — distinguishing this from the
+  // terminal-error states above is exactly what the fix depends on.
+  const inProgress = vm.runInContext(
+    'networkRoutingNextAction({ id: "mock-1", routing: { state: "tun_starting" }, usbNetwork: null })', context
+  );
+  assert.equal(inProgress.disabled, true);
+  assert.equal(inProgress.action, null);
+});
+
+test("the re-enroll escape hatch appears once enrolled and idle, but not while start-enrollment is already offered or while actively routed", () => {
+  const context = vm.createContext({
+    document: { createElement: element },
+    selectErrorEl: {},
+    networkRoutingStatusText: () => "status",
+    triggerRoutingAction: () => {},
+    networkRoutingNextAction: () => context.__next,
+  });
+  vm.runInContext(section("function buildNetworkRoutingPanel(device)", "function broadcastLocalFleetRefresh"), context);
+  const hasReEnroll = (panel) => panel.children.some(child => child.textContent === "Re-enroll network");
+
+  context.__next = { label: "Start network enrollment", action: "network-enrollment/start" };
+  const unenrolled = vm.runInContext(
+    'buildNetworkRoutingPanel({ id: "mock-1", label: "Phone", usbNetwork: null })', context
+  );
+  assert.equal(hasReEnroll(unenrolled), false, "no escape hatch needed — the primary button already offers it");
+
+  context.__next = { label: "Discover IP", action: "discover-ip" };
+  const enrolledIdle = vm.runInContext(
+    'buildNetworkRoutingPanel({ id: "mock-1", label: "Phone", usbNetwork: { usbIface: "en5" } })', context
+  );
+  assert.equal(hasReEnroll(enrolledIdle), true, "this is the exact dead-end the fix closes — must be reachable");
+
+  context.__next = { label: "Stop routing", action: "stop-routing", kind: "stop" };
+  const routed = vm.runInContext(
+    'buildNetworkRoutingPanel({ id: "mock-1", label: "Phone", usbNetwork: { usbIface: "en5", usbIp: "192.168.2.10" } })', context
+  );
+  assert.equal(hasReEnroll(routed), false, "must stop routing first — the server refuses to change network identity while routed");
 });

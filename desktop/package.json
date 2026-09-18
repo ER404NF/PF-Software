@@ -1,0 +1,47 @@
+{
+  "name": "phone-farm-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop wrapper for Phone Farm: one download, two first-run modes (set up a new host, or connect to an existing one).",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist:win": "electron-builder --win",
+    "dist:mac": "electron-builder --mac"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.phonefarm.desktop",
+    "productName": "Phone Farm",
+    "files": [
+      "**/*",
+      "!dist/**"
+    ],
+    "extraResources": [
+      {
+        "from": "../system",
+        "to": "system",
+        "filter": [
+          "**/*",
+          "!storage/**",
+          "!*.config.json",
+          "!test-*.txt"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.utilities"
+    }
+  }
+}

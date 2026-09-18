@@ -703,6 +703,237 @@ internal record-keeping works first.
 
 ---
 
+## MS14 — Automated device/WDA/iproxy provisioning (Phase A)
+
+**Depends on:** MS5 (extends the same real-device path, does not replace it)
+**Maps to:** root `Phone_Farm_Automation_Architecture.md` §4.1-4.3, §5, §11
+(Phase A only — device discovery, WdaManager, IProxyManager, the state
+machine, and the observed-failure error map; not the proxy pool or TUN/PF
+routing, tracked separately as Phase B)
+**Why:** the manual path (build WDA in Xcode, run `iproxy` by hand, hand-edit
+`devices.config.json` with a UDID/port) does not scale past one bench phone
+and was the explicit ask behind this milestone: plug in a phone, start the
+relay, and have it come online on its own.
+
+### Steps
+- MS14.1 `hostPreflight.js` — fail-fast Xcode/`idevice_id`/`iproxy`/
+  `WDA_REPO_PATH` checks, logged with an actionable fix instead of looping
+  broken launches
+- MS14.2 `portAllocator.js` + `deviceProvisioningStore.js` — stable
+  per-UDID WDA port and derived-data path, persisted across restarts/replugs
+- MS14.3 `processSupervisor.js`, `wdaProcessManager.js`, `iproxyManager.js`
+  — per-device supervised child processes (argv arrays, never a shell
+  string; `iproxy` always scoped with `-u`; bounded restart/backoff; capped
+  log ring)
+- MS14.4 `deviceProvisioner.js` — continuous discovery polling (replacing
+  the one-shot startup scan for unconfigured UDIDs), the attach/detach state
+  machine, and known-failure classification (untrusted cert, Developer Mode,
+  App ID limit) surfaced as `user_action_required` instead of a retry loop
+- MS14.5 Manual "Retry automatic setup" path: `POST
+  /api/admin/devices/:deviceId/retry-provisioning` (`device:provision`,
+  Admin-only) and the matching fleet-card button/banner
+
+### Testing gate
+- Unit: port allocation, persisted-record atomicity, argv construction for
+  both process managers (including the mandatory `-u` and per-device
+  derived-data guardrails), and the provisioner's full attach/detach/replug/
+  failure-classification/retry state machine, all against injected fakes —
+  no real `xcodebuild`/`iproxy` invoked in CI
+- Integration: a provisioned device appears in `device_list` once the
+  existing WDA-readiness loop marks it ready
+- Manual/hardware (unverified until run on the Mac mini): real `xcodebuild`/
+  `iproxy` behavior, actual Xcode trust-prompt flows, physical USB attach/
+  detach reconciliation
+
+---
+
+## MS15 — Shared proxy pool (Phase B, part 1)
+
+**Depends on:** nothing in MS14 (independent of device/WDA provisioning)
+**Maps to:** root `Phone_Farm_Automation_Architecture.md` §2.3, §4.6, §13
+(the `ProxyInventory`/`ProxyLeaseManager` credential/exclusivity model and
+the safe dropdown UI — not the TUN/PF tunnel itself, tracked as part 2 and
+not started)
+**Why:** the explicit ask was "ask for [proxy] information once, then
+automate" — an Admin should never re-type a provider's credentials per
+device, and assigning a proxy to one device must make it unavailable to
+every other device until released.
+
+### Steps
+- MS15.1 `proxyPool.js` — encrypted-at-rest credential storage (reusing
+  `twoFactor.js`'s AES-256-GCM helpers directly rather than duplicating
+  crypto code), CRUD, and the exclusive `AVAILABLE -> LEASED(deviceId) ->
+  RELEASED` lease state machine
+- MS15.2 `POST`/`GET`/`DELETE /api/admin/proxies` and
+  `PATCH /api/admin/devices/:deviceId/proxy-assignment`, gated by two new
+  capabilities (`proxy:view-pool`, `proxy:assign` — Admin + Manager) kept
+  separate from the existing Admin-only `proxy:manage` (pool CRUD, and the
+  older Phase-0 `network.enabled` toggle)
+- MS15.3 Fleet-card proxy picker (`<select>`, not a literal hover popover —
+  same information, keyboard-accessible) and an admin "Proxy Pool" panel
+  (add/list/delete) under Operations
+
+### Testing gate
+- Unit: `proxyPool.js` CRUD, encryption round-trip, lease exclusivity/
+  release/switch, corrupt-store handling
+- Integration: full HTTP route coverage against the real server/RBAC —
+  authentication, capability gating (view vs. assign vs. manage), exclusive
+  leasing across two devices, `device_list`'s `poolProxy` field only
+  visible to `proxy:view-pool` holders, audit trail, and proof that no
+  route or list response ever returns host/port/username/password
+- Manual: page-load console check (every new DOM reference resolves) — a
+  full authenticated click-through on the Mac mini is still recommended
+  before relying on this for a real provider
+
+---
+
+## MS16 — Proxy tunnel routing (Phase B, part 2)
+
+**Depends on:** MS15 (a device needs a leased pool proxy before it can be routed)
+**Maps to:** root `Phone_Farm_Automation_Architecture.md` §4.4-4.9, §6, §8,
+§11 E-PF-001, §12 (TunManager, PfManager, PrivilegedHelper, and the
+UsbNetworkMapper/UsbIpDiscovery diffing logic those depend on)
+**Why:** a leased pool proxy does nothing on its own — this is the piece
+that actually routes a phone's traffic through it, which was the second
+half of the original automation ask ("ask for [proxy] information once,
+then automate").
+
+### Steps
+- MS16.1 `pfRuleGenerator.js` — pure PF ruleset text generation, matching
+  the guide's exact validated grammar, with every interpolated field
+  (interface name, IPv4) strictly validated and rejected outright rather
+  than sanitized — the actual rule-injection boundary, since `pfctl -nf`
+  faithfully parses whatever text this returns
+- MS16.2 `privilegedOps.js` — the narrow `sudo -n` boundary (pfctl only,
+  this app's private anchor only, never `-F all` on the main ruleset) the
+  main server process never needs root itself for
+- MS16.3 `tunManager.js` — per-device supervised `tun2proxy` (never
+  `--setup`), `utunN` allocation, peer discovery, and credential redaction
+  on every log line/event it exposes (tun2proxy's own output can echo the
+  authenticated proxy URL back out)
+- MS16.4 `usbNetworkMapper.js`/`usbIpDiscovery.js` — the before/after
+  bridge-member diffing and tcpdump-output parsing the guide's enrollment
+  strategy needs, plus `POST /api/admin/devices/:deviceId/
+  network-enrollment/start`/`confirm` and `.../discover-ip`
+  (`routing:manage`) — still inherently a human-paced, one-phone-at-a-time
+  action (the admin manually enables Internet Sharing between start and
+  confirm; a bad diff or an ambiguous IP capture is refused with 409, never
+  guessed), just no longer a manual `curl`/shell exercise
+- MS16.5 `networkRoutingOrchestrator.js` — the state machine
+  (`PROXY_LEASED -> TUN_STARTING -> PF_APPLYING -> ROUTED`, with
+  `TUN_ERROR`/`PF_SYNTAX_ERROR` instead of ever guessing past a failure),
+  full-replace PF regeneration across every routed device, and
+  `POST /api/admin/devices/:deviceId/start-routing`/`stop-routing`
+  (`routing:manage`, Admin-only — a higher bar than `proxy:assign`);
+  `start-routing`'s `usbIp` falls back to whatever MS16.4's discover-ip
+  already resolved when omitted
+- MS16.6 Fleet-card "Network Routing" panel — one progressive-disclosure
+  button that always matches the next valid step across all five routes
+  (enrollment start → confirm → discover IP → start routing → stop
+  routing), rather than several simultaneous buttons for steps that aren't
+  reachable yet
+- MS16.7 Health-check loop (guide §4.10) — every `ROUTING_HEALTH_CHECK_
+  INTERVAL_MS` (default 30s), confirms each `ROUTED` device's tunnel
+  process is alive and its PF rule is still loaded (`pfctl -vvs rules`,
+  parsed by `parsePfCounters()`); either failing outside of a deliberate
+  `stopRouting()` flips the device to a new `ROUTE_LOST` state (distinct
+  from the setup-time error states) rather than silently going stale.
+  Deliberately not a "did packets increase" pass/fail check — a
+  legitimately idle device isn't broken — so the raw counter is recorded on
+  the route as informational data only
+
+### Testing gate
+- Unit: PF rule-injection resistance (malicious interface names/IPs
+  rejected, never smuggled into the ruleset text), the sudo wrapper's exact
+  argv per operation (including tcpdump's own `sudo -n` wrapping),
+  credential-redaction correctness, bridge/interface diffing, tcpdump/
+  ifconfig output parsing, the persisted enrollment/discovery store,
+  `parsePfCounters()`'s per-device summing — all against injected fakes, no
+  real `sudo`/`pfctl`/`tun2proxy`/`tcpdump` invoked
+- Integration: the orchestrator's full state machine (happy path, both
+  setup-time error states, multi-device full-replace regeneration, stop/
+  last-device-clears-anchor semantics, retry/interface-reuse, and the
+  health-check loop's tunnel-death/rule-vanished/transient-failure
+  branches, including its own start/stop timer lifecycle) against fakes;
+  all five live HTTP routes' auth/RBAC/disabled-state fallback, plus the
+  new `usbNetwork` summary field's visibility scoping, against the real
+  server
+- Manual/hardware (unverified until run on the Mac mini, explicitly not
+  claimed done): real `pfctl`/`tun2proxy`/`tcpdump` behavior, the sudoers
+  configuration itself, and the guide's AT-05/AT-06 leak/routing
+  acceptance tests
+
+---
+
+## MS17 — Fully automatic network enrollment
+
+**Depends on:** MS16 (extends its manual enrollment/discover-ip routes
+with an automatic path; does not replace them)
+**Maps to:** root `Phone_Farm_Automation_Architecture.md` §4.4/§4.5, and
+the explicit ask behind this milestone: close the last manual step in the
+"plug in phones, turn on the app" story
+**Why:** MS16 automated the tunnel/firewall side but still required an
+admin to click through Start enrollment → toggle Internet Sharing → Confirm
+→ Discover IP for every phone. Internet Sharing itself also has no
+supported toggle-on-its-own path Apple exposes.
+
+### Steps
+- MS17.1 `internetSharingManager.js` — enables Internet Sharing via the
+  same undocumented mechanism System Settings itself uses
+  (`com.apple.nat.plist` via `PlistBuddy`, restarting the
+  `com.apple.InternetSharing` launchd job, both through `sudo -n`), with
+  the primary interface auto-detected from `route get default` rather than
+  requiring configuration. No Apple-published schema exists for this
+  plist, so the exact keys are reconstructed from long-standing community
+  documentation, not guaranteed — this is the single piece of the whole
+  project most likely to need adjustment once tested against a specific
+  macOS version, which is why every call site treats it as best-effort:
+  attempted once at startup, logged on failure, never blocking anything
+  else
+- MS17.2 `autoNetworkEnrollment.js` — the continuous background version of
+  MS16.4's manual enrollment/discover-ip routes. Every poll tick,
+  statelessly recomputes (not incremental diff-tracking, so it self-heals)
+  which discovered UDIDs have no persisted `usbIface` yet and which bridge
+  members no device has already claimed; auto-pairs only when exactly one
+  of each is pending, otherwise flags `"ambiguous"` and waits — the exact
+  same "never guess" rule the manual flow already enforced, just running
+  on its own. Once enrolled, attempts USB-IP discovery on a cooldown
+  (never blocking other devices' reconciliation), and once an IP resolves
+  for a device that already has a pool proxy assigned, calls
+  `networkRoutingOrchestrator.startRouting()` automatically — the
+  orchestrator dependency is injected as a plain function, not imported
+  directly, keeping this module and networkRoutingOrchestrator.js
+  decoupled and independently testable
+- MS17.3 Wired into `index.js` behind two flags independent of each other
+  (`AUTO_ENABLE_INTERNET_SHARING`, `AUTO_NETWORK_ENROLLMENT`, both nested
+  under the existing `AUTO_ROUTE_PROXY_TUNNELS` gate) — an admin can use
+  either alone. A new `autoEnrollment` `device_list` summary field
+  (`routing:manage`-gated, same visibility rule as `poolProxy`/`routing`/
+  `usbNetwork`) surfaces the loop's live per-device status on the fleet
+  card, alongside the existing manual buttons, which remain a full
+  fallback/override
+
+### Testing gate
+- Unit: `internetSharingManager.js`'s exact PlistBuddy/launchctl argv
+  (including the same rule-injection validation as `pfRuleGenerator.js`)
+  and default-route parsing; `autoNetworkEnrollment.js`'s full
+  reconciliation logic (clean single-candidate pairing, multi-candidate
+  ambiguity on either side, manual-UDID exclusion, already-claimed-member
+  exclusion, IP-discovery cooldown and no-traffic/struggling messaging,
+  auto-start-routing when a proxy is already assigned vs. stopping at
+  "ready" when it isn't, and the start/stop timer lifecycle) — all against
+  injected fakes, no real `PlistBuddy`/`launchctl`/`route`/`tcpdump`
+  invoked
+- Integration: the new `autoEnrollment` summary field's visibility scoping
+  and the flag's absence-by-default, against the real server
+- Manual/hardware (unverified until run on the Mac mini, explicitly not
+  claimed done — and the most likely single piece in this project to need
+  adjustment): the NAT plist schema itself, real `PlistBuddy`/`launchctl`
+  behavior, and end-to-end "plug in phone -> routed with zero clicks"
+  acceptance on real hardware
+
+---
+
 ## Milestone summary
 
 | MS | Name | Depends on | Hardware-dependent? |
@@ -720,6 +951,10 @@ internal record-keeping works first.
 | 11 | Timed autonomous research sessions | 10 | Partial |
 | 12 | Multi-device AI fleet | 11 | Partial |
 | 13 | Optimization | 12 | No |
+| 14 | Automated device/WDA/iproxy provisioning (Phase A) | 5 | Partial (manual gate for real `xcodebuild`/`iproxy`/USB) |
+| 15 | Shared proxy pool (Phase B, part 1) | — | No |
+| 16 | Proxy tunnel routing (Phase B, part 2) | 15 | Partial (manual gate for real `pfctl`/`tun2proxy`/`tcpdump`/sudoers — code, UI, and health-check loop are all built and tested against fakes) |
+| 17 | Fully automatic network enrollment | 16 | Partial (manual gate for real `PlistBuddy`/`launchctl`/`route` behavior and the NAT plist schema itself — most likely single piece to need adjustment on real hardware) |
 
 MS1-4 and MS6-7 can be fully built and tested without any physical phone. MS5 is
 the first hard hardware gate. MS8 onward each keep an automatable fixture-based
