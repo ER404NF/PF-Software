@@ -4,13 +4,41 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 
-const html = fs.readFileSync(path.join(__dirname, "..", "first-run.html"), "utf8");
-const source = /  async function runFix[\s\S]*?\n  }\n/.exec(html)?.[0];
+const rawHtml = fs.readFileSync(path.join(__dirname, "..", "first-run.html"), "utf8");
+
+// The page's own function, cut out by matching braces (not by a pattern that assumes a line-ending style: a Windows
+// checkout gives the file CRLF line endings, which broke an earlier version of this test on Windows CI).
+function extractFunction(html, name) {
+  const source = html.replace(/\r\n?/g, "\n");
+  const start = source.search(new RegExp(`(?:async )?function ${name}\\b`));
+  if (start < 0) return null;
+  const open = source.indexOf("{", source.indexOf(")", start));
+  let depth = 0;
+  for (let index = open; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    else if (source[index] === "}" && --depth === 0) return source.slice(start, index + 1);
+  }
+  return null;
+}
+
+const source = extractFunction(rawHtml, "runFix");
 
 function buildRunFix(api) {
   assert.ok(source, "runFix is in the page");
   return new Function("window", `${source}\nreturn runFix;`)({ desktopApi: api });
 }
+
+test("the function is found whatever line endings the checkout used (LF, CRLF or old-Mac CR)", () => {
+  const lf = rawHtml.replace(/\r\n?/g, "\n");
+  for (const variant of [lf, lf.replace(/\n/g, "\r\n"), lf.replace(/\n/g, "\r")]) {
+    const found = extractFunction(variant, "runFix");
+    assert.ok(found, "runFix is found");
+    assert.match(found, /^async function runFix\(id, buttons, progressEl, afterFix\) \{/);
+    assert.match(found, /\}$/);
+    assert.equal(found, source, "the same function text regardless of line endings");
+  }
+  assert.equal(extractFunction(lf, "notInThePage"), null);
+});
 
 function harness({ result, throws = null }) {
   const events = { listening: 0, stopped: 0, fixed: 0 };

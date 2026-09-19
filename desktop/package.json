@@ -3,6 +3,7 @@
   "productName": "Phone Farm",
   "version": "0.1.0",
   "private": true,
+  "author": "Phone Farm",
   "description": "Desktop app for Phone Farm: one download, three first-run modes (set up a new host, connect to an existing hub as an operator, or run a remote site's Mac mini).",
   "main": "main.js",
   "engines": {

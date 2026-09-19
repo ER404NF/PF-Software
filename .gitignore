@@ -27,3 +27,7 @@ system/operators.config.json
 
 /desktop/build/runtime/
 /desktop/build/tmp/
+
+# macOS Finder metadata
+.DS_Store
+**/.DS_Store

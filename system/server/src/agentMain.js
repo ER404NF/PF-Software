@@ -12,7 +12,8 @@
 // Everything else (operators, roles, the queue, audit) stays on the hub.
 
 import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
+import { isDirectExecution } from "./directExecution.js";
 import { loadDeviceConfig } from "./deviceConfigLoader.js";
 import { loadDevices } from "./deviceRegistry.js";
 import { discoverIosDevices } from "./deviceDiscovery.js";
@@ -56,7 +57,7 @@ export function startAgent(env = process.env) {
   return { agent, devices, provisioner };
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+if (isDirectExecution(import.meta.url)) {
   try {
     startAgent();
   } catch (error) {

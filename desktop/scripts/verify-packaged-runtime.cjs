@@ -222,7 +222,10 @@ async function bootAndProbe(resourcesDir, nodeExecutable, { timeoutMs = 30_000 }
       else await new Promise(resolve => setTimeout(resolve, 150));
     }
     if (port === null) {
-      failures.push(`server did not report a listening port (exit=${exited}). Output:\n${output.slice(-1500)}`);
+      const hint = exited === 0
+        ? "\nThe server exited normally without listening: it probably decided it was imported rather than run (see server/src/directExecution.js; a symlinked folder such as macOS /var -> /private/var used to cause this)."
+        : "";
+      failures.push(`server did not report a listening port (exit=${exited}).${hint} Output:\n${output.slice(-1500)}`);
     } else {
       const me = await httpStatus(port, "/api/me");
       if (me.status !== 401) failures.push(`GET /api/me returned ${me.status}, expected 401 for an unauthenticated request`);

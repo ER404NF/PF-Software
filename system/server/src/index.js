@@ -6,7 +6,8 @@ import { createServer, ServerResponse } from "http";
 import path from "path";
 import fs from "fs";
 import { randomUUID } from "crypto";
-import { fileURLToPath, pathToFileURL } from "url";
+import { fileURLToPath } from "url";
+import { isDirectExecution } from "./directExecution.js";
 import { WdaDevice } from "./wdaDevice.js";
 import { StreamHub } from "./streamHub.js";
 import { frameKind } from "./mjpegParser.js";
@@ -87,7 +88,7 @@ const clientDir = path.join(__dirname, "../../client");
 const configPath = process.env.DEVICE_CONFIG_PATH || path.join(__dirname, "../../devices.config.json");
 const rawDeviceConfig = loadDeviceConfig({ env: process.env, defaultPath: configPath });
 const discoveredIosDevices = process.env.AUTO_DISCOVER_IOS_DEVICES === "false" ? [] : discoverIosDevices();
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+const isMain = isDirectExecution(import.meta.url);
 const deployment = resolveDeploymentConfig(process.env, {
   enforceStartup: Boolean(isMain),
   hasMockDevices: rawDeviceConfig.devices?.some(device => device?.type === "mock"),

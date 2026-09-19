@@ -1,6 +1,30 @@
 # Roadmap Status Report — updated 2026-09-19
 
-## 2026-09-19 (latest) — macOS installer hardening: setup without Terminal, and a farm host that stays up
+## 2026-09-19 (latest) — response to the review of commit ae8b2f9: both CI runs were red, now fixed
+
+The first GitHub run of the installer pipeline (macOS run 35432249587, Windows run 35432249628) failed. The review's findings were
+each reproduced or checked before changing anything:
+
+| Finding | Verdict | What was done |
+|---|---|---|
+| **Server exits 0 without listening when started through a symlinked folder** (macOS installer verification: "server did not report a listening port (exit=0)") | **Reproduced here** with a directory junction (direct path listens; linked path exits 0). Root cause: `import.meta.url === pathToFileURL(process.argv[1]).href` compares a symlink-resolved URL with an unresolved path; macOS temp folders are `/var` -> `/private/var`. | New `server/src/directExecution.js` compares real paths (case-insensitive on Windows); used by **both** `index.js` and `agentMain.js`. Tests start the real server and the real site agent through a linked folder, plus unit tests of the helper. The verifier's failure message now names this cause. |
+| **4 Windows test failures** (`firstRunPage.test.js`: "runFix is in the page") | **Reproduced** by converting the page to CRLF, which is what a Windows checkout produces. The test's regex assumed LF. | The test now cuts the function out by matching braces after normalising any line ending; a test proves LF, CRLF and CR all work. The page itself was never broken. |
+| `provisioningBoot.js` ignores the `env` it is given (preflight, iproxy, discovery tools, signing team fall back to global `process.env`) | **Confirmed** (harmless today because both callers pass `process.env`, but inconsistent). | Everything is now read from the supplied `env`, with bare command names as fallbacks; 4 tests, including "a value present only in the global environment is not picked up". |
+| Multer 1.x (deprecated, known vulnerabilities) | **Confirmed**; `npm audit` was 0 but the package itself warns. | Upgraded to Multer 2.4.0; full server suite (uploads included) passes; a test keeps it on 2.x. |
+| `.DS_Store` not ignored; `desktop/package.json` has no `author` | Confirmed | Ignored; `author` added (silences electron-builder's warning). |
+| README points at `/releases/latest`, which is a 404 until a release exists | Confirmed | README now says where to get the installer before the first release (Actions artifact). |
+| No Developer ID certificates configured -> `-UNSIGNED.pkg` | Correct, and **cannot be fixed in code**: needs your Apple Developer ID Application + Installer certificates and notarization credentials as GitHub secrets (`docs/MAC_RELEASE.md`). Until then the package works but macOS warns. | none |
+| `electron-winstaller` install script "not approved by allowScripts" | Windows packaging had not been reached. Checked by running the real `npm run dist:win` locally: the real `npm run dist:win` (NSIS) completed and produced a 114 MB installer, and its packaged server booted, so nothing is blocking there | none needed if the build succeeded |
+| Deprecated transitive build tooling (`glob@7`, `rimraf@2`, ...) | Build-only, audits clean | left as is |
+
+Not a bug and untouched: the earlier `/time` timezone failures are fixed; the review confirms all 1,095 server tests passed on the macOS runner.
+The pipeline got as far as producing `Phone-Farm-0.1.0-arm64-UNSIGNED.pkg` (electron-builder, pkgbuild and productbuild all succeeded) before
+failing in the post-build verification, so the macOS install-to-`/Applications` step and the artifact upload have still never run. The same
+caveat applies to the Windows installer build. **After this fix, re-run both workflows and review whatever the later stages show.**
+
+---
+
+## 2026-09-19 — macOS installer hardening: setup without Terminal, and a farm host that stays up
 
 **Goal:** an operator installs the `.pkg`, opens Phone Farm and plugs in phones one by one, with no Xcode window and no
 Terminal. The installer scripts were already written; this pass closed the gaps found when reading them as a first-time user.

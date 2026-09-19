@@ -2,7 +2,7 @@
 
 ## DOWNLOAD PHONE FARM FOR MAC
 
-**Get the installer from [GitHub Releases](https://github.com/ER404NF/PF-Software/releases/latest)** and download the single file:
+**Get the installer from [GitHub Releases](https://github.com/ER404NF/PF-Software/releases/latest)** (once a release has been published; until then, use the newest run's **Artifacts** under [GitHub Actions](https://github.com/ER404NF/PF-Software/actions/workflows/mac-installer.yml), see [docs/MAC_RELEASE.md](docs/MAC_RELEASE.md)) and download the single file:
 
 ```text
 Phone-Farm-<version>-arm64.pkg        (Apple silicon Macs)
