@@ -1,0 +1,29 @@
+{
+  "recordedFor": "sessions=16 seed=1",
+  "off": {
+    "sessions": 16,
+    "successRate": 1,
+    "recall": 1,
+    "costPerSessionUsd": 1.3125,
+    "latencyPerSessionMs": 60469,
+    "modelCallsPerSession": 18.75,
+    "strongCallsPerSession": 18.75,
+    "screenshotsPerSession": 18.75,
+    "stepsPerSession": 18.75,
+    "wrongActionsPerSession": 0,
+    "cacheHitRate": 0
+  },
+  "on": {
+    "sessions": 16,
+    "successRate": 1,
+    "recall": 1,
+    "costPerSessionUsd": 0.3525,
+    "latencyPerSessionMs": 28019,
+    "modelCallsPerSession": 13,
+    "strongCallsPerSession": 5.75,
+    "screenshotsPerSession": 0,
+    "stepsPerSession": 18.75,
+    "wrongActionsPerSession": 0,
+    "cacheHitRate": 0.6267
+  }
+}

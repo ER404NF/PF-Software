@@ -998,7 +998,8 @@ body {
   #command-form { flex-direction: column; }
 }
 /* Research remains available beside fleet/control without changing input ownership. */
-#research-panel {
+#research-panel,
+#review-panel {
   position: fixed;
   top: 72px;
   right: 12px;
@@ -1015,7 +1016,8 @@ body {
   box-shadow: 0 12px 40px #0008;
   overflow-wrap: anywhere;
 }
-#research-panel[hidden] { display: none; }
+#research-panel[hidden],
+#review-panel[hidden] { display: none; }
 .research-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 #research-account { width: 100%; margin: 8px 0 12px; padding: 8px; }
 .research-run { border-top: 1px solid #556274; margin-top: 16px; }
@@ -1159,7 +1161,8 @@ textarea:disabled { opacity: 0.48; cursor: not-allowed; }
 @media (prefers-reduced-motion: reduce) { #connection-status.connection-state.loading::before { animation: none; } }
 
 #logout-button,
-#research-toggle {
+#research-toggle,
+#review-toggle {
   min-height: 34px;
   padding: 6px 11px;
   border: 1px solid var(--line-strong);
@@ -1171,7 +1174,8 @@ textarea:disabled { opacity: 0.48; cursor: not-allowed; }
 }
 
 #logout-button:hover,
-#research-toggle:hover { background: var(--soft); color: var(--ink); }
+#research-toggle:hover,
+#review-toggle:hover { background: var(--soft); color: var(--ink); }
 
 #people-sidebar {
   top: 64px;
@@ -1885,7 +1889,8 @@ textarea:disabled { opacity: 0.48; cursor: not-allowed; }
 .role-confirm p { margin: 0; color: var(--ink); font-size: 12px; }
 .role-confirm button { border: 1px solid var(--ink); border-radius: 5px; background: var(--ink); color: var(--surface); padding: 5px 10px; }
 
-#research-panel {
+#research-panel,
+#review-panel {
   top: 76px;
   border: 1px solid var(--line-strong);
   border-radius: 8px;
@@ -1896,7 +1901,8 @@ textarea:disabled { opacity: 0.48; cursor: not-allowed; }
 .research-run { border-color: var(--line); }
 .research-candidate { border: 1px solid var(--line); background: var(--canvas); }
 .research-candidate a { color: var(--ink); text-decoration: underline; }
-#research-panel button { border: 1px solid var(--ink); border-radius: 6px; background: var(--ink); color: var(--surface); }
+#research-panel button,
+#review-panel button { border: 1px solid var(--ink); border-radius: 6px; background: var(--ink); color: var(--surface); }
 
 @media (max-width: 760px) {
   #app { padding-top: 0; }
@@ -2016,7 +2022,8 @@ button:not(:disabled):active { transform: translateY(1px); }
 
 #theme-toggle,
 #logout-button,
-#research-toggle {
+#research-toggle,
+#review-toggle {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2034,7 +2041,8 @@ button:not(:disabled):active { transform: translateY(1px); }
 
 #theme-toggle:hover,
 #logout-button:hover,
-#research-toggle:hover { background: var(--soft-strong); color: var(--ink); }
+#research-toggle:hover,
+#review-toggle:hover { background: var(--soft-strong); color: var(--ink); }
 
 #theme-toggle > span:first-child { font-size: 14px; line-height: 1; }
 
@@ -2389,7 +2397,8 @@ button:not(:disabled):active { transform: translateY(1px); }
 
 #screen-wrap { border-radius: 42px; box-shadow: 0 20px 54px rgba(0, 0, 0, 0.22); }
 
-#research-panel { background: var(--surface-solid); }
+#research-panel,
+#review-panel { background: var(--surface-solid); }
 #command-output { background: #16181b; color: #f3f4f5; }
 
 @media (max-width: 900px) {
@@ -2533,4 +2542,221 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 
 .device-fact-actions {
   padding: 0 14px 14px;
+}
+
+/* ---- Phone stage ------------------------------------------------------------
+   The phone-shaped control surface: a live canvas in a bezel with a real home
+   button. The old arrow / Home / type-box controls are gone; the operator clicks,
+   drags, scrolls with the wheel and types on their keyboard. */
+#phone-frame {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  max-width: 100%;
+  padding: 24px 14px 18px;
+  border-radius: 52px;
+  background: linear-gradient(150deg, #34373c, #0d0e10 60%);
+  box-shadow: inset 0 0 0 2px #4a4d53, inset 0 0 0 5px #0a0a0b, 0 24px 60px rgba(0, 0, 0, 0.3);
+  transition: box-shadow 0.15s;
+}
+#phone-frame.keyboard-active {
+  box-shadow: inset 0 0 0 2px #4a4d53, inset 0 0 0 5px #0a0a0b, 0 0 0 3px var(--online), 0 24px 60px rgba(0, 0, 0, 0.3);
+}
+#phone-speaker {
+  width: 56px;
+  height: 6px;
+  margin-bottom: -4px;
+  border-radius: 3px;
+  background: #050506;
+  box-shadow: inset 0 1px 2px rgba(255, 255, 255, 0.08);
+}
+#screen-wrap {
+  position: relative;
+  display: block;
+  border: 0;
+  border-radius: 16px;
+  overflow: hidden;
+  background: #000;
+  box-shadow: 0 0 0 2px #000;
+  line-height: 0;
+  cursor: default;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+}
+#phone-frame.controllable #screen-wrap { cursor: pointer; }
+#phone-frame.controllable #screen-wrap:active { cursor: grabbing; }
+#phone-frame.watching #screen-wrap { cursor: default; }
+#screen { display: block; }
+#phone-frame:not(.has-picture) #screen { width: min(270px, calc(100vw - 96px)); aspect-ratio: 9 / 19; background: #000; }
+.phone-canvas {
+  display: block;
+  width: auto;
+  height: auto;
+  max-width: min(320px, calc(100vw - 96px));
+  max-height: clamp(300px, calc(100vh - 440px), 660px);
+  background: #000;
+}
+#detail-view.ai-workspace .phone-canvas { max-width: 260px; }
+#touch-dot {
+  position: absolute;
+  left: 0;
+  top: 0;
+  z-index: 3;
+  width: 34px;
+  height: 34px;
+  margin: -17px 0 0 -17px;
+  border: 2px solid rgba(255, 255, 255, 0.85);
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.32);
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+  transition: width 0.12s, height 0.12s, margin 0.12s, background 0.12s;
+}
+#touch-dot[hidden] { display: none; }
+#touch-dot.moving { background: rgba(255, 255, 255, 0.2); }
+#touch-dot.holding { width: 54px; height: 54px; margin: -27px 0 0 -27px; background: rgba(10, 132, 255, 0.4); }
+#keyboard-capture {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  border: 0;
+  opacity: 0;
+  resize: none;
+  font-size: 16px;
+  pointer-events: none;
+}
+#stage-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  padding: 18px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #e5e7eb;
+  font: 600 13px/1.45 var(--font-ui, system-ui, sans-serif);
+  text-align: center;
+  pointer-events: none;
+}
+#stage-overlay:not(:empty) { display: flex; }
+#phone-home-button {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  padding: 0;
+  border: 2px solid #3f4248;
+  border-radius: 50%;
+  background: radial-gradient(circle at 35% 30%, #2b2d31, #111214);
+  box-shadow: inset 0 1px 2px rgba(255, 255, 255, 0.07), 0 1px 0 #000;
+  cursor: pointer;
+  transition: transform 0.08s, border-color 0.15s, background 0.08s;
+}
+#phone-home-button span { width: 16px; height: 16px; border: 2px solid #6d7178; border-radius: 4px; }
+#phone-home-button:hover:not(:disabled) { border-color: #70747c; }
+#phone-home-button:active:not(:disabled),
+#phone-home-button.pressed { transform: scale(0.92); background: radial-gradient(circle at 50% 50%, #191a1d, #0b0c0d); }
+#phone-home-button:focus-visible { outline: 2px solid var(--online); outline-offset: 3px; }
+#phone-home-button:disabled { opacity: 0.35; cursor: default; }
+#stream-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+#stream-status::before { width: 8px; height: 8px; border-radius: 50%; background: var(--offline); content: ""; }
+#stream-status[data-state="live"]::before { background: var(--online); }
+#stream-status[data-state="connecting"]::before,
+#stream-status[data-state="reconnecting"]::before,
+#stream-status[data-state="polling"]::before { background: var(--loading); }
+#keyboard-button,
+#stream-retry-button {
+  padding: 5px 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 12px;
+  cursor: pointer;
+}
+#keyboard-button[hidden],
+#stream-retry-button[hidden] { display: none; }
+@media (pointer: fine) { #keyboard-button { display: none !important; } }
+@media (max-width: 760px) {
+  #phone-frame { padding: 20px 10px 14px; border-radius: 44px; }
+  .phone-canvas { max-width: min(300px, calc(100vw - 80px)); max-height: 58vh; }
+}
+@media (prefers-reduced-motion: reduce) {
+  #phone-frame, #touch-dot, #phone-home-button { transition: none; }
+}
+
+/* Phone first: the phone is what an operator opened this page for, so it comes
+   before the fact cards (above them on narrow screens, beside them on wide ones). */
+#detail-view:not([hidden]):not(.media-workspace) {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  grid-template-areas: "heading" "note" "message" "body" "facts" "ai";
+  align-items: start;
+}
+#detail-view > #detail-heading { grid-area: heading; }
+#detail-view > #detail-access-note { grid-area: note; }
+#detail-view > #detail-message { grid-area: message; }
+#detail-view > #detail-body { grid-area: body; }
+#detail-view > #detail-device-facts { grid-area: facts; }
+#detail-view > #detail-ai-status { grid-area: ai; }
+#detail-view:not(.media-workspace) #screen-panel { min-width: 0; }
+@media (min-width: 1000px) {
+  #detail-view:not([hidden]):not(.media-workspace):not(.ai-workspace) {
+    grid-template-columns: minmax(340px, 400px) minmax(0, 1fr);
+    grid-template-rows: auto auto auto auto 1fr;
+    grid-template-areas: "heading heading" "note note" "message message" "body facts" "body ai";
+    column-gap: 28px;
+  }
+  #detail-view:not(.ai-workspace):not(.media-workspace) #detail-device-facts > .device-facts-primary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  #detail-view:not(.ai-workspace):not(.media-workspace) #files-panel { width: 100%; }
+}
+
+/* ---------- Review panel: approvals, hand-backs, action policy ---------- */
+#review-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 12px 0; }
+#review-tabs button { min-height: 32px; padding: 5px 10px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--surface); color: var(--ink); font-size: 12px; font-weight: 600; cursor: pointer; }
+#review-tabs button[aria-selected="true"] { background: var(--ink); color: var(--surface); }
+#review-panel #review-tabs button[aria-selected="false"] { background: var(--surface); color: var(--ink); }
+#review-account-row { display: grid; gap: 4px; margin-bottom: 8px; }
+#review-account { width: 100%; padding: 8px; }
+#review-message { min-height: 1.4em; margin: 10px 0; font-size: 13px; }
+.review-card { border: 1px solid var(--line); background: var(--canvas); border-radius: 8px; padding: 12px; margin: 10px 0; }
+.review-card h3 { margin: 0 0 6px; font-size: 14px; }
+.review-card p { margin: 4px 0; font-size: 13px; }
+.review-card blockquote { margin: 4px 0 8px; padding: 8px 10px; border-left: 3px solid var(--ink); background: var(--surface); font-size: 13px; white-space: pre-wrap; }
+.review-card input[type="text"] { width: 100%; box-sizing: border-box; margin: 6px 0; padding: 7px 8px; }
+.review-label, .review-meta { color: var(--muted, var(--ink)); opacity: 0.75; font-size: 12px; }
+.review-controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+#review-panel .review-controls button { padding: 7px 12px; cursor: pointer; }
+#review-panel .review-controls button:disabled { opacity: 0.5; cursor: default; }
+.review-policy { margin: 14px 0; }
+.review-policy h3 { margin: 0 0 6px; font-size: 13px; }
+.review-policy-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); align-items: center; gap: 8px; padding: 6px 0; border-top: 1px solid var(--line); font-size: 13px; }
+.review-policy-row select { width: 100%; padding: 6px; }
+@media (max-width: 520px) { .review-policy-row { grid-template-columns: 1fr; } }
+
+/* ---------- Phone-first on small screens (remote operators on mobile data) ---------- */
+@media (max-width: 760px) {
+  /* The roster is a nicety on a phone-sized screen; keep the one-line summary, drop the long list. */
+  #people-list,
+  #people-error { display: none; }
+  #people-heading { margin-top: 6px; }
+  /* With a phone open, the phone comes first: no sidebar above it. */
+  #app:has(#detail-view:not([hidden])) #people-sidebar { display: none; }
 }

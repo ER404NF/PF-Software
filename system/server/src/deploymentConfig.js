@@ -37,6 +37,7 @@ function resolveDeploymentConfig(env = process.env, { enforceStartup = false, ha
 
   return {
     host,
+    publicUrl: publicUrl ? publicUrl.origin : null,
     localDevelopment,
     secureCookies,
     trustProxy: secureCookies,

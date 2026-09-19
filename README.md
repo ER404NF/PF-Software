@@ -1,34 +1,51 @@
 # Phone Farm — Dual-Mode Human VA / Future AI VA Control System
 
-## Build the desktop installer from a checkout
+## DOWNLOAD PHONE FARM FOR MAC
 
-The repository root contains a developer/local builder so it is visible
-immediately after cloning or pulling the repository:
+**Get the installer from [GitHub Releases](https://github.com/ER404NF/PF-Software/releases/latest)** and download the single file:
 
-- macOS: open `DOWNLOAD_PHONE_FARM.command`, or run
-  `zsh ./DOWNLOAD_PHONE_FARM.command` from Terminal.
-- Windows: open `DOWNLOAD_PHONE_FARM.cmd`.
+```text
+Phone-Farm-<version>-arm64.pkg        (Apple silicon Macs)
+```
 
-Despite its historical `DOWNLOAD_...` filename, this script does **not** fetch a
-ready-made Phone Farm application. It installs the exact dependencies recorded
-in both lock files,
-runs the complete server test suite, and builds the local desktop installer in
-`desktop/dist/`. It never downloads credentials, operator accounts, device
-configuration, or runtime storage. The build computer needs Node.js 20 or newer;
-the installed Electron app carries its own runtime. Use `--dry-run` to show the
-commands without changing anything, or `--skip-tests` only when intentionally
-rebuilding an already-validated revision.
+Then **double-click it** in Finder. macOS Installer opens; click **Continue**, then
+**Install**. Phone Farm appears in **Applications**; open it like any other app.
 
-Installers produced locally are unsigned until Apple/Windows signing credentials
-are configured, so the operating system may show a security warning.
+You do **not** need the source code, Node.js, npm, Terminal, or this repository.
+Everything Phone Farm needs to run — including its server and the WebDriverAgent it
+uses to control iPhones — is already inside the app.
 
-The intended operator distribution is a prebuilt `Phone-Farm-x.x.x.dmg`:
-open the DMG, drag Phone Farm to Applications, then open it normally. The
-installed app carries its own server runtime and does not require Node.js or
-Terminal. On a macOS host, choosing **Set up a new host** discovers Finder-safe
-Xcode/Homebrew tool paths and `~/WebDriverAgent`, then enables automatic iPhone
-discovery, per-phone WDA, and per-phone `iproxy -u <UDID>` tunnels. See
-`docs/MAC_INSTALLER_ACCEPTANCE.md` for the still-required real-Mac acceptance.
+- A file named `...-UNSIGNED.pkg` or `...-NOT-NOTARIZED.pkg` is a development build made without
+  complete Apple signing credentials. macOS Gatekeeper will warn about it (Control-click → Open, or
+  allow it in System Settings → Privacy & Security). Only the plain `Phone-Farm-<version>-arm64.pkg`
+  is the signed and notarized public installer.
+- Computers that only *connect* to an existing Phone Farm host need nothing else: open the app and choose
+  **Connect to an existing Phone Farm host**.
+- The one Mac that *controls the iPhones* needs Xcode (App Store), the USB tools
+  `libimobiledevice` and `libusbmuxd`, and an Apple Developer account signed in to Xcode. Phone Farm's host
+  setup screen checks each of these, shows a **Fix it** button where it can do the step for you (macOS asks for
+  your Mac password once; the USB tools are installed with Homebrew if it is on the Mac) and says exactly what is
+  missing otherwise. The host keeps the Mac awake, restarts itself after a crash and opens at login. If
+  something does not work, **Help → Copy Diagnostics** gives you a report to send. Details:
+  [desktop/README.md](desktop/README.md).
+
+Real-Mac, real-iPhone acceptance steps: [docs/MAC_INSTALLER_ACCEPTANCE.md](docs/MAC_INSTALLER_ACCEPTANCE.md).
+How a maintainer publishes a release: [docs/MAC_RELEASE.md](docs/MAC_RELEASE.md).
+
+### For developers only: building the installer from source
+
+`BUILD_PHONE_FARM_INSTALLER.command` (macOS) / `BUILD_PHONE_FARM_INSTALLER.cmd` (Windows) are
+**developer tools, not the Phone Farm installer**. They need Node.js 20+, install the exact locked
+dependencies, run the server and desktop test suites, and build a local installer into `desktop/dist/`.
+Releases are normally produced by GitHub Actions (`.github/workflows/mac-installer.yml`) so that the
+tests gate the build and the package is signed and notarized; ordinary users should never run these files.
+
+```sh
+cd desktop
+npm ci
+npm test
+npm run dist:mac        # macOS only -> dist/Phone-Farm-<version>-arm64[-UNSIGNED].pkg
+```
 
 ## Product goal
 
@@ -224,7 +241,7 @@ MS8 read-only research path are built. Current priorities are:
 2. configure one managed account, its installed app version, and a model provider;
 3. run supervised read-only acceptance through `/cresearch`, including
    candidate/evidence persistence, challenge handoff, and provider switching;
-4. enable MS9 private research markers only after the MS8 gate passes;
+4. enable platform-visible actions (MS9/MS10, built and default-disabled) only after the MS8 gate passes;
 5. continue with configured account actions, then the measured
    1 → 2 → 5 device gates.
 

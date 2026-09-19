@@ -4,6 +4,8 @@
 // allowed, but execution always uses validated structured fields."
 
 import { PRIORITIES } from "./taskSpec.js";
+import { validTimeZone, zonedInstantForLocal, zonedLocalParts } from "./zonedRecurrence.js";
+import { resolveSchedulingTimeZone } from "./schedulingTimeZone.js";
 
 const TIME_RANGE_RE = /^(\d{1,2}:\d{2})-(\d{1,2}:\d{2})$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
@@ -20,22 +22,37 @@ function isRealCalendarDate(value) {
     && candidate.getUTCDate() === day;
 }
 
-// "HH:MM" (on `now`'s date, or `onDate` if given) -> a Date. Doesn't
-// reinterpret an already-past same-day time as tomorrow (COMMAND_QUEUE_SPEC.md
-// §2) — that's the caller's job to detect and reject/flag, not this
-// function's to hide. Takes `now` explicitly (never reads the real clock
-// itself) so the "same-day" path stays exactly as deterministic under test
-// as the explicit-date path already was.
-function timeToDate(hhmm, onDate, now) {
+// "HH:MM" on a calendar date, read as wall-clock time in the explicit IANA
+// `timeZone` -> a Date (the real instant). The date is `onDate` if given,
+// otherwise the calendar date `now` shows IN THAT ZONE (never in the host
+// process's zone, never `now`'s UTC date). Nothing here touches JavaScript's
+// process-local Date accessors (getHours/setHours/local-time date strings),
+// so the result is identical on every machine regardless of its OS timezone.
+// Doesn't reinterpret an already-past same-day time as tomorrow
+// (COMMAND_QUEUE_SPEC.md §2) — that's the caller's job to detect and
+// reject/flag, not this function's to hide. Takes `now` explicitly (never
+// reads the real clock itself) so the same-day path is as deterministic
+// under test as the explicit-date path.
+// DST: a local time that occurs twice (fall-back) resolves to its earlier
+// occurrence; one that doesn't exist (spring-forward gap) is shifted forward
+// by the length of the gap (02:15 -> 03:15 in Rome) — see zonedRecurrence.js.
+function timeToDate(hhmm, onDate, now, timeZone) {
   const [h, m] = hhmm.split(":").map(Number);
   if (Number.isNaN(h) || Number.isNaN(m) || h > 23 || m > 59) return null;
-  const base = onDate ? new Date(`${onDate}T00:00:00`) : new Date(now);
-  base.setHours(h, m, 0, 0);
-  return base;
+  let year, month, day;
+  if (onDate) {
+    [year, month, day] = onDate.split("-").map(Number);
+  } else {
+    ({ year, month, day } = zonedLocalParts(new Date(now).getTime(), timeZone));
+  }
+  return new Date(zonedInstantForLocal({ year, month, day, hour: h, minute: m, second: 0 }, timeZone));
 }
 
 // `/time <start>-<end> <task>` or `/time <YYYY-MM-DD> <start>-<end> <task>`
-function parseTimeArgs(rest, now) {
+// Wall-clock times are interpreted in `timeZone` (the deployment's scheduling
+// zone, PHONE_FARM_TIMEZONE — see schedulingTimeZone.js).
+function parseTimeArgs(rest, now, timeZone = resolveSchedulingTimeZone()) {
+  if (!validTimeZone(timeZone)) return err("scheduling timezone is not a valid IANA timezone");
   const parts = rest.trim().split(/\s+/);
   if (parts.length < 2) return err("usage: /time [YYYY-MM-DD] HH:MM-HH:MM <task>");
 
@@ -54,10 +71,14 @@ function parseTimeArgs(rest, now) {
   const goal = taskWords.join(" ").trim();
   if (!goal) return err("task description is required after the time range");
 
-  const start = timeToDate(match[1], dateStr, now);
-  const end = timeToDate(match[2], dateStr, now);
+  const start = timeToDate(match[1], dateStr, now, timeZone);
+  const end = timeToDate(match[2], dateStr, now, timeZone);
   if (!start || !end) return err(`invalid time range: ${rangeToken}`);
-  if (start >= end) return err("start time must be before end time");
+  const minutesOfDay = token => { const [h, m] = token.split(":").map(Number); return h * 60 + m; };
+  if (minutesOfDay(match[1]) >= minutesOfDay(match[2])) return err("start time must be before end time");
+  // Wall-clock order is fine but the real instants collapsed: the whole
+  // window sits inside a daylight-saving spring-forward gap.
+  if (start >= end) return err(`that window does not exist in ${timeZone} (daylight-saving transition) — pick different times`);
   // COMMAND_QUEUE_SPEC.md §2: never silently reinterpret an already-past
   // same-day window as tomorrow — reject it outright and let the operator
   // reschedule, rather than accepting it and having it expire moments later.
@@ -226,8 +247,11 @@ function parseQueueArgs(rest) {
 
 // `now` defaults to the real clock but is threaded through explicitly (not
 // called internally deeper in the parse tree) so tests can pass a fixed
-// timestamp and get fully deterministic /cresearch output.
-function parseCommand(text, now = new Date()) {
+// timestamp and get fully deterministic /cresearch output. `timeZone` is the
+// IANA zone /time reads wall-clock input in; it defaults to the deployment's
+// configured scheduling zone (PHONE_FARM_TIMEZONE, else America/Los_Angeles) — never
+// the host OS zone — and callers/tests may inject it explicitly.
+function parseCommand(text, now = new Date(), { timeZone = resolveSchedulingTimeZone() } = {}) {
   if (typeof text !== "string") return err("command must be a string");
   const trimmed = text.trim();
   if (!trimmed.startsWith("/")) {
@@ -247,7 +271,7 @@ function parseCommand(text, now = new Date()) {
     case "/mode":
       return parseModeArgs(rest);
     case "/time":
-      return parseTimeArgs(rest, now);
+      return parseTimeArgs(rest, now, timeZone);
     case "/cresearch":
       return parseCresearchArgs(rest, now);
     case "/queue":

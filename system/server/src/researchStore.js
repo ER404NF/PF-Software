@@ -93,6 +93,25 @@ function strings(value) {
 
 // Selection records describe observations; accepting an action record here
 // does not execute or authorize any platform action.
+// One platform-visible action mirrored into the research record (MS9.3/MS10). `text`
+// is a comment exactly as it was sent.
+function normalizePlatformAction(action) {
+  return {
+    action: action.action,
+    status: text(action.status),
+    text: text(action.text),
+    observed_at: text(action.observed_at),
+    task_id: text(action.task_id),
+    approval_id: text(action.approval_id),
+    source: text(action.source),
+  };
+}
+
+function samePlatformAction(a, b) {
+  return a.action === b.action && (a.text ?? null) === (b.text ?? null) && (a.task_id ?? null) === (b.task_id ?? null)
+    && (a.status ?? null) === (b.status ?? null);
+}
+
 function candidateRecord(input, context) {
   const c = input && typeof input === "object" && !Array.isArray(input) ? input : {};
   const canonicalUrl = webUrl(c.canonical_url ?? c.url);
@@ -119,8 +138,7 @@ function candidateRecord(input, context) {
     tags: strings(c.tags),
     platform_actions: Array.isArray(c.platform_actions) ? c.platform_actions
       .filter((action) => action && typeof action === "object" && typeof action.action === "string")
-      .map((action) => ({ action: action.action, status: text(action.status),
-        text: text(action.text), observed_at: text(action.observed_at) })) : [],
+      .map(normalizePlatformAction) : [],
     task_id: text(c.task_id),
     run_id: context.runId,
     // Set from candidateIndex in createRun when this identity was already
@@ -165,7 +183,9 @@ function upsertIndexEntry(index, entry) {
 function mergeCandidate(duplicate, candidate) {
   duplicate.evidence_refs = [...new Set([...duplicate.evidence_refs, ...candidate.evidence_refs])];
   duplicate.tags = [...new Set([...duplicate.tags, ...candidate.tags])];
-  duplicate.platform_actions.push(...candidate.platform_actions);
+  for (const action of candidate.platform_actions) {
+    if (!duplicate.platform_actions.some(existing => samePlatformAction(existing, action))) duplicate.platform_actions.push(action);
+  }
   duplicate.last_seen_at = candidate.last_seen_at;
   if (Object.keys(candidate.metrics).length) duplicate.metrics = { ...candidate.metrics };
   for (const field of ["platform_content_id", "canonical_url", "url", "source_handle", "sourceHandle",
@@ -284,7 +304,40 @@ export function appendCandidate(workspaceId, account, runId, input) {
   return recorded;
 }
 
-export function finalizeRun(workspaceId, account, runId, { overview, outcome = "SUCCEEDED" } = {}) {
+// Finds the record for a piece of content by its platform id or canonical URL, in this
+// account's runs (the cross-run index says which run holds it). Returns null if the
+// content was never recorded.
+export function locateCandidate(workspaceId, account, target) {
+  if (typeof target !== "string" || !target.trim() || !accountFile(workspaceId, account)) return null;
+  const key = target.trim();
+  const data = readAccount(workspaceId, account);
+  const hit = candidate => candidate.canonical_url === key || candidate.url === key || candidate.platform_content_id === key;
+  for (const run of [...data.runs].reverse()) {
+    const candidate = run.candidates.find(hit);
+    if (candidate) return { runId: run.id, candidate };
+  }
+  return null;
+}
+
+// Mirrors a platform-visible action into its candidate's platform_actions[]. Idempotent:
+// recording the same action for the same task twice adds nothing, and a NOOP ("already
+// saved") is recorded once, not every time the task re-runs.
+export function recordPlatformAction(workspaceId, account, runId, candidateId, entry) {
+  if (!accountFile(workspaceId, account)) return null;
+  const data = readAccount(workspaceId, account);
+  const run = data.runs.find(item => item.id === runId);
+  const candidate = run?.candidates.find(item => item.id === candidateId);
+  if (!candidate) return null;
+  const action = normalizePlatformAction({ observed_at: new Date().toISOString(), ...entry });
+  const repeat = candidate.platform_actions.find(existing => samePlatformAction(existing, action)
+    || (action.status === "NOOP" && existing.action === action.action && ["VERIFIED", "NOOP"].includes(existing.status)));
+  if (repeat) return { candidate, action: repeat, added: false };
+  candidate.platform_actions.push(action);
+  writeAccount(workspaceId, account, data);
+  return { candidate, action, added: true };
+}
+
+export function finalizeRun(workspaceId, account, runId, { overview, outcome = "SUCCEEDED", session = null } = {}) {
   if (!accountFile(workspaceId, account)) return null;
   if (typeof overview !== "string" || !overview.trim()) return null;
   const data = readAccount(workspaceId, account);
@@ -293,6 +346,7 @@ export function finalizeRun(workspaceId, account, runId, { overview, outcome = "
   run.overview = overview.trim();
   run.outcome = outcome;
   run.completedAt = new Date().toISOString();
+  if (session && typeof session === "object") run.session = session; // the MS11 session report
   writeAccount(workspaceId, account, data);
   return run;
 }

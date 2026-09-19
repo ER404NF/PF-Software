@@ -1,54 +1,128 @@
-# Phone Farm desktop host
+# Phone Farm desktop app
 
-The Electron app has two isolated window types:
+Users get this as a ready-made installer — `Phone-Farm-<version>-arm64.pkg` from
+[GitHub Releases](https://github.com/ER404NF/PF-Software/releases/latest) — and never
+build anything. This directory is the source of that app and of the pipeline that
+builds and verifies the installer.
 
-- the packaged local first-run window receives `preload.js` and can invoke the
-  narrowly scoped host-setup IPC handlers;
-- the Phone Farm web window receives no preload, even in client mode, and is
-  restricted to the configured HTTP(S) origin.
+## What ships inside `Phone Farm.app`
 
-On macOS, host startup resolves Xcode, libimobiledevice, iproxy, and
-WebDriverAgent before spawning the server with Electron's bundled Node runtime.
-It searches both Apple Silicon and Intel Homebrew paths and does not depend on
-Finder inheriting Terminal's `PATH`. A fresh install does not need a manual
-`devices.config.json`.
+| In the app | Where (`Contents/Resources/…`) | Notes |
+|---|---|---|
+| Electron app + desktop host code | `app.asar` | `main.js`, `preload.js`, `first-run.html`, `hostEnvironment.js`, `windowSecurity.js`, `wdaSource.js` |
+| Phone Farm server | `system/server/src/` | run with the app's own Electron binary as Node (`ELECTRON_RUN_AS_NODE=1`) — **no system Node.js needed** |
+| Production dependencies | `system/node_modules/` | installed from the lockfile with `npm ci --omit=dev` |
+| Web client | `system/client/` | |
+| WebDriverAgent (unmodified, pinned) | `wda/WebDriverAgent/` | see below |
+| Licenses / notices | `licenses/`, `THIRD_PARTY_NOTICES.txt` | Electron, Chromium, WebDriverAgent |
 
-## Build and test
+Nothing else from the repository is packaged: an explicit allow-list is copied
+(`scripts/prepare-runtime.cjs`), so operator accounts, device configuration, runtime
+storage, tests and fixtures can never reach an installer. `scripts/verify-packaged-runtime.cjs`
+proves this on every build — see [Verification](#verification).
+
+## Host behaviour on first launch (unchanged)
+
+On a Mac, **Set up a new host** runs host preflight — Xcode, `idevice_id`, `ideviceinfo`,
+`iproxy`, WebDriverAgent — then starts the server with `AUTO_PROVISION_WDA=true`. Each trusted
+iPhone gets its own `xcodebuild` WDA instance (unique derived-data path and port) and its own
+`iproxy -u <UDID>`. Tools are found in Homebrew and system locations without relying on the
+Finder's `PATH`. No Terminal is needed to operate the app after installation.
+
+`AUTO_ROUTE_PROXY_TUNNELS`, `AUTO_NETWORK_ENROLLMENT` and `AUTO_ENABLE_INTERNET_SHARING` are not
+enabled by desktop startup.
+
+### Bundled WebDriverAgent
+
+- **License.** WebDriverAgent (appium/WebDriverAgent) carries the Facebook BSD 3-Clause `LICENSE`
+  (its `package.json` declares Apache-2.0 for Appium's own changes). Both permit redistribution when
+  the notice is kept, so it is bundled **unmodified** with its `LICENSE` beside it and copied to
+  `licenses/`.
+- **Pinned.** `wda.lock.json` names a tag *and* the exact commit; `scripts/prepare-wda.cjs` refuses to
+  bundle anything that does not resolve to that commit.
+- **Never built inside the signed app.** On first launch the source is copied to
+  `~/Library/Application Support/Phone Farm/wda-source/<version>-<commit>/` (`wdaSource.js`), and
+  derived data lives under `…/host-storage/wda-derived-data/`. Nothing inside `Phone Farm.app` is
+  modified at runtime — the verifier checks this.
+- **Signing.** An unsigned WDA project cannot run on a physical iPhone. Host setup detects an Apple
+  development team from your keychain when there is exactly one; otherwise it asks for your 10-character
+  **Team ID** once. Xcode must be signed in to that Apple ID. `xcodebuild` then signs with automatic
+  provisioning under a bundle id unique to your team (`com.phonefarm.wda.<teamid>`). This signing
+  automation is **not yet verified on real hardware**. A WebDriverAgent checkout you supply yourself
+  (`WDA_REPO_PATH`, or `~/WebDriverAgent`) takes precedence, is assumed already signed, and receives no
+  signing overrides.
+- **Still external, but fixed from the setup screen.** Xcode (App Store), and the USB tools
+  `libimobiledevice` + `libusbmuxd`. These are LGPL/GPL native components and are not bundled. Host setup
+  lists what is missing and offers **Fix it** (`hostFixes.js`): for Xcode, one macOS password prompt selects it
+  and finishes its licence/first-launch setup; for the USB tools it runs `brew install libimobiledevice
+  libusbmuxd` when Homebrew is installed (without Homebrew it says to install that from https://brew.sh —
+  the one step outside the app).
+- **Running unattended.** The app keeps the Mac awake while the server or site agent runs, restarts a crashed
+  server/agent with backoff (`serverSupervisor.js`), starts at login (host/site modes; a checkbox on the setup
+  page and in the Help menu), allows one instance, and falls back to the next free port if 4173 is taken (`PHONE_FARM_PORT` changes the default).
+- **Diagnosing.** Logs are written to `~/Library/Logs/Phone Farm/phone-farm.log` (rotating, secrets scrubbed).
+  **Help > Copy Diagnostics** copies a plain-text report (prerequisites, tool paths, WebDriverAgent source,
+  recent log); **Help > Show Log Folder** opens the folder (`diagnostics.js`).
+- **Development switches.** `PHONE_FARM_PORT` changes the default port. `PHONE_FARM_SKIP_HOST_PREFLIGHT=1` starts the
+  host server on a machine that is not a farm host (no Xcode, no phones) without the Mac prerequisite checks; the automated
+  tests set it, and the installed app never does.
+- **Checking a release.** `npm run check:release` lists everything about the installer that can be verified
+  without a Mac and whether it is committed; see [docs/MAC_RELEASE.md](../docs/MAC_RELEASE.md).
+
+## Building the installer
+
+Normal path: **GitHub Actions** — `.github/workflows/mac-installer.yml` (see
+[docs/MAC_RELEASE.md](../docs/MAC_RELEASE.md)).
+
+Locally, on a Mac:
 
 ```sh
 cd desktop
 npm ci
-npm test
-npm run dist:mac
+npm test                 # desktop tests
+npm run dist:mac         # = dist:mac:pkg  -> dist/Phone-Farm-<version>-arm64[-UNSIGNED].pkg
+npm run dist:mac:pkg:universal   # Apple silicon + Intel
+npm run dist:mac:app     # just the .app (dist/mac-arm64/Phone Farm.app)
+npm run verify:pkg -- path/to/Phone-Farm-<version>-arm64.pkg
 ```
 
-`dist:mac` first runs `npm ci --omit=dev` in `../system`, verifies the server
-entry point, web client, and production modules, then packages that complete
-runtime under the app's `Contents/Resources/system` directory. The output is
-written to `desktop/dist/`.
+`scripts/build-mac-pkg.cjs` runs: stage runtime → stage pinned WDA → electron-builder makes the `.app`
+→ sign/notarize/staple the app → `pkgbuild` (install-location `/Applications`, non-relocatable, no
+scripts) + `productbuild` (welcome / read-me / conclusion pages) → sign/notarize/staple the package →
+verify. Add `--dry-run` to print the plan.
 
-The root `DOWNLOAD_PHONE_FARM.command` is retained for compatibility, but it is
-a developer/local installer builder rather than an end-user downloader. A
-normal operator should receive the generated DMG and should not need Node.js or
-Terminal after installation.
+| Credentials present | Result | File name |
+|---|---|---|
+| Developer ID Application + Installer + notarization | signed, notarized, stapled | `Phone-Farm-<v>-arm64.pkg` |
+| both identities, no notarization | signed only | `Phone-Farm-<v>-arm64-NOT-NOTARIZED.pkg` |
+| none | ad-hoc-signed app, unsigned package | `Phone-Farm-<v>-arm64-UNSIGNED.pkg` |
 
-## Automatic and explicit settings
+An unsigned/un-notarized package triggers Gatekeeper warnings and is **not** equivalent to the seamless
+public installer. A release build (`--release`) fails unless it is notarized, unless
+`PHONE_FARM_ALLOW_UNSIGNED=true` explicitly allows the clearly-named fallback.
 
-The desktop host automatically supplies:
+The root `BUILD_PHONE_FARM_INSTALLER.command`/`.cmd` are developer conveniences that run the same
+steps (plus the test suites); they are **not** an installer for users.
 
-- `AUTO_PROVISION_WDA=true`
-- `AUTO_DISCOVER_IOS_DEVICES=true`
-- `DESKTOP_AUTO_DEVICE_MODE=true` so the repository's example device file is
-  ignored unless an advanced explicit `DEVICE_CONFIG_PATH` is supplied
-- resolved `WDA_REPO_PATH`, `IPROXY_BIN`, `IDEVICE_ID_BIN`,
-  `IDEVICEINFO_BIN`, `XCODEBUILD_BIN`, and `XCODE_SELECT_BIN`
-- a Finder-safe `PATH`
-- per-user runtime storage and WDA derived-data paths
+## Verification
 
-`AUTO_ROUTE_PROXY_TUNNELS`, `AUTO_NETWORK_ENROLLMENT`, and
-`AUTO_ENABLE_INTERNET_SHARING` are not enabled by desktop startup. If routing
-is explicitly enabled, the resolver accepts either `tun2proxy` or
-`tun2proxy-bin` and supplies `TUN2PROXY_BIN`.
+- `npm test` — 80+ tests: staging allow-list, verifier, build plan (unsigned / signed / notarized),
+  workflow structure, WDA copy/signing, audit classification.
+- `scripts/verify-packaged-runtime.cjs <resources> <executable>` — required files present; every bare
+  `import`/`require` in `system/server/src` resolves inside the packaged `node_modules`; forbidden files
+  (accounts, storage, tests, key material) absent; the real server **boots** using the packaged
+  executable, serves the client, answers the API, and leaves the bundle byte-for-byte unmodified.
+- `npm run audit:gate` — dependency audit that classifies each finding as *shipped* (reaches the
+  installed app: production dependencies + the Electron runtime) or *build-only*.
+- In CI the finished `.pkg` is expanded and inspected, then **installed with macOS Installer** on a clean
+  runner and the installed app's server is booted.
 
-Real Mac, WDA signing, trusted-device, Developer Mode, and two-phone behavior
-must still be validated using `../docs/MAC_INSTALLER_ACCEPTANCE.md`.
+Hardware validation (real iPhones) is separate: [docs/MAC_INSTALLER_ACCEPTANCE.md](../docs/MAC_INSTALLER_ACCEPTANCE.md).
+
+## Isolation and security notes
+
+- Only the packaged first-run window receives `preload.js`; the Phone Farm web window has no preload and
+  is confined to its configured HTTP(S) origin.
+- The server sidecar depends on Electron's `runAsNode` fuse staying enabled; it is not disabled.
+- Electron is pinned to a patched release (44.x). `npm run audit:gate` fails the build on a high/critical
+  finding in the shipped runtime.

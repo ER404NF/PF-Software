@@ -2,3 +2,6 @@
 *.command text eol=lf
 *.pdf binary
 *.docx binary
+deploy/**/*.sh text eol=lf
+deploy/hub/Dockerfile text eol=lf
+deploy/hub/Caddyfile text eol=lf

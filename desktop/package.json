@@ -1,49 +1,91 @@
 {
   "name": "phone-farm-desktop",
+  "productName": "Phone Farm",
   "version": "0.1.0",
   "private": true,
-  "description": "Desktop wrapper for Phone Farm: one download, two first-run modes (set up a new host, or connect to an existing one).",
+  "description": "Desktop app for Phone Farm: one download, three first-run modes (set up a new host, connect to an existing hub as an operator, or run a remote site's Mac mini).",
   "main": "main.js",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "start": "electron .",
     "test": "node --test test/*.test.js",
+    "ensure:electron": "node scripts/ensure-electron.cjs",
     "prepare:runtime": "node scripts/prepare-runtime.cjs",
-    "dist:win": "npm run prepare:runtime && electron-builder --win",
-    "dist:mac": "npm run prepare:runtime && electron-builder --mac"
+    "prepare:wda": "node scripts/prepare-wda.cjs",
+    "audit:gate": "node scripts/audit-gate.cjs",
+    "dist:win": "npm run ensure:electron && npm run prepare:runtime && electron-builder --win",
+    "dist:mac:app": "node scripts/build-mac-pkg.cjs --arch arm64 --app-only",
+    "dist:mac:pkg": "node scripts/build-mac-pkg.cjs --arch arm64",
+    "dist:mac:pkg:universal": "node scripts/build-mac-pkg.cjs --arch universal",
+    "dist:mac": "npm run dist:mac:pkg",
+    "verify:pkg": "node scripts/build-mac-pkg.cjs --verify",
+    "check:release": "node scripts/check-release.cjs"
   },
   "devDependencies": {
-    "electron": "^33.0.0",
-    "electron-builder": "^25.1.8"
+    "electron": "^44.4.2",
+    "electron-builder": "^26.15.3",
+    "js-yaml": "^4.3.2"
   },
   "build": {
     "appId": "com.phonefarm.desktop",
     "productName": "Phone Farm",
+    "copyright": "Copyright (c) Phone Farm",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
     "files": [
-      "**/*",
-      "!dist/**"
+      "main.js",
+      "preload.js",
+      "first-run.html",
+      "hostEnvironment.js",
+      "hostFixes.js",
+      "serverSupervisor.js",
+      "diagnostics.js",
+      "siteAgentConfig.js",
+      "windowSecurity.js",
+      "wdaSource.js",
+      "package.json"
     ],
     "extraResources": [
       {
-        "from": "../system",
-        "to": "system",
+        "from": "build/runtime",
+        "to": ".",
         "filter": [
-          "**/*",
-          "!storage/**",
-          "!*.config.json",
-          "!test-*.txt"
+          "system/**/*",
+          "wda/**/*",
+          "licenses/**/*",
+          "THIRD_PARTY_NOTICES.txt"
         ]
       }
     ],
+    "mac": {
+      "category": "public.app-category.utilities",
+      "target": [
+        {
+          "target": "dir",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "minimumSystemVersion": "12.0",
+      "hardenedRuntime": true,
+      "gatekeeperAssess": false,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.plist",
+      "icon": "build/icon.png",
+      "notarize": false
+    },
     "win": {
-      "target": "nsis"
+      "target": "nsis",
+      "icon": "build/icon.png"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true
-    },
-    "mac": {
-      "target": "dmg",
-      "category": "public.app-category.utilities"
     }
   }
 }

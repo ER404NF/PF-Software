@@ -7,7 +7,10 @@
   "scripts": {
     "start": "node server/src/index.js",
     "test": "node server/scripts/run-tests.js",
-    "soak": "node server/scripts/soak-test.js"
+    "soak": "node server/scripts/soak-test.js",
+    "demo": "node server/scripts/demo.js",
+    "bench": "node server/bench/run.js",
+    "agent": "node server/src/agentMain.js"
   },
   "dependencies": {
     "express": "^4.19.2",

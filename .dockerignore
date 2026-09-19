@@ -1,0 +1,11 @@
+**/node_modules
+.git
+desktop
+research
+source-material
+archive
+graphify-out
+artifacts
+tmp
+system/storage
+system/operators.config.json

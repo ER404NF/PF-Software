@@ -38,7 +38,7 @@ Optional explicit date:
 /time 2026-09-05 09:00-10:30 <task>
 ```
 
-Workspace timezone is configured centrally. Do not silently reinterpret an expired same-day window as tomorrow; reject/mark expired and ask the operator to reschedule.
+**Timezone (implemented 2026-09-18).** `HH:MM` is wall-clock time in one explicit IANA scheduling timezone for the whole deployment: `PHONE_FARM_TIMEZONE` (for example `America/Los_Angeles` or `Europe/Bucharest`), defaulting to `America/Los_Angeles` (California). It is never the host operating system's timezone, so the same command means the same window on every machine. "Today" for a same-day `/time` is the calendar date in that zone. An invalid `PHONE_FARM_TIMEZONE` stops startup rather than falling back. DST follows the IANA rules: a local time that occurs twice (autumn fall-back) resolves to its earlier occurrence; a local time that does not exist (spring-forward gap) is shifted forward by the length of the gap; a window that lies entirely inside the gap is rejected. Do not silently reinterpret an expired same-day window as tomorrow; reject/mark expired and ask the operator to reschedule.
 
 ### Research shorthand — `/cresearch`
 

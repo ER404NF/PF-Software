@@ -1,0 +1,8 @@
+{
+  "repository": "https://github.com/appium/WebDriverAgent.git",
+  "tag": "v16.12.1",
+  "version": "16.12.1",
+  "commit": "6e2b5c026f728aed9098481e756b458db87d1272",
+  "license": "BSD-3-Clause",
+  "licenseNote": "The upstream LICENSE file is the Facebook BSD 3-Clause text (copyright 2015-present Facebook, Inc.); the package.json of the Appium fork declares Apache-2.0 for Appium's own changes. Both permit redistribution in source form provided the notice is retained, so the LICENSE file is shipped verbatim next to the source. WebDriverAgent is bundled UNMODIFIED."
+}

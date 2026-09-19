@@ -21,7 +21,26 @@
 // task's goal text. This module does not depend on MS8.2 existing yet — the
 // contract only cares about the shape of what comes back, not what goes in.
 
+import { isCommentAction } from "./actionCatalog.js";
+
 const REQUIRED_STRING_FIELDS = ["screen_state", "goal_progress", "action", "reason"];
+
+// The exact words the AI wants posted. Whether they may be posted at all is decided
+// by commentGuard.js and the account's policy, never by this schema.
+function validComment(comment, providerName) {
+  if (!comment || typeof comment !== "object" || Array.isArray(comment)) {
+    throw new Error(`${providerName} decision "comment" must be an object`);
+  }
+  if (typeof comment.text !== "string" || !comment.text.trim() || comment.text.length > 2000) {
+    throw new Error(`${providerName} decision comment requires non-empty "text" of at most 2000 characters`);
+  }
+  if (!["preset", "generated"].includes(comment.source)) {
+    throw new Error(`${providerName} decision comment "source" must be "preset" or "generated"`);
+  }
+  if (comment.template_id != null && (typeof comment.template_id !== "string" || !comment.template_id.trim())) {
+    throw new Error(`${providerName} decision comment "template_id" must be a non-empty string`);
+  }
+}
 
 function validCandidate(candidate, providerName) {
   if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
@@ -95,6 +114,13 @@ export function assertValidStructuredDecision(decision, providerName = "provider
     throw new Error(`${providerName} decision "confidence" must be a number between 0 and 1`);
   }
   if (decision.candidate != null) validCandidate(decision.candidate, providerName);
+  if (decision.comment != null) validComment(decision.comment, providerName);
+  if (isCommentAction(decision.action) && decision.comment == null) {
+    throw new Error(`${providerName} decision action "${decision.action}" requires a "comment" with the exact text`);
+  }
+  if (!isCommentAction(decision.action) && decision.comment != null) {
+    throw new Error(`${providerName} decision "comment" is only valid for comment or reply actions`);
+  }
   if (decision.goal_progress.trim().toLowerCase() === "candidate_found" && decision.candidate == null) {
     throw new Error(`${providerName} decision with goal_progress "candidate_found" requires candidate details`);
   }

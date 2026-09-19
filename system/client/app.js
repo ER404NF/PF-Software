@@ -82,11 +82,14 @@ const fileListEl = document.getElementById("file-list");
 const uploadFormEl = document.getElementById("upload-form");
 const uploadInputEl = document.getElementById("upload-input");
 const deviceControlBarEl = document.getElementById("device-control-bar");
-const swipeControlsEl = document.getElementById("swipe-controls");
-const homeButtonEl = document.getElementById("home-button");
-const refreshScreenButtonEl = document.getElementById("refresh-screen-button");
-const typeFormEl = document.getElementById("type-form");
-const typeInputEl = document.getElementById("type-input");
+const streamStatusEl = document.getElementById("stream-status");
+const streamRetryButtonEl = document.getElementById("stream-retry-button");
+const keyboardButtonEl = document.getElementById("keyboard-button");
+const phoneFrameEl = document.getElementById("phone-frame");
+const phoneHomeButtonEl = document.getElementById("phone-home-button");
+const touchDotEl = document.getElementById("touch-dot");
+const keyboardCaptureEl = document.getElementById("keyboard-capture");
+const stageOverlayEl = document.getElementById("stage-overlay");
 const liveViewControlsEl = document.getElementById("live-view-controls");
 const liveViewToggleEl = document.getElementById("live-view-toggle");
 const liveViewStatusEl = document.getElementById("live-view-status");
@@ -127,6 +130,19 @@ const usersEmptyEl = document.getElementById("users-empty");
 const auditRefreshButtonEl = document.getElementById("audit-refresh-button");
 const auditBodyEl = document.getElementById("audit-body");
 const auditEmptyEl = document.getElementById("audit-empty");
+const sitesPanelEl = document.getElementById("sites-panel");
+const sitesRefreshButtonEl = document.getElementById("sites-refresh-button");
+const siteCreateFormEl = document.getElementById("site-create-form");
+const siteNameEl = document.getElementById("site-name");
+const siteTimezoneEl = document.getElementById("site-timezone");
+const siteTimezonesEl = document.getElementById("site-timezones");
+const siteTokenRevealEl = document.getElementById("site-token-reveal");
+const siteTokenCommandEl = document.getElementById("site-token-command");
+const siteTokenCopyButtonEl = document.getElementById("site-token-copy-button");
+const siteTokenDismissButtonEl = document.getElementById("site-token-dismiss-button");
+const sitesMessageEl = document.getElementById("sites-message");
+const sitesListEl = document.getElementById("sites-list");
+const sitesEmptyEl = document.getElementById("sites-empty");
 const proxyPoolPanelEl = document.getElementById("proxy-pool-panel");
 const proxyPoolRefreshButtonEl = document.getElementById("proxy-pool-refresh-button");
 const proxyPoolCreateFormEl = document.getElementById("proxy-pool-create-form");
@@ -280,11 +296,15 @@ const UI_CAPABILITIES = Object.freeze({
   RUN_NETWORK_CHECK: "network-health:verify",
   MONITOR_DEVICE: "device:monitor",
   VIEW_PEOPLE: "people:view",
+  MANAGE_SITES: "sites:manage",
 });
 
 function can(capability) {
   return currentOperator?.capabilities?.includes(capability) === true;
 }
+// Read-only accessors for the separate review panel (review.js); the server re-checks every request.
+window.phoneFarmCan = can;
+window.phoneFarmUsername = () => currentOperator?.username ?? null;
 
 function canManageOperations() {
   return can(UI_CAPABILITIES.MANAGE_QUEUE);
@@ -345,6 +365,136 @@ const liveViewController = new window.LiveViewController({
   },
 });
 
+// ---- live video and the phone-shaped control surface ----------------------------
+// Video arrives as binary WebSocket frames and is drawn by PhoneStage; the operator
+// drives the phone with the mouse and keyboard directly on that picture. Phones
+// without a video port fall back to screenshots (see stream_unsupported below).
+let streamActive = false;
+let streamState = null; // { deviceId, streamId, mode }
+let streamRetryTimerId = null;
+let screenshotFallback = false;
+let streamPausedForVisibility = false;
+
+const phoneStage = new window.PhoneStage({
+  screenEl,
+  frameEl: phoneFrameEl,
+  homeButtonEl: phoneHomeButtonEl,
+  dotEl: touchDotEl,
+  keyboardEl: keyboardCaptureEl,
+  send: message => sendStageInput(message),
+  onStatus(kind) {
+    if (kind === "fps" && streamActive && streamStatusEl.dataset.state === "live") setStreamStatus("live", streamLabel());
+    if (kind === "decode-error") setStreamStatus("off", "Cannot display this phone's video", { retry: true });
+  },
+});
+
+// An operator input from the stage. Returns the request id (the stage tracks it
+// until the phone acknowledges) or null when it could not be sent. Without live
+// video the classic flow applies: one action at a time, then a fresh screenshot.
+function sendStageInput(message) {
+  if (!currentDeviceId || pendingDeviceId) return null;
+  const requestId = nextActionRequestId();
+  if (!streamActive) {
+    setBusy(true);
+    liveViewController.supersedePendingFrame();
+  }
+  const sent = safeSend({ ...message, deviceId: currentDeviceId, requestId }, { uncertain: true, statusEl: detailMessageEl });
+  if (!sent) {
+    if (!streamActive) setBusy(false);
+    return null;
+  }
+  return requestId;
+}
+
+function setStreamStatus(state, label, { retry = false } = {}) {
+  streamStatusEl.dataset.state = state;
+  streamStatusEl.textContent = label;
+  streamRetryButtonEl.hidden = !retry;
+}
+
+function streamLabel() {
+  const mode = streamState?.mode === "watch" ? "Watching live" : "Live";
+  return phoneStage.fps > 0 ? `${mode} · ${phoneStage.fps} fps` : mode;
+}
+
+function requestStream(deviceId = currentDeviceId || watchedDeviceId) {
+  clearTimeout(streamRetryTimerId);
+  streamRetryTimerId = null;
+  if (!deviceId) return false;
+  if (document.hidden) {
+    // A hidden tab must not pull video (mobile data), but it must remember to start it when the
+    // tab comes back — e.g. a phone that reconnected and re-selected the device while locked.
+    streamPausedForVisibility = true;
+    return false;
+  }
+  screenshotFallback = false;
+  setStreamStatus("connecting", "Connecting video…");
+  return safeSend({ type: "start_stream", deviceId }, { statusEl: detailMessageEl });
+}
+
+function scheduleStreamRetry(delayMs = 1500) {
+  clearTimeout(streamRetryTimerId);
+  streamRetryTimerId = setTimeout(() => {
+    streamRetryTimerId = null;
+    if (currentDeviceId || watchedDeviceId) requestStream();
+  }, delayMs);
+}
+
+function resetStreamState() {
+  clearTimeout(streamRetryTimerId);
+  streamRetryTimerId = null;
+  streamActive = false;
+  streamState = null;
+  screenshotFallback = false;
+  streamPausedForVisibility = false;
+  stageOverlayEl.textContent = "";
+  streamRetryButtonEl.hidden = true;
+  keyboardButtonEl.hidden = true;
+  phoneStage.setMode("idle");
+  phoneStage.clear();
+}
+
+function handleStreamMessage(msg) {
+  if (msg.deviceId !== (currentDeviceId || watchedDeviceId)) return;
+  if (msg.type === "stream_started") {
+    streamState = { deviceId: msg.deviceId, streamId: msg.streamId, mode: msg.mode };
+    streamActive = true;
+    screenshotFallback = false;
+    phoneStage.setStream(msg.streamId);
+    stopLiveView(); // video replaces screenshot polling
+    syncLiveViewControls();
+    setStreamStatus("connecting", "Connecting video…");
+    if (!phoneStage.hasPicture) stageOverlayEl.textContent = "Waiting for the phone's video…";
+  } else if (msg.type === "stream_state" && msg.streamId === streamState?.streamId) {
+    if (msg.state === "live") {
+      stageOverlayEl.textContent = "";
+      setStreamStatus("live", streamLabel());
+    } else if (msg.state === "closed") {
+      streamActive = false;
+      setStreamStatus("reconnecting", "Video restarting…");
+      scheduleStreamRetry(500);
+    } else {
+      setStreamStatus(msg.state === "reconnecting" ? "reconnecting" : "connecting", msg.state === "reconnecting" ? "Reconnecting video…" : "Connecting video…");
+    }
+  } else if (msg.type === "stream_stopped") {
+    streamActive = false;
+    streamState = null;
+    setStreamStatus("off", "Video stopped", { retry: true });
+    scheduleStreamRetry();
+  } else if (msg.type === "stream_unsupported") {
+    streamActive = false;
+    streamState = null;
+    screenshotFallback = true;
+    stageOverlayEl.textContent = "";
+    setStreamStatus("polling", "Screenshot mode · this phone has no live video port");
+    if (currentDeviceId) {
+      syncLiveViewControls();
+      liveViewToggleEl.checked = true;
+      liveViewController.start(currentDeviceId);
+    }
+  }
+}
+
 function stopLiveView(options) {
   liveViewController.stop(options);
   liveViewToggleEl.checked = false;
@@ -357,7 +507,7 @@ function syncLiveViewControls(device = lastDevices.find(candidate => candidate.i
     && device?.controllerMode === "HUMAN"
     && device?.monitor?.adapter === "wda"
     && can(UI_CAPABILITIES.CONTROL_DEVICE);
-  liveViewControlsEl.hidden = !available;
+  liveViewControlsEl.hidden = !(available && screenshotFallback);
   if (!available && liveViewController.isActiveFor(currentDeviceId)) stopLiveView();
 }
 
@@ -369,6 +519,12 @@ function updateTopNav() {
 
 function showFleetView() {
   stopLiveView();
+  if (streamActive) {
+    // Leaving the phone view: stop paying for video. Selecting the phone again restarts it.
+    streamActive = false;
+    streamState = null;
+    safeSend({ type: "stop_stream" });
+  }
   if (!currentDeviceId) {
     mediaDeviceId = null;
     fileRequestGeneration++;
@@ -452,11 +608,7 @@ const BUSY_TIMEOUT_MS = 10000;
 function setBusy(value, { timedOut = false } = {}) {
   busy = value;
   screenWrapEl.classList.toggle("busy", value);
-  for (const btn of swipeControlsEl.querySelectorAll("button")) btn.disabled = value;
-  homeButtonEl.disabled = value;
-  refreshScreenButtonEl.disabled = value;
-  typeInputEl.disabled = value;
-  typeFormEl.querySelector("button").disabled = value || !typeInputEl.value.trim();
+  phoneHomeButtonEl.disabled = value || phoneStage.mode !== "control";
 
   clearTimeout(busyTimeoutId);
   if (value) {
@@ -543,7 +695,8 @@ function clearLocalAuthenticatedState() {
   clearTimeout(watchRefreshTimerId);
   watchRefreshTimerId = null;
   clearAiWorkspace();
-  screenEl.replaceChildren();
+  resetStreamState();
+  clearSitesView();
   fileListEl.replaceChildren();
   deviceControlBarEl.hidden = true;
   uploadFormEl.hidden = true;
@@ -601,6 +754,8 @@ function setOperatorProfile(profile) {
   userCreateFormEl.hidden = !can(UI_CAPABILITIES.MANAGE_USERS);
   proxyPoolPanelEl.hidden = !can(UI_CAPABILITIES.VIEW_PROXY_POOL);
   proxyPoolCreateFormEl.hidden = !can(UI_CAPABILITIES.MANAGE_PROXY);
+  sitesPanelEl.hidden = !can(UI_CAPABILITIES.MANAGE_SITES);
+  if (!can(UI_CAPABILITIES.MANAGE_SITES)) clearSitesView();
   assignmentCreateFormEl.hidden = !can(UI_CAPABILITIES.MANAGE_ASSIGNMENTS);
   const managesAssignments = can(UI_CAPABILITIES.MANAGE_ASSIGNMENTS);
   assignmentsHeadingEl.textContent = isVa ? "My to-do list" : managesAssignments ? "Team tasks" : "My assignments";
@@ -640,6 +795,7 @@ function applyLiveOperatorProfile(profile) {
   fleetEmptyEl.textContent = "Refreshing fleet access…";
   detailDeviceFactsEl.replaceChildren();
   detailAiStatusEl.replaceChildren();
+  clearSitesView();
 
   renderAssignments([]);
   assignmentsMessageEl.textContent = "";
@@ -1327,6 +1483,7 @@ adminNavButtonEl.addEventListener("click", () => showAdminView());
 function connect() {
   setConnectionState("loading", "Connecting");
   ws = new WebSocket(`${location.protocol === "https:" ? "wss:" : "ws:"}//${location.host}`);
+  ws.binaryType = "arraybuffer";
 
   ws.addEventListener("open", () => {
     setConnectionState("online", "Online");
@@ -1334,6 +1491,11 @@ function connect() {
   });
 
   ws.addEventListener("message", (event) => {
+    // Binary messages are live video frames; everything else is JSON.
+    if (typeof event.data !== "string") {
+      phoneStage.handleBinary(event.data);
+      return;
+    }
     const msg = JSON.parse(event.data);
     if (msg.type === "operator_profile") {
       applyLiveOperatorProfile(msg.operator);
@@ -1354,7 +1516,17 @@ function connect() {
       if (msg.deviceId === currentDeviceId && !pendingDeviceId) {
         renderFrame(msg);
         setBusy(false);
+        phoneStage.settleAll();
       }
+    }
+
+    if (msg.type === "stream_started" || msg.type === "stream_state" || msg.type === "stream_stopped"
+      || msg.type === "stream_unsupported") {
+      handleStreamMessage(msg);
+    }
+
+    if (msg.type === "action_ack" && msg.deviceId === currentDeviceId) {
+      phoneStage.actionSettled(msg.requestId);
     }
 
     if (msg.type === "live_frame") {
@@ -1379,7 +1551,7 @@ function connect() {
       hintEl.textContent = watchedSummary?.controllerMode !== "HUMAN"
         ? "AI-controlled phone · screen read-only"
         : msg.operator ? `Watching ${msg.operator} · read-only` : "Read-only live view";
-      scheduleWatchRefresh();
+      if (!streamActive) scheduleWatchRefresh(); // with live video there is nothing to poll
     }
 
     if (msg.type === "watch_stopped" && msg.deviceId === watchedDeviceId) {
@@ -1398,7 +1570,7 @@ function connect() {
         pendingWatchDeviceId = null;
         filesPanelEl.hidden = false;
         clearAiWorkspace();
-        screenEl.replaceChildren();
+        resetStreamState();
         showFleetView();
         selectErrorEl.textContent = msg.message;
       } else if (msg.deviceId === watchedDeviceId) {
@@ -1421,6 +1593,7 @@ function connect() {
         // Release available instead of abandoning an owned device locally.
         hintEl.textContent = msg.message;
         setBusy(false);
+        phoneStage.settleAll();
       } else {
         // Neither pending nor current — e.g. a fleet-card AI control
         // button failing for a device this connection never selected in the
@@ -1435,6 +1608,7 @@ function connect() {
 
   ws.addEventListener("close", (event) => {
     const actionWasPending = busy;
+    resetStreamState();
     pendingDeviceId = null;
     pendingWatchDeviceId = null;
     watchedDeviceId = null;
@@ -2674,12 +2848,11 @@ function confirmSelection(id) {
   if (currentView === "detail") showDetailView(id);
   uploadFormEl.hidden = false;
   deviceControlBarEl.hidden = false;
-  swipeControlsEl.hidden = false;
-  homeButtonEl.hidden = false;
-  refreshScreenButtonEl.hidden = false;
-  typeFormEl.hidden = false;
   releaseButtonEl.hidden = false;
+  phoneStage.setMode("control");
+  keyboardButtonEl.hidden = false; // shown only on touch screens (CSS hides it for a mouse)
   syncLiveViewControls(lastDevices.find(device => device.id === id));
+  if (currentView === "detail") requestStream(id);
   watchControlsEl.hidden = true;
   filesPanelEl.hidden = false;
   clearAiWorkspace();
@@ -2698,12 +2871,10 @@ function confirmWatch(id, operatorName = null) {
   watchedDeviceId = id;
   pendingWatchDeviceId = null;
   uploadFormEl.hidden = true;
-  deviceControlBarEl.hidden = true;
-  swipeControlsEl.hidden = true;
-  homeButtonEl.hidden = true;
-  refreshScreenButtonEl.hidden = true;
-  typeFormEl.hidden = true;
+  deviceControlBarEl.hidden = false; // carries the video status; there are no controls to show
   releaseButtonEl.hidden = true;
+  phoneStage.setMode("watch");
+  keyboardButtonEl.hidden = true;
   watchControlsEl.hidden = false;
   filesPanelEl.hidden = true;
   showDetailView(id);
@@ -2723,6 +2894,7 @@ function confirmWatch(id, operatorName = null) {
     detailAccessNoteEl.textContent = `Read-only live view${operatorName ? ` of ${operatorName}` : ""}. Phone controls and files are unavailable.`;
   }
   hintEl.textContent = "Waiting for the next screen update…";
+  requestStream(id);
   if (lastDevices.length) renderFleetSafely(lastDevices);
 }
 
@@ -2742,7 +2914,7 @@ function stopWatching(message = "Live watching ended.", { notifyServer = false }
   pendingAiWorkspaceExitDeviceId = null;
   clearTimeout(watchRefreshTimerId);
   watchRefreshTimerId = null;
-  screenEl.replaceChildren();
+  resetStreamState();
   watchControlsEl.hidden = true;
   filesPanelEl.hidden = false;
   clearAiWorkspace();
@@ -2761,14 +2933,10 @@ function deselect(message) {
   mediaDeviceId = null;
   pendingDeviceId = null;
   pendingAiWorkspaceExitDeviceId = null;
-  screenEl.innerHTML = "";
+  resetStreamState();
   hintEl.textContent = message;
   uploadFormEl.hidden = true;
   deviceControlBarEl.hidden = true;
-  swipeControlsEl.hidden = true;
-  homeButtonEl.hidden = true;
-  refreshScreenButtonEl.hidden = true;
-  typeFormEl.hidden = true;
   releaseButtonEl.hidden = true;
   watchControlsEl.hidden = true;
   filesPanelEl.hidden = false;
@@ -2792,11 +2960,10 @@ releaseButtonEl.addEventListener("click", () => {
 });
 
 function renderFrame(frame) {
-  if (frame.kind === "image") {
-    screenEl.innerHTML = `<img src="data:${frame.mime};base64,${frame.data}" alt="" />`;
-  } else {
-    screenEl.innerHTML = frame.data;
-  }
+  // Once live video is flowing it is always newer than a screenshot that was
+  // requested before the stream started.
+  if (streamActive && phoneStage.streamFrames > 0) return;
+  phoneStage.showLegacyFrame(frame);
   hintEl.textContent = "";
 }
 
@@ -2812,65 +2979,26 @@ liveViewToggleEl.addEventListener("change", () => {
   }
 });
 
-document.addEventListener("visibilitychange", () => liveViewController.visibilityChanged());
-
-screenEl.addEventListener("click", (e) => {
-  if (!currentDeviceId || pendingDeviceId || busy) return;
-  const image = screenEl.querySelector("img, svg");
-  if (!image) return;
-  const rect = image.getBoundingClientRect();
-  if (!rect.width || !rect.height) return;
-  const x = (e.clientX - rect.left) / rect.width;
-  const y = (e.clientY - rect.top) / rect.height;
-  if (x < 0 || x > 1 || y < 0 || y > 1) return;
-  setBusy(true);
-  liveViewController.supersedePendingFrame();
-  if (!safeSend({ type: "tap", deviceId: currentDeviceId, requestId: nextActionRequestId(), x, y }, { uncertain: true, statusEl: detailMessageEl })) setBusy(false);
-});
-
-swipeControlsEl.addEventListener("click", (e) => {
-  const direction = e.target.dataset.direction;
-  if (!direction || !currentDeviceId || pendingDeviceId || busy) return;
-  setBusy(true);
-  liveViewController.supersedePendingFrame();
-  if (!safeSend({ type: "swipe", deviceId: currentDeviceId, requestId: nextActionRequestId(), direction }, { uncertain: true, statusEl: detailMessageEl })) setBusy(false);
-});
-
-homeButtonEl.addEventListener("click", () => {
-  if (!currentDeviceId || pendingDeviceId || busy) return;
-  setBusy(true);
-  liveViewController.supersedePendingFrame();
-  if (!safeSend({ type: "home", deviceId: currentDeviceId, requestId: nextActionRequestId() }, { uncertain: true, statusEl: detailMessageEl })) setBusy(false);
-});
-
-refreshScreenButtonEl.addEventListener("click", () => {
-  if (!currentDeviceId || pendingDeviceId || busy) return;
-  setBusy(true);
-  if (!safeSend({ type: "refresh_screen", deviceId: currentDeviceId, requestId: nextActionRequestId() },
-    { statusEl: detailMessageEl })) setBusy(false);
-});
-
-typeFormEl.addEventListener("submit", (e) => {
-  e.preventDefault();
-  const text = typeInputEl.value;
-  if (!text.trim()) {
-    hintEl.textContent = "Enter text to send.";
-    return;
-  }
-  if (!currentDeviceId || pendingDeviceId || busy) return;
-  setBusy(true);
-  liveViewController.supersedePendingFrame();
-  if (safeSend({ type: "type_text", deviceId: currentDeviceId, requestId: nextActionRequestId(), text }, { uncertain: true, statusEl: detailMessageEl })) {
-    typeInputEl.value = "";
-  } else {
-    setBusy(false);
+// Video is the biggest data cost for a remote operator on mobile data, so it stops
+// while the tab is hidden and resumes when it comes back.
+document.addEventListener("visibilitychange", () => {
+  liveViewController.visibilityChanged();
+  const deviceId = currentDeviceId || watchedDeviceId;
+  if (!deviceId) return;
+  if (document.hidden) {
+    if (streamActive) {
+      streamPausedForVisibility = true;
+      streamActive = false;
+      safeSend({ type: "stop_stream" });
+    }
+  } else if (streamPausedForVisibility) {
+    streamPausedForVisibility = false;
+    requestStream(deviceId);
   }
 });
 
-typeInputEl.addEventListener("input", () => {
-  typeFormEl.querySelector("button").disabled = busy || !typeInputEl.value.trim();
-  if (typeInputEl.value.trim() && hintEl.textContent === "Enter text to send.") hintEl.textContent = "";
-});
+streamRetryButtonEl.addEventListener("click", () => requestStream());
+keyboardButtonEl.addEventListener("click", () => phoneStage.focusKeyboard());
 
 async function refreshFiles() {
   if (!mediaDeviceId) return;
@@ -3671,6 +3799,152 @@ proxyPoolCreateFormEl.addEventListener("submit", async event => {
 
 proxyPoolRefreshButtonEl.addEventListener("click", refreshProxyPool);
 
+// ---- Sites: other locations that link their phones to this hub ---------------------
+function clearSitesView() {
+  sitesListEl.replaceChildren();
+  siteTokenCommandEl.textContent = ""; // never leave a token on screen after a role change or sign-out
+  siteTokenRevealEl.hidden = true;
+  sitesMessageEl.textContent = "";
+}
+
+function showSiteToken(body) {
+  const siteId = body.site.id;
+  siteTokenCommandEl.textContent = [
+    `HUB_URL=${body.hubUrl}`,
+    `SITE_ID=${siteId}`,
+    `SITE_TOKEN=${body.token}`,
+    "npm run agent",
+  ].join("\n");
+  siteTokenRevealEl.hidden = false;
+}
+
+function formatSiteSeen(site) {
+  if (site.online) return "connected now";
+  return site.lastSeenAt ? `last seen ${formatLastSeen(site.lastSeenAt)}` : "never connected";
+}
+
+function renderSites(sites) {
+  sitesListEl.replaceChildren();
+  sitesEmptyEl.hidden = sites.length !== 0;
+  for (const site of sites) {
+    const card = document.createElement("article");
+    card.className = "user-card";
+
+    const heading = document.createElement("div");
+    heading.className = "user-card-heading";
+    const name = document.createElement("strong");
+    name.textContent = site.name;
+    const state = document.createElement("span");
+    state.className = `user-state ${site.online ? "approved" : "inactive"}`;
+    state.textContent = site.online ? "Online" : "Offline";
+    heading.append(name, state);
+
+    const identity = document.createElement("p");
+    identity.className = "user-identity";
+    identity.textContent = [
+      site.id,
+      site.timeZone,
+      `${site.deviceCount} phone${site.deviceCount === 1 ? "" : "s"}`,
+      formatSiteSeen(site),
+    ].join(" · ");
+
+    const actions = document.createElement("div");
+    const rotate = document.createElement("button");
+    rotate.type = "button";
+    rotate.textContent = "New token";
+    rotate.title = "Issues a new token and disconnects the site until it uses the new one.";
+    rotate.addEventListener("click", async () => {
+      if (!window.confirm(`Issue a new token for ${site.name}? The site will be disconnected until you give it the new token.`)) return;
+      rotate.disabled = true;
+      try {
+        const { body } = await requestJson(`/api/admin/sites/${encodeURIComponent(site.id)}/rotate-token`, { method: "POST" });
+        showSiteToken(body);
+        sitesMessageEl.textContent = `New token issued for ${site.name}.`;
+        await refreshSites();
+      } catch (error) {
+        sitesMessageEl.textContent = error.message;
+        rotate.disabled = false;
+      }
+    });
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Delete";
+    remove.addEventListener("click", async () => {
+      if (!window.confirm(`Delete ${site.name}? Its phones leave the fleet and the site is disconnected. This cannot be undone.`)) return;
+      remove.disabled = true;
+      try {
+        await requestJson(`/api/admin/sites/${encodeURIComponent(site.id)}`, { method: "DELETE" });
+        sitesMessageEl.textContent = `${site.name} deleted.`;
+        await refreshSites();
+      } catch (error) {
+        sitesMessageEl.textContent = error.message;
+        remove.disabled = false;
+      }
+    });
+    actions.append(rotate, remove);
+    card.append(heading, identity, actions);
+    sitesListEl.appendChild(card);
+  }
+}
+
+async function refreshSites() {
+  if (!can(UI_CAPABILITIES.MANAGE_SITES)) return;
+  const generation = operatorProfileGeneration;
+  try {
+    const { body } = await requestJson("/api/admin/sites");
+    if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_SITES)) return;
+    if (siteTimezonesEl.childElementCount === 0 && typeof Intl.supportedValuesOf === "function") {
+      for (const zone of Intl.supportedValuesOf("timeZone")) {
+        const option = document.createElement("option");
+        option.value = zone;
+        siteTimezonesEl.appendChild(option);
+      }
+    }
+    siteTimezoneEl.placeholder = body.defaultTimeZone || "America/Los_Angeles";
+    renderSites(Array.isArray(body.sites) ? body.sites : []);
+  } catch (error) {
+    if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_SITES)) return;
+    sitesListEl.replaceChildren();
+    sitesMessageEl.textContent = `Could not load sites: ${error.message}`;
+  }
+}
+
+siteCreateFormEl.addEventListener("submit", async event => {
+  event.preventDefault();
+  sitesMessageEl.textContent = "";
+  const submit = siteCreateFormEl.querySelector("button[type=submit]");
+  submit.disabled = true;
+  try {
+    const { body } = await requestJson("/api/admin/sites", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: siteNameEl.value, timeZone: siteTimezoneEl.value.trim() || undefined }),
+    });
+    showSiteToken(body);
+    sitesMessageEl.textContent = `${body.site.name} added. Give the values below to the person setting up that location.`;
+    siteCreateFormEl.reset();
+    await refreshSites();
+  } catch (error) {
+    sitesMessageEl.textContent = error.message;
+  } finally {
+    submit.disabled = false;
+  }
+});
+
+siteTokenCopyButtonEl.addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(siteTokenCommandEl.textContent);
+    sitesMessageEl.textContent = "Copied.";
+  } catch {
+    sitesMessageEl.textContent = "Could not copy automatically. Select the text and copy it.";
+  }
+});
+siteTokenDismissButtonEl.addEventListener("click", () => {
+  siteTokenCommandEl.textContent = "";
+  siteTokenRevealEl.hidden = true;
+});
+sitesRefreshButtonEl.addEventListener("click", refreshSites);
+
 async function refreshUsers() {
   if (!can(UI_CAPABILITIES.MANAGE_USERS) && !can(UI_CAPABILITIES.MANAGE_TEAM_MEMBERS)) return;
   const generation = operatorProfileGeneration;
@@ -3747,6 +4021,7 @@ async function refreshAdminView() {
     can(UI_CAPABILITIES.VIEW_AUDIT) ? refreshAuditViewer() : Promise.resolve(),
     canManagePeople() ? refreshUsers() : Promise.resolve(),
     can(UI_CAPABILITIES.VIEW_PROXY_POOL) ? refreshProxyPool() : Promise.resolve(),
+    can(UI_CAPABILITIES.MANAGE_SITES) ? refreshSites() : Promise.resolve(),
   ]);
 }
 
@@ -3846,3 +4121,12 @@ for (const suggestion of document.querySelectorAll("[data-ai-prefill]")) {
 queueRefreshButtonEl.addEventListener("click", refreshQueueViewer);
 auditRefreshButtonEl.addEventListener("click", refreshAuditViewer);
 adminRefreshButtonEl.addEventListener("click", refreshAdminView);
+
+// Installable web app: lets a remote operator add Phone Farm to a phone, tablet or
+// desktop and open its shell offline (see sw.js). Needs HTTPS or localhost; on plain
+// http the browser simply refuses, which is fine.
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    navigator.serviceWorker.register("/sw.js").catch(() => {});
+  });
+}

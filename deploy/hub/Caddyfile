@@ -1,0 +1,16 @@
+# Terminates HTTPS for the hub. WebSockets (the operator screen stream and the site
+# agent link) pass through reverse_proxy without extra configuration.
+{$PUBLIC_HOSTNAME} {
+	encode zstd gzip
+	reverse_proxy hub:4173 {
+		# Live video is a long-lived stream; never buffer it.
+		flush_interval -1
+		health_uri /healthz
+		health_interval 30s
+	}
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options nosniff
+		Referrer-Policy no-referrer
+	}
+}

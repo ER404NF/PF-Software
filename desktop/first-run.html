@@ -25,6 +25,14 @@
   .status-value { font-size: 12px; color: #9bd6a4; }
   .status-row.problem .status-value { color: #ff9a9a; }
   .status-message { grid-column: 1 / -1; color: #aaa; font-size: 11px; line-height: 1.45; }
+  .status-actions { grid-column: 1 / -1; display: flex; align-items: center; gap: 12px; }
+  .status-actions button { padding: 6px 12px; border-radius: 5px; border: none; background: #eee; color: #111; font-weight: 700; cursor: pointer; font-size: 12px; }
+  .status-actions button:disabled { opacity: 0.5; cursor: default; }
+  .status-progress { color: #bbb; font-size: 11px; overflow-wrap: anywhere; }
+  .check-row { display: flex; align-items: center; gap: 8px; margin: 14px 0 0; font-size: 12px; color: #bbb; }
+  .check-row input { width: auto; }
+  .help-row { display: flex; gap: 16px; align-items: center; margin-top: 28px; padding-top: 14px; border-top: 1px solid #2b2b2b; font-size: 11px; color: #888; }
+  .help-row button { background: none; border: none; color: #9bb8ff; cursor: pointer; padding: 0; font-size: 11px; text-decoration: underline; }
 </style>
 </head>
 <body>
@@ -38,8 +46,30 @@
       </button>
       <button class="choice" id="client-choice">
         Connect to an existing Phone Farm host
-        <small>Sign in or apply for access on a host that's already running elsewhere.</small>
+        <small>Sign in or apply for access on a host that's already running elsewhere. Use this for remote operators.</small>
       </button>
+      <button class="choice" id="site-choice">
+        This is a remote site's Mac mini
+        <small>Link this Mac's iPhones to your company's Phone Farm hub. Nobody operates the phones from this Mac; your team uses the hub.</small>
+      </button>
+    </div>
+
+    <div id="site-view" hidden>
+      <button class="back" id="site-back">&larr; Back</button>
+      <h1>Link this site to the hub</h1>
+      <p class="sub">On the hub, open Operations, then Sites, then Add site. Enter the three values it shows you.</p>
+      <div class="status-list" id="site-status-list" hidden></div>
+      <label for="site-hub-url">Hub address</label>
+      <input id="site-hub-url" placeholder="https://phones.example.com" autocomplete="off" spellcheck="false" />
+      <label for="site-id">Site ID</label>
+      <input id="site-id" placeholder="bucharest" autocomplete="off" spellcheck="false" />
+      <label for="site-token">Site token</label>
+      <input id="site-token" type="password" placeholder="pfs_..." autocomplete="off" spellcheck="false" />
+      <label class="check-row"><input type="checkbox" id="site-launch-login" checked /> Start Phone Farm automatically when this Mac starts</label>
+      <button class="primary" id="site-start">Save and link this site</button>
+      <p class="error" id="site-error"></p>
+      <p class="sub" id="site-state" role="status"></p>
+      <button class="back" id="site-stop" hidden>Stop and unlink this Mac</button>
     </div>
 
     <div id="host-setup-view" hidden>
@@ -47,7 +77,14 @@
       <h1>Host setup</h1>
       <p class="sub">Phone Farm is checking the local tools needed to detect and control connected iPhones automatically.</p>
       <div class="status-list" id="host-status-list"></div>
+      <div id="team-block" hidden>
+        <label for="team-id">Apple Developer Team ID</label>
+        <input id="team-id" maxlength="10" autocapitalize="characters" spellcheck="false" placeholder="ABCDE12345" />
+        <button class="primary" id="team-save">Save Team ID</button>
+        <p class="error" id="team-error"></p>
+      </div>
       <p class="error" id="host-error"></p>
+      <label class="check-row"><input type="checkbox" id="host-launch-login" checked /> Start Phone Farm automatically when this Mac starts</label>
       <button class="primary" id="host-retry" hidden>Check again</button>
       <button class="primary" id="host-continue" hidden>Create the first admin</button>
     </div>
@@ -77,6 +114,12 @@
       <button class="primary" id="connect-submit">Connect</button>
       <p class="error" id="connect-error"></p>
     </div>
+    <div class="help-row">
+      <span>Something not working?</span>
+      <button id="copy-diagnostics">Copy diagnostics</button>
+      <button id="show-logs">Show log folder</button>
+      <span id="help-status" role="status"></span>
+    </div>
   </div>
 
 <script>
@@ -84,16 +127,74 @@
   const adminView = document.getElementById("create-admin-view");
   const connectView = document.getElementById("connect-view");
   const hostSetupView = document.getElementById("host-setup-view");
+  const siteView = document.getElementById("site-view");
+  let siteTimer = null;
+
+  // iPhone automation needs macOS and Xcode, so a Windows PC is only ever an operator's
+  // workstation: offer just "connect to your hub".
+  if (/Windows/i.test(navigator.userAgent)) {
+    document.getElementById("host-choice").hidden = true;
+    document.getElementById("site-choice").hidden = true;
+    document.querySelector("#choice-view .sub").textContent = "Connect to your company's Phone Farm hub to operate its phones.";
+  }
 
   function show(view) {
     choiceView.hidden = view !== choiceView;
     adminView.hidden = view !== adminView;
     connectView.hidden = view !== connectView;
     hostSetupView.hidden = view !== hostSetupView;
+    siteView.hidden = view !== siteView;
+    if (view !== siteView) { clearInterval(siteTimer); siteTimer = null; }
+  }
+
+  const SITE_STATE_TEXT = {
+    starting: "Starting…",
+    linked: "Linked to the hub. This Mac's iPhones are available to your team.",
+    reconnecting: "Cannot reach the hub right now. Retrying automatically.",
+    refused: "The hub does not accept this site's token.",
+    error: "The site agent hit a problem.",
+    stopped: "Not running.",
+  };
+
+  function renderSiteStatus(status) {
+    const el = document.getElementById("site-state");
+    el.textContent = status?.detail || SITE_STATE_TEXT[status?.state] || "";
+    document.getElementById("site-stop").hidden = !status || status.state === "stopped";
+  }
+
+  function pollSiteStatus() {
+    clearInterval(siteTimer);
+    siteTimer = setInterval(async () => {
+      const result = await window.desktopApi.getSiteStatus();
+      if (result?.ok) renderSiteStatus(result.status);
+    }, 2000);
   }
 
   function renderPreflight(preflight, pending = false) {
-    const list = document.getElementById("host-status-list");
+    renderPreflightInto(document.getElementById("host-status-list"), preflight, pending, beginHostSetup);
+  }
+
+  // Runs a one-click fix (Xcode setup, iPhone tools), shows its progress on the row, then checks everything again.
+  async function runFix(id, buttons, progressEl, afterFix) {
+    for (const button of buttons) button.disabled = true;
+    progressEl.textContent = "Working…";
+    const stopListening = window.desktopApi.onFixProgress(line => { progressEl.textContent = line; });
+    let succeeded = false;
+    try {
+      const result = await window.desktopApi.fixPrerequisite(id);
+      progressEl.textContent = result?.message || result?.error || "That did not work. Try again.";
+      if (result?.ok) { succeeded = true; await afterFix(); }
+    } catch (error) {
+      // A failed request must never leave the row stuck on "Working..." with its button dead.
+      progressEl.textContent = `That did not work: ${error?.message || "unknown error"}`;
+      succeeded = false;
+    } finally {
+      stopListening();
+    }
+    if (!succeeded) for (const button of buttons) button.disabled = false;
+  }
+
+  function renderPreflightInto(list, preflight, pending = false, afterFix = null) {
     const checks = preflight?.checks || [
       { label: "Mac host tools", ok: false, message: pending ? "Checking…" : "Not checked yet." },
     ];
@@ -110,8 +211,24 @@
       message.className = "status-message";
       message.textContent = check.message || "";
       row.append(label, value, message);
+      if (check.fixable && !check.ok && !pending && afterFix) {
+        const actions = document.createElement("div");
+        actions.className = "status-actions";
+        const button = document.createElement("button");
+        button.textContent = "Fix it";
+        const progress = document.createElement("span");
+        progress.className = "status-progress";
+        button.addEventListener("click", () => runFix(check.fixable, [...list.querySelectorAll(".status-actions button")], progress, afterFix));
+        actions.append(button, progress);
+        row.append(actions);
+      }
       return row;
     }));
+  }
+
+  function showTeamInput(preflight) {
+    const needsTeam = (preflight?.checks || []).some(check => check.needsInput === "wdaDevelopmentTeam" && !check.ok);
+    document.getElementById("team-block").hidden = !needsTeam;
   }
 
   async function beginHostSetup() {
@@ -122,6 +239,7 @@
     document.getElementById("host-continue").hidden = true;
     const result = await window.desktopApi.startHostSetup();
     renderPreflight(result.preflight);
+    showTeamInput(result.preflight);
     if (!result.ok) {
       document.getElementById("host-error").textContent = result.error;
       document.getElementById("host-retry").hidden = false;
@@ -130,12 +248,55 @@
     if (!result.alreadyConfigured) document.getElementById("host-continue").hidden = false;
   }
 
+  document.getElementById("team-save").addEventListener("click", async () => {
+    const errorEl = document.getElementById("team-error");
+    errorEl.textContent = "";
+    const result = await window.desktopApi.saveHostSettings({
+      wdaDevelopmentTeam: document.getElementById("team-id").value,
+    });
+    if (!result.ok) { errorEl.textContent = result.error; return; }
+    beginHostSetup();
+  });
+
   document.getElementById("host-choice").addEventListener("click", beginHostSetup);
   document.getElementById("host-retry").addEventListener("click", beginHostSetup);
   document.getElementById("host-continue").addEventListener("click", () => show(adminView));
   document.getElementById("host-back").addEventListener("click", () => show(choiceView));
 
   document.getElementById("client-choice").addEventListener("click", () => show(connectView));
+  document.getElementById("site-choice").addEventListener("click", () => show(siteView));
+  document.getElementById("site-back").addEventListener("click", () => show(choiceView));
+
+  document.getElementById("site-start").addEventListener("click", async () => {
+    const errorEl = document.getElementById("site-error");
+    errorEl.textContent = "";
+    const result = await window.desktopApi.startSiteAgent({
+      hubUrl: document.getElementById("site-hub-url").value,
+      siteId: document.getElementById("site-id").value,
+      siteToken: document.getElementById("site-token").value,
+    });
+    if (result.preflight) {
+      const list = document.getElementById("site-status-list");
+      list.hidden = false;
+      renderPreflightInto(list, result.preflight, false, retrySiteLink);
+    }
+    if (!result.ok) { errorEl.textContent = result.error; return; }
+    document.getElementById("site-token").value = ""; // the token now lives only in the app's private settings
+    renderSiteStatus(result.status);
+    pollSiteStatus();
+  });
+
+  // After a fix, link again straight away if the three values are still filled in.
+  async function retrySiteLink() {
+    const filled = ["site-hub-url", "site-id", "site-token"].every(id => document.getElementById(id).value.trim());
+    if (filled) document.getElementById("site-start").click();
+    else document.getElementById("site-error").textContent = "Fixed. Enter the hub address, site ID and token again, then link this site.";
+  }
+
+  document.getElementById("site-stop").addEventListener("click", async () => {
+    await window.desktopApi.stopSiteAgent();
+    renderSiteStatus({ state: "stopped" });
+  });
   document.getElementById("admin-back").addEventListener("click", () => show(choiceView));
   document.getElementById("connect-back").addEventListener("click", () => show(choiceView));
 
@@ -159,10 +320,45 @@
     if (!result.ok) errorEl.textContent = result.error;
   });
 
-  window.desktopApi.getStartupState().then(state => {
+  for (const id of ["host-launch-login", "site-launch-login"]) {
+    document.getElementById(id).addEventListener("change", event => {
+      for (const other of ["host-launch-login", "site-launch-login"]) document.getElementById(other).checked = event.target.checked;
+      window.desktopApi.setLaunchAtLogin(event.target.checked);
+    });
+  }
+
+  function helpStatus(text) {
+    const el = document.getElementById("help-status");
+    el.textContent = text;
+    setTimeout(() => { if (el.textContent === text) el.textContent = ""; }, 4000);
+  }
+  document.getElementById("copy-diagnostics").addEventListener("click", async () => {
+    const result = await window.desktopApi.copyDiagnostics();
+    helpStatus(result?.ok ? "Copied. Paste it into a message." : "Could not copy.");
+  });
+  document.getElementById("show-logs").addEventListener("click", () => window.desktopApi.showLogs());
+
+  window.desktopApi.getStartupState().then(async state => {
+    if (state?.ok) {
+      for (const id of ["host-launch-login", "site-launch-login"]) document.getElementById(id).checked = state.launchAtLogin !== false;
+    }
+    if (state?.ok && state.mode === "site") {
+      show(siteView);
+      if (state.preflight) {
+        const list = document.getElementById("site-status-list");
+        list.hidden = false;
+        renderPreflightInto(list, state.preflight, false, retrySiteLink);
+      }
+      if (state.error) document.getElementById("site-error").textContent = state.error;
+      const status = await window.desktopApi.getSiteStatus();
+      if (status?.ok) renderSiteStatus(status.status);
+      pollSiteStatus();
+      return;
+    }
     if (!state?.ok || state.mode !== "host" || !state.error) return;
     show(hostSetupView);
     renderPreflight(state.preflight);
+    showTeamInput(state.preflight);
     document.getElementById("host-error").textContent = state.error;
     document.getElementById("host-retry").hidden = false;
   });

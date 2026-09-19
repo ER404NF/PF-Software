@@ -65,3 +65,12 @@ test("a corrupt store surfaces an explicit error instead of silently resetting",
   fs.writeFileSync(storePath, JSON.stringify({ devices: ["not-an-object"] }));
   assert.throws(() => loadProvisioningRecords(storePath), /corrupt/);
 });
+
+test("the MJPEG video port is stored and survives a later partial update", () => {
+  const storePath = tempStorePath();
+  upsertProvisioningRecord(storePath, "00008110-ABCDEF1234567890", {
+    logicalId: "ios-abc123", wdaLocalPort: 8101, mjpegLocalPort: 9101, derivedDataPath: "/tmp/derived/ios-abc123",
+  });
+  const updated = upsertProvisioningRecord(storePath, "00008110-ABCDEF1234567890", { displayName: "Renamed" });
+  assert.equal(updated.mjpegLocalPort, 9101);
+});

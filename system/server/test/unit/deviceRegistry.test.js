@@ -45,3 +45,24 @@ test("device registry validates WDA deployment fields before adapter creation", 
   assert.throws(() => loadDevices({ devices: [wda("wda-1", { udid: undefined })] }), /requires a valid UDID/);
   assert.throws(() => loadDevices({ devices: [wda("wda-1", { label: "" })] }), /requires a non-empty label/);
 });
+
+test("a pinned WDA phone can declare its video port, which enables live streaming", () => {
+  const devices = loadDevices({ devices: [wda("wda-1", { mjpegPort: 9100 }), wda("wda-2", { port: 8101 })] });
+  assert.equal(devices.get("wda-1").mjpegPort, 9100);
+  assert.equal(devices.get("wda-1").supportsStream, true);
+  assert.equal(devices.get("wda-2").supportsStream, false, "no video port: screenshots only");
+});
+
+test("a video port must be valid and distinct from every other endpoint", () => {
+  for (const mjpegPort of [0, 70000, 8100, "9100", 1.5]) {
+    assert.throws(() => loadDevices({ devices: [wda("wda-1", { mjpegPort })] }), /mjpegPort/, String(mjpegPort));
+  }
+  assert.throws(() => loadDevices({ devices: [
+    wda("wda-1", { mjpegPort: 9100 }),
+    wda("wda-2", { port: 8101, mjpegPort: 9100 }),
+  ] }), /Duplicate WDA endpoint/);
+  assert.throws(() => loadDevices({ devices: [
+    wda("wda-1", { mjpegPort: 8101 }),
+    wda("wda-2", { port: 8101 }),
+  ] }), /Duplicate WDA endpoint/);
+});

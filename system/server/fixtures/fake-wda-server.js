@@ -12,6 +12,8 @@
 // Then point a devices.config.json entry at { "type": "wda", "port": <port> }.
 
 import express from "express";
+import http from "node:http";
+import { testCardFrame } from "./png-frame.js";
 
 // Distinguishes "no argument" (default to 8199) from an explicit "0" (ask
 // the OS for an ephemeral port) — `Number(x) || 8199` would collapse both to
@@ -102,6 +104,24 @@ app.get("/session/:id/screenshot", (req, res) => {
   });
 });
 
+// ---- gestures used by the phone-like control surface ------------------------
+app.post("/session/:id/wda/dragfromtoforduration", (req, res) => {
+  respond(req, res, "drag", { fromX: req.body.fromX, fromY: req.body.fromY, toX: req.body.toX, toY: req.body.toY, duration: req.body.duration }, () => res.json({ value: null }));
+});
+
+app.post("/session/:id/wda/touchAndHold", (req, res) => {
+  respond(req, res, "long-press", { x: req.body.x, y: req.body.y, duration: req.body.duration }, () => res.json({ value: null }));
+});
+
+app.post("/session/:id/wda/doubleTap", (req, res) => {
+  respond(req, res, "double-tap", { x: req.body.x, y: req.body.y }, () => res.json({ value: null }));
+});
+
+// Real WDA applies MJPEG framerate/scaling/quality through this Appium-style route.
+app.post("/session/:id/appium/settings", (req, res) => {
+  respond(req, res, "settings", { settings: req.body?.settings }, () => res.json({ value: req.body?.settings ?? {} }));
+});
+
 app.get("/session/:id/source", (req, res) => {
   respond(req, res, "source", {}, () => res.json({ value: "<Application name=\"Fake\"><Button label=\"Research\"/></Application>" }));
 });
@@ -161,9 +181,68 @@ app.post("/debug/unhang", (req, res) => {
   res.json({ ok: true });
 });
 
+// ---- MJPEG video server (real WDA serves this on a separate device port, 9100) ----
+const stream = { fps: 20, stalled: false, connections: 0, frames: 0, sockets: new Set(), nextFrame: 0 };
+
+app.get("/debug/stream-stats", (req, res) => {
+  res.json({ connections: stream.connections, active: stream.sockets.size, frames: stream.frames, fps: stream.fps, stalled: stream.stalled });
+});
+app.post("/debug/stream-fps", (req, res) => {
+  stream.fps = Math.min(60, Math.max(1, Number(req.body?.fps) || 20));
+  res.json({ ok: true, fps: stream.fps });
+});
+// Connection stays open but no frames flow: a frozen phone / locked screen.
+app.post("/debug/stream-stall", (req, res) => {
+  stream.stalled = req.body?.stalled !== false;
+  res.json({ ok: true, stalled: stream.stalled });
+});
+// Kill every open video connection: a dropped USB tunnel.
+app.post("/debug/stream-drop", (req, res) => {
+  for (const socket of stream.sockets) socket.destroy();
+  stream.sockets.clear();
+  res.json({ ok: true });
+});
+
+const mjpegServer = http.createServer((req, res) => {
+  if (req.url !== "/" ) {
+    res.statusCode = 404;
+    res.end();
+    return;
+  }
+  stream.connections += 1;
+  stream.sockets.add(req.socket);
+  res.writeHead(200, {
+    "Content-Type": "multipart/x-mixed-replace; boundary=--BoundaryString",
+    "Cache-Control": "no-cache",
+    Connection: "close",
+  });
+  let timer = null;
+  const tick = () => {
+    if (!stream.stalled) {
+      const frame = testCardFrame(stream.nextFrame++);
+      stream.frames += 1;
+      res.write(`--BoundaryString\r\nContent-type: image/png\r\nContent-Length: ${frame.length}\r\n\r\n`);
+      res.write(frame);
+      res.write("\r\n");
+    }
+    timer = setTimeout(tick, Math.round(1000 / stream.fps));
+  };
+  tick();
+  const cleanup = () => { clearTimeout(timer); stream.sockets.delete(req.socket); };
+  req.on("close", cleanup);
+  res.on("error", cleanup);
+});
+
 app.post("/debug/fail-next-screenshot", (req, res) => {
   failNextScreenshot = true;
   res.json({ ok: true });
+});
+
+// Distinguish "no argument" (a stable default next to the control port) from an
+// explicit 0 (ephemeral).
+const MJPEG_PORT = process.argv[3] === undefined ? (PORT === 0 ? 0 : PORT + 1) : Number(process.argv[3]);
+mjpegServer.listen(MJPEG_PORT, "127.0.0.1", () => {
+  console.log(`[fake-wda] mjpeg listening on http://127.0.0.1:${mjpegServer.address().port}`);
 });
 
 const server = app.listen(PORT, () => {
@@ -174,4 +253,4 @@ const server = app.listen(PORT, () => {
   console.log(`[fake-wda] listening on http://127.0.0.1:${server.address().port}`);
 });
 
-export { app, server };
+export { app, server, mjpegServer };

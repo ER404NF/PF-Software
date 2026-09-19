@@ -41,3 +41,8 @@ test("bind host and public URL parsing fail closed", () => {
   assert.throws(() => resolveDeploymentConfig({ HOST: "farm.internal" }), /HOST/);
   assert.throws(() => resolveDeploymentConfig({ PUBLIC_BASE_URL: "ftp://farm.example" }), /http or https/);
 });
+
+test("the configured public URL is exposed as an origin, so site enrollment shows the address operators really use", () => {
+  assert.equal(resolveDeploymentConfig({ PUBLIC_BASE_URL: "https://phones.example.com/some/path?x=1", SESSION_SECRET: "x".repeat(40) }).publicUrl, "https://phones.example.com");
+  assert.equal(resolveDeploymentConfig({}).publicUrl, null);
+});

@@ -1,0 +1,46 @@
+# Phone Farm hub with automatic HTTPS.
+#
+#   cp .env.example .env      # then fill in PUBLIC_HOSTNAME and SESSION_SECRET
+#   docker compose up -d --build
+#
+# The hub itself only listens inside the compose network; Caddy is the only thing
+# exposed to the internet, and it obtains and renews the TLS certificate by itself.
+
+services:
+  hub:
+    build:
+      context: ../..
+      dockerfile: deploy/hub/Dockerfile
+    restart: unless-stopped
+    environment:
+      PUBLIC_BASE_URL: https://${PUBLIC_HOSTNAME:?set PUBLIC_HOSTNAME in .env}
+      SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env (at least 32 random characters)}
+      PHONE_FARM_TIMEZONE: ${PHONE_FARM_TIMEZONE:-America/Los_Angeles}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+    volumes:
+      - hub-data:/app/system/storage
+    expose:
+      - "4173"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - hub
+    environment:
+      PUBLIC_HOSTNAME: ${PUBLIC_HOSTNAME}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+volumes:
+  hub-data:
+  caddy-data:
+  caddy-config:

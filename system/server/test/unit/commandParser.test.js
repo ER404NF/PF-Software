@@ -1,6 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseCommand } from "../../src/commandParser.js";
+import { parseCommand as parse } from "../../src/commandParser.js";
+
+// These /time inputs (injected `now` instants like 06:00Z) were written for a
+// UTC+1/+2 wall clock. The scheduling zone is a deployment setting (default
+// America/Los_Angeles), so they say which zone they mean instead of relying on
+// whatever the default happens to be.
+const ROME = { timeZone: "Europe/Rome" };
+const parseCommand = (text, now) => parse(text, now, ROME);
 
 test("plain text with no leading slash is treated as a natural-language goal", () => {
   const result = parseCommand("Research AI coding posts for a while");

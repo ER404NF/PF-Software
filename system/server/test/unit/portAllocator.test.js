@@ -41,3 +41,11 @@ test("resolvePortRange falls back to the default when env vars are missing or in
 test("resolvePortRange honors a valid configured range", () => {
   assert.deepEqual(resolvePortRange({ WDA_PORT_RANGE_START: "9000", WDA_PORT_RANGE_END: "9050" }), { start: 9000, end: 9050 });
 });
+
+test("resolveMjpegPortRange defaults to 9100-9199 and honours a valid override", async () => {
+  const { resolveMjpegPortRange } = await import("../../src/portAllocator.js");
+  assert.deepEqual(resolveMjpegPortRange({}), { start: 9100, end: 9199 });
+  assert.deepEqual(resolveMjpegPortRange({ WDA_MJPEG_PORT_RANGE_START: "9300", WDA_MJPEG_PORT_RANGE_END: "9310" }), { start: 9300, end: 9310 });
+  assert.deepEqual(resolveMjpegPortRange({ WDA_MJPEG_PORT_RANGE_START: "9310", WDA_MJPEG_PORT_RANGE_END: "9300" }), { start: 9100, end: 9199 }, "inverted range falls back");
+  assert.deepEqual(resolveMjpegPortRange({ WDA_MJPEG_PORT_RANGE_START: "x" }), { start: 9100, end: 9199 });
+});

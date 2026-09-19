@@ -21,7 +21,12 @@ export function parseResearchAccountDefinitions(config) {
       throw new Error(`research account "${account.id}" requires platform: ${RESEARCH_PLATFORMS.join("|" )}`);
     }
     if (accounts.has(account.id)) throw new Error(`duplicate research account: ${account.id}`);
-    accounts.set(account.id, Object.freeze({ id: account.id, workspaceId: account.workspaceId, platform: account.platform }));
+    if (account.deviceId !== undefined && !/^[a-zA-Z0-9_-]{1,100}$/.test(String(account.deviceId))) {
+      throw new Error(`research account "${account.id}" has an invalid deviceId`);
+    }
+    // deviceId (optional) pins the account to the phone it is signed in on (fleet affinity).
+    accounts.set(account.id, Object.freeze({ id: account.id, workspaceId: account.workspaceId, platform: account.platform,
+      deviceId: account.deviceId ?? null }));
   }
   return accounts;
 }

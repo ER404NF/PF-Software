@@ -51,6 +51,7 @@ export function upsertProvisioningRecord(storePath, udid, patch = {}) {
     logicalId: patch.logicalId ?? existing?.logicalId,
     displayName: patch.displayName ?? existing?.displayName ?? null,
     wdaLocalPort: patch.wdaLocalPort ?? existing?.wdaLocalPort ?? null,
+    mjpegLocalPort: patch.mjpegLocalPort ?? existing?.mjpegLocalPort ?? null,
     derivedDataPath: patch.derivedDataPath ?? existing?.derivedDataPath ?? null,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,

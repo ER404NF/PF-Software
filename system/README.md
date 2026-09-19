@@ -12,9 +12,11 @@ Implemented now:
 - device list/status;
 - exclusive device selection;
 - screenshot/frame delivery;
-- optional WDA Live view polling at a conservative one-second interval while
-  the controlled device detail is visible, with overlap suppression, hidden-tab
-  pause, repeated-failure shutdown, and the manual/action frame path retained;
+- live video (WDA MJPEG shared per phone, binary frames over the WebSocket) with a timed-screenshot fallback,
+  a phone-like stage (wheel scroll, drag, tap, long press, double tap, keyboard, bezel Home), multi-site hub and
+  site agents, and MS9-MS13 research actions, sessions, fleet monitoring and optimizations — see "Live video,
+  gestures and multi-site" and "MS9-MS13" below;
+- the older one-second WDA polling path, kept as the fallback when a device cannot stream;
 - human click -> normalized coordinate -> WDA tap;
 - swipe (four directions), text/keyboard input, and the hardware Home
   button, end to end for both mock and WDA devices;
@@ -637,6 +639,7 @@ Server -> client:
   Task instructions, credentials, proxy secrets, and access lists are omitted
   for viewers without the corresponding management capability.
 - `frame`: `{ deviceId, kind, data, mime? }`
+- live video: JSON `stream_started` / `stream_state` / `stream_stopped` / `stream_unsupported` plus binary frames (see "Live video, gestures and multi-site")
 - `error`: `{ deviceId?, message }`
 
 Client -> server:
@@ -648,6 +651,8 @@ Client -> server:
   springboard, backgrounding whatever app was open (unlike a tapped in-app
   Back control, which only works from screens that have one)
 - `type_text`: `{ text }`, 1-1000 characters
+- `drag`: `{ x1, y1, x2, y2, holdMs? }`, `long_press`: `{ x, y, durationMs? }`, `double_tap`: `{ x, y }` (normalized 0-1)
+- `start_stream` / `stop_stream`: `{ deviceId }` — start or stop the live video for the phone this connection controls or watches
 - `release_device`
 - `switch_to_ai`: `{ deviceId }` — Admin-only; moves an authorized idle device into
   `AI_IDLE`; rejected if it is claimed by a human
@@ -698,7 +703,7 @@ Unless a task specifies otherwise:
 1. validate the Human VA path on one physical iPhone when hardware is connected;
 2. configure one managed research account, its installed app version, and a model provider;
 3. run the supervised MS8 read-only navigation/candidate/evidence gate;
-4. keep MS9 platform markers disabled until the MS8 gate passes;
+4. keep every platform-visible action `DISABLED` per account until the supervised MS8 run passes (MS9-MS13 are built and default to disabled);
 5. scale through measured 1 -> 2 -> 5 device gates.
 
 Everything hardware-independent in the current Human VA Pilot scope is now
@@ -788,7 +793,12 @@ Every device-targeting command is still checked against the operator's
 audit history remain Admin-only:
 
 - `/time <start>-<end> <task>` is parsed for forward compatibility but rejected
-  before queue admission until a generic task worker exists. `/cresearch
+  before queue admission until a generic task worker exists. Its `HH:MM` values are
+  wall-clock time in **one explicit scheduling timezone**: `PHONE_FARM_TIMEZONE`
+  (an IANA name such as `Europe/Rome`; default `America/Los_Angeles`, California; an invalid value stops
+  startup), never the host operating system's zone, so a Mac left on a US timezone
+  parses the same window as a Rome-zoned one. DST follows the IANA rules; see
+  `docs/COMMAND_QUEUE_SPEC.md`. `/cresearch
   <platform> <minutes> <goal>` — queue a real task
 - `/queue add|list|pause|resume|cancel|move|priority ...` — queue management;
   `/queue add` accepts a `/time` or `/cresearch` command as its argument, but
@@ -875,8 +885,8 @@ queue dispatch, exact account resolution, model selection, and durable records.
 
 `server/src/observationPackage.js` prefers the UI tree and safely falls back to
 a screenshot; the adapters emit vendor-native multimodal requests.
-`server/src/actionPolicy.js` enforces account policy and keeps every MS9/MS10
-platform-visible action disabled. `server/src/platformSkill.js` defines the
+`server/src/actionPolicy.js` enforces account policy; every MS9/MS10
+platform-visible action is `DISABLED` until an administrator enables it for that account. `server/src/platformSkill.js` defines the
 detect/available/execute/verify/recover contract and rechecks the input lease
 immediately before an action. `server/src/researchWorker.js` joins these pieces
 for one bounded step and routes challenge/low-confidence states through the
@@ -889,6 +899,78 @@ before/after accessibility structure. Tests use fixtures and `MockDevice`; no
 live vendor or real platform app has been exercised. See
 `docs/CODING_ROADMAP_STATUS.md` for the
 remaining MS8 gates.
+
+## Live video, gestures and multi-site (built; hardware behaviour unverified)
+
+**Live video.** A selected or watched phone streams as video instead of timed screenshots. WebDriverAgent's
+MJPEG server (device port 9100, reached through a second `iproxy` mapping that the provisioner allocates) is
+read once per phone by `streamHub.js` and shared by every viewer; the last viewer leaving closes it after
+`STREAM_IDLE_CLOSE_MS` (default 10 s). Protocol:
+
+- client -> server `start_stream` `{ deviceId }` (the connection must already control or watch that phone);
+  `stop_stream`;
+- server -> client JSON `stream_started` `{ deviceId, streamId, mode: "control"|"watch" }`, `stream_state`
+  `{ state, detail }`, `stream_stopped` `{ reason }`, `stream_unsupported` `{ deviceId }` (the client then falls
+  back to timed screenshots and labels the view "screenshots");
+- server -> client **binary** frames: `[kind: 1 byte][streamId: 4 bytes big-endian][image bytes]`, where kind
+  1 = JPEG, 2 = PNG, 3 = SVG (the mock phone).
+
+Frames are dropped for a viewer whose socket has more than `STREAM_BACKPRESSURE_BYTES` queued (retry every
+`STREAM_FLUSH_RETRY_MS`), and every frame is re-checked against the viewer's live authorization; the session is
+re-validated every `STREAM_SESSION_RECHECK_MS`.
+
+**Phone-like control.** `client/phoneStage.js` draws only the phone. The wheel scrolls, a click-drag swipes
+(`drag` `{ x1, y1, x2, y2, holdMs? }`, normalized 0-1; `holdMs` is the press-hold before the drag starts, as
+WDA's `dragfromtoforduration` defines it), a short press taps, `long_press` `{ x, y, durationMs? }`,
+`double_tap` `{ x, y }`, the keyboard types (`type_text`, Backspace and Enter as `\b` / `\n`), and the Home control
+is the bezel gesture bar. There are no arrow buttons.
+
+**Multi-site.** `npm run agent` starts a site agent (`HUB_URL`, `SITE_ID`, `SITE_TOKEN`; the token is shown once
+when an admin creates the site under Sites). It dials the hub, so a site needs no inbound port; the hub shows its
+phones as `<site>__<device>`. Operators, roles, the queue and the audit log stay on the hub; a site can only make
+calls on an allow-list; a lost link marks that site's phones offline and streams re-open after reconnect.
+`deploy/hub/` + `docs/DEPLOY_HUB.md` describe the public hub (Docker + Caddy, automatic HTTPS); remote operators
+need only an internet connection.
+
+**Time zone.** `/time` windows are wall-clock in `PHONE_FARM_TIMEZONE` (default `America/Los_Angeles`).
+
+**Demo without hardware.** `npm run demo` starts the server with mock phones and a scrolling feed.
+
+## MS9-MS13: actions, sessions, fleet, optimization (built locally, not exercised on a real device)
+
+- **Actions and policy (MS9/MS10).** `actionCatalog.js` lists every action; `actionPolicy.js` validates each
+  one before the device is touched. Per account, each action is `ALLOW_AUTONOMOUS`, `REQUIRE_APPROVAL` or
+  `DISABLED` (default `DISABLED`); only an administrator of that client changes it
+  (`GET/PUT /api/research/:account/policies[/:action]`). Toggle-type actions (save, like, vote, repost) use
+  verify-before-toggle: read the control's state, press only if it differs, re-read to confirm, and never press
+  on an ambiguous read. Content must have a research record before any platform-visible action on it.
+- **Approvals.** A `REQUIRE_APPROVAL` action waits for a manager or admin
+  (`GET /api/research/:account/approvals`, `POST .../approvals/:id/approve|reject`). An approval is single-use and
+  bound to the exact action, target and wording.
+- **Comments.** `commentGuard.js` refuses exact and near duplicates, over-rate comments and text not grounded in
+  the recorded content; preset templates are managed per client (`/api/research/:account/templates`). Text is
+  written to the ledger before it is sent and logged exactly as sent. A platform-visible failure is never blindly
+  retried: it becomes an intervention.
+- **Sessions (MS11).** `researchSession.js`: step, time, spend, kept-candidate and per-action quotas, stop on
+  repeated failures, a scoring profile that decides what is kept, budgets rebuilt from checkpoints after a
+  restart, and a report per finished session (`GET /api/research/:account/runs/:runId/report`).
+- **Review panel.** The header's **Review** button (approvals for everyone with research access; the hand-back queue for
+  managers/admins) is `client/review.js`: Approvals, Needs a person, and "What the AI may do" (the per-action policy).
+  It only calls the routes below, which enforce permissions themselves.
+- **Fleet (MS12).** `fleetPolicy.js` limits concurrent AI workers and hourly spend and pins accounts to devices;
+  `interventionQueue.js` collects what needs a person (`GET /api/fleet/ai`, `GET /api/fleet/interventions`,
+  `POST /api/fleet/interventions/:id/claim|resolve`). Managers and admins only, scoped to their own clients.
+- **Optimization (MS13), off by default.** `PHONE_FARM_OPTIMIZATIONS=on` (or a list of `router`, `localPlanner`,
+  `stateCache`, `pacing`); `PHONE_FARM_CHEAP_MODEL` names a cheap provider from `models.config.json`;
+  `PHONE_FARM_ESCALATE_BELOW` (default 0.75) is the confidence under which a cheap answer is thrown away and the
+  strong model decides. The local planner only proposes opening a closed app or moving on after a recorded post,
+  and only if the task permits that action. `GET /api/fleet/analytics` shows intervention statistics and how the
+  routing and cache are performing; `GET /api/research/:account/search?q=` searches an account's own records and
+  `?similarTo=<candidateId>` finds near-duplicates.
+- **Regression benchmark.** `npm run bench` prints before/after for each optimization from a deterministic
+  simulation (real skill and mock phone; model cost and latency are modeled constants). The test suite fails if any
+  optimization lowers success rate, recall or action accuracy; `--update-baseline` re-records
+  `server/bench/baseline.json` after an intended change.
 
 ## Network isolation (Phase 0)
 

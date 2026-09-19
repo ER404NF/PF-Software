@@ -8,8 +8,22 @@ import fs from "fs";
 import { randomUUID } from "crypto";
 import { fileURLToPath, pathToFileURL } from "url";
 import { WdaDevice } from "./wdaDevice.js";
-import { ensureDeviceDir, listFiles, resolveFile, deleteFile, safeFilename, safeDeviceId, assertMediaStorageIsolated } from "./fileStore.js";
+import { StreamHub } from "./streamHub.js";
+import { frameKind } from "./mjpegParser.js";
+import { SiteStore, SiteError } from "./siteStore.js";
+import { SiteLinkHub } from "./siteLink.js";
+import { ApprovalStore, ApprovalError } from "./approvalStore.js";
+import { CommentLedger } from "./commentGuard.js";
+import { TemplateLibrary } from "./commentTemplates.js";
+import { PolicyStore } from "./policyStore.js";
+import { InterventionQueue } from "./interventionQueue.js";
+import { createFleetPolicy, fleetConfigFromEnv, SpendTracker } from "./fleetPolicy.js";
+import { ACTIONS as ALL_ACTIONS } from "./actionCatalog.js";
+import { ensureDeviceDir, STORAGE_ROOT, listFiles, resolveFile, deleteFile, safeFilename, safeDeviceId, assertMediaStorageIsolated } from "./fileStore.js";
 import { listRuns, getRun, createRun, setCandidateStatus } from "./researchStore.js";
+import { parseOptimizationConfig, createOptimizationRuntime } from "./optimizationRuntime.js";
+import { ResearchIndex } from "./optimization/researchIndex.js";
+import { analyzeInterventions } from "./optimization/interventionAnalytics.js";
 import {
   canAccessDevice, publicOperator, resolveOperator, hasCapability, operators, verifyPassword,
   listOperatorAccounts, createOperatorAccount, updateOperatorAccount, operatorByUsername,
@@ -27,6 +41,7 @@ import { FileSessionStore } from "./fileSessionStore.js";
 import * as deviceLease from "./deviceLease.js";
 import { createTaskQueue } from "./taskQueue.js";
 import { parseCommand } from "./commandParser.js";
+import { resolveSchedulingTimeZone } from "./schedulingTimeZone.js";
 import { loadDeviceNetworkMap, publicNetworkConfig } from "./deviceNetworkConfig.js";
 import { isProxyEgress, setDeviceProxyEnabled } from "./deviceNetworkStore.js";
 import {
@@ -53,11 +68,7 @@ import { decryptTotpSecret, encryptTotpSecret, generateRecoveryCodes, generateTo
 import { discoverIosDevices } from "./deviceDiscovery.js";
 import { loadDeviceConfig } from "./deviceConfigLoader.js";
 import { loadDevices } from "./deviceRegistry.js";
-import { runHostPreflight } from "./hostPreflight.js";
-import { resolvePortRange } from "./portAllocator.js";
-import { WdaProcessManager } from "./wdaProcessManager.js";
-import { IProxyManager } from "./iproxyManager.js";
-import { DeviceProvisioner } from "./deviceProvisioner.js";
+import { startAutoProvisioning } from "./provisioningBoot.js";
 import { TunManager } from "./tunManager.js";
 import { PrivilegedOps } from "./privilegedOps.js";
 import { NetworkRoutingOrchestrator } from "./networkRoutingOrchestrator.js";
@@ -82,9 +93,17 @@ const deployment = resolveDeploymentConfig(process.env, {
   hasMockDevices: rawDeviceConfig.devices?.some(device => device?.type === "mock"),
 });
 
+// One explicit scheduling timezone for /time wall-clock input (PHONE_FARM_TIMEZONE,
+// default America/Los_Angeles) — never whatever zone the OS/process happens to be in.
+// An invalid value fails startup instead of silently falling back.
+const schedulingTimeZone = resolveSchedulingTimeZone(process.env);
+
 const app = express();
 if (deployment.trustProxy) app.set("trust proxy", 1);
 app.use(express.static(clientDir));
+// Liveness probe for Docker / uptime monitors. Deliberately unauthenticated and
+// revealing nothing but "the process is answering".
+app.get("/healthz", (req, res) => res.json({ ok: true }));
 app.use(express.json());
 
 // Env-overridable (not just a fixed path like fileStore.js/researchStore.js)
@@ -637,6 +656,12 @@ const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
 // is authenticated with the exact same session store and cookie as the rest
 // of the app, rather than a second, parallel auth mechanism.
 server.on("upgrade", (request, socket, head) => {
+  // Site agents (other locations' Mac minis) authenticate with a site token, not an
+  // operator session.
+  if (String(request.url ?? "").split("?")[0] === "/agent-link") {
+    siteLinkHub.handleUpgrade(request, socket, head);
+    return;
+  }
   // A real (if disconnected) ServerResponse, not a bare {} — express-session
   // reads/writes several res methods (writeHead, getHeader, setHeader, end)
   // while parsing a request's session, and a plain object stub is missing
@@ -693,6 +718,27 @@ for (const discovered of discoveredIosDevices) {
     deviceMonitorConfig.set(discovered.id, { adapter: "unconfigured", physicallyValidated: false });
   }
 }
+
+// ---- sites: other locations that link their phones to this hub ----------------------
+const siteStore = new SiteStore(process.env.SITE_STORE_PATH || path.join(STORAGE_ROOT, "sites.json"),
+  { defaultTimeZone: schedulingTimeZone });
+const siteLinkHub = new SiteLinkHub({
+  siteStore,
+  devices,
+  onDevicesChanged: () => broadcastDeviceList(),
+  registerRemoteDevice: (device, site) => {
+    deviceHost.set(device.id, site.name);
+    deviceMonitorConfig.set(device.id, {
+      adapter: device.type === "mock" ? "mock" : device.type === "wda" ? "wda" : "unconfigured",
+      physicallyValidated: false,
+    });
+  },
+  unregisterRemoteDevice: device => {
+    deviceHost.delete(device.id);
+    deviceMonitorConfig.delete(device.id);
+  },
+  onSiteEvent: event => auditLog.logEvent({ operator: "system", type: event.type, detail: { siteId: event.siteId, ...event.detail } }),
+});
 
 function validateOperatorResources(input) {
   if (Object.hasOwn(input ?? {}, "allowedDevices") && input.allowedDevices !== null) {
@@ -982,17 +1028,38 @@ for (const discovered of discoveredIosDevices) {
 // Env-overridable like auditLogPath/sessionStoreDir above, for the same
 // reason — tests need an isolated queue file, not the real one under
 // storage/queue/.
+// ---- AI research: approvals, comment safety, policy overrides, fleet (MS9-MS12) -----------------
+const researchStoreFile = (envName, name) => process.env[envName] || path.join(STORAGE_ROOT, name);
+const approvalStore = new ApprovalStore({ filePath: researchStoreFile("APPROVAL_STORE_PATH", "research-approvals.json") });
+const commentLedger = new CommentLedger({ filePath: researchStoreFile("COMMENT_LEDGER_PATH", "comment-ledger.json") });
+const templateLibrary = new TemplateLibrary({ filePath: researchStoreFile("COMMENT_TEMPLATES_PATH", "comment-templates.json") });
+const policyStore = new PolicyStore({ filePath: researchStoreFile("ACTION_POLICY_OVERRIDES_PATH", "action-policy-overrides.json") });
+const interventionQueue = new InterventionQueue({ filePath: researchStoreFile("INTERVENTION_STORE_PATH", "interventions.json") });
+const spendTracker = new SpendTracker();
+// The validator sees configured policy with any runtime override applied on top, looked up
+// afresh for every action so a change takes effect on the very next step.
+const effectiveActionPolicies = { get: accountId => policyStore.effective(researchActionPolicies).get(accountId) };
+let fleetPolicy = null; // created below, once the queue exists
+
 const queueStorePath = process.env.QUEUE_STORE_PATH || path.join(__dirname, "../../storage/queue/tasks.json");
 const taskQueue = createTaskQueue({ devices, deviceLease, auditLog, storePath: queueStorePath, dispatchOnCreate: false,
   canDispatch: (task, deviceId) => {
     const operator = operatorByUsername(task.createdBy);
     return canAccessDevice(operator, deviceId)
       && networkDecision(deviceId).allowed
-      && (task.kind !== "research" || !!researchWorkspaceFor(operator, task.accountSelector?.accountId));
+      && (task.kind !== "research" || !!researchWorkspaceFor(operator, task.accountSelector?.accountId))
+      && (fleetPolicy?.canDispatch(task, deviceId) ?? true);
   } });
 const modelSelectionStorePath = process.env.MODEL_SELECTION_STORE_PATH
   || path.join(__dirname, "../../storage/models/selection.json");
 const modelSelection = createModelSelection({ providers, defaultProviderName, storePath: modelSelectionStorePath });
+fleetPolicy = createFleetPolicy({
+  runningTasks: () => taskQueue.listTasks().filter(task => task.state === "RUNNING"),
+  workspaceOf: accountId => researchAccounts.get(accountId) ?? null,
+  providerOf: task => modelSelection.resolve({ taskId: task.id, workspaceId: researchAccounts.get(task.accountSelector?.accountId), deviceId: task.deviceSelector?.deviceId }) ?? null,
+  spentLastHourUsd: () => spendTracker.totalUsd(),
+  config: fleetConfigFromEnv(process.env, researchAccountDefinitions),
+});
 const assignmentStorePath = process.env.ASSIGNMENT_STORE_PATH
   || path.join(__dirname, "../../storage/assignments/assignments.json");
 const assignmentStore = createAssignmentStore({ storePath: assignmentStorePath });
@@ -1183,18 +1250,31 @@ app.patch("/api/assignments/:assignmentId", requireCapability(CAPABILITIES.VIEW_
     next(error);
   }
 });
+// MS13: opt-in optimizations (model routing, state cache, adaptive pacing). Off unless
+// PHONE_FARM_OPTIMIZATIONS says otherwise; see optimizationRuntime.js.
+const optimizationRuntime = createOptimizationRuntime({
+  config: parseOptimizationConfig(process.env),
+  getProvider,
+  getPlatformSkill,
+});
 const researchTaskRunner = createResearchTaskRunner({
   taskQueue,
   devices,
   deviceLease,
   auditLog,
   accountWorkspaces: researchAccounts,
-  accountPolicies: researchActionPolicies,
+  accountPolicies: effectiveActionPolicies,
+  approvals: approvalStore,
+  commentLedger,
+  templates: templateLibrary,
+  interventions: interventionQueue,
+  spend: spendTracker,
   providerForTask: (task, { workspaceId, deviceId }) => {
     const name = modelSelection.resolve({ taskId: task.id, workspaceId, deviceId });
-    return name ? getProvider(name) : null;
+    return name ? optimizationRuntime.providerFor(name, task.accountSelector?.platform) : null;
   },
-  skillForPlatform: (platform) => getPlatformSkill(platform),
+  skillForPlatform: (platform) => optimizationRuntime.skillFor(platform),
+  pacingForTask: () => optimizationRuntime.pacingFor(),
   operatorForUsername: operatorByUsername,
   workspaceForOperatorAccount: researchWorkspaceFor,
   canUseDevice: (deviceId) => networkDecision(deviceId).allowed,
@@ -1226,6 +1306,18 @@ const MAX_CONCURRENT_LIVE_FRAMES = 4;
 const liveFrameNextByDevice = new Map();
 const liveFrameNextByOperator = new Map();
 let activeLiveFrames = 0;
+
+// Live video. One upstream MJPEG connection per phone, shared by the controlling
+// operator and any watchers (see streamHub.js). A viewer whose socket has more
+// than STREAM_BACKPRESSURE_BYTES queued (slow mobile link) skips frames instead
+// of buffering them, so latency stays low rather than growing without bound.
+const streamHub = new StreamHub({ idleCloseMs: Number(process.env.STREAM_IDLE_CLOSE_MS) || 3000 });
+const STREAM_BACKPRESSURE_BYTES = 1_000_000;
+const STREAM_FLUSH_RETRY_MS = 120;
+const STREAM_SESSION_RECHECK_MS = 5000;
+// Input messages one connection may have waiting behind the phone. A wheel-happy
+// or hostile client must not be able to build an unbounded backlog of gestures.
+const MAX_QUEUED_INPUT_MESSAGES = 60;
 
 function getHealth(deviceId) {
   if (!deviceHealth.has(deviceId)) deviceHealth.set(deviceId, { lastSeenAt: null, consecutiveFailures: 0 });
@@ -1371,6 +1463,10 @@ const summary = (d, viewer = null, viewerSocket = null) => {
     discoveryState: d.discoveryState ?? null,
     discoveryStateMessage: d.discoveryStateMessage ?? null,
     hostLabel: deviceHost.get(d.id) ?? DEFAULT_HOST_LABEL,
+    siteId: d.siteId ?? null,
+    siteName: d.siteName ?? null,
+    siteOnline: d.isRemote ? d.siteOnline : null,
+    timeZone: d.timeZone ?? null,
     ...getHealth(d.id),
     controllerMode: deviceLease.getMode(d.id),
     currentOperator: humanOwners.get(d.id)?.operatorUsername ?? null,
@@ -1661,6 +1757,65 @@ app.post("/api/admin/devices/:deviceId/retry-provisioning", requireCapability(CA
 // password to the browser. Actually starting a tunnel for a leased proxy
 // (TUN/PF) is a later step and does not exist yet — this is the pool and
 // exclusive per-device lease only.
+// ---- sites ------------------------------------------------------------------------
+const publicSite = site => ({ ...site, ...siteLinkHub.siteStatus(site.id) });
+const siteError = (res, error) => {
+  if (error instanceof SiteError) {
+    return res.status(error.code === "unknown_site" ? 404 : error.code === "duplicate_site" ? 409 : 400)
+      .json({ error: error.message, code: error.code });
+  }
+  throw error;
+};
+function hubOrigin(req) {
+  return deployment.publicUrl ? String(deployment.publicUrl).replace(/\/+$/, "") : `${req.protocol}://${req.get("host")}`;
+}
+
+app.get("/api/admin/sites", requireCapability(CAPABILITIES.MANAGE_SITES), (req, res) => {
+  res.json({ sites: siteStore.list().map(publicSite), defaultTimeZone: schedulingTimeZone });
+});
+
+app.post("/api/admin/sites", requireCapability(CAPABILITIES.MANAGE_SITES), (req, res) => {
+  try {
+    const { site, token } = siteStore.create({ name: req.body?.name, timeZone: req.body?.timeZone || undefined });
+    auditLog.logEvent({ operator: req.currentOperator.username, type: "site_created", detail: { siteId: site.id, name: site.name, timeZone: site.timeZone } });
+    // The token is shown this once; only its hash is stored.
+    res.status(201).json({ site: publicSite(site), token, hubUrl: hubOrigin(req) });
+  } catch (error) {
+    siteError(res, error);
+  }
+});
+
+app.patch("/api/admin/sites/:siteId", requireCapability(CAPABILITIES.MANAGE_SITES), (req, res) => {
+  try {
+    const site = siteStore.update(req.params.siteId, { name: req.body?.name, timeZone: req.body?.timeZone });
+    auditLog.logEvent({ operator: req.currentOperator.username, type: "site_updated", detail: { siteId: site.id, name: site.name, timeZone: site.timeZone } });
+    broadcastDeviceList();
+    res.json({ site: publicSite(site) });
+  } catch (error) {
+    siteError(res, error);
+  }
+});
+
+app.post("/api/admin/sites/:siteId/rotate-token", requireCapability(CAPABILITIES.MANAGE_SITES), (req, res) => {
+  try {
+    const { site, token } = siteStore.rotate(req.params.siteId);
+    siteLinkHub.disconnect(site.id); // the agent holding the old token is cut off at once
+    auditLog.logEvent({ operator: req.currentOperator.username, type: "site_token_rotated", detail: { siteId: site.id } });
+    res.json({ site: publicSite(site), token, hubUrl: hubOrigin(req) });
+  } catch (error) {
+    siteError(res, error);
+  }
+});
+
+app.delete("/api/admin/sites/:siteId", requireCapability(CAPABILITIES.MANAGE_SITES), (req, res) => {
+  const site = siteStore.get(req.params.siteId);
+  if (!site) return res.status(404).json({ error: "Unknown site.", code: "unknown_site" });
+  siteLinkHub.removeSite(site.id);
+  siteStore.remove(site.id);
+  auditLog.logEvent({ operator: req.currentOperator.username, type: "site_removed", detail: { siteId: site.id, name: site.name } });
+  res.json({ ok: true });
+});
+
 app.get("/api/admin/proxies", requireCapability(CAPABILITIES.VIEW_PROXY_POOL), (req, res) => {
   res.json({ proxies: proxyPoolCache });
 });
@@ -1949,6 +2104,155 @@ app.patch("/api/research/:account/runs/:runId/candidates/:candidateId", (req, re
   res.json({ candidate });
 });
 
+// ---- MS10: action policy, preset comments, approvals; MS11: session reports ----------------------
+const denyUnless = (req, res, capability, message) => {
+  if (hasCapability(req.currentOperator, capability)) return false;
+  res.status(403).json({ error: message });
+  return true;
+};
+
+app.get("/api/research/:account/policies", (req, res) => {
+  if (denyUnless(req, res, CAPABILITIES.VIEW_RESEARCH, "research access is not permitted for this role")) return;
+  res.json({ policies: policyStore.describe(req.params.account, researchActionPolicies) });
+});
+
+app.put("/api/research/:account/policies/:action", (req, res) => {
+  if (denyUnless(req, res, CAPABILITIES.MANAGE_ACTION_POLICY, "changing action policy requires an administrator")) return;
+  try {
+    const entry = policyStore.set(req.params.account, req.params.action, req.body?.policy, req.currentOperator.username);
+    auditLog.logEvent({ operator: req.currentOperator.username, type: "action_policy_changed",
+      detail: { workspaceId: req.researchWorkspaceId, account: req.params.account, action: req.params.action, policy: entry.value } });
+    res.json({ policy: { action: req.params.action, policy: entry.value, source: "runtime" } });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.get("/api/research/:account/templates", (req, res) => {
+  if (denyUnless(req, res, CAPABILITIES.VIEW_RESEARCH, "research access is not permitted for this role")) return;
+  res.json({ templates: templateLibrary.list(req.researchWorkspaceId) });
+});
+
+app.post("/api/research/:account/templates", (req, res) => {
+  if (denyUnless(req, res, CAPABILITIES.MANAGE_ACTION_POLICY, "managing preset comments requires an administrator")) return;
+  try {
+    const template = templateLibrary.add({ workspaceId: req.researchWorkspaceId, text: req.body?.text, tags: req.body?.tags, createdBy: req.currentOperator.username });
+    auditLog.logEvent({ operator: req.currentOperator.username, type: "comment_template_added",
+      detail: { workspaceId: req.researchWorkspaceId, templateId: template.id } });
+    res.status(201).json({ template });
+  } catch (error) {
+    res.status(400).json({ error: error.message });
+  }
+});
+
+app.delete("/api/research/:account/templates/:templateId", (req, res) => {
+  if (denyUnless(req, res, CAPABILITIES.MANAGE_ACTION_POLICY, "managing preset comments requires an administrator")) return;
+  if (!templateLibrary.remove(req.researchWorkspaceId, req.params.templateId)) return res.status(404).json({ error: "template not found" });
+  auditLog.logEvent({ operator: req.currentOperator.username, type: "comment_template_removed",
+    detail: { workspaceId: req.researchWorkspaceId, templateId: req.params.templateId } });
+  res.json({ ok: true });
+});
+
+const ownApproval = (req, id) => {
+  const approval = approvalStore.get(id);
+  return approval && approval.workspaceId === req.researchWorkspaceId && approval.accountId === req.params.account ? approval : null;
+};
+
+app.get("/api/research/:account/approvals", (req, res) => {
+  if (denyUnless(req, res, CAPABILITIES.VIEW_RESEARCH, "research access is not permitted for this role")) return;
+  const states = typeof req.query.state === "string" ? req.query.state.split(",").map(value => value.trim().toUpperCase()) : null;
+  res.json({ approvals: approvalStore.list({ workspaceId: req.researchWorkspaceId, states })
+    .filter(approval => approval.accountId === req.params.account) });
+});
+
+app.post("/api/research/:account/approvals/:id/:decision(approve|reject)", (req, res) => {
+  if (denyUnless(req, res, CAPABILITIES.APPROVE_ACTIONS, "approving AI actions requires a manager or administrator")) return;
+  if (!ownApproval(req, req.params.id)) return res.status(404).json({ error: "approval not found" });
+  try {
+    const approval = approvalStore.decide(req.params.id, { decision: req.params.decision, decidedBy: req.currentOperator.username, reason: req.body?.reason });
+    auditLog.logEvent({ operator: req.currentOperator.username, type: "approval_decided",
+      detail: { workspaceId: approval.workspaceId, account: approval.accountId, approvalId: approval.id, action: approval.action,
+        target: approval.target, decision: approval.state, taskId: approval.taskId } });
+    res.json({ approval, note: approval.state === "APPROVED"
+      ? "Approved. The action runs the next time the paused task is resumed and reaches this step." : "Rejected." });
+  } catch (error) {
+    if (error instanceof ApprovalError) return res.status(error.code === "unknown_approval" ? 404 : 409).json({ error: error.message, code: error.code });
+    throw error;
+  }
+});
+
+// MS13.4: search and near-duplicate lookup over this account's own recorded candidates.
+app.get("/api/research/:account/search", (req, res) => {
+  if (denyUnless(req, res, CAPABILITIES.VIEW_RESEARCH, "research access is not permitted for this role")) return;
+  const runs = listRuns(req.researchWorkspaceId, req.params.account);
+  if (runs === null) return res.status(404).json({ error: "unknown account" });
+  const index = ResearchIndex.fromRuns(runs);
+  const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 20));
+  if (typeof req.query.similarTo === "string" && req.query.similarTo) {
+    const anchor = [...index.docs.values()].map(doc => doc.candidate).find(candidate => candidate.id === req.query.similarTo);
+    if (!anchor) return res.status(404).json({ error: "candidate not found" });
+    return res.json({ similarTo: anchor.id, matches: index.findNearDuplicates(anchor).slice(0, limit) });
+  }
+  const query = typeof req.query.q === "string" ? req.query.q.slice(0, 200) : "";
+  if (!query.trim()) return res.status(400).json({ error: "a search query (q) or similarTo is required" });
+  res.json({ query, indexed: index.size, results: index.search(query, { limit }) });
+});
+
+app.get("/api/research/:account/runs/:runId/report", (req, res) => {
+  if (denyUnless(req, res, CAPABILITIES.VIEW_RESEARCH, "research access is not permitted for this role")) return;
+  const run = getRun(req.researchWorkspaceId, req.params.account, req.params.runId);
+  if (!run) return res.status(404).json({ error: "run not found" });
+  res.json({ report: run.session ?? null, outcome: run.outcome ?? null, finished: Boolean(run.completedAt) });
+});
+
+// ---- MS12: centralised AI-fleet monitoring and the human intervention queue ------------------------
+const visibleAccount = (req, accountId) => Boolean(accountId) && Boolean(researchWorkspaceFor(req.currentOperator, accountId));
+
+app.get("/api/fleet/ai", requireCapability(CAPABILITIES.MANAGE_QUEUE), (req, res) => {
+  const snapshot = fleetPolicy.snapshot();
+  const workers = snapshot.workers.filter(worker => visibleAccount(req, worker.accountId)).map(worker => {
+    const budget = researchTaskRunner.sessionBudget(worker.taskId);
+    return { ...worker, session: budget ? { steps: budget.state.steps, keptCandidates: budget.state.keptCandidates,
+      costUsd: budget.state.costUsd, minutes: Math.round(budget.minutesElapsed() * 10) / 10, failuresInARow: budget.state.consecutiveFailures } : null };
+  });
+  const open = interventionQueue.list({ states: ["OPEN", "CLAIMED"] }).filter(item => visibleAccount(req, item.accountId));
+  res.json({ workers, activeWorkers: workers.length, limits: snapshot.limits, spentLastHourUsd: snapshot.spentLastHourUsd,
+    interventions: { open: open.filter(item => item.state === "OPEN").length, claimed: open.filter(item => item.state === "CLAIMED").length } });
+});
+
+// MS13.4: why people were needed, how fast they were picked up, and what optimization saved.
+app.get("/api/fleet/analytics", requireCapability(CAPABILITIES.MANAGE_QUEUE), (req, res) => {
+  const items = interventionQueue.list().filter(item => visibleAccount(req, item.accountId));
+  const steps = researchTaskRunner.sessionSummaries()
+    .filter(summary => visibleAccount(req, taskQueue.getTask(summary.taskId)?.accountSelector?.accountId))
+    .reduce((total, summary) => total + summary.steps, 0);
+  res.json({ interventions: analyzeInterventions(items, { steps: steps || null }), optimizations: optimizationRuntime.describe() });
+});
+
+app.get("/api/fleet/interventions", requireCapability(CAPABILITIES.MANAGE_QUEUE), (req, res) => {
+  const states = typeof req.query.state === "string" ? req.query.state.split(",").map(value => value.trim().toUpperCase()) : ["OPEN", "CLAIMED"];
+  res.json({ interventions: interventionQueue.list({ states }).filter(item => visibleAccount(req, item.accountId)) });
+});
+
+function interventionAction(action) {
+  return (req, res) => {
+    const item = interventionQueue.list().find(entry => entry.id === req.params.id);
+    if (!item || !visibleAccount(req, item.accountId)) return res.status(404).json({ error: "intervention not found" });
+    try {
+      const updated = action === "claim"
+        ? interventionQueue.claim(item.id, req.currentOperator.username)
+        : interventionQueue.resolve(item.id, { by: req.currentOperator.username, resolution: req.body?.resolution });
+      auditLog.logEvent({ operator: req.currentOperator.username, type: `intervention_${action}`, deviceId: item.deviceId,
+        detail: { interventionId: item.id, taskId: item.taskId, accountId: item.accountId, kind: item.kind } });
+      res.json({ intervention: updated });
+    } catch (error) {
+      res.status(409).json({ error: error.message });
+    }
+  };
+}
+app.post("/api/fleet/interventions/:id/claim", requireCapability(CAPABILITIES.MANAGE_QUEUE), interventionAction("claim"));
+app.post("/api/fleet/interventions/:id/resolve", requireCapability(CAPABILITIES.MANAGE_QUEUE), interventionAction("resolve"));
+
 // AI command console (docs/COMMAND_QUEUE_SPEC.md) — the HTTP counterpart to
 // the WS device-control protocol above. Stateless per request, unlike the WS
 // protocol: every command that targets a device names it explicitly, since
@@ -2080,7 +2384,7 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null, client
     }
 
     case "queue_add": {
-      const inner = parseCommand(parsed.commandText);
+      const inner = parseCommand(parsed.commandText, new Date(), { timeZone: schedulingTimeZone });
       if (inner.error) return { error: inner.error };
       if (inner.type !== "time" && inner.type !== "cresearch") {
         return { error: "/queue add requires a /time or /cresearch command" };
@@ -2290,7 +2594,7 @@ app.post("/api/queue/command", requireCapability(CAPABILITIES.MANAGE_QUEUE), asy
         return res.status(403).json({ error: decision.watchReason });
       }
     }
-    const parsed = parseCommand(text);
+    const parsed = parseCommand(text, new Date(), { timeZone: schedulingTimeZone });
     const result = await executeCommand(parsed, req.currentOperator, workspaceDeviceId, clientRequestId);
     res.status(result.status ?? (result.error ? 400 : 200)).json(result);
   } catch (error) { next(error); }
@@ -2306,6 +2610,14 @@ app.get("/api/queue", requireCapability(CAPABILITIES.MANAGE_QUEUE), (req, res) =
 // page instead of the JSON the client expects.
 app.use((err, req, res, next) => {
   if (!err) return next();
+  // The client sent something the JSON body parser cannot use. That is the caller's mistake (400/413), not a
+  // server failure: without these branches every such request was reported as a 500 "request failed".
+  if (err.type === "entity.parse.failed") return res.status(400).json({ error: "the request body is not valid JSON", code: "INVALID_JSON" });
+  if (err.type === "entity.too.large") return res.status(413).json({ error: "the request body is too large", code: "PAYLOAD_TOO_LARGE" });
+  if (["encoding.unsupported", "charset.unsupported", "request.aborted", "request.size.invalid"].includes(err.type)) {
+    return res.status(Number.isInteger(err.status) && err.status >= 400 && err.status < 500 ? err.status : 400)
+      .json({ error: "the request could not be read", code: "BAD_REQUEST" });
+  }
   if (err.code === "LIMIT_FILE_SIZE") return res.status(413).json({ error: "file too large" });
   if (err.code?.startsWith("MEDIA_")) {
     return res.status(err.statusCode ?? 400).json({ error: err.message, code: err.code, ...err.detail });
@@ -2445,7 +2757,58 @@ wss.on("connection", (ws, request) => {
   let watched = null;
   let liveFramePending = false;
   let selectionGeneration = 0;
+
+  // ---- live video subscription (at most one per connection) -------------------
+  let streamSubscription = null;
+  let streamTarget = null;
+  let streamSeq = 0; // stamped into every binary frame so a stale stream's frames can be ignored
+  let streamSessionTimer = null;
+  let streamPendingFrame = null; // newest frame skipped for backpressure
+  let streamFlushTimer = null;
+  const stopStream = ({ notify = false, reason = "stopped" } = {}) => {
+    if (!streamSubscription && !streamTarget) return false;
+    const stoppedId = streamTarget?.id;
+    streamSubscription?.unsubscribe();
+    streamSubscription = null;
+    streamTarget = null;
+    clearInterval(streamSessionTimer);
+    clearTimeout(streamFlushTimer);
+    streamSessionTimer = null;
+    streamFlushTimer = null;
+    streamPendingFrame = null;
+    if (notify && ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: "stream_stopped", deviceId: stoppedId, reason }));
+    }
+    return true;
+  };
+  const sendStreamPacket = (streamId, frame) => {
+    const kind = frameKind(frame);
+    if (kind === 0 || ws.readyState !== ws.OPEN) return;
+    if (ws.bufferedAmount > STREAM_BACKPRESSURE_BYTES) {
+      // Keep only the newest skipped frame and retry shortly, so a screen that
+      // then goes still still ends on its final picture.
+      streamPendingFrame = frame;
+      if (!streamFlushTimer) {
+        streamFlushTimer = setTimeout(() => {
+          streamFlushTimer = null;
+          const pending = streamPendingFrame;
+          streamPendingFrame = null;
+          if (pending && streamSubscription && streamSeq === streamId) sendStreamPacket(streamId, pending);
+        }, STREAM_FLUSH_RETRY_MS);
+        streamFlushTimer.unref?.();
+      }
+      return;
+    }
+    streamPendingFrame = null;
+    const packet = Buffer.allocUnsafe(frame.length + 5);
+    packet[0] = kind;
+    packet.writeUInt32BE(streamId, 1);
+    frame.copy(packet, 5);
+    ws.send(packet, { binary: true });
+  };
+
   const releaseSelection = () => {
+    if (streamTarget && streamTarget === selected) stopStream();
     const hadSelection = Boolean(selected);
     if (selected && humanOwners.get(selected.id) === ws) {
       humanOwners.delete(selected.id);
@@ -2487,6 +2850,7 @@ wss.on("connection", (ws, request) => {
   const clearWatch = (action = "stopped", { notify = false } = {}) => {
     if (!watched) return false;
     const watchedId = watched.id;
+    if (streamTarget && streamTarget === watched) stopStream();
     watched = null;
     ws.watchedDeviceId = null;
     auditLog.logEvent({ operator: operator.username, type: "device_watch_stopped", deviceId: watchedId,
@@ -2628,7 +2992,7 @@ wss.on("connection", (ws, request) => {
       return;
     }
     const target = selected;
-    if (!(target instanceof WdaDevice)) {
+    if (!(target instanceof WdaDevice) && !(target.isRemote === true && target.type === "wda")) {
       ws.send(JSON.stringify({ type: "live_frame_error", code: "live_view_unsupported",
         deviceId: target.id, requestId, message: "Live view is available only for WDA devices." }));
       return;
@@ -2680,6 +3044,67 @@ wss.on("connection", (ws, request) => {
     }
   };
 
+  // Per-frame gate for live video. Cheap and synchronous on purpose (it runs at
+  // the stream frame rate); the slower session-store check runs on a timer.
+  const deliverStreamFrame = (target, streamId, frame) => {
+    if (streamSeq !== streamId || ws.readyState !== ws.OPEN) return;
+    if (selected === target) {
+      if (!selectedAccessActive(target)) {
+        revokeSelectedAccess("stream_frame", target, selectionGeneration);
+        return;
+      }
+    } else if (watched === target) {
+      if (!watchAccessActive(target)) {
+        clearWatch("stream_frame", { notify: true });
+        return;
+      }
+    } else {
+      stopStream();
+      return;
+    }
+    sendStreamPacket(streamId, frame);
+  };
+
+  // With live video running the phone's new state is already on its way to the
+  // operator, so an input is just acknowledged; without it (older client, device
+  // that cannot stream) the classic follow-up screenshot is sent.
+  const afterAction = async (label, msg) => {
+    const requestId = Number.isSafeInteger(msg.requestId) ? msg.requestId : null;
+    if (streamSubscription && streamTarget && streamTarget === selected) {
+      ws.send(JSON.stringify({ type: "action_ack", deviceId: selected.id, requestId, action: label }));
+      return;
+    }
+    await sendFrame({ appliedAction: label, requestId });
+  };
+
+  // One authorised device input (used by the gesture messages). Same contract as
+  // the tap/swipe handlers: authorise before and after the device call, audit,
+  // record health, then acknowledge or refresh the picture.
+  const performInput = async (msg, { label, auditType, detail = {}, run }) => {
+    const target = selected;
+    const generation = selectionGeneration;
+    const authorize = () => selectionAccessActive(target, generation);
+    try {
+      await run(target, authorize);
+      if (!await ws.validateSession()) return;
+      if (!authorize()) {
+        revokeSelectedAccess(`${msg.type}_result`, target, generation);
+        return;
+      }
+      auditLog.logEvent({
+        operator: operator.username,
+        type: auditType,
+        deviceId: target.id,
+        detail: withNetworkEgress(target.id, detail),
+      });
+      recordSuccess(target.id);
+      await afterAction(label, msg);
+    } catch (err) {
+      if (err?.code === "DEVICE_ACCESS_REVOKED") revokeSelectedAccess(msg.type, target, generation);
+      else reportTransportError(err, target, generation);
+    }
+  };
+
   // Shared by select_device's success path and takeover's post-handoff
   // claim — releasing whatever this connection had before, then claiming
   // `target` for it, sending a frame, and telling everyone else.
@@ -2722,10 +3147,12 @@ wss.on("connection", (ws, request) => {
   // connection — every handler below already catches its own errors, but
   // this is the backstop for anything that doesn't.
   let actionQueue = Promise.resolve();
+  let queuedMessages = 0;
   const enqueue = (fn) => {
+    queuedMessages += 1;
     actionQueue = actionQueue.then(fn).catch((err) => {
       console.error("Unexpected error in connection message queue:", err);
-    });
+    }).finally(() => { queuedMessages -= 1; });
   };
 
   const handleMessage = async (raw) => {
@@ -2955,7 +3382,56 @@ wss.on("connection", (ws, request) => {
       return;
     }
 
-    if (["tap", "swipe", "home", "type_text", "release_device"].includes(msg.type) && watched && !selected) {
+    // Live video for whichever phone this connection controls or watches.
+    if (msg.type === "start_stream") {
+      const target = selected && msg.deviceId === selected.id ? selected
+        : watched && msg.deviceId === watched.id ? watched : null;
+      if (!target) {
+        ws.send(JSON.stringify({ type: "error", code: "stream_denied", deviceId: msg.deviceId,
+          message: "Select or watch this phone before starting its live view." }));
+        return;
+      }
+      if (target === selected ? !selectedAccessActive(target) : !watchAccessActive(target)) {
+        if (target === selected) revokeSelectedAccess("start_stream");
+        else clearWatch("start_stream", { notify: true });
+        return;
+      }
+      if (!streamHub.supports(target)) {
+        ws.send(JSON.stringify({ type: "stream_unsupported", deviceId: target.id }));
+        return;
+      }
+      stopStream();
+      streamSeq += 1;
+      const streamId = streamSeq;
+      ws.send(JSON.stringify({ type: "stream_started", deviceId: target.id, streamId,
+        mode: target === selected ? "control" : "watch" }));
+      streamTarget = target;
+      const subscription = streamHub.subscribe(target, {
+        onFrame: frame => deliverStreamFrame(target, streamId, frame),
+        onState: (state, detail) => {
+          if (streamSeq !== streamId || ws.readyState !== ws.OPEN) return;
+          ws.send(JSON.stringify({ type: "stream_state", deviceId: target.id, streamId, state, detail: detail ?? null }));
+        },
+      });
+      if (!subscription || streamSeq !== streamId || (selected !== target && watched !== target)) {
+        subscription?.unsubscribe();
+        if (streamTarget === target && streamSeq === streamId) streamTarget = null;
+        return;
+      }
+      streamSubscription = subscription;
+      streamSessionTimer = setInterval(() => {
+        void ws.validateSession().then(valid => { if (!valid) stopStream(); }).catch(() => {});
+      }, STREAM_SESSION_RECHECK_MS);
+      streamSessionTimer.unref?.();
+      return;
+    }
+
+    if (msg.type === "stop_stream") {
+      stopStream();
+      return;
+    }
+
+    if (["tap", "swipe", "home", "type_text", "release_device", "drag", "long_press", "double_tap"].includes(msg.type) && watched && !selected) {
       auditLog.logEvent({ operator: operator.username, type: "device_watch_input_denied", deviceId: msg.deviceId ?? watched.id,
         detail: { action: msg.type } });
       ws.send(JSON.stringify({ type: "error", code: "watch_read_only", deviceId: msg.deviceId ?? watched.id,
@@ -2963,7 +3439,7 @@ wss.on("connection", (ws, request) => {
       return;
     }
 
-    if (["tap", "swipe", "home", "type_text", "refresh_screen"].includes(msg.type) && selected) {
+    if (["tap", "swipe", "home", "type_text", "refresh_screen", "drag", "long_press", "double_tap"].includes(msg.type) && selected) {
       if (msg.deviceId !== undefined && msg.deviceId !== selected.id) {
         ws.send(JSON.stringify({ type: "error", deviceId: msg.deviceId, message: "Stale device input rejected." }));
         return;
@@ -3004,7 +3480,7 @@ wss.on("connection", (ws, request) => {
           detail: withNetworkEgress(target.id, { x: msg.x, y: msg.y }),
         });
         recordSuccess(target.id);
-        await sendFrame({ appliedAction: "Tap", requestId: Number.isSafeInteger(msg.requestId) ? msg.requestId : null });
+        await afterAction("Tap", msg);
       } catch (err) {
         if (err?.code === "DEVICE_ACCESS_REVOKED") revokeSelectedAccess("tap", target, generation);
         else reportTransportError(err, target, generation);
@@ -3033,7 +3509,7 @@ wss.on("connection", (ws, request) => {
           detail: withNetworkEgress(target.id, { direction: msg.direction }),
         });
         recordSuccess(target.id);
-        await sendFrame({ appliedAction: "Swipe", requestId: Number.isSafeInteger(msg.requestId) ? msg.requestId : null });
+        await afterAction("Swipe", msg);
       } catch (err) {
         if (err?.code === "DEVICE_ACCESS_REVOKED") revokeSelectedAccess("swipe", target, generation);
         else reportTransportError(err, target, generation);
@@ -3059,7 +3535,7 @@ wss.on("connection", (ws, request) => {
           detail: withNetworkEgress(target.id),
         });
         recordSuccess(target.id);
-        await sendFrame({ appliedAction: "Home", requestId: Number.isSafeInteger(msg.requestId) ? msg.requestId : null });
+        await afterAction("Home", msg);
       } catch (err) {
         if (err?.code === "DEVICE_ACCESS_REVOKED") revokeSelectedAccess("home", target, generation);
         else reportTransportError(err, target, generation);
@@ -3091,11 +3567,52 @@ wss.on("connection", (ws, request) => {
           detail: withNetworkEgress(target.id, { length: msg.text.length }),
         });
         recordSuccess(target.id);
-        await sendFrame({ appliedAction: "Text input", requestId: Number.isSafeInteger(msg.requestId) ? msg.requestId : null });
+        await afterAction("Text input", msg);
       } catch (err) {
         if (err?.code === "DEVICE_ACCESS_REVOKED") revokeSelectedAccess("type_text", target, generation);
         else reportTransportError(err, target, generation);
       }
+      return;
+    }
+
+    // Mouse/touch gestures from the phone-shaped control surface. Coordinates are
+    // 0..1 of the phone screen and are validated here, at the trust boundary,
+    // because a real WDA device turns them into real touches.
+    if (["drag", "long_press", "double_tap"].includes(msg.type) && selected) {
+      const isUnit = value => typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+      const boundedMs = (value, fallback, min, max) => typeof value === "number" && Number.isFinite(value)
+        ? Math.min(max, Math.max(min, value)) : fallback;
+
+      if (msg.type === "drag") {
+        if (![msg.x1, msg.y1, msg.x2, msg.y2].every(isUnit)) return;
+        if (msg.x1 === msg.x2 && msg.y1 === msg.y2) return;
+        const holdSec = boundedMs(msg.holdMs, 50, 0, 3000) / 1000;
+        await performInput(msg, {
+          label: "Scroll",
+          auditType: "action_drag",
+          detail: { x1: msg.x1, y1: msg.y1, x2: msg.x2, y2: msg.y2, holdMs: Math.round(holdSec * 1000) },
+          run: (target, authorize) => target.drag(msg.x1, msg.y1, msg.x2, msg.y2, holdSec, { authorize }),
+        });
+        return;
+      }
+
+      if (!isUnit(msg.x) || !isUnit(msg.y)) return;
+      if (msg.type === "long_press") {
+        const durationSec = boundedMs(msg.durationMs, 800, 300, 5000) / 1000;
+        await performInput(msg, {
+          label: "Long press",
+          auditType: "action_long_press",
+          detail: { x: msg.x, y: msg.y, durationMs: Math.round(durationSec * 1000) },
+          run: (target, authorize) => target.longPress(msg.x, msg.y, durationSec, { authorize }),
+        });
+        return;
+      }
+      await performInput(msg, {
+        label: "Double tap",
+        auditType: "action_double_tap",
+        detail: { x: msg.x, y: msg.y },
+        run: (target, authorize) => target.doubleTap(msg.x, msg.y, { authorize }),
+      });
       return;
     }
 
@@ -3145,10 +3662,14 @@ wss.on("connection", (ws, request) => {
     if (emergency) void handleMessage(raw).catch(error => {
       console.error("Emergency control failed:", error);
     });
-    else enqueue(() => handleMessage(raw));
+    else if (queuedMessages >= MAX_QUEUED_INPUT_MESSAGES) {
+      ws.send(JSON.stringify({ type: "error", code: "input_backlog",
+        message: "The phone is still catching up. Slow down and try again." }));
+    } else enqueue(() => handleMessage(raw));
   });
 
   ws.on("close", () => {
+    stopStream();
     presenceStore.disconnect(ws.presenceConnectionId);
     clearWatch("connection_closed");
     broadcastPresence();
@@ -3183,6 +3704,7 @@ if (isMain) {
     // when PORT=0 asks the OS for an ephemeral port.
     const displayHost = deployment.host.includes(":") ? `[${deployment.host}]` : deployment.host;
     console.log(`Phone Farm control server running at http://${displayHost}:${server.address().port}`);
+    console.log(`Scheduling timezone for /time: ${schedulingTimeZone} (set PHONE_FARM_TIMEZONE to change)`);
   });
   // Only when actually running as the server, not on import — tests drive
   // taskQueue.tick() explicitly with controlled timestamps, and a real
@@ -3197,36 +3719,14 @@ if (isMain) {
     void refreshWdaReadiness().catch(error => console.error("WDA readiness refresh failed:", error));
   }, WDA_READINESS_INTERVAL_MS);
 
-  // Opt-in: off by default until Phase A has been bench-tested on real
-  // hardware. Manually pinned devices.config.json WDA entries (the existing
-  // MS5 hardware-validation path) are left untouched — only UDIDs with no
-  // explicit config entry are auto-provisioned.
-  if (process.env.AUTO_PROVISION_WDA === "true") {
-    const preflight = runHostPreflight();
-    if (!preflight.ok) {
-      console.error("Automatic WDA provisioning is disabled — host preflight failed:");
-      for (const check of preflight.checks) if (!check.ok) console.error(`  [${check.id}] ${check.message}`);
-    } else {
-      deviceProvisioner = new DeviceProvisioner({
-        devices,
-        discoverIosDevices,
-        manualUdids: manualWdaUdids,
-        wdaProcessManager: new WdaProcessManager({
-          wdaRepoPath: process.env.WDA_REPO_PATH,
-          xcodebuildBin: process.env.XCODEBUILD_BIN,
-        }),
-        iproxyManager: new IProxyManager(),
-        provisioningStorePath: process.env.DEVICE_PROVISIONING_STORE_PATH
-          || path.join(__dirname, "../../storage/device-provisioning.json"),
-        derivedDataRoot: process.env.WDA_DERIVED_DATA_ROOT
-          || path.join(__dirname, "../../storage/wda-derived-data"),
-        portRange: resolvePortRange(process.env),
-        pollIntervalMs: Number(process.env.PROVISION_POLL_INTERVAL_MS) || undefined,
-        onDeviceListChanged: broadcastDeviceList,
-      });
-      deviceProvisioner.start();
-    }
-  }
+  // Opt-in (AUTO_PROVISION_WDA=true): find USB iPhones and set up WebDriverAgent on
+  // each. Manually pinned devices.config.json WDA entries are left untouched. Shared
+  // with the site agent; see provisioningBoot.js.
+  deviceProvisioner = startAutoProvisioning({
+    devices,
+    manualUdids: manualWdaUdids,
+    onDeviceListChanged: broadcastDeviceList,
+  });
 
   // Opt-in, independent of AUTO_PROVISION_WDA above (a device can be
   // manually configured in devices.config.json and still get automatic
@@ -3293,9 +3793,21 @@ if (isMain) {
   }
 }
 
+server.on("close", () => { streamHub.closeAll(); siteLinkHub.closeAll(); });
+
 export {
   app,
   server,
+  streamHub,
+  siteStore,
+  siteLinkHub,
+  approvalStore,
+  commentLedger,
+  templateLibrary,
+  policyStore,
+  interventionQueue,
+  fleetPolicy,
+  deviceMonitorConfig,
   wss,
   devices,
   deviceHealth,
@@ -3308,6 +3820,7 @@ export {
   networkVerifier,
   deviceHost,
   researchTaskRunner,
+  optimizationRuntime,
   modelSelection,
   presenceStore,
   assignmentStore,

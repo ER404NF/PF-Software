@@ -72,6 +72,15 @@ function instantForLocal(target, timeZone) {
   return best.candidate;
 }
 
+// Shared with commandParser.js so /time resolves wall-clock times with the
+// exact DST rules recurring assignments already use, instead of a second
+// timezone implementation:
+//   zonedLocalParts(ms, zone)         -> the calendar/clock fields `zone` shows at that instant
+//   zonedInstantForLocal(parts, zone) -> the instant a wall-clock reading occurs in `zone`;
+//     a repeated fall-back time resolves to its EARLIER occurrence and a skipped
+//     spring-forward time is shifted forward by the length of the gap.
+export { partsAt as zonedLocalParts, instantForLocal as zonedInstantForLocal };
+
 export function advanceRecurringWindow({ startAt, endAt, recurrence, timeZone, after }) {
   if (!validTimeZone(timeZone)) throw new Error("recurring assignment requires a valid IANA timezone");
   if (!new Set(["daily", "weekly"]).has(recurrence)) throw new Error("recurrence must be daily or weekly");

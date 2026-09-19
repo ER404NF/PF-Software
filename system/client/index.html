@@ -2,8 +2,15 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Phone Farm — VA Control (dev)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="theme-color" content="#17191d" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="Phone Farm" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" href="icons/icon.svg" type="image/svg+xml" />
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+  <title>Phone Farm</title>
   <script>
     (() => {
       try {
@@ -88,6 +95,7 @@
         <span id="role-badge"></span>
         <span id="whoami"></span>
         <button type="button" id="research-toggle" aria-controls="research-panel" aria-expanded="false">Research</button>
+        <button type="button" id="review-toggle" aria-controls="review-panel" aria-expanded="false" hidden>Review</button>
         <button type="button" id="logout-button">Sign out</button>
       </div>
     </header>
@@ -148,6 +156,7 @@
       <div id="detail-body">
         <main id="screen-panel">
           <div id="device-control-bar" hidden>
+            <span id="stream-status" role="status" aria-live="polite" data-state="off">Connecting…</span>
             <div id="live-view-controls" hidden>
               <label for="live-view-toggle">
                 <input type="checkbox" id="live-view-toggle" />
@@ -155,21 +164,18 @@
               </label>
               <span id="live-view-status" role="status" aria-live="polite" hidden></span>
             </div>
-            <div id="swipe-controls" hidden aria-label="Swipe controls">
-              <button type="button" data-direction="left" aria-label="Swipe left">&larr;</button>
-              <button type="button" data-direction="up" aria-label="Swipe up">&uarr;</button>
-              <button type="button" data-direction="down" aria-label="Swipe down">&darr;</button>
-              <button type="button" data-direction="right" aria-label="Swipe right">&rarr;</button>
-            </div>
-            <button type="button" id="home-button" hidden>&#9673; Home</button>
-            <button type="button" id="refresh-screen-button" hidden>Refresh screen</button>
-            <form id="type-form" hidden>
-              <input type="text" id="type-input" placeholder="Type on device…" maxlength="1000" />
-              <button type="submit" disabled>Send</button>
-            </form>
+            <button type="button" id="keyboard-button" hidden aria-label="Show keyboard">Keyboard</button>
+            <button type="button" id="stream-retry-button" hidden>Reconnect video</button>
           </div>
-          <div id="screen-wrap">
-            <div id="screen"></div>
+          <div id="phone-frame">
+            <div id="phone-speaker" aria-hidden="true"></div>
+            <div id="screen-wrap" role="application" aria-label="Phone screen. Click to tap, drag to swipe, scroll with the mouse wheel, and type on your keyboard.">
+              <div id="screen"></div>
+              <div id="touch-dot" hidden aria-hidden="true"></div>
+              <textarea id="keyboard-capture" rows="1" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" aria-label="Keyboard input for the phone"></textarea>
+              <div id="stage-overlay" aria-live="polite"></div>
+            </div>
+            <button type="button" id="phone-home-button" aria-label="Home" title="Home" disabled><span></span></button>
           </div>
           <p id="hint">Select a device to begin.</p>
           <div id="watch-controls" hidden>
@@ -331,6 +337,33 @@
         <p id="users-empty" class="admin-empty" hidden>No users configured.</p>
       </section>
 
+      <section class="admin-panel" id="sites-panel" hidden>
+        <div class="admin-panel-heading">
+          <div>
+            <h3>Sites</h3>
+            <span>Other locations link their phones to this hub. Add a site, then run the Phone Farm site app there with the values shown once.</span>
+          </div>
+          <button type="button" id="sites-refresh-button">Refresh</button>
+        </div>
+        <form id="site-create-form" class="user-form">
+          <label>Site name<input id="site-name" maxlength="60" autocomplete="off" placeholder="Bucharest office" required /></label>
+          <label>Time zone<input id="site-timezone" maxlength="60" autocomplete="off" placeholder="America/Los_Angeles" list="site-timezones" /></label>
+          <datalist id="site-timezones"></datalist>
+          <button type="submit">Add site</button>
+        </form>
+        <div id="site-token-reveal" role="status" hidden>
+          <strong>Copy these now. The token is shown only once.</strong>
+          <pre id="site-token-command"></pre>
+          <div>
+            <button type="button" id="site-token-copy-button">Copy</button>
+            <button type="button" id="site-token-dismiss-button">I have saved it</button>
+          </div>
+        </div>
+        <p id="sites-message" role="status" aria-live="polite"></p>
+        <div id="sites-list" class="users-list"></div>
+        <p id="sites-empty" class="admin-empty" hidden>No sites yet. Phones plugged into this machine appear under this-mac.</p>
+      </section>
+
       <section class="admin-panel" id="proxy-pool-panel" hidden>
         <div class="admin-panel-heading">
           <div>
@@ -395,9 +428,26 @@
       <p id="research-message" role="status" aria-live="polite"></p>
       <div id="research-results"></div>
     </aside>
+    <aside id="review-panel" hidden aria-label="Approvals, hand-backs and action policy">
+      <div class="research-heading"><h2>Review</h2><button type="button" id="review-close">Close</button></div>
+      <div id="review-tabs" role="tablist" aria-label="Review sections">
+        <button type="button" role="tab" data-review-tab="approvals" aria-selected="true">Approvals</button>
+        <button type="button" role="tab" data-review-tab="queue" aria-selected="false">Needs a person</button>
+        <button type="button" role="tab" data-review-tab="policy" aria-selected="false">What the AI may do</button>
+      </div>
+      <div id="review-account-row">
+        <label for="review-account">Account</label>
+        <select id="review-account"></select>
+      </div>
+      <button type="button" id="review-refresh">Refresh</button>
+      <p id="review-message" role="status" aria-live="polite"></p>
+      <div id="review-body"></div>
+    </aside>
   </div>
   <script src="liveViewController.js"></script>
+  <script src="phoneStage.js"></script>
   <script src="research.js"></script>
+  <script src="review.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

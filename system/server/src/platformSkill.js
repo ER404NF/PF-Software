@@ -71,7 +71,8 @@ export async function executeSkillAction({ skill, decision, observation, policyR
     if (typeof canExecute !== "function" || !canExecute()) {
       return { outcome: "BLOCKED", state, reason: "AI input lease is no longer active" };
     }
-    const execution = await skill.execute(decision, { ...context, state, observation, canExecute });
+    // `reobserve` lets a multi-step action (a toggle, a comment) take a fresh look between its own presses.
+    const execution = await skill.execute(decision, { ...context, state, observation, canExecute, reobserve: observeAfter });
     if (!canExecute()) return { outcome: "BLOCKED", reason: "AI input authorization was revoked during execution", execution };
     if (typeof observeAfter !== "function") throw new Error("observeAfter callback is required for verification");
     const observationAfter = await observeAfter();

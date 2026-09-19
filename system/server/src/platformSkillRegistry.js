@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 import { assertPlatformSkill } from "./platformSkill.js";
+import { withPlatformActions } from "./platformSkills/toggleActions.js";
 import { createInstagramSkill } from "./platformSkills/instagramSkill.js";
 import { createRedditSkill } from "./platformSkills/redditSkill.js";
 import { createXSkill } from "./platformSkills/xSkill.js";
@@ -20,7 +21,7 @@ export function buildPlatformSkills(config) {
     const builder = BUILDERS[entry?.platform];
     if (!builder) throw new Error(`unsupported platform skill: ${entry?.platform}`);
     if (skills.has(entry.platform)) throw new Error(`duplicate platform skill: ${entry.platform}`);
-    skills.set(entry.platform, assertPlatformSkill(builder({ appVersion: entry.appVersion })));
+    skills.set(entry.platform, assertPlatformSkill(withPlatformActions(builder({ appVersion: entry.appVersion }))));
   }
   return skills;
 }

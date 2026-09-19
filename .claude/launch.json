@@ -4,7 +4,19 @@
     {
       "name": "phone-farm-control",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["start"],
+      "runtimeArgs": [
+        "start"
+      ],
+      "port": 4173,
+      "cwd": "system"
+    },
+    {
+      "name": "phone-farm-demo",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "demo"
+      ],
       "port": 4173,
       "cwd": "system"
     }

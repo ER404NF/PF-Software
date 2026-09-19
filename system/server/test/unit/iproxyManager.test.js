@@ -38,3 +38,17 @@ test("start() rejects an out-of-range local port", () => {
   assert.throws(() => manager.start({ udid: "udid-1", localPort: 0 }), /valid localPort/);
   assert.throws(() => manager.start({ udid: "udid-1", localPort: 70000 }), /valid localPort/);
 });
+
+test("start() forwards the MJPEG video port too when one is given, in the same iproxy process", () => {
+  const calls = [];
+  const spawn = (bin, args) => { calls.push(args); return fakeChild(); };
+  const manager = new IProxyManager({ spawn, bin: "iproxy" });
+  manager.start({ udid: "udid-1", localPort: 8101, mjpegLocalPort: 9101 });
+  assert.deepEqual(calls[0], ["-u", "udid-1", "8101:8100", "9101:9100"]);
+});
+
+test("start() rejects an MJPEG port that is invalid or equal to the control port", () => {
+  const manager = new IProxyManager({ spawn: () => fakeChild() });
+  assert.throws(() => manager.start({ udid: "udid-1", localPort: 8101, mjpegLocalPort: 8101 }), /mjpegLocalPort/);
+  assert.throws(() => manager.start({ udid: "udid-1", localPort: 8101, mjpegLocalPort: 70000 }), /mjpegLocalPort/);
+});

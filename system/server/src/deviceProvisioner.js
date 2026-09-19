@@ -1,7 +1,7 @@
 import path from "path";
 import { WdaDevice } from "./wdaDevice.js";
 import { discoveredDeviceId } from "./deviceDiscovery.js";
-import { allocatePort, resolvePortRange } from "./portAllocator.js";
+import { allocatePort, resolveMjpegPortRange, resolvePortRange } from "./portAllocator.js";
 import { upsertProvisioningRecord, loadProvisioningRecords } from "./deviceProvisioningStore.js";
 
 const DEFAULT_POLL_INTERVAL_MS = 5000;
@@ -16,7 +16,7 @@ const KNOWN_FAILURES = [
   { pattern: /developer mode/i, message: "Enable Developer Mode on the phone (Settings > Privacy & Security), then click Retry." },
   { pattern: /untrusted developer|verify.{0,20}app|trust.{0,20}certificate/i, message: "Trust the developer certificate on the phone (Settings > General > VPN & Device Management), then click Retry." },
   { pattern: /maximum app id limit/i, message: "Apple's App ID creation limit was hit for this signing account. Reuse an existing bundle id instead of generating a new one." },
-  { pattern: /requires a provisioning profile|no profiles for|provisioning profile .* (?:doesn't include|not found)|signing for .* requires a development team|code signing is required/i, message: "WDA signing needs to be configured once in Xcode. Open WebDriverAgent.xcodeproj, select a development team for WebDriverAgentRunner, run it once, then click Retry." },
+  { pattern: /requires a provisioning profile|no profiles for|provisioning profile .* (?:doesn't include|not found)|signing for .* requires a development team|code signing is required/i, message: "WDA signing needs to be configured once in Xcode. With Phone Farm's bundled WebDriverAgent, enter your Apple Developer Team ID in host setup (and stay signed in to Xcode); with your own WebDriverAgent checkout, open WebDriverAgent.xcodeproj, select a development team for WebDriverAgentRunner, run it once. Then click Retry." },
 ];
 
 export function classifyWdaFailure(logText) {
@@ -50,6 +50,7 @@ export class DeviceProvisioner {
     provisioningStorePath,
     derivedDataRoot,
     portRange = resolvePortRange(),
+    mjpegPortRange = resolveMjpegPortRange(),
     pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
     onDeviceListChanged = () => {},
   }) {
@@ -61,9 +62,10 @@ export class DeviceProvisioner {
     this.provisioningStorePath = provisioningStorePath;
     this.derivedDataRoot = derivedDataRoot;
     this.portRange = portRange;
+    this.mjpegPortRange = mjpegPortRange;
     this.pollIntervalMs = pollIntervalMs;
     this.onDeviceListChanged = onDeviceListChanged;
-    this.runtime = new Map(); // udid -> { logicalId, wdaDevice, port, derivedDataPath }
+    this.runtime = new Map(); // udid -> { logicalId, wdaDevice, port, mjpegPort, derivedDataPath }
     this.udidByLogicalId = new Map(); // logicalId -> udid, so routes/clients only ever handle the logical id (never the raw UDID — CLAUDE.md §14.8)
     this.timer = null;
 
@@ -114,28 +116,33 @@ export class DeviceProvisioner {
     const usedPorts = new Set([...this.runtime.values()].map(entry => entry.port).filter(Boolean));
     const existingRecord = this._loadRecord(udid);
     let port;
+    let mjpegPort;
     try {
       port = allocatePort({ range: this.portRange, used: usedPorts, preferred: existingRecord?.wdaLocalPort ?? null });
+      const usedMjpegPorts = new Set([...this.runtime.values()].map(entry => entry.mjpegPort).filter(Boolean));
+      mjpegPort = allocatePort({ range: this.mjpegPortRange, used: usedMjpegPorts, preferred: existingRecord?.mjpegLocalPort ?? null });
     } catch (error) {
       console.error(`no free WDA port for ${logicalId}:`, error.message);
       return;
     }
-    this._saveRecord(udid, { logicalId, displayName: discovered.label, wdaLocalPort: port, derivedDataPath });
+    this._saveRecord(udid, { logicalId, displayName: discovered.label, wdaLocalPort: port, mjpegLocalPort: mjpegPort, derivedDataPath });
 
     let wdaDevice = this.devices.get(logicalId);
     if (!(wdaDevice instanceof WdaDevice)) {
-      wdaDevice = new WdaDevice(logicalId, discovered.label, { host: "127.0.0.1", port });
+      wdaDevice = new WdaDevice(logicalId, discovered.label, { host: "127.0.0.1", port, mjpegPort });
       this.devices.set(logicalId, wdaDevice);
+    } else {
+      wdaDevice.mjpegPort = mjpegPort;
     }
     wdaDevice.discoveryState = "provisioning";
     wdaDevice.discoveryStateMessage = "Starting WDA. Starting the USB tunnel. Waiting for device readiness. This can take a minute.";
     wdaDevice.status = "offline";
-    this.runtime.set(udid, { logicalId, wdaDevice, port, derivedDataPath });
+    this.runtime.set(udid, { logicalId, wdaDevice, port, mjpegPort, derivedDataPath });
     this.udidByLogicalId.set(logicalId, udid);
 
     try {
       this.wdaProcessManager.start({ udid, derivedDataPath });
-      this.iproxyManager.start({ udid, localPort: port });
+      this.iproxyManager.start({ udid, localPort: port, mjpegLocalPort: mjpegPort });
     } catch (error) {
       wdaDevice.discoveryState = "provisioning_error";
       wdaDevice.discoveryStateMessage = error.message;
@@ -228,7 +235,7 @@ export class DeviceProvisioner {
     entry.wdaDevice.discoveryStateMessage = "Retrying automatic setup.";
     entry.wdaDevice.status = "offline";
     this.wdaProcessManager.start({ udid, derivedDataPath: entry.derivedDataPath });
-    this.iproxyManager.start({ udid, localPort: entry.port });
+    this.iproxyManager.start({ udid, localPort: entry.port, mjpegLocalPort: entry.mjpegPort });
     this.onDeviceListChanged();
     return true;
   }

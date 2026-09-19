@@ -15,8 +15,26 @@
 // otherwise hang a fetch — and with it, that connection's whole action queue
 // — forever. Every request below carries this as its abort signal so a dead
 // device surfaces as an error within a bounded time instead of hanging.
+import { MjpegParser } from "./mjpegParser.js";
+
 const DEFAULT_TIMEOUT_MS = 8000;
 const MAX_IOS_LOGICAL_DIMENSION = 10000;
+
+// Video profile requested from WDA's MJPEG server. Modest on purpose: several
+// operators may watch over mobile data, and a phone's own encoder is the
+// bottleneck long before the network is. Override per host with WDA_STREAM_FPS /
+// WDA_STREAM_SCALE (percent of native size) / WDA_STREAM_QUALITY (JPEG 1-100).
+function envInt(name, fallback, min, max) {
+  const value = Number.parseInt(process.env[name] ?? "", 10);
+  return Number.isSafeInteger(value) && value >= min && value <= max ? value : fallback;
+}
+export function defaultStreamProfile() {
+  return {
+    framerate: envInt("WDA_STREAM_FPS", 15, 1, 60),
+    scalingFactor: envInt("WDA_STREAM_SCALE", 50, 10, 100),
+    quality: envInt("WDA_STREAM_QUALITY", 35, 5, 100),
+  };
+}
 
 export class WdaAuthorizationError extends Error {
   constructor() {
@@ -26,7 +44,7 @@ export class WdaAuthorizationError extends Error {
   }
 }
 
-function assertAuthorized(authorize) {
+export function assertAuthorized(authorize) {
   if (typeof authorize === "function" && authorize() !== true) throw new WdaAuthorizationError();
 }
 
@@ -37,9 +55,12 @@ function validWindowSize(value) {
 }
 
 export class WdaDevice {
-  constructor(id, label, { host = "127.0.0.1", port, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  constructor(id, label, { host = "127.0.0.1", port, mjpegPort = null, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
     this.id = id;
+    this.kind = "wda";
     this.label = label;
+    this.host = host;
+    this.mjpegPort = Number.isSafeInteger(mjpegPort) ? mjpegPort : null;
     this.status = "offline"; // fail closed until /status confirms this WDA endpoint is ready
     this.readiness = { ready: false, checkedAt: null };
     this.baseUrl = `http://${host}:${port}`;
@@ -268,6 +289,139 @@ export class WdaDevice {
       if (err?.code !== "DEVICE_ACCESS_REVOKED" && id !== null) this.invalidateSession(id);
       throw err;
     }
+  }
+
+  // ---- gestures (all coordinates normalized 0..1 like tap/swipe) ---------------
+
+  // One authorized, session-scoped WDA gesture call. Same failure contract as
+  // tap/swipe: a revoked authorization wins over a transport error, and any
+  // failure invalidates the cached session so the next attempt starts fresh.
+  async _gesture(route, buildBody, authorize) {
+    let id = null;
+    try {
+      id = await this.ensureSession();
+      assertAuthorized(authorize);
+      const size = await this.ensureWindowSize({ authorize });
+      assertAuthorized(authorize);
+      const res = await fetch(`${this.baseUrl}/session/${id}/wda/${route}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildBody(size)),
+        signal: AbortSignal.timeout(this.timeoutMs),
+      });
+      if (!res.ok) throw new Error(`WDA ${route} failed: HTTP ${res.status}`);
+    } catch (err) {
+      if (err?.code !== "DEVICE_ACCESS_REVOKED" && typeof authorize === "function" && authorize() !== true) {
+        throw new WdaAuthorizationError();
+      }
+      if (err?.code !== "DEVICE_ACCESS_REVOKED" && id !== null) this.invalidateSession(id);
+      throw err;
+    }
+  }
+
+  // Finger down at (x1,y1), hold for `holdSec`, drag to (x2,y2), finger up. WDA's
+  // handleDrag calls XCUICoordinate pressForDuration:thenDragToCoordinate:, so
+  // `duration` is the press-and-hold BEFORE the drag, not the drag time (the drag
+  // speed is XCUITest's own). A short hold scrolls a list; a hold of ~0.5s+ turns
+  // the same gesture into a press-and-drag (re-ordering icons, selecting text).
+  async drag(x1, y1, x2, y2, holdSec = 0.05, { authorize } = {}) {
+    return this._gesture("dragfromtoforduration", ({ width, height }) => ({
+      fromX: x1 * width, fromY: y1 * height, toX: x2 * width, toY: y2 * height, duration: holdSec,
+    }), authorize);
+  }
+
+  async longPress(x, y, durationSec = 0.8, { authorize } = {}) {
+    return this._gesture("touchAndHold", ({ width, height }) => ({ x: x * width, y: y * height, duration: durationSec }), authorize);
+  }
+
+  async doubleTap(x, y, { authorize } = {}) {
+    return this._gesture("doubleTap", ({ width, height }) => ({ x: x * width, y: y * height }), authorize);
+  }
+
+  // ---- live video (WDA MJPEG server, forwarded by iproxy) ---------------------
+
+  get supportsStream() {
+    return this.mjpegPort !== null;
+  }
+
+  // Best effort: WDA applies these to the MJPEG server it is running.
+  async configureStreaming(profile = defaultStreamProfile()) {
+    const id = await this.ensureSession();
+    const res = await fetch(`${this.baseUrl}/session/${id}/appium/settings`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ settings: {
+        mjpegServerFramerate: profile.framerate,
+        mjpegScalingFactor: profile.scalingFactor,
+        mjpegServerScreenshotQuality: profile.quality,
+      } }),
+      signal: AbortSignal.timeout(this.timeoutMs),
+    });
+    if (!res.ok) throw new Error(`WDA settings failed: HTTP ${res.status}`);
+  }
+
+  // Starts pulling frames and keeps going until close(): a dropped connection or
+  // a stream that stops producing frames (frozen phone, locked screen) is
+  // reconnected with backoff, and onState reports connecting/live/reconnecting.
+  openStream({ onFrame, onState = () => {}, fetchImpl = fetch, reconnectDelayMs = 1000, maxReconnectDelayMs = 10_000, stallMs = 8000 } = {}) {
+    if (!this.supportsStream) throw new Error("this WDA device has no MJPEG port configured");
+    let closed = false;
+    let controller = null;
+    let stallTimer = null;
+    let wake = null;
+    const url = `http://${this.host}:${this.mjpegPort}/`;
+
+    const run = async () => {
+      let delay = reconnectDelayMs;
+      while (!closed) {
+        controller = new AbortController();
+        let reported = false;
+        onState("connecting");
+        try {
+          await this.configureStreaming().catch(() => {});
+          const res = await fetchImpl(url, { signal: controller.signal });
+          if (!res.ok || !res.body) throw new Error(`MJPEG stream HTTP ${res.status}`);
+          const parser = new MjpegParser();
+          const armStall = () => {
+            clearTimeout(stallTimer);
+            stallTimer = setTimeout(() => controller.abort(), stallMs);
+          };
+          armStall();
+          for await (const chunk of res.body) {
+            if (closed) break;
+            for (const frame of parser.push(chunk)) {
+              armStall();
+              delay = reconnectDelayMs;
+              onFrame(frame);
+            }
+          }
+        } catch (error) {
+          if (closed) break;
+          reported = true;
+          onState("reconnecting", error?.name === "AbortError" ? "stream stalled" : error?.message);
+        } finally {
+          clearTimeout(stallTimer);
+        }
+        if (closed) break;
+        if (!reported) onState("reconnecting", "stream ended");
+        await new Promise(resolve => {
+          const timer = setTimeout(resolve, delay);
+          wake = () => { clearTimeout(timer); resolve(); };
+        });
+        wake = null;
+        delay = Math.min(delay * 2, maxReconnectDelayMs);
+      }
+      onState("closed");
+    };
+    void run();
+    return {
+      close: () => {
+        closed = true;
+        controller?.abort();
+        clearTimeout(stallTimer);
+        wake?.();
+      },
+    };
   }
 
   async getUiTree() {

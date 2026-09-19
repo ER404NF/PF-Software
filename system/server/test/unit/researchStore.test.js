@@ -288,3 +288,56 @@ test("duplicate observations replace metrics with the latest supplied snapshot",
   assert.deepEqual(updated.metrics, { likes: 100 });
   assert.deepEqual(getRun("fresh-metrics", run.id).candidates[0].metrics, { likes: 100 });
 });
+
+// ---- MS9.3 / MS10: platform actions mirrored into the research record -------------
+
+test("locateCandidate finds recorded content by URL or platform id, and never invents one", () => {
+  const account = `${TEST_ACCOUNT}-locate`;
+  const run = createRun(account, { platform: "instagram", timeWindow: {}, overview: "o", candidates: [] });
+  const recorded = appendCandidate(account, run.id, { canonical_url: "https://www.instagram.com/p/AAA/", platform_content_id: "AAA" });
+  assert.equal(store.locateCandidate("workspace-a", account, "https://www.instagram.com/p/AAA/").candidate.id, recorded.id);
+  assert.equal(store.locateCandidate("workspace-a", account, "AAA").runId, run.id);
+  assert.equal(store.locateCandidate("workspace-a", account, "https://www.instagram.com/p/NOPE/"), null);
+  assert.equal(store.locateCandidate("workspace-a", "../etc", "AAA"), null);
+  assert.equal(store.locateCandidate("workspace-b", account, "AAA"), null, "another workspace cannot see it");
+});
+
+test("a platform action is mirrored into its candidate and a repeat adds nothing", () => {
+  const account = `${TEST_ACCOUNT}-mirror`;
+  const run = createRun(account, { platform: "instagram", timeWindow: {}, overview: "o", candidates: [] });
+  const candidate = appendCandidate(account, run.id, { canonical_url: "https://www.instagram.com/p/BBB/" });
+  const first = store.recordPlatformAction("workspace-a", account, run.id, candidate.id,
+    { action: "platform_save", status: "VERIFIED", task_id: "task-1" });
+  assert.equal(first.added, true);
+  const again = store.recordPlatformAction("workspace-a", account, run.id, candidate.id,
+    { action: "platform_save", status: "VERIFIED", task_id: "task-1" });
+  assert.equal(again.added, false);
+  assert.equal(getRun(account, run.id).candidates[0].platform_actions.length, 1);
+  assert.equal(getRun(account, run.id).candidates[0].platform_actions[0].task_id, "task-1");
+});
+
+test("re-running the same task: the second save is a NOOP recorded once, and no duplicate candidate appears", () => {
+  const account = `${TEST_ACCOUNT}-rerun`;
+  const run = createRun(account, { platform: "reddit", timeWindow: {}, overview: "o", candidates: [] });
+  const url = "https://www.reddit.com/r/x/comments/abc/";
+  const first = appendCandidate(account, run.id, { canonical_url: url });
+  const second = appendCandidate(account, run.id, { canonical_url: url }); // the re-run observes the same post
+  assert.equal(second.id, first.id, "deduplicated");
+  store.recordPlatformAction("workspace-a", account, run.id, first.id, { action: "platform_save", status: "VERIFIED", task_id: "t1" });
+  const noop = store.recordPlatformAction("workspace-a", account, run.id, first.id, { action: "platform_save", status: "NOOP", task_id: "t2" });
+  assert.equal(noop.added, false, "already saved: nothing new to record");
+  assert.equal(getRun(account, run.id).candidates.length, 1);
+  assert.equal(getRun(account, run.id).candidates[0].platform_actions.length, 1);
+});
+
+test("a comment is stored exactly as sent, with who approved it", () => {
+  const account = `${TEST_ACCOUNT}-comment`;
+  const run = createRun(account, { platform: "x", timeWindow: {}, overview: "o", candidates: [] });
+  const candidate = appendCandidate(account, run.id, { canonical_url: "https://x.com/u/status/1" });
+  store.recordPlatformAction("workspace-a", account, run.id, candidate.id,
+    { action: "comment_generated", status: "VERIFIED", text: "Lovely harbour sunrise! 🌅", task_id: "t1", approval_id: "apr-1", source: "generated" });
+  const stored = getRun(account, run.id).candidates[0].platform_actions[0];
+  assert.equal(stored.text, "Lovely harbour sunrise! 🌅", "punctuation and emoji survive untouched");
+  assert.equal(stored.approval_id, "apr-1");
+  assert.equal(store.recordPlatformAction("workspace-a", account, run.id, "cand-missing", { action: "like", status: "VERIFIED" }), null);
+});

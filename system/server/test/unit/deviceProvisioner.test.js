@@ -289,3 +289,22 @@ test("stop() tears down every managed process", async () => {
   assert.ok(wdaProcessManager.stops.includes("UDID-00000001"));
   assert.ok(iproxyManager.stops.includes("UDID-00000001"));
 });
+
+test("each phone gets its own video port, forwarded next to the control port and given to WdaDevice", async () => {
+  const { provisioner, iproxyManager, devices, state } = makeProvisioner();
+  state.attached = [
+    { id: "a", udid: "00008110-AAAAAAAAAAAAAAAA", label: "One" },
+    { id: "b", udid: "00008110-BBBBBBBBBBBBBBBB", label: "Two" },
+  ];
+  await provisioner.pollOnce();
+
+  assert.equal(iproxyManager.starts.length, 2);
+  const video = iproxyManager.starts.map(start => start.mjpegLocalPort);
+  assert.equal(new Set(video).size, 2, "video ports are distinct");
+  assert.ok(video.every(port => port >= 9100 && port <= 9199));
+  for (const start of iproxyManager.starts) assert.notEqual(start.mjpegLocalPort, start.localPort);
+
+  const first = devices.get(discoveredDeviceId("00008110-AAAAAAAAAAAAAAAA"));
+  assert.equal(first.supportsStream, true);
+  assert.equal(first.mjpegPort, iproxyManager.starts[0].mjpegLocalPort);
+});

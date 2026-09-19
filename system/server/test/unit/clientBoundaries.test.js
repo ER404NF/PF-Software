@@ -84,12 +84,14 @@ test("failed server logout clears local state and leaves a persistent retry warn
   let loginShown = 0;
   let pending = false;
   let liveViewStops = 0;
+  let streamResets = 0;
+  let sitesCleared = 0;
   const context = vm.createContext({
     signedOut: false, fileRequestGeneration: 0, currentDeviceId: "a", pendingDeviceId: "a",
     watchedDeviceId: "a", pendingWatchDeviceId: "a", pendingAiWorkspaceExitDeviceId: "a",
     lastDevices: [{ id: "a" }], watchRefreshTimerId: 1,
     clearTimeout() {}, clearAiWorkspace() {}, setBusy() {}, stopLiveView() { liveViewStops++; },
-    screenEl: { replaceChildren() {} }, fileListEl: { replaceChildren() {} },
+    resetStreamState() { streamResets++; }, clearSitesView() { sitesCleared++; }, fileListEl: { replaceChildren() {} },
     deviceControlBarEl: {}, uploadFormEl: {}, releaseButtonEl: {},
     setOperatorProfile(value) { profile = value; }, showLogin() { loginShown++; },
     logoutRetryButtonEl: { hidden: true, disabled: false }, loginErrorEl: {},
@@ -105,6 +107,8 @@ test("failed server logout clears local state and leaves a persistent retry warn
   assert.equal(context.signedOut, true);
   assert.equal(context.currentDeviceId, null);
   assert.equal(liveViewStops, 1, "sign-out must stop screenshot polling immediately");
+  assert.equal(streamResets, 1, "sign-out must stop the live video and clear the picture immediately");
+  assert.equal(sitesCleared, 1, "sign-out must remove any site token still on screen");
   assert.equal(pending, true);
   assert.equal(context.logoutRetryButtonEl.hidden, false);
   assert.match(context.loginErrorEl.textContent, /server could not confirm session revocation/);
@@ -113,13 +117,14 @@ test("failed server logout clears local state and leaves a persistent retry warn
 test("releasing a device stops live polling before clearing the control view", () => {
   let releaseHandler;
   let liveViewStops = 0;
+  let streamResets = 0;
   const sent = [];
   const context = vm.createContext({
     currentDeviceId: "wda-1", mediaDeviceId: "wda-1", pendingDeviceId: null,
     pendingAiWorkspaceExitDeviceId: null, fileRequestGeneration: 0,
     stopLiveView() { liveViewStops++; },
-    screenEl: { innerHTML: "frame" }, hintEl: {}, uploadFormEl: {}, deviceControlBarEl: {},
-    swipeControlsEl: {}, homeButtonEl: {}, refreshScreenButtonEl: {}, typeFormEl: {}, releaseButtonEl: {
+    resetStreamState() { streamResets++; },
+    hintEl: {}, uploadFormEl: {}, deviceControlBarEl: {}, releaseButtonEl: {
       hidden: false,
       addEventListener(name, handler) { if (name === "click") releaseHandler = handler; },
     },
@@ -133,6 +138,7 @@ test("releasing a device stops live polling before clearing the control view", (
   assert.equal(sent[0].type, "release_device");
   assert.equal(sent[0].deviceId, "wda-1");
   assert.equal(liveViewStops, 1);
+  assert.equal(streamResets, 1, "releasing a phone stops its live video");
   assert.equal(context.currentDeviceId, null);
 });
 test("task status ignores historical and queued entries", async () => {
@@ -197,39 +203,53 @@ for (const protocol of ["https:", "http:"]) test(`WebSocket URL follows ${protoc
   vm.runInContext("connect()", context);
   assert.equal(url, `${protocol === "https:" ? "wss:" : "ws:"}//phones.example:8443`);
 });
-test("tap mapping uses the uncropped image rectangle in either orientation", () => {
+test("the drawn picture keeps its own aspect ratio, so a click maps onto the phone without letterbox correction", () => {
   const css = fs.readFileSync(new URL("../../../client/style.css", import.meta.url), "utf8");
-  assert.match(css, /#screen img\s*\{[^}]*height: auto;[^}]*object-fit: contain;/);
-  for (const [width, height] of [[300, 300 * 844 / 390], [300, 300 * 390 / 844]]) {
-    let handler, sent;
-    const context = vm.createContext({ currentDeviceId: "a", pendingDeviceId: null, busy: false,
-      detailMessageEl: {}, nextActionRequestId: () => 1, liveViewController: { supersedePendingFrame() {} },
-      screenEl: { querySelector: () => ({ getBoundingClientRect: () => ({ left: 10, top: 20, width, height }) }),
-        addEventListener: (_, fn) => { handler = fn; } }, setBusy() {}, safeSend: value => { sent = value; } });
-    vm.runInContext(section('screenEl.addEventListener("click"', 'swipeControlsEl.addEventListener'), context);
-    handler({ clientX: 10 + width / 2, clientY: 20 + height / 10 });
-    assert.equal(sent.x, 0.5); assert.ok(Math.abs(sent.y - 0.1) < 1e-10);
-  }
+  assert.match(css, /\.phone-canvas\s*\{[^}]*width: auto;[^}]*height: auto;/);
+  assert.doesNotMatch(css, /\.phone-canvas\s*\{[^}]*object-fit/);
+  const stage = fs.readFileSync(new URL("../../../client/phoneStage.js", import.meta.url), "utf8");
+  assert.match(stage, /displayRect\(\) \{\s*const target = this\.canvas \|\| this\.screenEl;/, "clicks are measured against the canvas itself");
 });
 
-test("pending device switches disable old-screen input and scope later taps", () => {
-  let click;
+test("pending device switches disable old-screen input and scope later inputs", () => {
   const sent = [];
-  const context = vm.createContext({ currentDeviceId: "a", pendingDeviceId: null, busy: false,
+  let requestId = 0;
+  const context = vm.createContext({ currentDeviceId: "a", pendingDeviceId: null, busy: false, streamActive: true,
     UI_CAPABILITIES: { CONTROL_DEVICE: "device:control" }, can: () => true,
-    selectErrorEl: {}, detailMessageEl: {}, hintEl: {}, nextActionRequestId: () => 1, showDetailView() {}, stopLiveView() {}, setBusy(value) { context.busy = value; }, safeSend: msg => (sent.push(msg), true),
-    liveViewController: { supersedePendingFrame() {} },
-    screenEl: { addEventListener: (_, fn) => { click = fn; }, querySelector: () => ({ getBoundingClientRect: () => ({ left: 0, top: 0, width: 100, height: 100 }) }) } });
+    selectErrorEl: {}, detailMessageEl: {}, hintEl: {}, nextActionRequestId: () => ++requestId, showDetailView() {}, stopLiveView() {},
+    setBusy(value) { context.busy = value; }, safeSend: msg => (sent.push(msg), true),
+    liveViewController: { supersedePendingFrame() {} } });
   vm.runInContext(section("function selectDevice(id)", "// The server confirmed this selection"), context);
-  vm.runInContext(section('screenEl.addEventListener("click"', 'swipeControlsEl.addEventListener'), context);
+  vm.runInContext(section("function sendStageInput(message)", "function setStreamStatus("), context);
+  assert.equal(vm.runInContext('sendStageInput({ type: "tap", x: 0.1, y: 0.1 })', context), 1, "an input for the current phone is sent");
+  assert.equal(sent[0].deviceId, "a");
   vm.runInContext('selectDevice("b")', context);
-  context.busy = false; // even a stale frame cannot bypass the pending gate
-  click({ clientX: 10, clientY: 10 });
-  assert.equal(sent.length, 1);
-  assert.equal(sent[0].type, "select_device");
+  // Whatever is still on screen belongs to the old phone: no input may reach either phone.
+  assert.equal(vm.runInContext('sendStageInput({ type: "tap", x: 0.1, y: 0.1 })', context), null);
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1].type, "select_device");
   context.currentDeviceId = "b"; context.pendingDeviceId = null;
-  click({ clientX: 10, clientY: 10 });
-  assert.equal(sent[1].deviceId, "b");
+  context.busy = false; // the first frame of the new phone cleared the selection lock
+  assert.equal(vm.runInContext('sendStageInput({ type: "drag", x1: 0.5, y1: 0.8, x2: 0.5, y2: 0.2 })', context), 2, "a blocked input never consumed a request id");
+  assert.equal(sent[2].deviceId, "b");
+  assert.equal(sent[2].requestId, 2);
+  assert.equal(context.busy, false, "live video means no one-at-a-time busy lock");
+});
+
+test("without live video the classic one-at-a-time flow still applies", () => {
+  const sent = [];
+  let superseded = 0;
+  const context = vm.createContext({ currentDeviceId: "a", pendingDeviceId: null, busy: false, streamActive: false,
+    detailMessageEl: {}, nextActionRequestId: () => 9, setBusy(value) { context.busy = value; },
+    liveViewController: { supersedePendingFrame() { superseded++; } }, safeSend: msg => (sent.push(msg), true) });
+  vm.runInContext(section("function sendStageInput(message)", "function setStreamStatus("), context);
+  vm.runInContext('sendStageInput({ type: "tap", x: 0.5, y: 0.5 })', context);
+  assert.equal(context.busy, true);
+  assert.equal(superseded, 1);
+  context.safeSend = () => false;
+  context.busy = false;
+  assert.equal(vm.runInContext('sendStageInput({ type: "tap", x: 0.5, y: 0.5 })', context), null);
+  assert.equal(context.busy, false, "a failed send unlocks the screen again");
 });
 for (const code of [1008, 1006]) test(`expired session returns to login after close ${code}`, async () => {
   const handlers = {};
@@ -237,7 +257,7 @@ for (const code of [1008, 1006]) test(`expired session returns to login after cl
   const context = vm.createContext({ location: { protocol: "http:", host: "localhost" }, signedOut: false,
     busy: false,
     watchedDeviceId: null, pendingWatchDeviceId: null, watchRefreshTimerId: null, watchControlsEl: {}, filesPanelEl: {},
-    fleetGroupsEl: {}, selectErrorEl: {}, connectionStatusEl: {}, deselect() {}, setOperatorProfile() {}, showLogin() { login++; },
+    fleetGroupsEl: {}, selectErrorEl: {}, connectionStatusEl: {}, deselect() {}, setOperatorProfile() {}, showLogin() { login++; }, resetStreamState() {},
     setConnectionState() {}, clearAiWorkspace() {}, markPresenceUnavailable() {},
     setTimeout(fn) { reconnect = fn; }, clearTimeout() {}, fetch: async () => ({ status: 401 }),
     WebSocket: class { addEventListener(name, fn) { handlers[name] = fn; } } });
@@ -251,9 +271,10 @@ for (const code of [1008, 1006]) test(`expired session returns to login after cl
 });
 
 test("transient device error keeps selection and Release available", () => {
-  const handlers = {}; let busy;
+  const handlers = {}; let busy; let settled = false;
   const context = vm.createContext({ location: { protocol: "http:", host: "localhost" }, currentDeviceId: "a", pendingDeviceId: null,
     watchedDeviceId: null, pendingWatchDeviceId: null,
+    phoneStage: { settleAll() { settled = true; } },
     hintEl: {}, releaseButtonEl: { hidden: false }, setBusy(value) { busy = value; }, deselect() { assert.fail("must keep ownership visible"); },
     setConnectionState() {},
     WebSocket: class { addEventListener(name, fn) { handlers[name] = fn; } } });
@@ -261,6 +282,7 @@ test("transient device error keeps selection and Release available", () => {
   handlers.message({ data: JSON.stringify({ type: "error", deviceId: "a", message: "temporary timeout" }) });
   assert.equal(context.currentDeviceId, "a"); assert.equal(context.releaseButtonEl.hidden, false);
   assert.equal(context.hintEl.textContent, "temporary timeout"); assert.equal(busy, false);
+  assert.equal(settled, true, "a failed input must not leave the stage waiting for an acknowledgement");
 });
 
 test("an unopenable fleet summary cannot send select_device", () => {
@@ -310,6 +332,7 @@ test("live role updates clear privileged DOM before safe data is reloaded", () =
   const cleared = () => ({ children: ["sensitive"], replaceChildren() { this.children = []; } });
   let renderedAssignments = null;
   let assignmentRefreshes = 0;
+  let sitesCleared = 0;
   const context = vm.createContext({
     currentOperator: { username: "operator", role: "admin", capabilities: ["queue:manage", "users:manage"] },
     lastDevices: [{ authorizedOperators: ["private"] }], renderToken: 4,
@@ -321,6 +344,7 @@ test("live role updates clear privileged DOM before safe data is reloaded", () =
     can(capability) { return context.currentOperator.capabilities.includes(capability); },
     canManageOperations() { return context.can("queue:manage"); },
     renderAssignments(value) { renderedAssignments = value; },
+    clearSitesView() { sitesCleared++; },
     refreshAssignments() { assignmentRefreshes++; return Promise.resolve(); },
     fleetGroupsEl: cleared(), fleetSummaryEl: {}, fleetAccessMessageEl: {}, fleetEmptyEl: {},
     detailDeviceFactsEl: cleared(), detailAiStatusEl: cleared(), assignmentsMessageEl: {},
@@ -342,6 +366,7 @@ test("live role updates clear privileged DOM before safe data is reloaded", () =
   assert.equal(context.lastDevices.length, 0);
   assert.equal(context.renderToken, 5);
   assert.equal(renderedAssignments.length, 0);
+  assert.equal(sitesCleared, 1, "a demoted operator loses any site token on screen");
   assert.equal(assignmentRefreshes, 1);
   assert.equal(context.commandOutputEl.textContent, "");
   assert.deepEqual(context.queueBodyEl.children, []);

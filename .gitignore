@@ -24,3 +24,6 @@ system/operators.config.json
 # electron-builder output (installers/unpacked builds) — regenerate with
 # `npm run dist:win`/`dist:mac` inside desktop/, never commit the binary.
 /desktop/dist/
+
+/desktop/build/runtime/
+/desktop/build/tmp/

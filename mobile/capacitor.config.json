@@ -1,0 +1,11 @@
+{
+  "appId": "com.phonefarm.operator",
+  "appName": "Phone Farm",
+  "webDir": "www",
+  "server": {
+    "url": "https://REPLACE-WITH-YOUR-HUB-HOSTNAME",
+    "cleartext": false
+  },
+  "android": { "allowMixedContent": false },
+  "ios": { "contentInset": "always" }
+}

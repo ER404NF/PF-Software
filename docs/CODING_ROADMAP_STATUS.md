@@ -1,4 +1,224 @@
-# Roadmap Status Report — updated 2026-09-18
+# Roadmap Status Report — updated 2026-09-19
+
+## 2026-09-19 (latest) — macOS installer hardening: setup without Terminal, and a farm host that stays up
+
+**Goal:** an operator installs the `.pkg`, opens Phone Farm and plugs in phones one by one, with no Xcode window and no
+Terminal. The installer scripts were already written; this pass closed the gaps found when reading them as a first-time user.
+
+**Setup without commands.** The setup screen's red rows now have a **Fix it** button where a fix can work: *Xcode installed
+but not selected / licence not accepted / first-launch components unfinished* -> one standard macOS password prompt (via
+`osascript`, no sudo typed by anyone); *iPhone tools missing* -> `brew install libimobiledevice libusbmuxd` when Homebrew
+is on the Mac (progress shown on the row). Without Homebrew the row says to install it from brew.sh. Only two fixes exist, they
+are allow-listed, take no user text, and run without a shell.
+
+**A farm host that stays up.** The Mac is kept awake while the server or site agent runs; a crashed server or agent is
+restarted with backoff (and reported after repeated crashes instead of looping); the app starts at login (default on for a
+host/site, off for an operator workstation, one checkbox); only one copy can run; if the usual port 4173 is taken the next free
+one is used; a failed start now says why (e.g. the server's own error line).
+
+**Debuggable on a Mac.** The app is opened from Finder, so nothing showed on a console. It now writes a rotating log to
+`~/Library/Logs/Phone Farm/` and **Help > Copy Diagnostics** puts a plain-text report (prerequisite rows, tool paths, WebDriverAgent
+source, recent log; secrets scrubbed) on the clipboard; **Help > Show Log Folder** opens it.
+
+**Continuous checks.** `cd desktop && npm run check:release` lists what can be verified without a Mac (needed files exist, are
+not git-ignored, are committed; `git add -A` would not push a key/account file/node_modules; workflows parse and reference real
+scripts; every module the app loads is in its package list; lockfiles match; the build plan is complete). It also runs inside the
+desktop test suite, and the packaged-runtime verifier now requires every script/stylesheet/icon the web client's page names.
+
+**Debugging pass (structured: reproduce, isolate, diagnose, fix).** Every API route (68) was hit with 380 hostile requests, the
+WebSocket protocol with ~5,900 malformed messages, and the mock fleet soaked for a minute (1,385 actions). Findings:
+1. **Malformed, `null` or oversized JSON returned 500 "request failed" on all 39 write routes.** Root cause: the global error
+   handler had no branch for the body parser's client errors. Now 400 `INVALID_JSON` / 413 `PAYLOAD_TOO_LARGE` (parser text never
+   echoed); 11 regression tests. Re-fuzz: 0 server errors.
+2. **The setup page's "Fix it" could leave a row stuck on "Working…" with a dead button** if the request itself failed. Fixed, with
+   behaviour tests that run the page's own function.
+3. **The installer's read-me page still told people to open Xcode and run `brew install`** — the opposite of the goal. Rewritten
+   in plain language to match the Fix it flow.
+4. **Flaky desktop test:** two tests fought over port 4173 when the suite ran in parallel. The default port can now be set with
+   `PHONE_FARM_PORT`; the tests no longer share one.
+5. **A failure that would only have appeared on the first macOS GitHub build.** The new desktop tests start the real host flow;
+   on Windows that skips the Mac checks, but on a clean macOS runner it runs them for real (no iPhone tools installed) and would
+   have refused to start, failing the desktop test step and so the whole installer build. Found by reading the code for what
+   differs on a Mac; fixed with an explicit development/test switch (`PHONE_FARM_SKIP_HOST_PREFLIGHT=1`, never set in the
+   installed app) that the shared test harness sets. The other desktop tests were checked and already inject their machine.
+No crash or hang came from the WebSocket fuzz or the soak (heap stable, 0 errors). One first-run detail to know about: the first
+sign-in of a new administrator asks them to set up two-factor sign-in (an authenticator app), by design.
+
+**Tests:** desktop suite **149** (was 97), server suite **1095**, server suite also passes under `TZ=Asia/Tokyo` as CI runs it. A
+new end-to-end test drives the real first run: host setup starts the real server, the first admin is created from the setup page's
+channel, and that admin signs in (up to the two-factor step).
+`test/mainLifecycle.test.js` loads the real `main.js` against a stand-in for Electron and starts the **real server process**: it
+kills it and watches it come back, checks a deliberate quit does not restart it, that every IPC channel refuses any page but the
+setup page, and the busy-port fallback. The setup page's Fix it flow was exercised in a browser against a stubbed API.
+
+**Still NOT done and not claimed:** the `.pkg` has never been built (needs macOS: the GitHub workflow does it); **the installer
+files are still uncommitted** (`.github/`, `build-mac-pkg.cjs`, `wdaSource.js`, … are untracked, so GitHub has nothing to build);
+the Fix it flows, the login item, the sleep blocker and Gatekeeper behaviour have never run on a Mac; no real iPhone was used;
+the package is unsigned/not notarized until Apple certificates are added as secrets (see `docs/MAC_RELEASE.md`).
+
+---
+
+## 2026-09-19 — live phone stream, multi-site hub, remote access, and MS9–MS13 built
+
+Everything below is implemented, has tests, and passes locally: server suite **1084/1084 (101 files)**,
+desktop suite **97/97**. Nothing here has run against a real iPhone — see "Not verified" at the end.
+
+**Live video, not screenshots.** The phone is now a video stream. WebDriverAgent's MJPEG server (device
+port 9100, exposed through a second `iproxy` mapping) feeds one shared upstream per phone (`streamHub.js`)
+to the controlling operator and any watchers; frames go to the browser as binary WebSocket messages.
+Slow viewers drop frames instead of building lag, every frame is re-authorized per viewer, and when a
+device cannot stream (mock without a stream, WDA without MJPEG) the client falls back to timed
+screenshots and says so. Ports come from `portAllocator.js` and are allocated per device by the provisioner.
+
+**The operator's screen is the phone.** `client/phoneStage.js` renders only the phone — no arrow buttons,
+no Home button. Mouse wheel scrolls the phone (throttled into drags), click-drag swipes, a short press taps,
+a long press and double click are real gestures, the keyboard types into the phone (Backspace and Enter
+included), and the Home control is the phone's own bezel/gesture bar like a real iPhone. The layout is
+phone-first.
+
+**Multi-site.** One central hub plus one outbound-only site agent per location (`siteAgent.js`,
+`npm run agent`). The agent dials the hub over TLS with its site id and a token (stored hashed), so a site
+needs no inbound port. Devices show up on the hub namespaced as `<site>__<device>`; frames, taps, swipes,
+typing, screenshots, file transfer and leases all work through the link; only an allow-listed set of calls
+is accepted from a site; streams re-open automatically after a reconnect. Admins manage sites in the new
+Sites panel.
+
+**Remote operators.** Remote operators open the app (browser, installable PWA, or the desktop app in
+"client" mode) and need only internet — Wi-Fi or mobile data. `deploy/hub/` has a Docker + Caddy hub with
+automatic HTTPS; `docs/DEPLOY_HUB.md` explains it. `/healthz`, a web manifest, service worker (network-first,
+never caches the API or the stream) and icons are in. The desktop app has host / client / site modes; the
+Windows installer workflow exists. A Capacitor project for iOS/Android store apps is scaffolded in `mobile/`
+(**not built**, needs the store accounts).
+
+**Time zone.** `/time` is wall-clock in an explicit IANA zone; the default is now `America/Los_Angeles`
+(`PHONE_FARM_TIMEZONE` overrides).
+
+**MS9 — private markers.** Save/bookmark and other private markers use verify-before-toggle: the skill reads
+the control's state, presses only when the state differs, then re-reads to confirm; an ambiguous read never
+presses. The research record is written first, and an action on content with no record is refused.
+
+**MS10 — configured account actions.** Every action (like, vote, repost, comment, …) has a per-account
+policy `ALLOW_AUTONOMOUS` / `REQUIRE_APPROVAL` / `DISABLED`, default DISABLED, changeable only by an
+administrator of that client and effective immediately. The validator enforces it before the device is
+touched. Approvals are single-use and bound to the exact action, target and wording; a manager or admin
+decides, and every decision is audited. Comments pass an application-level guard (exact and near
+duplicates, rate limits, grounding in the viewed content, preset templates) and are recorded in a ledger
+before sending; comment text is logged exactly as sent. A platform-visible action that fails is never
+blindly retried — it goes to a person.
+
+**Review panel (MS10.4 approval-gate UI, MS12.3 intervention queue UI).** A "Review" button opens a panel with three
+tabs, in plain language. *Approvals*: each waiting action shows what the AI wants to do, on which post, and — for a
+comment — the exact wording that will be posted; managers and admins approve or reject with an optional reason, others
+see it read-only. *Needs a person*: everything the AI handed back (security check, unsure, unconfirmed action, comment not
+sent, a person took over), with "I'll handle this" / "Mark as done"; managers and admins only, per-client. *What the AI
+may do*: every action grouped (looking around / private markers / visible to others / comments) with Never / Ask a person
+first / AI may do this on its own; only an administrator can change it. The server re-checks every request; the panel only
+hides what a role cannot use. `npm run demo` now includes a demo account with one approval and one hand-back to try it.
+
+**Mobile.** With a phone open on a narrow screen the phone now comes first (no sidebar above it) and the People list is
+dropped there. Bug found and fixed while testing this: a phone opened while the browser tab was hidden — for example a
+phone that locked its screen, reconnected and re-selected the device — never started its video when the tab came back.
+
+**MS11 — timed sessions.** Sessions have step, time, spend, kept-candidate and per-action quotas and stop on
+consecutive failures; a scoring profile decides what is kept; budgets and reports are rebuilt from
+checkpoints, so a restart continues the session instead of resetting it. Each finished session has a
+report (`/api/research/:account/runs/:runId/report`).
+
+**MS12 — fleet.** A fleet gate limits concurrent AI workers and hourly spend and pins accounts to devices;
+the intervention queue collects everything a person is needed for (challenge, low confidence, approval)
+with claim/resolve and per-client visibility (`/api/fleet/ai`, `/api/fleet/interventions`).
+
+**MS13 — optimization.** Local screen classification and a mechanical planner (open the app when closed,
+move on after a recorded post) — no model call; a three-tier router (local / cheap / strong) that only
+trusts the cheap model when it is confident and escalates otherwise or after a failure; a state-detection
+cache keyed on the whole accessibility tree (never serves a challenge screen); adaptive pacing that never
+waits less than the app needs to settle; search and near-duplicate lookup over an account's own records
+(`/api/research/:account/search?q=` and `?similarTo=`); intervention analytics and optimization status
+(`/api/fleet/analytics`). All of it is **off unless** `PHONE_FARM_OPTIMIZATIONS` is set
+(`on`, or a list of `router,localPlanner,stateCache,pacing`), with `PHONE_FARM_CHEAP_MODEL` naming the cheap
+provider.
+`server/bench/` is the regression gate: a deterministic benchmark (`npm run bench`) runs the real skill and
+mock phone under every optimization one at a time and all together, and a test fails if any of them lowers
+the success rate, recall or action accuracy — including a deliberately bad configuration that the gate must
+catch. Modeled result, 16 sessions: all optimizations on vs off — success rate 1.0 in both, cost per session
+$1.31 → $0.35, latency 60.5 s → 28.0 s, strong-model calls 18.75 → 5.75, screenshots 18.75 → 0.
+
+**Not verified (do not treat as done):**
+- No real iPhone was used. Live MJPEG on real WDA, the real gesture timing (press-hold before drag), and
+  Backspace/Enter through `wda/keys` are unconfirmed on hardware.
+- Save/like/vote/repost/comment rely on accessibility labels taken from fixtures; the real apps' labels
+  and app versions have not been checked.
+- The benchmark's model cost and latency are modeled constants, not measurements; real vendor pricing and
+  a supervised run are needed before relying on the savings numbers.
+- The Docker hub image, the Windows installer and the macOS package were not built here; the store apps
+  are unbuilt.
+- `/time` uses the deployment time zone, not a per-site one.
+- No slash-command form of `/policy`, `/comment`, `/template`, `/report`, `/fleet` (the Review panel and API cover them);
+  no data-saver stream profile for weak mobile data; the Review panel was checked in the demo browser only, not on a phone.
+
+---
+
+## 2026-09-18 — real `.pkg` installer pipeline, `/time` timezone fix, Electron 44
+
+**`/time` failures (3 tests on a real Mac).** Root cause: `commandParser.js` built wall-clock
+times with process-local `Date` accessors (`new Date(now)` + `setHours`, and
+`new Date(\`${date}T00:00:00\`)`), so `/time` meant a different window — and a different
+"already passed" verdict — depending on the host's OS timezone. The Mac mini was on a US zone
+(reproduced here with `America/Los_Angeles`: exactly the same 3 failures; the injected
+`06:00Z` instant is 23:00 the previous day there, and the explicit-date window ends after
+`12:00Z`). Fix: `/time` is wall-clock in one explicit IANA scheduling timezone,
+`PHONE_FARM_TIMEZONE` (default `Europe/Rome` when this was written, `America/Los_Angeles` since 2026-09-19; invalid value stops startup), reusing
+`zonedRecurrence.js`'s DST-correct helpers (now exported) instead of a second implementation.
+The three failing assertions are unchanged. New regression coverage: a table of zones
+(Rome, Bucharest, LA, Tokyo, Kiritimati UTC+14, UTC), explicit dates, "today" across the UTC
+boundary, both 2026 Rome DST transitions, gap/repeated hours, and a child-process matrix that
+runs the same inputs under six different *process* timezones and asserts identical output.
+Server suite: **819/819**, also 819/819 with the whole suite forced into `America/Los_Angeles`
+and into `Pacific/Kiritimati`. (`docs/COMMAND_QUEUE_SPEC.md` §/time updated.)
+
+**The old "downloader" was not an installer** — `DOWNLOAD_PHONE_FARM.*` is now
+`BUILD_PHONE_FARM_INSTALLER.*`, labelled **DEVELOPER TOOL — NOT THE PHONE FARM INSTALLER**; the
+README's top section now sends users to GitHub Releases for one file, `Phone-Farm-<version>-arm64.pkg`.
+
+**Packaging bug found and fixed.** electron-builder unconditionally drops a `node_modules`
+directory at the *root* of an `extraResources` source (`app-builder-lib/out/util/filter.js`), so
+the previous `extraResources: ../system` produced apps **without the server's dependencies**.
+Runtime is now staged into `desktop/build/runtime/` from an explicit allow-list
+(`prepare-runtime.cjs`; production `npm ci` into the staging directory, so accounts/storage/tests can
+never ship) and shipped from that root. `verify-packaged-runtime.cjs` proves, against a real packaged
+app, that dependencies resolve, forbidden files are absent, and the server **boots using the packaged
+executable as its Node** while the bundle stays byte-for-byte unmodified — verified on a Windows
+`electron-builder --win --dir` build here.
+
+**Installer.** `build-mac-pkg.cjs`: electron-builder makes `Phone Farm.app`; `pkgbuild`/`productbuild`
+make the package (install-location `/Applications`, non-relocatable, no scripts; welcome/read-me/
+conclusion wizard pages; `hostArchitectures`); Developer ID signing, `notarytool` notarization and
+stapling for app and package; verification with `codesign`, `pkgutil --check-signature`, `spctl`,
+`stapler validate`, and an expanded-package inspection. Levels: notarized → `Phone-Farm-<v>-arm64.pkg`;
+signed only → `…-NOT-NOTARIZED.pkg`; nothing → `…-UNSIGNED.pkg` (loudly warned; a tagged release fails
+unless notarized or `ALLOW_UNSIGNED_RELEASE` is set). `.github/workflows/mac-installer.yml` runs the full
+server suite (under a US timezone), desktop tests, audits, the build, verification, **installs the package
+with macOS Installer on a clean runner and boots the installed app's server**, uploads the artifact, and on
+`v*` tags publishes the Release. See `docs/MAC_RELEASE.md`.
+
+**WebDriverAgent is bundled** (pinned tag + exact commit in `desktop/wda.lock.json`, unmodified,
+BSD-3-Clause/Apache-2.0 with its `LICENSE`). On first launch it is copied to
+`~/Library/Application Support/Phone Farm/wda-source/…` — nothing is built inside the signed app. An
+unsigned WDA needs a development team: detected from the keychain when there is exactly one, else asked for
+once in host setup; `WdaProcessManager` then adds `DEVELOPMENT_TEAM`, automatic provisioning and a team-unique
+bundle id (argv unchanged when no team is configured, and never applied to an operator's own checkout).
+
+**Security audit.** The Mac's "14 vulnerabilities (13 high, 1 critical)" were all in `desktop/`: `electron`
+33.4.11 itself (**shipped** in every installed app — high, fixed 44.4.2) plus electron-builder 25's build-time
+tree (`tar` critical, `app-builder-lib`, `node-gyp`, … — **never shipped**, but they run on the signing
+machine). Upgraded to electron 44.4.2 / electron-builder 26.15.3 (and `js-yaml` 4.3.2, itself newly
+flagged): `npm audit` now reports 0 in `desktop/` (all dependencies) and 0 in `system/`
+(`--omit=dev` and full). `audit-gate.cjs` classifies findings as shipped vs build-only and fails CI on
+either unless a build-only waiver is explicit.
+
+Desktop suite: **82/82**. NOT done and not claimed: the `.pkg` has **not been built on macOS**, has not been
+installed by a person, is **not signed or notarized** (no Apple credentials), and **no real iPhone** was
+exercised (WDA signing automation is untested on hardware).
 
 ## 2026-09-18 — macOS installed-host automatic WDA startup and Electron isolation
 
@@ -589,11 +809,11 @@ hardware to build or test.
 | 6 | Controller mode & input-lease abstraction | ✅ Done (MS6.3 UI: see detail — STOP AI is now `admin`-only, a deliberate 2026-09-09 decision) | ✅ Passing (part of the 354) |
 | 7 | Command & queue scheduler | ✅ Done | ✅ Passing (part of the 354) |
 | 8 | AI VA read-only research mode | 🟡 Software path complete locally: providers, model selection, three versioned accessibility profiles, production runner, candidate/evidence pipeline and handoff | ✅ Local unit/integration coverage passing; live provider/app/device gate not run |
-| 9 | Private research markers | ⬜ Not started, blocked on MS8 | ❌ Not run |
-| 10 | Configured account actions | ⬜ Not started, blocked on MS8-9 | ❌ Not run |
-| 11 | Timed autonomous research sessions | ⬜ Not started, blocked on MS10 (MS7 now done) | ❌ Not run |
-| 12 | Multi-device AI fleet | ⬜ Not started, blocked on MS11 | ❌ Not run |
-| 13 | Optimization | ⬜ Not started, blocked on MS12 | ❌ Not run |
+| 9 | Private research markers | ✅ Built: verify-before-toggle save/bookmark, record-before-act | ✅ Local tests passing; real-app labels unverified |
+| 10 | Configured account actions | ✅ Built: per-account policy, single-use approvals, comment guard + ledger | ✅ Local tests passing; real-app labels unverified |
+| 11 | Timed autonomous research sessions | ✅ Built: quotas, budgets, restart-safe checkpoints, session reports | ✅ Local tests passing; supervised device run not done |
+| 12 | Multi-device AI fleet | ✅ Built: fleet gate, spend limits, affinity, intervention queue with a Review-panel UI | ✅ Local tests passing; multi-device hardware run not done |
+| 13 | Optimization | ✅ Built, opt-in: local planner, 3-tier router, state cache, adaptive pacing, search/dedup, analytics, regression benchmark | ✅ Benchmark gate passing (modeled costs); real-model measurement not done |
 
 🟡 = real code exists that maps to this milestone, but the milestone (as
 scoped, with its testing gate) is not complete. ⬜ = no code exists for this
@@ -1147,10 +1367,23 @@ iPhone. No live vendor call or platform action has been claimed.
 
 ## MS9 – MS13
 
-**Status: ⬜ Not started, and structurally blocked**, not just unscheduled:
-MS9-10 need MS8's completed real skill and record pipeline, MS11 needs MS8-10 to exist
-first (MS7's scheduler it also depends on is now done), MS12 needs MS11,
-MS13 needs MS12. No code exists for any of them.
+**Status: ✅ Built and passing local tests (2026-09-19); not exercised on a real device.** The details are in
+the 2026-09-19 entry at the top of this file. Where the code lives:
+
+- MS9 — `stateToggle.js` (verify-before-toggle), `platformSkills/toggleActions.js`, `platformSkill.js`
+  (re-observe), `researchStore.js` (`locateCandidate`, `recordPlatformAction`).
+- MS10 — `actionCatalog.js`, `actionPolicy.js` (validator), `policyStore.js`, `approvalStore.js`,
+  `commentGuard.js`, `commentTemplates.js`, `researchWorker.js`; API under `/api/research/:account/`
+  (`policies`, `templates`, `approvals`).
+- MS11 — `researchSession.js` (budgets, quotas, scoring, reports), `researchTaskRunner.js`.
+- MS12 — `fleetPolicy.js`, `interventionQueue.js`, `researchAccess.js` (device affinity); API
+  `/api/fleet/ai`, `/api/fleet/interventions`.
+- MS13 — `optimization/` (`stateCache.js`, `screenClassifier.js`, `modelRouter.js`, `adaptivePacing.js`,
+  `researchIndex.js`, `interventionAnalytics.js`), `optimizationRuntime.js` (opt-in wiring),
+  `server/bench/` (regression benchmark), API `/api/research/:account/search` and `/api/fleet/analytics`.
+
+Gaps that remain: see "Not verified" in the 2026-09-19 entry. The blocking dependency on the supervised MS8
+device run still applies before any platform-visible action is enabled for a real account.
 
 ---
 

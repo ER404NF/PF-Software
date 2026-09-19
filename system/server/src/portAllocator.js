@@ -5,6 +5,19 @@
 
 const DEFAULT_RANGE = { start: 8100, end: 8199 };
 
+// Local ports for each phone's forwarded MJPEG video feed (device port 9100).
+const DEFAULT_MJPEG_RANGE = { start: 9100, end: 9199 };
+
+export function resolveMjpegPortRange(env = process.env) {
+  const start = Number.parseInt(env.WDA_MJPEG_PORT_RANGE_START, 10);
+  const end = Number.parseInt(env.WDA_MJPEG_PORT_RANGE_END, 10);
+  if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end)
+    || start < 1 || end > 65535 || start > end) {
+    return { ...DEFAULT_MJPEG_RANGE };
+  }
+  return { start, end };
+}
+
 export function resolvePortRange(env = process.env) {
   const start = Number.parseInt(env.WDA_PORT_RANGE_START, 10);
   const end = Number.parseInt(env.WDA_PORT_RANGE_END, 10);

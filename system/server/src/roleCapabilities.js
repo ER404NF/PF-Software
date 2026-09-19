@@ -36,6 +36,9 @@ export const CAPABILITIES = Object.freeze({
   MANAGE_ROUTING: "routing:manage",
   MANAGE_SECURITY: "security:manage",
   MONITOR_DEVICE: "device:monitor",
+  MANAGE_SITES: "sites:manage",
+  MANAGE_ACTION_POLICY: "research:policy",   // per-account action policy and the preset-comment library
+  APPROVE_ACTIONS: "research:approve",       // decide REQUIRE_APPROVAL actions
 });
 
 const lowerOperational = [
@@ -58,6 +61,7 @@ export const ROLE_CAPABILITIES = Object.freeze({
     CAPABILITIES.MANAGE_QUEUE,
     CAPABILITIES.RUN_NETWORK_CHECK,
     CAPABILITIES.MONITOR_DEVICE,
+    CAPABILITIES.APPROVE_ACTIONS,
     CAPABILITIES.MANAGE_TEAM_MEMBERS,
     CAPABILITIES.VIEW_PROXY_POOL,
     CAPABILITIES.ASSIGN_PROXY,

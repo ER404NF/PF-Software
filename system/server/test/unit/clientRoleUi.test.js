@@ -66,7 +66,8 @@ test("live watch UI uses server-calculated permission and renders read-only cont
   assert.match(app, /isAiMode \? "Open AI workspace"/);
   assert.match(app, /safeSend\(\{ type: "watch_device", deviceId: device\.id \}, \{ statusEl: detailMessageEl \}\)/);
   assert.match(app, /Phone controls and files are unavailable/);
-  assert.match(app, /if \(!currentDeviceId \|\| pendingDeviceId \|\| busy\) return/);
+  assert.match(app, /phoneStage\.setMode\("watch"\)/, "a watcher's stage can never send input");
+  assert.match(app, /if \(!currentDeviceId \|\| pendingDeviceId\) return null/);
 });
 
 test("AI workspace commands remain device-scoped and never enable screen input", () => {
@@ -132,11 +133,15 @@ test("role and error-handling audit controls are explicit and recoverable", () =
   assert.match(app, /No tasks are currently in the queue\./);
   assert.match(app, /markPresenceUnavailable\(\)/);
   assert.match(html, /id="release-button"[^>]*>Release device<\/button>[\s\S]*id="detail-access-note"/);
-  assert.match(html, /id="type-form"[\s\S]*button type="submit" disabled>Send/);
+  for (const removed of ["swipe-controls", "home-button", "refresh-screen-button", "type-form", "type-input"]) {
+    assert.doesNotMatch(html, new RegExp(`id="${removed}"`), `the old ${removed} control is gone: the phone is driven directly`);
+  }
+  assert.match(html, /id="phone-home-button"[^>]*aria-label="Home"/);
+  assert.match(html, /id="keyboard-capture"/);
   assert.match(html, /id="upload-form"[\s\S]*button type="submit" disabled>Upload/);
   const css = fs.readFileSync(path.join(clientDir, "style.css"), "utf8");
   assert.match(css, /#device-control-bar\s*\{[\s\S]*position: sticky/);
-  assert.match(css, /max-height: clamp\(240px, calc\(100vh - 390px\), 620px\)/);
+  assert.match(css, /\.phone-canvas\s*\{[\s\S]*max-height: clamp\(300px, calc\(100vh - 440px\), 660px\)/);
 });
 
 test("fleet connectors stop at the device group and proxy switching stays capability-gated", () => {
@@ -169,11 +174,11 @@ test("proxy tunnel routing controls are visible only through the server-issued r
   }
 });
 
-test("phone inputs carry request IDs and expose a dedicated screen refresh", () => {
-  assert.match(html, /id="refresh-screen-button"[^>]*>Refresh screen/);
+test("every phone input carries a request ID and the current device", () => {
+  assert.doesNotMatch(html, /id="refresh-screen-button"/);
   assert.match(app, /function nextActionRequestId\(\)/);
-  assert.match(app, /type: "tap", deviceId: currentDeviceId, requestId: nextActionRequestId\(\)/);
-  assert.match(app, /type: "refresh_screen", deviceId: currentDeviceId, requestId: nextActionRequestId\(\)/);
+  assert.match(app, /safeSend\(\{ \.\.\.message, deviceId: currentDeviceId, requestId \}/);
+  assert.match(app, /const requestId = nextActionRequestId\(\);/);
 });
 
 test("AI and research mutations preserve uncertain state until reconciled", () => {
@@ -183,4 +188,15 @@ test("AI and research mutations preserve uncertain state until reconciled", () =
   assert.match(app, /if \(completed && !aiChatPanelEl\.hidden\)/);
   assert.match(research, /window\.phoneFarmRequestJson/);
   assert.match(research, /Review result is uncertain\. Checking the saved run before retrying/);
+});
+
+test("the Sites panel is admin-only, hidden by default, and never keeps a token on screen after a role change", () => {
+  assert.match(html, /id="sites-panel"\s+hidden/);
+  assert.match(html, /id="site-token-reveal"[^>]*hidden/);
+  assert.match(html, /The token is shown only once/);
+  assert.match(app, /MANAGE_SITES: "sites:manage"/);
+  assert.match(app, /sitesPanelEl\.hidden = !can\(UI_CAPABILITIES\.MANAGE_SITES\)/);
+  assert.match(app, /can\(UI_CAPABILITIES\.MANAGE_SITES\) \? refreshSites\(\)/);
+  assert.match(app, /function clearSitesView\(\)[\s\S]*siteTokenCommandEl\.textContent = ""/);
+  assert.match(app, /profileRequestActive\(generation, UI_CAPABILITIES\.MANAGE_SITES\)/, "a stale response cannot repopulate the panel after demotion");
 });

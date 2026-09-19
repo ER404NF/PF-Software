@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><style>body{font-family:-apple-system,Helvetica,sans-serif;font-size:13px;line-height:1.5}h1{font-size:20px}h2{font-size:14px}code{background:#eee;padding:1px 4px;border-radius:3px}</style></head>
+<body>
+<h1>Before you start</h1>
+<h2>Computers that only connect to an existing Phone Farm host</h2>
+<p>Nothing else is required. Open Phone Farm and choose <b>Connect to an existing Phone Farm host</b>.</p>
+<h2>The Mac that will control the iPhones (the host)</h2>
+<p>Phone Farm automates the phones through Apple's own developer tools, which stay on your Mac. You do not need to use Terminal: when Phone Farm opens, its setup screen checks each item below and shows a <b>Fix it</b> button for anything it can do for you.</p>
+<ul>
+<li>macOS 12 or later, Apple silicon.</li>
+<li><b>Xcode</b> from the App Store. You do not need to open it; if it still needs finishing, Phone Farm does it and macOS asks for your Mac password once.</li>
+<li>The USB tools <code>libimobiledevice</code> and <code>libusbmuxd</code>. Phone Farm installs them for you when this Mac has Homebrew (free, from <code>brew.sh</code>); if it does not, the setup screen says so.</li>
+<li>An Apple Developer account signed in to Xcode. Phone Farm finds your <b>Team ID</b> by itself; if there is more than one, it asks you to choose once.</li>
+<li>On each iPhone: turn on <b>Developer Mode</b>, tap <b>Trust</b> when connecting it to the Mac, and keep it unlocked the first time.</li>
+</ul>
+<p>WebDriverAgent is included in the app; you do not need to download it.</p>
+</body>
+</html>

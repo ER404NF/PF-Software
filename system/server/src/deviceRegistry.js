@@ -22,10 +22,17 @@ function wdaOptions(device) {
     && (!Number.isSafeInteger(device.timeoutMs) || device.timeoutMs < 500 || device.timeoutMs > 60_000)) {
     throw new Error(`WDA device ${device.id} timeoutMs must be an integer from 500 to 60000`);
   }
+  if (device.mjpegPort !== undefined
+    && (!Number.isSafeInteger(device.mjpegPort) || device.mjpegPort < 1 || device.mjpegPort > 65535
+      || device.mjpegPort === device.port)) {
+    throw new Error(`WDA device ${device.id} mjpegPort must be an integer from 1 to 65535, different from its port`);
+  }
   if (typeof device.udid !== "string" || !/^[A-Za-z0-9-]{8,100}$/.test(device.udid)) {
     throw new Error(`WDA device ${device.id} requires a valid UDID`);
   }
-  return { host, port: device.port, timeoutMs: device.timeoutMs };
+  // mjpegPort is the local end of the iproxy forward to WDA's video server (device
+  // port 9100). Optional: without it the phone works but streams no live video.
+  return { host, port: device.port, mjpegPort: device.mjpegPort ?? null, timeoutMs: device.timeoutMs };
 }
 
 export function loadDevices(raw, discoveries = []) {
@@ -50,10 +57,15 @@ export function loadDevices(raw, discoveries = []) {
 
     const options = wdaOptions(device);
     const endpoint = `loopback:${options.port}`;
+    const videoEndpoint = options.mjpegPort === null ? null : `loopback:${options.mjpegPort}`;
     if (seenUdids.has(device.udid)) throw new Error(`Duplicate WDA UDID: ${device.udid}`);
     if (seenEndpoints.has(endpoint)) throw new Error(`Duplicate WDA endpoint: ${options.host}:${options.port}`);
+    if (videoEndpoint !== null && (seenEndpoints.has(videoEndpoint) || videoEndpoint === endpoint)) {
+      throw new Error(`Duplicate WDA endpoint: ${options.host}:${options.mjpegPort}`);
+    }
     seenUdids.add(device.udid);
     seenEndpoints.add(endpoint);
+    if (videoEndpoint !== null) seenEndpoints.add(videoEndpoint);
     map.set(device.id, new WdaDevice(device.id, label, options));
     if (discovered) discoveryByUdid.delete(device.udid);
   }
