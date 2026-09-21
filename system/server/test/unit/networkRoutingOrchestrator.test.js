@@ -119,6 +119,42 @@ test("startRouting happy path: proxy_leased -> tun_starting -> pf_applying -> ro
   ]);
 });
 
+test("concurrent startRouting requests for one device share one tunnel setup", async () => {
+  const storePath = tempStorePath();
+  const proxy = createProxy(storePath, samplePayload(), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxy.id });
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({ proxyPoolStorePath: storePath });
+
+  const [first, second] = await Promise.all([
+    orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" }),
+    orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" }),
+  ]);
+
+  assert.equal(first.state, ROUTING_STATES.ROUTED);
+  assert.equal(second.state, ROUTING_STATES.ROUTED);
+  assert.equal(tunManager.starts.length, 1);
+  assert.equal(privilegedOps.loadCalls.length, 1);
+  assert.equal(tunManager.isRunning("mock-1"), true);
+});
+
+test("stopRouting requested during setup runs after setup and leaves no resurrected route", async () => {
+  const storePath = tempStorePath();
+  const proxy = createProxy(storePath, samplePayload(), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxy.id });
+  const { orchestrator, tunManager } = makeOrchestrator({ proxyPoolStorePath: storePath });
+  let releaseInterfaces;
+  orchestrator.listAllInterfaces = () => new Promise(resolve => { releaseInterfaces = resolve; });
+
+  const starting = orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" });
+  await new Promise(resolve => setImmediate(resolve));
+  const stopping = orchestrator.stopRouting("mock-1");
+  releaseInterfaces(["lo0", "en0"]);
+  await Promise.all([starting, stopping]);
+
+  assert.equal(orchestrator.getRoute("mock-1"), null);
+  assert.equal(tunManager.isRunning("mock-1"), false);
+});
+
 test("a tunnel that never reports a peer address ends in tun_error and stops the tunnel process", async () => {
   const storePath = tempStorePath();
   const proxy = createProxy(storePath, samplePayload(), MASTER_KEY);
@@ -159,6 +195,27 @@ test("a PF syntax failure ends in pf_syntax_error, the ruleset is never loaded, 
   assert.equal(orchestrator.getRoute("mock-1").state, ROUTING_STATES.PF_SYNTAX_ERROR);
   assert.equal(privilegedOps.loadCalls.length, 0, "an unsyntactic ruleset must never be loaded");
   assert.equal(tunManager.stops.includes("mock-1"), true);
+});
+
+test("a failure after PF is loaded rolls back the device rule before stopping its tunnel", async () => {
+  const storePath = tempStorePath();
+  const proxy = createProxy(storePath, samplePayload(), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxy.id });
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({ proxyPoolStorePath: storePath });
+  privilegedOps.clearState = async ip => {
+    privilegedOps.clearStateCalls.push(ip);
+    throw new Error("state table unavailable");
+  };
+
+  await assert.rejects(
+    () => orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" }),
+    /state table unavailable/,
+  );
+
+  assert.equal(tunManager.isRunning("mock-1"), false);
+  assert.equal(privilegedOps.loadCalls.length, 1, "the device rule was installed before the late failure");
+  assert.equal(privilegedOps.clearAnchorCalls, 1, "the installed rule must be removed during rollback");
+  assert.equal(orchestrator.getRoute("mock-1").state, ROUTING_STATES.TUN_ERROR);
 });
 
 test("a second device routing regenerates the FULL ruleset including the first (full-replace, not append)", async () => {
@@ -207,6 +264,33 @@ test("stopRouting the LAST routed device clears the whole anchor instead of load
   await orchestrator.stopRouting("mock-1");
 
   assert.equal(privilegedOps.clearAnchorCalls, 1);
+});
+
+test("a failed PF cleanup keeps teardown retryable instead of forgetting the stale route", async () => {
+  const storePath = tempStorePath();
+  const proxy = createProxy(storePath, samplePayload(), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxy.id });
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({ proxyPoolStorePath: storePath });
+  await orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" });
+
+  privilegedOps.clearAnchor = async () => {
+    privilegedOps.clearAnchorCalls += 1;
+    throw new Error("pfctl unavailable");
+  };
+
+  await assert.rejects(() => orchestrator.stopRouting("mock-1"), /pfctl unavailable/);
+  assert.equal(tunManager.isRunning("mock-1"), false);
+  assert.equal(orchestrator.getRoute("mock-1").state, ROUTING_STATES.STOP_ERROR);
+  assert.match(orchestrator.getRoute("mock-1").lastError, /pfctl unavailable/);
+
+  privilegedOps.clearAnchor = async () => {
+    privilegedOps.clearAnchorCalls += 1;
+    return { ok: true };
+  };
+  await orchestrator.stopRouting("mock-1");
+
+  assert.equal(orchestrator.getRoute("mock-1"), null);
+  assert.equal(privilegedOps.clearAnchorCalls, 2);
 });
 
 test("stopRouting a device with no active route is a harmless no-op", async () => {

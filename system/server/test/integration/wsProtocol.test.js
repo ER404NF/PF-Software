@@ -316,18 +316,21 @@ test("a device already in use cannot be selected by a second connection", async 
   );
 });
 
-test("out-of-range tap coordinates are dropped silently, never forwarded", async () => {
+test("out-of-range tap coordinates are rejected explicitly and never forwarded", async () => {
   const client = await openClient();
   await client.waitFor((m) => m.type === "device_list");
   client.send({ type: "select_device", deviceId: "mock-1" });
   await client.waitFor((m) => m.type === "frame" && m.deviceId === "mock-1");
 
   const framesBefore = client.received.filter((m) => m.type === "frame").length;
-  client.send({ type: "tap", x: 2, y: 0.5 }); // out of [0,1]
-  client.send({ type: "tap", x: Number.NaN, y: 0.5 });
+  client.send({ type: "tap", x: 2, y: 0.5, requestId: 201 }); // out of [0,1]
+  client.send({ type: "tap", x: Number.NaN, y: 0.5, requestId: 202 });
 
-  // Prove the bad taps produced no response by sending one good action after
-  // them and confirming exactly one new frame arrives, not three. Counting
+  await client.waitForNext(() => client.received.filter((m) => m.code === "invalid_input").length >= 2);
+  assert.deepEqual(client.received.filter((m) => m.code === "invalid_input").slice(-2).map(m => m.requestId), [201, 202]);
+
+  // Prove the bad taps never reached the device by sending one good action
+  // after them and confirming exactly one new frame arrives. Counting
   // rather than matching frame content: mock-1 carries state over from the
   // earlier end-to-end test in this file (it's the same device instance), so
   // its screen may already contain swipe/typed text from that test.
@@ -400,7 +403,8 @@ test("a single failure reports an error but does not flip the device offline", a
   client.send({ type: "tap", x: 0.3, y: 0.3 });
   const err = await client.waitForNext((m) => m.type === "error");
   assert.equal(err.deviceId, "test-wda");
-  assert.match(err.message, /Couldn't reach/);
+  assert.equal(err.code, "action_result_uncertain");
+  assert.match(err.message, /may have reached the phone/i);
 
   // One blip shouldn't alarm every other VA watching the device list, or
   // knock the active VA off their own in-progress selection — only a run of

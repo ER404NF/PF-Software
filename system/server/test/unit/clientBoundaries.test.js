@@ -251,6 +251,21 @@ test("without live video the classic one-at-a-time flow still applies", () => {
   assert.equal(vm.runInContext('sendStageInput({ type: "tap", x: 0.5, y: 0.5 })', context), null);
   assert.equal(context.busy, false, "a failed send unlocks the screen again");
 });
+
+test("the screenshot-mode safety timeout outlasts remote actions and warns against duplicate input", () => {
+  let timer;
+  const context = vm.createContext({
+    busy: false, busyTimeoutId: null, currentDeviceId: "a", hintEl: {},
+    screenWrapEl: { classList: { toggle() {} } }, phoneHomeButtonEl: {}, phoneStage: { mode: "control" },
+    clearTimeout() {}, setTimeout(fn, delay) { timer = { fn, delay }; return 1; },
+  });
+  vm.runInContext(section("const BUSY_TIMEOUT_MS", "// Without this, a dropped connection"), context);
+  vm.runInContext("setBusy(true)", context);
+  assert.equal(timer.delay, 45_000);
+  timer.fn();
+  assert.match(context.hintEl.textContent, /may still be running/i);
+  assert.match(context.hintEl.textContent, /before deciding whether to repeat/i);
+});
 for (const code of [1008, 1006]) test(`expired session returns to login after close ${code}`, async () => {
   const handlers = {};
   let login = 0, reconnect;
@@ -259,7 +274,8 @@ for (const code of [1008, 1006]) test(`expired session returns to login after cl
     watchedDeviceId: null, pendingWatchDeviceId: null, watchRefreshTimerId: null, watchControlsEl: {}, filesPanelEl: {},
     fleetGroupsEl: {}, selectErrorEl: {}, connectionStatusEl: {}, deselect() {}, setOperatorProfile() {}, showLogin() { login++; }, resetStreamState() {},
     setConnectionState() {}, clearAiWorkspace() {}, markPresenceUnavailable() {},
-    setTimeout(fn) { reconnect = fn; }, clearTimeout() {}, fetch: async () => ({ status: 401 }),
+    setTimeout(fn) { reconnect = fn; }, clearTimeout() {},
+    requestJson: async () => { throw Object.assign(new Error("not logged in"), { status: 401 }); },
     WebSocket: class { addEventListener(name, fn) { handlers[name] = fn; } } });
   vm.runInContext(section("function connect()", "checkSession();"), context);
   vm.runInContext("connect()", context);

@@ -1313,7 +1313,10 @@ let activeLiveFrames = 0;
 // than STREAM_BACKPRESSURE_BYTES queued (slow mobile link) skips frames instead
 // of buffering them, so latency stays low rather than growing without bound.
 const streamHub = new StreamHub({ idleCloseMs: Number(process.env.STREAM_IDLE_CLOSE_MS) || 3000 });
-const STREAM_BACKPRESSURE_BYTES = 1_000_000;
+// One megabyte could hold many half-size JPEGs and make the operator watch old
+// input results. Start dropping while roughly one large frame is queued; the
+// newest skipped frame is retained below and replaces older skipped frames.
+const STREAM_BACKPRESSURE_BYTES = 128 * 1024;
 const STREAM_FLUSH_RETRY_MS = 120;
 const STREAM_SESSION_RECHECK_MS = 5000;
 // Input messages one connection may have waiting behind the phone. A wheel-happy
@@ -2171,9 +2174,17 @@ app.post("/api/research/:account/approvals/:id/:decision(approve|reject)", (req,
   if (!ownApproval(req, req.params.id)) return res.status(404).json({ error: "approval not found" });
   try {
     const approval = approvalStore.decide(req.params.id, { decision: req.params.decision, decidedBy: req.currentOperator.username, reason: req.body?.reason });
-    auditLog.logEvent({ operator: req.currentOperator.username, type: "approval_decided",
-      detail: { workspaceId: approval.workspaceId, account: approval.accountId, approvalId: approval.id, action: approval.action,
-        target: approval.target, decision: approval.state, taskId: approval.taskId } });
+    try {
+      auditLog.logEvent({ operator: req.currentOperator.username, type: "approval_decided",
+        detail: { workspaceId: approval.workspaceId, account: approval.accountId, approvalId: approval.id, action: approval.action,
+          target: approval.target, decision: approval.state, taskId: approval.taskId } });
+    } catch (error) {
+      // The approval decision is already durably committed. Do not turn an
+      // audit-disk problem into a misleading failed response (or an
+      // unhandled Express 4 async rejection) that invites a conflicting
+      // retry of the now-final decision.
+      console.error("Approval decision audit failed:", error);
+    }
     res.json({ approval, note: approval.state === "APPROVED"
       ? "Approved. The action runs the next time the paused task is resumed and reaches this step." : "Rejected." });
   } catch (error) {
@@ -2901,13 +2912,14 @@ wss.on("connection", (ws, request) => {
   // offline (which is what other VAs see in their device list) after a run
   // of consecutive failures, not one blip. This is the single funnel for
   // every failure below — success is recorded separately, in sendFrame.
-  const reportError = (message, target = selected, generation = selectionGeneration) => {
+  const reportError = (message, target = selected, generation = selectionGeneration, { code, requestId } = {}) => {
     if (!target || selected !== target || selectionGeneration !== generation) return;
     if (!selectedAccessActive(target)) {
       revokeSelectedAccess("device_error", target, generation);
       return;
     }
-    ws.send(JSON.stringify({ type: "error", deviceId: target.id, message }));
+    ws.send(JSON.stringify({ type: "error", deviceId: target.id, message,
+      ...(code ? { code } : {}), ...(Number.isSafeInteger(requestId) ? { requestId } : {}) }));
     const failures = recordFailure(target.id);
     if (failures >= OFFLINE_AFTER_FAILURES && target.status !== "offline") {
         const offlineId = target.id;
@@ -2922,6 +2934,21 @@ wss.on("connection", (ws, request) => {
   const reportTransportError = (error, target, generation) => {
     console.error(`Device transport failed for ${target.id}:`, error?.code || error?.name || "Error");
     reportError(`Couldn't reach ${target.label}.`, target, generation);
+  };
+  const reportInputTransportError = (error, target, generation, msg) => {
+    if (error?.code === "SITE_OFFLINE") {
+      // RemoteDevice rejects before sending an RPC when the site link is
+      // already down, so this case is definite rather than uncertain.
+      reportTransportError(error, target, generation);
+      return;
+    }
+    console.error(`Device input result uncertain for ${target.id}:`, error?.code || error?.name || "Error");
+    reportError(
+      `The connection to ${target.label} was lost while sending this action. It may have reached the phone. Refresh the screen before deciding whether to repeat it.`,
+      target,
+      generation,
+      { code: "action_result_uncertain", requestId: msg?.requestId },
+    );
   };
 
   const sendFrame = async ({ appliedAction = null, requestId = null } = {}) => {
@@ -3102,7 +3129,7 @@ wss.on("connection", (ws, request) => {
       await afterAction(label, msg);
     } catch (err) {
       if (err?.code === "DEVICE_ACCESS_REVOKED") revokeSelectedAccess(msg.type, target, generation);
-      else reportTransportError(err, target, generation);
+      else reportInputTransportError(err, target, generation, msg);
     }
   };
 
@@ -3407,13 +3434,22 @@ wss.on("connection", (ws, request) => {
       ws.send(JSON.stringify({ type: "stream_started", deviceId: target.id, streamId,
         mode: target === selected ? "control" : "watch" }));
       streamTarget = target;
-      const subscription = streamHub.subscribe(target, {
-        onFrame: frame => deliverStreamFrame(target, streamId, frame),
-        onState: (state, detail) => {
-          if (streamSeq !== streamId || ws.readyState !== ws.OPEN) return;
-          ws.send(JSON.stringify({ type: "stream_state", deviceId: target.id, streamId, state, detail: detail ?? null }));
-        },
-      });
+      let subscription;
+      try {
+        subscription = streamHub.subscribe(target, {
+          onFrame: frame => deliverStreamFrame(target, streamId, frame),
+          onState: (state, detail) => {
+            if (streamSeq !== streamId || ws.readyState !== ws.OPEN) return;
+            ws.send(JSON.stringify({ type: "stream_state", deviceId: target.id, streamId, state, detail: detail ?? null }));
+          },
+        });
+      } catch (error) {
+        if (streamTarget === target && streamSeq === streamId) streamTarget = null;
+        console.error("Live stream open failed:", error?.code || error?.name || "Error");
+        ws.send(JSON.stringify({ type: "stream_state", deviceId: target.id, streamId,
+          state: "error", detail: "Could not start live video. Try again." }));
+        return;
+      }
       if (!subscription || streamSeq !== streamId || (selected !== target && watched !== target)) {
         subscription?.unsubscribe();
         if (streamTarget === target && streamSeq === streamId) streamTarget = null;
@@ -3451,6 +3487,11 @@ wss.on("connection", (ws, request) => {
       }
     }
 
+    const rejectInvalidInput = (message) => {
+      ws.send(JSON.stringify({ type: "error", code: "invalid_input", deviceId: selected?.id,
+        requestId: Number.isSafeInteger(msg.requestId) ? msg.requestId : undefined, message }));
+    };
+
     if (msg.type === "refresh_screen" && selected) {
       await sendFrame({ requestId: Number.isSafeInteger(msg.requestId) ? msg.requestId : null });
       return;
@@ -3462,7 +3503,10 @@ wss.on("connection", (ws, request) => {
       // malformed message (NaN, missing, out of range) must stop here
       // rather than silently propagate.
       const isUnitCoord = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1;
-      if (!isUnitCoord(msg.x) || !isUnitCoord(msg.y)) return;
+      if (!isUnitCoord(msg.x) || !isUnitCoord(msg.y)) {
+        rejectInvalidInput("Tap coordinates must be within the visible phone screen.");
+        return;
+      }
 
       const target = selected;
       const generation = selectionGeneration;
@@ -3484,14 +3528,17 @@ wss.on("connection", (ws, request) => {
         await afterAction("Tap", msg);
       } catch (err) {
         if (err?.code === "DEVICE_ACCESS_REVOKED") revokeSelectedAccess("tap", target, generation);
-        else reportTransportError(err, target, generation);
+        else reportInputTransportError(err, target, generation, msg);
       }
       return;
     }
 
     if (msg.type === "swipe" && selected) {
       const directions = ["up", "down", "left", "right"];
-      if (!directions.includes(msg.direction)) return;
+      if (!directions.includes(msg.direction)) {
+        rejectInvalidInput("Swipe direction must be up, down, left, or right.");
+        return;
+      }
 
       const target = selected;
       const generation = selectionGeneration;
@@ -3513,7 +3560,7 @@ wss.on("connection", (ws, request) => {
         await afterAction("Swipe", msg);
       } catch (err) {
         if (err?.code === "DEVICE_ACCESS_REVOKED") revokeSelectedAccess("swipe", target, generation);
-        else reportTransportError(err, target, generation);
+        else reportInputTransportError(err, target, generation, msg);
       }
       return;
     }
@@ -3539,7 +3586,7 @@ wss.on("connection", (ws, request) => {
         await afterAction("Home", msg);
       } catch (err) {
         if (err?.code === "DEVICE_ACCESS_REVOKED") revokeSelectedAccess("home", target, generation);
-        else reportTransportError(err, target, generation);
+        else reportInputTransportError(err, target, generation, msg);
       }
       return;
     }
@@ -3547,7 +3594,10 @@ wss.on("connection", (ws, request) => {
     if (msg.type === "type_text" && selected) {
       // Cap length — this goes straight to the keyboard on a real device;
       // no reason to accept an unbounded payload.
-      if (typeof msg.text !== "string" || msg.text.length === 0 || msg.text.length > 1000) return;
+      if (typeof msg.text !== "string" || msg.text.length === 0 || msg.text.length > 1000) {
+        rejectInvalidInput("Text input must contain between 1 and 1,000 characters.");
+        return;
+      }
 
       const target = selected;
       const generation = selectionGeneration;
@@ -3571,7 +3621,7 @@ wss.on("connection", (ws, request) => {
         await afterAction("Text input", msg);
       } catch (err) {
         if (err?.code === "DEVICE_ACCESS_REVOKED") revokeSelectedAccess("type_text", target, generation);
-        else reportTransportError(err, target, generation);
+        else reportInputTransportError(err, target, generation, msg);
       }
       return;
     }
@@ -3585,8 +3635,14 @@ wss.on("connection", (ws, request) => {
         ? Math.min(max, Math.max(min, value)) : fallback;
 
       if (msg.type === "drag") {
-        if (![msg.x1, msg.y1, msg.x2, msg.y2].every(isUnit)) return;
-        if (msg.x1 === msg.x2 && msg.y1 === msg.y2) return;
+        if (![msg.x1, msg.y1, msg.x2, msg.y2].every(isUnit)) {
+          rejectInvalidInput("Drag coordinates must be within the visible phone screen.");
+          return;
+        }
+        if (msg.x1 === msg.x2 && msg.y1 === msg.y2) {
+          rejectInvalidInput("Drag start and end points must be different.");
+          return;
+        }
         const holdSec = boundedMs(msg.holdMs, 50, 0, 3000) / 1000;
         await performInput(msg, {
           label: "Scroll",
@@ -3597,7 +3653,10 @@ wss.on("connection", (ws, request) => {
         return;
       }
 
-      if (!isUnit(msg.x) || !isUnit(msg.y)) return;
+      if (!isUnit(msg.x) || !isUnit(msg.y)) {
+        rejectInvalidInput(`${msg.type === "long_press" ? "Long-press" : "Double-tap"} coordinates must be within the visible phone screen.`);
+        return;
+      }
       if (msg.type === "long_press") {
         const durationSec = boundedMs(msg.durationMs, 800, 300, 5000) / 1000;
         await performInput(msg, {

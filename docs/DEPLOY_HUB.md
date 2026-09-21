@@ -95,9 +95,9 @@ of 1–3 Mbps while watching; **this is an estimate, not a measurement on real h
 To use less, set these on the machine that runs the phone (the site agent, or the host):
 
 ```
-WDA_STREAM_FPS=8        # frames per second (1-60, default 15)
+WDA_STREAM_FPS=8        # frames per second (1-60, default 30)
 WDA_STREAM_SCALE=40     # percent of the phone's native size (10-100, default 50)
-WDA_STREAM_QUALITY=30   # JPEG quality (5-100, default 35)
+WDA_STREAM_QUALITY=30   # JPEG quality (5-100, default 45)
 ```
 
 ## 4. Time zone

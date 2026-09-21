@@ -206,11 +206,14 @@ test("mouse-style gestures: drag scrolls the feed, long press and double tap are
 test("malformed gestures never reach the device", async () => {
   const client = await openClient();
   await select(client, "stream-wda");
-  client.send({ type: "drag", x1: 2, y1: 0.5, x2: 0.5, y2: 0.3 });
-  client.send({ type: "drag", x1: "a", y1: 0.5, x2: 0.5, y2: 0.3 });
-  client.send({ type: "drag", x1: 0.5, y1: 0.5, x2: 0.5, y2: 0.5 });
-  client.send({ type: "long_press", x: NaN, y: 0.2 });
-  client.send({ type: "double_tap", x: -1, y: 0.2 });
+  client.send({ type: "drag", x1: 2, y1: 0.5, x2: 0.5, y2: 0.3, requestId: 101 });
+  client.send({ type: "drag", x1: "a", y1: 0.5, x2: 0.5, y2: 0.3, requestId: 102 });
+  client.send({ type: "drag", x1: 0.5, y1: 0.5, x2: 0.5, y2: 0.5, requestId: 103 });
+  client.send({ type: "long_press", x: NaN, y: 0.2, requestId: 104 });
+  client.send({ type: "double_tap", x: -1, y: 0.2, requestId: 105 });
+  await client.until(() => client.messages.filter(m => m.code === "invalid_input").length === 5,
+    { label: "one explicit rejection for each malformed gesture" });
+  assert.deepEqual(client.messages.filter(m => m.code === "invalid_input").map(m => m.requestId), [101, 102, 103, 104, 105]);
   const framesBefore = client.messages.filter(m => m.type === "frame").length;
   client.send({ type: "tap", x: 0.5, y: 0.5 }); // proves the queue drained past the bad ones
   await client.until(() => client.messages.filter(m => m.type === "frame").length > framesBefore, { label: "the valid tap completes" });

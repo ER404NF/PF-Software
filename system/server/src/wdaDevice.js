@@ -20,9 +20,9 @@ import { MjpegParser } from "./mjpegParser.js";
 const DEFAULT_TIMEOUT_MS = 8000;
 const MAX_IOS_LOGICAL_DIMENSION = 10000;
 
-// Video profile requested from WDA's MJPEG server. Modest on purpose: several
-// operators may watch over mobile data, and a phone's own encoder is the
-// bottleneck long before the network is. Override per host with WDA_STREAM_FPS /
+// Video profile requested from WDA's MJPEG server. The default favors a responsive
+// local control surface while keeping the half-size frames small enough to encode
+// and discard quickly. Override per host with WDA_STREAM_FPS /
 // WDA_STREAM_SCALE (percent of native size) / WDA_STREAM_QUALITY (JPEG 1-100).
 function envInt(name, fallback, min, max) {
   const value = Number.parseInt(process.env[name] ?? "", 10);
@@ -30,9 +30,9 @@ function envInt(name, fallback, min, max) {
 }
 export function defaultStreamProfile() {
   return {
-    framerate: envInt("WDA_STREAM_FPS", 15, 1, 60),
+    framerate: envInt("WDA_STREAM_FPS", 30, 1, 60),
     scalingFactor: envInt("WDA_STREAM_SCALE", 50, 10, 100),
-    quality: envInt("WDA_STREAM_QUALITY", 35, 5, 100),
+    quality: envInt("WDA_STREAM_QUALITY", 45, 5, 100),
   };
 }
 

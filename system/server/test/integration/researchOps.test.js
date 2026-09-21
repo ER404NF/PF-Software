@@ -135,6 +135,23 @@ test("approvals: a manager or admin decides, a VA cannot, each decision is audit
   assert.equal(approvalStore.findApproved({ ...ask, target: "https://www.instagram.com/p/BBB/" }), null);
 });
 
+test("an audit write failure after an approval decision does not report the committed decision as failed", async () => {
+  const pending = approvalStore.request({
+    workspaceId: "client-a", accountId: "account-a", action: "comment_generated",
+    target: "https://www.instagram.com/p/AUDIT/", commentText: "Useful", requestedBy: "va", taskId: "task-audit",
+  });
+  const originalLogEvent = auditLog.logEvent;
+  auditLog.logEvent = () => { throw new Error("audit disk full"); };
+  try {
+    const response = await request("manager", `/api/research/account-a/approvals/${pending.id}/approve`, "POST");
+    assert.equal(response.status, 200);
+    assert.equal(response.body.approval.state, "APPROVED");
+    assert.equal(approvalStore.get(pending.id).state, "APPROVED");
+  } finally {
+    auditLog.logEvent = originalLogEvent;
+  }
+});
+
 // ---- reports --------------------------------------------------------------------------------
 
 test("a finished session's report is readable by its workspace and nobody else", async () => {

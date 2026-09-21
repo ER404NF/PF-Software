@@ -53,6 +53,42 @@ test("an unexpected exit restarts after the configured backoff, not instantly", 
   assert.equal(children.length, 2); // restarted after backoff
 });
 
+test("a spawn error without an exit event still retries and reaches the restart limit", async () => {
+  const children = [];
+  const spawn = () => { const child = fakeChild(); children.push(child); return child; };
+  const group = new SupervisedProcessGroup({ spawn, restartBackoffMs: [5] });
+  let limitEvent = null;
+  group.on("restart-limit-exceeded", event => { limitEvent = event; });
+  group.start("udid-1", "missing-binary", []);
+
+  // Node emits `error` but no `exit` when the executable cannot be found.
+  children[0].emit("error", Object.assign(new Error("spawn missing-binary ENOENT"), { code: "ENOENT" }));
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(children.length, 2, "the missing executable is retried after backoff");
+  children[1].emit("error", Object.assign(new Error("spawn missing-binary ENOENT"), { code: "ENOENT" }));
+
+  assert.ok(limitEvent, "the permanent failure is surfaced after retries are exhausted");
+  assert.equal(group.isRunning("udid-1"), false);
+  assert.match(group.getLog("udid-1").join("\n"), /ENOENT/);
+});
+
+test("an exit listener can stop supervision before retry or restart-limit handling", () => {
+  let child;
+  const group = new SupervisedProcessGroup({
+    spawn: () => { child = fakeChild(); return child; },
+    restartBackoffMs: [],
+  });
+  let limitEvents = 0;
+  group.on("exit", ({ key }) => group.stop(key));
+  group.on("restart-limit-exceeded", () => { limitEvents += 1; });
+  group.start("udid-1", "bin", []);
+
+  child.emit("exit", 1, null);
+
+  assert.equal(group.isRunning("udid-1"), false);
+  assert.equal(limitEvents, 0, "a classified/manual stop must not be overwritten by the generic limit state");
+});
+
 test("stop() is terminal — no restart follows a deliberate stop", async () => {
   const children = [];
   const spawn = () => { const child = fakeChild(); children.push(child); return child; };

@@ -1,4 +1,21 @@
-# Roadmap Status Report — updated 2026-09-19
+# Roadmap Status Report — updated 2026-09-21
+
+## 2026-09-21 — larger phone view and low-latency transport decision
+
+The desktop live phone was artificially capped at 320 px wide and 660 px high.
+It now uses up to 480 px / 860 px in the normal workspace, gets a larger desktop
+column, and has a full-screen phone mode that preserves canvas-based input
+coordinates. The WDA profile now asks for 30 fps at 50% scale and quality 45.
+The relay begins dropping video at a 128 KiB WebSocket backlog instead of 1 MB,
+so slow links keep the newest picture rather than displaying a queue of old
+frames.
+
+WDA remains the supported automation and fallback video path. Research found
+that its MJPEG feed cannot satisfy a zero-backlog, smooth real-time target on
+its own because it captures and JPEG-encodes each frame. The recommended
+iOS 17+ experiment is CoreDevice HEVC display streaming plus CoreDevice HID
+input. Requirements, licensing constraints, performance gates, and the staged
+implementation plan are in [LIVE_CONTROL_TRANSPORT.md](LIVE_CONTROL_TRANSPORT.md).
 
 ## 2026-09-19 (latest) — response to the review of commit ae8b2f9: both CI runs were red, now fixed
 

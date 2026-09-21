@@ -2595,8 +2595,8 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
   display: block;
   width: auto;
   height: auto;
-  max-width: min(320px, calc(100vw - 96px));
-  max-height: clamp(300px, calc(100vh - 440px), 660px);
+  max-width: min(480px, calc(100vw - 96px));
+  max-height: clamp(420px, calc(100vh - 260px), 860px);
   background: #000;
 }
 #detail-view.ai-workspace .phone-canvas { max-width: 260px; }
@@ -2680,6 +2680,7 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 #stream-status[data-state="reconnecting"]::before,
 #stream-status[data-state="polling"]::before { background: var(--loading); }
 #keyboard-button,
+#phone-size-button,
 #stream-retry-button {
   padding: 5px 10px;
   border: 1px solid var(--line-strong);
@@ -2690,12 +2691,34 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
   cursor: pointer;
 }
 #keyboard-button[hidden],
+#phone-size-button[hidden],
 #stream-retry-button[hidden] { display: none; }
 @media (pointer: fine) { #keyboard-button { display: none !important; } }
 @media (max-width: 760px) {
   #phone-frame { padding: 20px 10px 14px; border-radius: 44px; }
-  .phone-canvas { max-width: min(300px, calc(100vw - 80px)); max-height: 58vh; }
+  .phone-canvas { max-width: min(390px, calc(100vw - 48px)); max-height: 72vh; }
 }
+#screen-panel:fullscreen {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  width: 100vw;
+  height: 100vh;
+  padding: 12px 20px;
+  overflow: hidden;
+  background: #090a0c;
+}
+#screen-panel:fullscreen #device-control-bar { position: static; flex: 0 0 auto; }
+#screen-panel:fullscreen #phone-frame { min-height: 0; padding: 14px 12px 10px; gap: 8px; border-radius: 42px; }
+#screen-panel:fullscreen .phone-canvas {
+  max-width: calc(100vw - 72px);
+  max-height: calc(100vh - 142px);
+}
+#screen-panel:fullscreen #phone-speaker { height: 4px; }
+#screen-panel:fullscreen #phone-home-button { width: 34px; height: 34px; }
+#screen-panel:fullscreen #hint { display: none; }
 @media (prefers-reduced-motion: reduce) {
   #phone-frame, #touch-dot, #phone-home-button { transition: none; }
 }
@@ -2717,7 +2740,7 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 #detail-view:not(.media-workspace) #screen-panel { min-width: 0; }
 @media (min-width: 1000px) {
   #detail-view:not([hidden]):not(.media-workspace):not(.ai-workspace) {
-    grid-template-columns: minmax(340px, 400px) minmax(0, 1fr);
+    grid-template-columns: minmax(460px, 540px) minmax(0, 1fr);
     grid-template-rows: auto auto auto auto 1fr;
     grid-template-areas: "heading heading" "note note" "message message" "body facts" "body ai";
     column-gap: 28px;

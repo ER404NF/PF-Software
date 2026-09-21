@@ -22,7 +22,10 @@ export const ROUTING_STATES = Object.freeze({
   TUN_ERROR: "tun_error",
   PF_APPLYING: "pf_applying",
   PF_SYNTAX_ERROR: "pf_syntax_error",
+  PF_CLEANUP_ERROR: "pf_cleanup_error",
   ROUTED: "routed",
+  STOPPING: "stopping",
+  STOP_ERROR: "stop_error",
   // A device that reached ROUTED and then lost either its tunnel process
   // or its loaded PF rule outside of a deliberate stopRouting() call
   // (guide §5's HEALTH_CHECKING -> NETWORK_ERROR -> RECOVER_ROUTE
@@ -64,6 +67,8 @@ export class NetworkRoutingOrchestrator {
     this.discoverTunPeer = discoverTunPeer;
     this.onStateChanged = onStateChanged;
     this.routes = new Map(); // deviceId -> { state, usbIp, tunIface, tunPeer, proxyId, lastError, lastPackets?, lastHealthCheckAt? }
+    this.startPromises = new Map(); // deviceId -> in-flight setup, shared by duplicate admin requests
+    this.stopPromises = new Map(); // deviceId -> in-flight teardown, shared by duplicate admin requests
     this.healthCheckTimer = null;
   }
 
@@ -113,9 +118,42 @@ export class NetworkRoutingOrchestrator {
     await this.privilegedOps.loadRuleset(ruleset);
   }
 
+  async _removeDeviceFromPf(deviceId) {
+    const remaining = this._desiredPfDevices(deviceId);
+    if (remaining.length > 0) {
+      await this._applyPfRuleset(remaining);
+    } else {
+      await this.privilegedOps.clearAnchor();
+    }
+  }
+
   // `usbIp` must already be resolved (see the class-level comment).
-  async startRouting(deviceId, { usbIp }) {
+  async startRouting(deviceId, options) {
+    const inFlight = this.startPromises.get(deviceId);
+    if (inFlight) return inFlight;
+    const operation = (async () => {
+      const stopping = this.stopPromises.get(deviceId);
+      if (stopping) await stopping;
+      return this._startRouting(deviceId, options);
+    })();
+    this.startPromises.set(deviceId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.startPromises.get(deviceId) === operation) this.startPromises.delete(deviceId);
+    }
+  }
+
+  async _startRouting(deviceId, { usbIp }) {
     if (typeof usbIp !== "string" || !usbIp) throw new Error("startRouting requires a known usbIp");
+
+    const active = this.routes.get(deviceId);
+    if (active?.state === ROUTING_STATES.ROUTED) {
+      if (active.usbIp === usbIp) return active;
+      const error = new Error("routing is already active for this device; stop it before changing its USB IP");
+      error.status = 409;
+      throw error;
+    }
 
     const proxyRecord = proxyForDevice(this.proxyPoolStorePath, deviceId);
     if (!proxyRecord) throw new Error("no pool proxy is assigned to this device — assign one before starting routing");
@@ -125,6 +163,7 @@ export class NetworkRoutingOrchestrator {
     // PF_SYNTAX_ERROR rather than leaving the route stuck at PROXY_LEASED
     // with no recorded error — interface discovery/allocation included,
     // not just the tunnel/PF steps below.
+    let pfLoaded = false;
     try {
       const existingIfaces = await this.listAllInterfaces();
       const previousTunIface = this.routes.get(deviceId)?.tunIface ?? null;
@@ -152,36 +191,65 @@ export class NetworkRoutingOrchestrator {
 
       this._setState(deviceId, ROUTING_STATES.PF_APPLYING, { usbIp, proxyId: proxyRecord.id, tunIface, tunPeer: peer.peerIp });
       await this._applyPfRuleset(this._desiredPfDevices());
+      pfLoaded = true;
       await this.privilegedOps.clearState(usbIp);
 
       return this._setState(deviceId, ROUTING_STATES.ROUTED, { usbIp, proxyId: proxyRecord.id, tunIface, tunPeer: peer.peerIp });
     } catch (error) {
+      let reportedError = error;
+      let state = error.pfSyntaxError ? ROUTING_STATES.PF_SYNTAX_ERROR : ROUTING_STATES.TUN_ERROR;
+      if (pfLoaded) {
+        try {
+          // Remove a rule that was installed for a route that never reached
+          // ROUTED while its tunnel is still alive. This avoids leaving PF
+          // pointed at a dead interface after a later setup step fails.
+          await this._removeDeviceFromPf(deviceId);
+        } catch (cleanupError) {
+          reportedError = new Error(`${error.message}; PF rollback failed: ${cleanupError.message}`, { cause: error });
+          state = ROUTING_STATES.PF_CLEANUP_ERROR;
+        }
+      }
       this.tunManager.stop(deviceId);
-      const state = error.pfSyntaxError ? ROUTING_STATES.PF_SYNTAX_ERROR : ROUTING_STATES.TUN_ERROR;
-      this._setError(deviceId, state, error.message);
-      throw error;
+      this._setError(deviceId, state, reportedError.message);
+      throw reportedError;
     }
   }
 
   async stopRouting(deviceId) {
+    const inFlight = this.stopPromises.get(deviceId);
+    if (inFlight) return inFlight;
+    const operation = (async () => {
+      const starting = this.startPromises.get(deviceId);
+      if (starting) {
+        try { await starting; } catch { /* tear down whatever the failed setup left behind */ }
+      }
+      return this._stopRouting(deviceId);
+    })();
+    this.stopPromises.set(deviceId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.stopPromises.get(deviceId) === operation) this.stopPromises.delete(deviceId);
+    }
+  }
+
+  async _stopRouting(deviceId) {
     const route = this.routes.get(deviceId);
-    // Deleted before any await (and before tunManager.stop(), which is what
-    // makes isRunning() go false) so a health-check tick that interleaves
-    // with this teardown sees the device as already gone rather than
-    // "ROUTED but its tunnel just died" — checkHealth()'s own `!route`
-    // guard then skips it instead of emitting a spurious ROUTE_LOST for a
-    // deliberate stop. _desiredPfDevices() below doesn't need the entry
-    // still present; it excludes `deviceId` explicitly either way.
-    this.routes.delete(deviceId);
     this.tunManager.stop(deviceId);
     if (!route) return;
-    const remaining = this._desiredPfDevices(deviceId);
-    if (remaining.length > 0) {
-      await this._applyPfRuleset(remaining);
-    } else {
-      await this.privilegedOps.clearAnchor();
+    // Keep the route until privileged cleanup succeeds. STOPPING is ignored
+    // by both health checks and desired-PF generation, so concurrent work
+    // cannot resurrect it or retain its rule. If cleanup fails, preserving
+    // the route makes a later stopRouting() call able to retry the removal.
+    this._setState(deviceId, ROUTING_STATES.STOPPING);
+    try {
+      await this._removeDeviceFromPf(deviceId);
+      if (route.usbIp) await this.privilegedOps.clearState(route.usbIp);
+    } catch (error) {
+      this._setError(deviceId, ROUTING_STATES.STOP_ERROR, error.message);
+      throw error;
     }
-    if (route.usbIp) await this.privilegedOps.clearState(route.usbIp);
+    this.routes.delete(deviceId);
     this.onStateChanged(deviceId, null);
   }
 

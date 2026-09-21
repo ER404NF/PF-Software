@@ -85,6 +85,7 @@ const deviceControlBarEl = document.getElementById("device-control-bar");
 const streamStatusEl = document.getElementById("stream-status");
 const streamRetryButtonEl = document.getElementById("stream-retry-button");
 const keyboardButtonEl = document.getElementById("keyboard-button");
+const phoneSizeButtonEl = document.getElementById("phone-size-button");
 const phoneFrameEl = document.getElementById("phone-frame");
 const phoneHomeButtonEl = document.getElementById("phone-home-button");
 const touchDotEl = document.getElementById("touch-dot");
@@ -517,7 +518,38 @@ function updateTopNav() {
   adminNavButtonEl.classList.toggle("active", currentView === "admin");
 }
 
+function syncPhoneSizeButton() {
+  const expanded = document.fullscreenElement === screenPanelEl;
+  phoneSizeButtonEl.textContent = expanded ? "Exit full screen" : "Full screen";
+  phoneSizeButtonEl.setAttribute("aria-pressed", String(expanded));
+}
+
+async function togglePhoneFullscreen() {
+  detailMessageEl.textContent = "";
+  try {
+    if (document.fullscreenElement === screenPanelEl) await document.exitFullscreen();
+    else if (document.fullscreenElement) {
+      detailMessageEl.textContent = "Exit the current full-screen view, then try again.";
+    } else if (typeof screenPanelEl.requestFullscreen === "function") {
+      await screenPanelEl.requestFullscreen();
+    } else {
+      detailMessageEl.textContent = "Full-screen phone view is not supported by this browser.";
+    }
+  } catch {
+    detailMessageEl.textContent = "The browser could not open the full-screen phone view. Try again from the phone screen.";
+  } finally {
+    syncPhoneSizeButton();
+  }
+}
+
+function exitPhoneFullscreen() {
+  if (document.fullscreenElement === screenPanelEl && typeof document.exitFullscreen === "function") {
+    void document.exitFullscreen().catch(() => {});
+  }
+}
+
 function showFleetView() {
+  exitPhoneFullscreen();
   stopLiveView();
   if (streamActive) {
     // Leaving the phone view: stop paying for video. Selecting the phone again restarts it.
@@ -603,7 +635,11 @@ function nextActionRequestId() {
 // A real device response should arrive well under this; if it doesn't, the
 // server-side action queue still processes things in order regardless, so
 // unsticking the UI early here is a minor cosmetic risk, not a correctness one.
-const BUSY_TIMEOUT_MS = 10000;
+// A remote-site action can legitimately use the hub's 20-second RPC window
+// and then need a second round trip for the refreshed screenshot. Keep the
+// fallback beyond that combined window so it cannot unlock the stage and
+// encourage a duplicate while the first action is still being resolved.
+const BUSY_TIMEOUT_MS = 45000;
 
 function setBusy(value, { timedOut = false } = {}) {
   busy = value;
@@ -620,7 +656,7 @@ function setBusy(value, { timedOut = false } = {}) {
     // Distinguishes "the safety net fired" from "a real response arrived" —
     // without this, hitting the timeout looked identical to success, with no
     // indication anything actually went wrong.
-    hintEl.textContent = "No response from the device — you can try again.";
+    hintEl.textContent = "No response yet. The action may still be running on the phone. Refresh the screen before deciding whether to repeat it.";
   }
 }
 
@@ -1636,14 +1672,18 @@ function connect() {
     setTimeout(async () => {
       if (signedOut) return;
       try {
-        const response = await fetch("/api/me");
-        if (response.status === 401) {
+        await requestJson("/api/me", {}, { timeoutMs: 5000 });
+      } catch (error) {
+        if (error?.status === 401) {
           signedOut = true;
           setOperatorProfile(null);
           showLogin();
           return;
         }
-      } catch { /* A network outage may recover on the next connection. */ }
+        // A network outage or a hung session check may recover on the next
+        // socket connection. requestJson bounds the wait so this reconnect
+        // path cannot stall forever on a half-open HTTP request.
+      }
       if (!signedOut) connect();
     }, 2000);
   });
@@ -2999,6 +3039,8 @@ document.addEventListener("visibilitychange", () => {
 
 streamRetryButtonEl.addEventListener("click", () => requestStream());
 keyboardButtonEl.addEventListener("click", () => phoneStage.focusKeyboard());
+phoneSizeButtonEl.addEventListener("click", () => { void togglePhoneFullscreen(); });
+document.addEventListener("fullscreenchange", syncPhoneSizeButton);
 
 async function refreshFiles() {
   if (!mediaDeviceId) return;

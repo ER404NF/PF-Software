@@ -42,6 +42,21 @@ test("only stream-capable devices can be subscribed", () => {
   assert.equal(hub.subscribe({ id: "x", supportsStream: false, openStream() {} }, { onFrame() {} }), null);
 });
 
+test("a synchronous upstream open failure does not poison later stream retries", () => {
+  const hub = new StreamHub();
+  const device = fakeDevice();
+  const open = device.openStream;
+  device.openStream = () => { throw new Error("video port unavailable"); };
+
+  assert.throws(() => hub.subscribe(device, { onFrame() {} }), /video port unavailable/);
+  assert.equal(hub.stats(device.id).state, "idle");
+
+  device.openStream = open;
+  const subscription = hub.subscribe(device, { onFrame() {} });
+  assert.ok(subscription);
+  assert.equal(device.opened, 1);
+});
+
 test("many viewers share ONE upstream, and each receives every frame", () => {
   const hub = new StreamHub();
   const device = fakeDevice();

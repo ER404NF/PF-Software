@@ -145,7 +145,7 @@ export class DeviceProvisioner {
       this.iproxyManager.start({ udid, localPort: port, mjpegLocalPort: mjpegPort });
     } catch (error) {
       wdaDevice.discoveryState = "provisioning_error";
-      wdaDevice.discoveryStateMessage = error.message;
+      wdaDevice.discoveryStateMessage = "Automatic WDA setup could not start. An admin can review the host logs and retry.";
     }
     this.onDeviceListChanged();
   }
@@ -205,12 +205,15 @@ export class DeviceProvisioner {
     this.onDeviceListChanged();
   }
 
-  _onRestartLimitExceeded(kind, udid, log) {
+  _onRestartLimitExceeded(kind, udid, _log) {
     const entry = this.runtime.get(udid);
     if (!entry) return;
-    const lastLine = log?.length ? log[log.length - 1].trim().slice(0, 300) : "";
     entry.wdaDevice.discoveryState = "provisioning_error";
-    entry.wdaDevice.discoveryStateMessage = `${kind} failed to start after repeated attempts. An admin can retry.${lastLine ? ` Last log: ${lastLine}` : ""}`;
+    // Process output can contain a raw UDID, host username, checkout path,
+    // signing identity, or command arguments. Device summaries are visible
+    // to operators, so keep diagnostics in the host log and expose only a
+    // stable recovery instruction here.
+    entry.wdaDevice.discoveryStateMessage = `${kind} failed to start after repeated attempts. An admin can review the host logs and retry.`;
     entry.wdaDevice.status = "offline";
     this.onDeviceListChanged();
   }

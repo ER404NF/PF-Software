@@ -53,10 +53,19 @@ export class StreamHub {
         fps: 0,
       };
       this.entries.set(device.id, entry);
-      entry.source = device.openStream({
-        onFrame: frame => this._fanout(entry, frame),
-        onState: (state, detail) => this._setState(entry, state, detail),
-      });
+      try {
+        entry.source = device.openStream({
+          onFrame: frame => this._fanout(entry, frame),
+          onState: (state, detail) => this._setState(entry, state, detail),
+        });
+      } catch (error) {
+        // Do not retain a source-less "connecting" entry. A transient port
+        // or adapter failure must allow the next viewer request to make a
+        // fresh open attempt instead of attaching forever to a dead entry.
+        if (this.entries.get(device.id) === entry) this.entries.delete(device.id);
+        try { entry.source?.close?.(); } catch { /* no usable source remains */ }
+        throw error;
+      }
     }
     if (entry.idleTimer) {
       this.clearTimeoutFn(entry.idleTimer);

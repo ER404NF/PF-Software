@@ -127,9 +127,9 @@ test("openStream delivers real, changing, decodable frames and applies the video
     assert.ok(states.includes("connecting"));
     const settings = (await history()).find(h => h.type === "settings");
     assert.ok(settings, "streaming profile posted to WDA");
-    assert.equal(settings.settings.mjpegServerFramerate, 15);
+    assert.equal(settings.settings.mjpegServerFramerate, 30);
     assert.equal(settings.settings.mjpegScalingFactor, 50);
-    assert.equal(settings.settings.mjpegServerScreenshotQuality, 35);
+    assert.equal(settings.settings.mjpegServerScreenshotQuality, 45);
   } finally {
     stream.close();
   }

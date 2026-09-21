@@ -141,7 +141,10 @@ test("role and error-handling audit controls are explicit and recoverable", () =
   assert.match(html, /id="upload-form"[\s\S]*button type="submit" disabled>Upload/);
   const css = fs.readFileSync(path.join(clientDir, "style.css"), "utf8");
   assert.match(css, /#device-control-bar\s*\{[\s\S]*position: sticky/);
-  assert.match(css, /\.phone-canvas\s*\{[\s\S]*max-height: clamp\(300px, calc\(100vh - 440px\), 660px\)/);
+  assert.match(css, /\.phone-canvas\s*\{[\s\S]*max-width: min\(480px,[\s\S]*max-height: clamp\(420px, calc\(100vh - 260px\), 860px\)/);
+  assert.match(html, /id="phone-size-button"[^>]*aria-pressed="false"[^>]*>Full screen<\/button>/);
+  assert.match(app, /screenPanelEl\.requestFullscreen\(\)/);
+  assert.match(css, /#screen-panel:fullscreen \.phone-canvas\s*\{[\s\S]*max-height: calc\(100vh - 142px\)/);
 });
 
 test("fleet connectors stop at the device group and proxy switching stays capability-gated", () => {

@@ -226,17 +226,18 @@ test("an unrecognized process exit is left to the restart/backoff path, not surf
   assert.equal(device.discoveryState, "provisioning"); // unchanged — SupervisedProcessGroup handles the restart itself
 });
 
-test("exhausting the restart budget surfaces provisioning_error with the last log line", async () => {
+test("exhausting the restart budget surfaces a retryable error without exposing raw process output", async () => {
   const { provisioner, wdaProcessManager, devices, state } = makeProvisioner();
   state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
   await provisioner.pollOnce();
 
-  wdaProcessManager.emitRestartLimitExceeded("UDID-00000001", ["boom happened\n"]);
+  wdaProcessManager.emitRestartLimitExceeded("UDID-00000001", ["failed /Users/operator/WDA for UDID-00000001\n"]);
 
   const device = devices.get(discoveredDeviceId("UDID-00000001"));
   assert.equal(device.discoveryState, "provisioning_error");
   assert.match(device.discoveryStateMessage, /WDA failed to start after repeated attempts/);
-  assert.match(device.discoveryStateMessage, /boom happened/);
+  assert.doesNotMatch(device.discoveryStateMessage, /UDID-00000001/);
+  assert.doesNotMatch(device.discoveryStateMessage, /\/Users\/operator/);
 });
 
 test("retry() restarts both processes with the persisted port/derivedDataPath and resets the banner", async () => {
