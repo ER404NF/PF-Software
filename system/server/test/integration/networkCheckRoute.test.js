@@ -126,7 +126,7 @@ test("commands require authentication like every other device route", async () =
   assert.equal(res.status, 401);
 });
 
-test("a verification endpoint is required", async () => {
+test("an unassigned phone reports that no automatic verification path is available", async () => {
   const res = await fetch(`${httpUrl}/api/devices/mock-1/network-check`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Cookie: cookie },
@@ -134,7 +134,8 @@ test("a verification endpoint is required", async () => {
   });
   assert.equal(res.status, 409);
   const body = await res.json();
-  assert.match(body.error, /endpoint is not configured/);
+  assert.equal(body.code, "V201");
+  assert.match(body.error, /saved proxy is assigned/);
 });
 
 test("an unknown device is rejected", async () => {

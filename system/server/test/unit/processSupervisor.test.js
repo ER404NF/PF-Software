@@ -134,3 +134,21 @@ test("getLog() still works after restart-limit-exceeded, for post-mortem diagnos
   assert.equal(group.isRunning("udid-1"), false);
   assert.deepEqual(group.getLog("udid-1"), ["fatal error"]);
 });
+
+test("a stable run resets old restart failures before a later crash", async () => {
+  const children = [];
+  const spawn = () => { const child = fakeChild(); children.push(child); return child; };
+  const group = new SupervisedProcessGroup({ spawn, restartBackoffMs: [5], stableRunMs: 15 });
+  let limitEvents = 0;
+  group.on("restart-limit-exceeded", () => { limitEvents += 1; });
+  group.start("udid-1", "bin", []);
+  children[0].emit("exit", 1, null);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(children.length, 2);
+  await new Promise(resolve => setTimeout(resolve, 25));
+  assert.equal(group.getStatus("udid-1").restartCount, 0);
+  children[1].emit("exit", 1, null);
+  await new Promise(resolve => setTimeout(resolve, 10));
+  assert.equal(children.length, 3, "a crash after stability receives a fresh retry budget");
+  assert.equal(limitEvents, 0);
+});

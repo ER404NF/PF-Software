@@ -132,6 +132,17 @@ test("role and error-handling audit controls are explicit and recoverable", () =
   assert.match(app, /Reject \$\{user\.username\}\?/);
   assert.match(app, /No tasks are currently in the queue\./);
   assert.match(app, /markPresenceUnavailable\(\)/);
+  assert.match(app, /function deviceComponentRows\(device\)/);
+  for (const label of ["Device", "Control", "WDA", "iproxy", "Network", "Proxy"]) {
+    assert.match(app, new RegExp(`\\["${label}"`));
+  }
+  assert.match(app, /\["Error name", error\.name\]/);
+  assert.match(app, /\["Location", error\.location/);
+  assert.match(app, /\["How to fix", error\.operatorAction\]/);
+  assert.match(app, /diagnostics\.textContent = "Diagnostics"/);
+  for (const label of ["Physical devices", "Device control", "Proxy tunnels", "Protected routes"]) {
+    assert.match(app, new RegExp(`\\["${label}"`));
+  }
   assert.match(html, /id="release-button"[^>]*>Release device<\/button>[\s\S]*id="detail-access-note"/);
   for (const removed of ["swipe-controls", "home-button", "refresh-screen-button", "type-form", "type-input"]) {
     assert.doesNotMatch(html, new RegExp(`id="${removed}"`), `the old ${removed} control is gone: the phone is driven directly`);

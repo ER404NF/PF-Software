@@ -16,8 +16,10 @@
 // — forever. Every request below carries this as its abort signal so a dead
 // device surfaces as an error within a bounded time instead of hanging.
 import { MjpegParser } from "./mjpegParser.js";
+import { diagnosticError } from "./errorCatalog.js";
 
 const DEFAULT_TIMEOUT_MS = 8000;
+const DEFAULT_READINESS_FAILURE_THRESHOLD = 3;
 const MAX_IOS_LOGICAL_DIMENSION = 10000;
 
 // Video profile requested from WDA's MJPEG server. The default favors a responsive
@@ -54,15 +56,46 @@ function validWindowSize(value) {
     && Number.isFinite(value.height) && value.height > 0 && value.height <= MAX_IOS_LOGICAL_DIMENSION;
 }
 
+function readinessFailureWhy(error) {
+  if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+    return "The WDA /status endpoint did not answer before the configured timeout. This does not by itself prove the iPhone was unplugged.";
+  }
+  if (error?.readinessReason === "http") {
+    return `The WDA /status endpoint returned HTTP ${error.httpStatus}, so the process was reachable but did not report a usable readiness response.`;
+  }
+  if (error?.readinessReason === "not_ready") {
+    return "The WDA endpoint answered, but its response did not declare the service ready.";
+  }
+  return "The WDA /status request failed before a valid ready response was received. Attachment and process health must be checked separately.";
+}
+
 export class WdaDevice {
-  constructor(id, label, { host = "127.0.0.1", port, mjpegPort = null, timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  constructor(id, label, { host = "127.0.0.1", port, mjpegPort = null, timeoutMs = DEFAULT_TIMEOUT_MS,
+    readinessFailureThreshold = DEFAULT_READINESS_FAILURE_THRESHOLD } = {}) {
     this.id = id;
     this.kind = "wda";
     this.label = label;
     this.host = host;
     this.mjpegPort = Number.isSafeInteger(mjpegPort) ? mjpegPort : null;
     this.status = "offline"; // fail closed until /status confirms this WDA endpoint is ready
-    this.readiness = { ready: false, checkedAt: null };
+    this.readinessFailureThreshold = readinessFailureThreshold;
+    this.readiness = {
+      ready: false,
+      state: "UNKNOWN",
+      checkedAt: null,
+      lastHealthyAt: null,
+      consecutiveFailures: 0,
+      lastError: null,
+    };
+    this.componentHealth = {
+      deviceAttachment: "UNKNOWN",
+      wdaProcess: "UNKNOWN",
+      iproxy: "UNKNOWN",
+      wdaEndpoint: "UNKNOWN",
+      control: "UNAVAILABLE",
+      recovery: "IDLE",
+    };
+    this.diagnosticEvents = [];
     this.baseUrl = `http://${host}:${port}`;
     this.timeoutMs = timeoutMs;
     this.sessionId = null;
@@ -75,18 +108,95 @@ export class WdaDevice {
     const checkedAt = new Date().toISOString();
     try {
       const response = await fetch(`${this.baseUrl}/status`, { signal: AbortSignal.timeout(this.timeoutMs) });
-      if (!response.ok) throw new Error(`WDA readiness failed: HTTP ${response.status}`);
+      if (!response.ok) {
+        const error = new Error(`WDA readiness failed: HTTP ${response.status}`);
+        error.readinessReason = "http";
+        error.httpStatus = response.status;
+        throw error;
+      }
       const body = await response.json();
       const ready = body?.ready === true || body?.value?.ready === true;
-      if (!ready) throw new Error("WDA readiness response was not ready");
-      this.readiness = { ready: true, checkedAt };
+      if (!ready) {
+        const error = new Error("WDA readiness response was not ready");
+        error.readinessReason = "not_ready";
+        throw error;
+      }
+      this.readiness = {
+        ready: true,
+        state: "HEALTHY",
+        checkedAt,
+        lastHealthyAt: checkedAt,
+        consecutiveFailures: 0,
+        lastError: null,
+      };
+      this.setComponentHealth({ wdaEndpoint: "HEALTHY", control: "READY", recovery: "IDLE" });
+      this.recordDiagnosticEvent("WDA_READY", { checkedAt });
       if (this.status !== "in-use") this.status = "idle";
       return true;
-    } catch {
-      this.readiness = { ready: false, checkedAt };
-      if (this.status !== "in-use") this.status = "offline";
+    } catch (error) {
+      const failures = (this.readiness.consecutiveFailures ?? 0) + 1;
+      const state = failures === 1 ? "SUSPECT"
+        : failures < this.readinessFailureThreshold ? "DEGRADED" : "FAILED";
+      const code = error?.name === "TimeoutError" || error?.name === "AbortError" ? "W201" : "W204";
+      const detail = diagnosticError(code, {
+        why: readinessFailureWhy(error),
+        technical: {
+          reason: error?.readinessReason || error?.code || error?.name || "request_failed",
+          httpStatus: error?.httpStatus,
+          timeoutMs: this.timeoutMs,
+          consecutiveFailures: failures,
+        },
+        at: checkedAt,
+      });
+      this.readiness = {
+        ready: false,
+        state,
+        checkedAt,
+        lastHealthyAt: this.readiness.lastHealthyAt ?? null,
+        consecutiveFailures: failures,
+        lastError: detail,
+      };
+      this.setComponentHealth({
+        wdaEndpoint: state,
+        control: state === "FAILED" ? "UNAVAILABLE" : "DEGRADED",
+      });
+      this.recordDiagnosticEvent("WDA_HEALTH_CHECK_FAILED", {
+        checkedAt, error: detail, consecutiveFailures: failures,
+      });
+      // A single transient endpoint failure is evidence of degraded health,
+      // not evidence that the physical phone disappeared. Preserve a phone
+      // that was already usable until the configured repeated-failure
+      // threshold is reached. A never-ready phone starts offline and stays so.
+      if (failures >= this.readinessFailureThreshold && this.status !== "in-use") this.status = "offline";
       return false;
     }
+  }
+
+  setComponentHealth(patch = {}) {
+    this.componentHealth = { ...this.componentHealth, ...patch };
+    return this.componentHealth;
+  }
+
+  recordDiagnosticEvent(type, detail = {}) {
+    const event = { type, at: new Date().toISOString(), ...detail };
+    this.diagnosticEvents.push(event);
+    if (this.diagnosticEvents.length > 50) this.diagnosticEvents.shift();
+    return event;
+  }
+
+  beginRecovery(component) {
+    this.readiness = { ...this.readiness, ready: false, state: "RECOVERING", consecutiveFailures: 0 };
+    this.setComponentHealth({ wdaEndpoint: "RECOVERING", control: "DEGRADED", recovery: component });
+    this.recordDiagnosticEvent("WDA_RECOVERING", { component });
+  }
+
+  healthSnapshot() {
+    return {
+      ...this.componentHealth,
+      readiness: { ...this.readiness },
+      latestError: this.readiness.lastError ?? null,
+      recentEvents: this.diagnosticEvents.slice(-10),
+    };
   }
 
   async ensureSession() {

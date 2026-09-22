@@ -30,9 +30,10 @@ class FakeProcessManager {
     this.running = new Set();
   }
   on(...args) { this.emitter.on(...args); return this; }
-  start(opts) { this.starts.push(opts); this.running.add(opts.udid); }
+  start(opts) { this.starts.push(opts); this.running.add(opts.udid); this.emitter.emit("starting", { key: opts.udid }); }
   stop(udid) { this.stops.push(udid); this.running.delete(udid); }
   stopAll() { for (const udid of [...this.running]) this.stop(udid); }
+  getStatus(udid) { return { state: this.running.has(udid) ? "running" : "stopped", restartCount: 0 }; }
   emitExit(udid, log = []) { this.emitter.emit("exit", { key: udid, code: 1, signal: null, log }); }
   emitRestartLimitExceeded(udid, log = []) { this.emitter.emit("restart-limit-exceeded", { key: udid, restartCount: 99, log }); }
 }
@@ -41,7 +42,7 @@ function tempStorePath() {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pf-provisioner-")), "device-provisioning.json");
 }
 
-function makeProvisioner({ manualUdids = new Set() } = {}) {
+function makeProvisioner({ manualUdids = new Set(), recoveryCooldownMs, now } = {}) {
   const state = { attached: [] };
   const devices = new Map();
   const wdaProcessManager = new FakeProcessManager();
@@ -56,6 +57,8 @@ function makeProvisioner({ manualUdids = new Set() } = {}) {
     provisioningStorePath: tempStorePath(),
     derivedDataRoot: "/tmp/derived-root",
     portRange: { start: 9000, end: 9010 },
+    ...(recoveryCooldownMs === undefined ? {} : { recoveryCooldownMs }),
+    ...(now ? { now } : {}),
     onDeviceListChanged: () => changes.push(true),
   });
   return { provisioner, wdaProcessManager, iproxyManager, devices, changes, state };
@@ -78,6 +81,22 @@ test("a newly discovered, unconfigured UDID is provisioned automatically", async
   assert.equal(iproxyManager.starts.length, 1);
   assert.equal(iproxyManager.starts[0].localPort, 9000);
   assert.ok(changes.length > 0);
+});
+
+test("a discovery command failure retains attached runtimes instead of treating every phone as unplugged", async () => {
+  const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+
+  state.attached = { ok: false, devices: [], error: { code: "D102", reason: "EPIPE" } };
+  await provisioner.pollOnce();
+
+  assert.equal(provisioner.runtime.has("UDID-00000001"), true);
+  assert.equal(wdaProcessManager.stops.length, 0);
+  assert.equal(iproxyManager.stops.length, 0);
+  assert.equal(devices.get(logicalId).componentHealth.deviceAttachment, "UNKNOWN");
+  assert.equal(devices.get(logicalId).readiness.lastError.code, "D102");
 });
 
 test("polling again for the same attached UDID does not start a second process", async () => {
@@ -154,7 +173,7 @@ test("detach stops both processes and marks the device disconnected without dele
   assert.equal(devices.has(logicalId), true); // kept, matching the architecture guide's "keep the stable registry entry"
 });
 
-test("detach never overrides an in-use device's status", async () => {
+test("detach preserves an in-flight ownership lock but reports the physical disconnect", async () => {
   const { provisioner, devices, state } = makeProvisioner();
   state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
   await provisioner.pollOnce();
@@ -164,7 +183,10 @@ test("detach never overrides an in-use device's status", async () => {
   state.attached = [];
   await provisioner.pollOnce();
   assert.equal(device.status, "in-use");
-  assert.notEqual(device.discoveryState, "disconnected");
+  assert.equal(device.discoveryState, "disconnected");
+  assert.equal(device.componentHealth.deviceAttachment, "DISCONNECTED");
+  assert.equal(device.componentHealth.control, "UNAVAILABLE");
+  assert.equal(device.readiness.lastError.code, "D101");
 });
 
 test("a replug after detach reuses the same WdaDevice instance and the same persisted port", async () => {
@@ -197,6 +219,8 @@ test("a recognized WDA failure surfaces as user_action_required and stops retryi
   assert.equal(device.discoveryState, "user_action_required");
   assert.match(device.discoveryStateMessage, /Trust the developer certificate/);
   assert.equal(device.status, "offline");
+  assert.equal(device.readiness.lastError.code, "W205");
+  assert.equal(device.componentHealth.recovery, "USER_ACTION_REQUIRED");
   assert.ok(wdaProcessManager.stops.includes("UDID-00000001"));
   assert.ok(iproxyManager.stops.includes("UDID-00000001"));
 });
@@ -224,6 +248,66 @@ test("an unrecognized process exit is left to the restart/backoff path, not surf
 
   wdaProcessManager.emitExit("UDID-00000001", ["some transient network blip\n"]);
   assert.equal(device.discoveryState, "provisioning"); // unchanged — SupervisedProcessGroup handles the restart itself
+});
+
+test("an unresponsive endpoint restarts iproxy first, then WDA, before exhausting recovery", async () => {
+  let clock = 1000;
+  const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner({
+    recoveryCooldownMs: 10,
+    now: () => clock,
+  });
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const device = devices.get(discoveredDeviceId("UDID-00000001"));
+  const initialWdaStarts = wdaProcessManager.starts.length;
+  const initialIproxyStarts = iproxyManager.starts.length;
+
+  device.readiness.state = "FAILED";
+  clock += 20;
+  await provisioner.pollOnce();
+  assert.equal(iproxyManager.starts.length, initialIproxyStarts + 1);
+  assert.equal(wdaProcessManager.starts.length, initialWdaStarts);
+  assert.equal(device.componentHealth.recovery, "IPROXY");
+  assert.equal(device.readiness.lastError.code, "I202");
+
+  device.readiness.state = "FAILED";
+  clock += 20;
+  await provisioner.pollOnce();
+  assert.equal(wdaProcessManager.starts.length, initialWdaStarts + 1);
+  assert.equal(iproxyManager.starts.length, initialIproxyStarts + 1);
+  assert.equal(device.componentHealth.recovery, "WDA");
+
+  device.readiness.state = "FAILED";
+  clock += 20;
+  await provisioner.pollOnce();
+  assert.equal(device.componentHealth.recovery, "EXHAUSTED");
+  assert.equal(device.readiness.lastError.code, "R201");
+  assert.equal(device.discoveryState, "provisioning_error");
+});
+
+test("endpoint recovery for Phone A never restarts Phone B processes", async () => {
+  let clock = 1000;
+  const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner({
+    recoveryCooldownMs: 10,
+    now: () => clock,
+  });
+  state.attached = [
+    { id: "a", udid: "UDID-00000001", label: "Phone A" },
+    { id: "b", udid: "UDID-00000002", label: "Phone B" },
+  ];
+  await provisioner.pollOnce();
+  devices.get(discoveredDeviceId("UDID-00000001")).readiness.state = "FAILED";
+  devices.get(discoveredDeviceId("UDID-00000002")).readiness.state = "HEALTHY";
+  wdaProcessManager.stops.length = 0;
+  iproxyManager.stops.length = 0;
+  clock += 20;
+
+  await provisioner.pollOnce();
+
+  assert.deepEqual(iproxyManager.stops, ["UDID-00000001"]);
+  assert.deepEqual(wdaProcessManager.stops, []);
+  assert.equal(iproxyManager.starts.filter(start => start.udid === "UDID-00000002").length, 1);
+  assert.equal(wdaProcessManager.starts.filter(start => start.udid === "UDID-00000002").length, 1);
 });
 
 test("exhausting the restart budget surfaces a retryable error without exposing raw process output", async () => {

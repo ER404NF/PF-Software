@@ -47,7 +47,9 @@ import { loadDeviceNetworkMap, publicNetworkConfig } from "./deviceNetworkConfig
 import { isProxyEgress, setDeviceProxyEnabled } from "./deviceNetworkStore.js";
 import {
   createProxy, deleteProxy, assignProxyToDevice, publicProxy, publicProxies,
+  getProxyRecord, decryptProxyPassword, updateProxyHealth,
 } from "./proxyPool.js";
+import { testProxy } from "./proxyTester.js";
 import { createNetworkVerifier } from "./networkVerifier.js";
 import { resolveNetworkCheckTarget } from "./networkCheckTarget.js";
 import { resolveDeploymentConfig } from "./deploymentConfig.js";
@@ -1472,6 +1474,7 @@ const summary = (d, viewer = null, viewerSocket = null) => {
     siteOnline: d.isRemote ? d.siteOnline : null,
     timeZone: d.timeZone ?? null,
     ...getHealth(d.id),
+    componentHealth: typeof d.healthSnapshot === "function" ? d.healthSnapshot() : null,
     controllerMode: deviceLease.getMode(d.id),
     currentOperator: humanOwners.get(d.id)?.operatorUsername ?? null,
     ...deviceOpenDecision(d, viewer, viewerSocket),
@@ -1500,6 +1503,14 @@ const summary = (d, viewer = null, viewerSocket = null) => {
     network: publicNetworkConfig(deviceNetwork.get(d.id)),
     poolProxy: hasCapability(viewer, CAPABILITIES.VIEW_PROXY_POOL) ? poolProxyForDevice(d.id) : null,
     routing: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? (networkRoutingOrchestrator?.getRoute(d.id) ?? null) : null,
+    networkRouteHealth: (() => {
+      const route = networkRoutingOrchestrator?.getRoute(d.id);
+      return route ? {
+        state: route.state,
+        protected: route.protected === true,
+        internetBlocked: route.internetBlocked === true,
+      } : null;
+    })(),
     usbNetwork: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? usbNetworkForDevice(d.id) : null,
     autoEnrollment: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? (autoNetworkEnrollment?.getStatus(d.id) ?? null) : null,
     ...networkVerifier.getStatus(d.id),
@@ -1516,6 +1527,20 @@ app.get("/api/devices/:deviceId/monitor", (req, res) => {
     return res.status(403).json({ error: "not authorized for this device" });
   }
   res.json({ monitor: runtimeMonitorState(req.params.deviceId) });
+});
+
+app.get("/api/admin/devices/:deviceId/diagnostics", requireCapability(CAPABILITIES.MANAGE_DEVICES), (req, res) => {
+  if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
+  if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
+    return res.status(403).json({ error: "not authorized for this device" });
+  }
+  const device = devices.get(req.params.deviceId);
+  res.json({
+    deviceId: device.id,
+    health: typeof device.healthSnapshot === "function" ? device.healthSnapshot() : null,
+    routing: networkRoutingOrchestrator?.getRoute(device.id) ?? null,
+    network: networkVerifier.getStatus(device.id),
+  });
 });
 
 // Stamps a device-scoped audit event's detail with which network egress the
@@ -1663,11 +1688,62 @@ app.post("/api/devices/:deviceId/network-check", (req, res) => {
     return res.status(error.status ?? 400).json({ error: error.message });
   }
   if (typeof checkUrl !== "string" || checkUrl.length === 0) {
-    return res.status(409).json({ error: "network verification endpoint is not configured" });
+    const assigned = poolProxyForDevice(req.params.deviceId);
+    if (!assigned) {
+      return res.status(409).json({
+        error: "No automatic network verification path is available until a saved proxy is assigned to this phone.",
+        code: "V201",
+      });
+    }
+    if (!proxyCredentialEncryptionKey) {
+      return res.status(503).json({ error: "proxy verification is unavailable until the credential encryption key is configured", code: "V201" });
+    }
+    const record = getProxyRecord(proxyPoolStorePath, assigned.id);
+    if (!record) return res.status(409).json({ error: "the assigned proxy no longer exists", code: "V201" });
+    checkUrl = null;
+    void (async () => {
+      const proxyResult = await testProxy({
+        protocol: record.protocol, host: record.host, port: record.port, username: record.username,
+        password: decryptProxyPassword(record, proxyCredentialEncryptionKey), country: record.country,
+      });
+      updateProxyHealth(proxyPoolStorePath, record.id, proxyResult);
+      refreshProxyPoolCache();
+      await networkRoutingOrchestrator?.checkHealth();
+      return networkVerifier.recordInfrastructureCheck(req.params.deviceId, {
+        proxyResult,
+        route: networkRoutingOrchestrator?.getRoute(req.params.deviceId) ?? null,
+      });
+    })().then((result) => {
+      const access = networkDecision(req.params.deviceId);
+      if (!access.allowed) {
+        taskQueue.stopDevice(req.params.deviceId, "network_policy");
+        for (const client of wss.clients) client.releaseUnauthorizedSelection?.("network_policy");
+      }
+      broadcastDeviceList();
+      const current = resolveOperator(req.session?.operator);
+      if (!current) return res.status(401).json({ error: "authentication required" });
+      if (!hasCapability(current, CAPABILITIES.RUN_NETWORK_CHECK)
+        || !canAccessDevice(current, req.params.deviceId)) return res.status(403).json({ error: "network verification is not permitted" });
+      auditLog.logEvent({ operator: current.username, type: "network_check", deviceId: req.params.deviceId,
+        detail: { proxyId: record.id, level: result.networkVerificationLevel, protected: false } });
+      res.json({ network: { ...(publicNetworkConfig(configuredNetwork) ?? {}), ...result } });
+    }).catch(error => {
+      console.error("Automatic proxy verification failed:", error?.code || error?.name || "Error");
+      const diagnostic = error?.diagnostic;
+      res.status(error?.status || 502).json({ error: diagnostic?.name || "network verification failed",
+        code: diagnostic?.code || "V201", diagnostic: diagnostic || null });
+    });
+    return;
   }
   networkVerifier
     .checkDevice(req.params.deviceId, checkUrl)
-    .then((result) => {
+    .then(async (result) => {
+      if (result.networkMismatch && isProxyEgress(configuredNetwork?.egress)) {
+        await networkRoutingOrchestrator?.quarantineRoute(req.params.deviceId, {
+          code: result.networkLatestError?.code || "V204",
+          why: result.networkMismatchReason || "End-to-end verification detected an unexpected route.",
+        });
+      }
       const access = networkDecision(req.params.deviceId);
       if (!access.allowed) {
         taskQueue.stopDevice(req.params.deviceId, "network_policy");
@@ -1849,6 +1925,64 @@ app.post("/api/admin/proxies", requireCapability(CAPABILITIES.MANAGE_PROXY), (re
   } catch (error) {
     if (error?.status) return res.status(error.status).json({ error: error.message });
     throw error;
+  }
+});
+
+function proxyTestFields(body = {}) {
+  return {
+    protocol: body.protocol,
+    host: body.host,
+    port: body.port,
+    username: body.username,
+    password: body.password,
+    country: body.country,
+  };
+}
+
+function proxyTestFailure(res, error) {
+  const diagnostic = error?.diagnostic;
+  return res.status(error?.status || 502).json({
+    error: diagnostic?.name || "Proxy test failed",
+    code: diagnostic?.code || "P111",
+    diagnostic: diagnostic || null,
+  });
+}
+
+app.post("/api/admin/proxies/test", requireCapability(CAPABILITIES.MANAGE_PROXY), async (req, res) => {
+  try {
+    const result = await testProxy(proxyTestFields(req.body));
+    res.json({ result });
+  } catch (error) {
+    proxyTestFailure(res, error);
+  }
+});
+
+app.post("/api/admin/proxies/:proxyId/test", requireCapability(CAPABILITIES.MANAGE_PROXY), async (req, res) => {
+  if (!proxyCredentialEncryptionKey) {
+    return res.status(503).json({ error: "proxy testing is unavailable until the credential encryption key is configured" });
+  }
+  const record = getProxyRecord(proxyPoolStorePath, req.params.proxyId);
+  if (!record) return res.status(404).json({ error: "unknown proxy" });
+  try {
+    const result = await testProxy({
+      protocol: record.protocol, host: record.host, port: record.port, username: record.username,
+      password: decryptProxyPassword(record, proxyCredentialEncryptionKey), country: record.country,
+    });
+    updateProxyHealth(proxyPoolStorePath, record.id, result);
+    refreshProxyPoolCache();
+    auditLog.logEvent({ operator: req.currentOperator.username, type: "proxy_test_succeeded",
+      detail: { proxyId: record.id, publicIpv4: result.publicIpv4, country: result.country, latencyMs: result.latencyMs } });
+    res.json({ result, proxy: publicProxy(getProxyRecord(proxyPoolStorePath, record.id)) });
+  } catch (error) {
+    const diagnostic = error?.diagnostic;
+    updateProxyHealth(proxyPoolStorePath, record.id, {
+      status: "failed", checkedAt: new Date().toISOString(),
+      errorCode: diagnostic?.code || "P111", errorName: diagnostic?.name || "Proxy test failed",
+    });
+    refreshProxyPoolCache();
+    auditLog.logEvent({ operator: req.currentOperator.username, type: "proxy_test_failed",
+      detail: { proxyId: record.id, errorCode: diagnostic?.code || "P111" } });
+    proxyTestFailure(res, error);
   }
 });
 
@@ -2655,9 +2789,11 @@ function broadcastDeviceList() {
 
 async function refreshWdaReadiness() {
   const candidates = [...devices.values()].filter(device => device instanceof WdaDevice && device.status !== "in-use");
-  const previous = new Map(candidates.map(device => [device.id, device.status]));
+  const previous = new Map(candidates.map(device => [device.id,
+    `${device.status}:${device.readiness?.state}:${device.readiness?.consecutiveFailures}`]));
   await Promise.all(candidates.map(device => device.checkReadiness()));
-  if (candidates.some(device => previous.get(device.id) !== device.status)) broadcastDeviceList();
+  if (candidates.some(device => previous.get(device.id)
+    !== `${device.status}:${device.readiness?.state}:${device.readiness?.consecutiveFailures}`)) broadcastDeviceList();
 }
 
 function runtimeMonitorState(deviceId) {

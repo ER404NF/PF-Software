@@ -1,7 +1,7 @@
-import { discoveredDeviceId, discoverIosDevices as defaultDiscoverIosDevices } from "./deviceDiscovery.js";
+import { discoveredDeviceId, discoverIosDevicesResult as defaultDiscoverIosDevices } from "./deviceDiscovery.js";
 import { listBridgeMembers as defaultListBridgeMembers, discoverBridgeOwnIp as defaultDiscoverBridgeOwnIp } from "./usbNetworkMapper.js";
 import { captureDeviceTraffic as defaultCaptureDeviceTraffic, discoverDeviceIp } from "./usbIpDiscovery.js";
-import { getUsbNetworkRecord, setUsbIface, setUsbIp, loadUsbNetworkRecords } from "./usbNetworkStore.js";
+import { clearUsbNetworkRecord, getUsbNetworkRecord, setUsbIface, setUsbIp, loadUsbNetworkRecords } from "./usbNetworkStore.js";
 import { proxyForDevice } from "./proxyPool.js";
 
 const DEFAULT_POLL_INTERVAL_MS = 5000;
@@ -51,6 +51,8 @@ export class AutoNetworkEnrollment {
     this.onStatusChanged = onStatusChanged;
     this.status = new Map(); // logicalId -> { state, note, updatedAt }
     this.ipAttempts = new Map(); // logicalId -> { lastAttemptAt, count }
+    this.attachedLastTick = new Set();
+    this.validatedMappings = new Set();
     this.timer = null;
   }
 
@@ -83,26 +85,59 @@ export class AutoNetworkEnrollment {
     } catch {
       return; // discovery hiccup — retried next tick, nothing to reconcile from
     }
+    if (attached && !Array.isArray(attached)) {
+      if (attached.ok !== true || !Array.isArray(attached.devices)) return;
+      attached = attached.devices;
+    }
+    if (!Array.isArray(attached)) return;
     const candidateDevices = attached.filter(d => !this.manualUdids.has(d.udid));
+    const attachedIds = new Set(candidateDevices.map(device => discoveredDeviceId(device.udid)));
+    for (const previousId of this.attachedLastTick) {
+      if (attachedIds.has(previousId)) continue;
+      clearUsbNetworkRecord(this.usbNetworkStorePath, previousId);
+      this.validatedMappings.delete(previousId);
+      this.ipAttempts.delete(previousId);
+      this._setStatus(previousId, "disconnected", "The cached USB interface and IP were cleared; they will be rediscovered after reconnect.");
+    }
+    this.attachedLastTick = attachedIds;
 
     const records = loadUsbNetworkRecords(this.usbNetworkStorePath);
-    const claimedIfaces = new Set(Object.values(records).map(r => r.usbIface).filter(Boolean));
-
-    const pendingDevices = candidateDevices.filter(d => !records[discoveredDeviceId(d.udid)]?.usbIface);
 
     let members;
     try {
       members = await this.listBridgeMembers({ bridgeIface: this.bridgeIface });
     } catch (error) {
-      for (const device of pendingDevices) this._setStatus(discoveredDeviceId(device.udid), "pending", `Waiting to read ${this.bridgeIface}: ${error.message}`);
+      for (const device of candidateDevices) this._setStatus(discoveredDeviceId(device.udid), "pending", `Waiting to read ${this.bridgeIface}: ${error.message}`);
       return;
     }
+    // Persisted enX/IP values are hints, never proof. On the first sighting
+    // in this process, require the interface to still be on the configured
+    // bridge and force a fresh traffic-based IP observation. A vanished
+    // interface invalidates the whole mapping instead of being guessed.
+    for (const device of candidateDevices) {
+      const logicalId = discoveredDeviceId(device.udid);
+      const record = records[logicalId];
+      if (!record?.usbIface || this.validatedMappings.has(logicalId)) continue;
+      if (!members.includes(record.usbIface)) {
+        clearUsbNetworkRecord(this.usbNetworkStorePath, logicalId);
+        delete records[logicalId];
+        this._setStatus(logicalId, "stale", "The saved USB interface is no longer on the bridge and will be rediscovered.");
+      } else {
+        records[logicalId] = setUsbIface(this.usbNetworkStorePath, logicalId, record.usbIface);
+        this._setStatus(logicalId, "discovering_ip", "Revalidating the phone's USB network address.");
+      }
+      this.validatedMappings.add(logicalId);
+    }
+
+    const claimedIfaces = new Set(Object.values(records).map(r => r.usbIface).filter(Boolean));
+    const pendingDevices = candidateDevices.filter(d => !records[discoveredDeviceId(d.udid)]?.usbIface);
     const pendingMembers = members.filter(m => !claimedIfaces.has(m));
 
     if (pendingDevices.length === 1 && pendingMembers.length === 1) {
       const logicalId = discoveredDeviceId(pendingDevices[0].udid);
       try {
         setUsbIface(this.usbNetworkStorePath, logicalId, pendingMembers[0]);
+        this.validatedMappings.add(logicalId);
         this._setStatus(logicalId, "discovering_ip", null);
       } catch (error) {
         this._setStatus(logicalId, "pending", `Could not record network enrollment: ${error.message}`);

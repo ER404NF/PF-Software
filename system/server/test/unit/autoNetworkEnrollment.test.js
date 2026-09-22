@@ -4,7 +4,7 @@ import fs from "fs";
 import os from "os";
 import path from "path";
 import { discoveredDeviceId } from "../../src/deviceDiscovery.js";
-import { getUsbNetworkRecord } from "../../src/usbNetworkStore.js";
+import { getUsbNetworkRecord, setUsbIface, setUsbIp } from "../../src/usbNetworkStore.js";
 import { createProxy, assignProxyToDevice } from "../../src/proxyPool.js";
 import { AutoNetworkEnrollment } from "../../src/autoNetworkEnrollment.js";
 
@@ -86,6 +86,19 @@ test("a phone with no new bridge member yet is left pending, not misassigned to 
   assert.equal(enrollment.getStatus(discoveredDeviceId(UDID_A)).state, "pending");
 });
 
+test("a bridge inspection failure stays retryable and reports pending instead of throwing", async () => {
+  const { enrollment } = makeEnrollment({
+    attached: [{ id: "x", udid: UDID_A, label: "Phone A" }], members: [],
+  });
+  enrollment.listBridgeMembers = async () => { throw new Error("ifconfig unavailable"); };
+
+  await enrollment.tick();
+
+  const status = enrollment.getStatus(discoveredDeviceId(UDID_A));
+  assert.equal(status.state, "pending");
+  assert.match(status.note, /ifconfig unavailable/);
+});
+
 test("a manually configured UDID is never auto-enrolled", async () => {
   const { enrollment, usbNetworkStorePath } = makeEnrollment({
     attached: [{ id: "x", udid: UDID_A, label: "Phone A" }],
@@ -116,6 +129,53 @@ test("a bridge member already claimed by a previously-enrolled device is exclude
   await enrollment.tick();
 
   assert.equal(enrollment.getStatus(discoveredDeviceId(UDID_B)).state, "discovering_ip");
+});
+
+test("a persisted USB IP is re-observed on startup and a vanished interface is never reused", async () => {
+  const { enrollment, usbNetworkStorePath } = makeEnrollment({
+    attached: [{ id: "x", udid: UDID_A, label: "Phone A" }],
+    members: ["en6"],
+  });
+  const logicalId = discoveredDeviceId(UDID_A);
+  setUsbIface(usbNetworkStorePath, logicalId, "en5");
+  setUsbIp(usbNetworkStorePath, logicalId, "192.168.2.99");
+
+  await enrollment.tick();
+
+  const record = getUsbNetworkRecord(usbNetworkStorePath, logicalId);
+  assert.equal(record.usbIface, "en6", "the lone current bridge member is enrolled instead of reusing vanished en5");
+  assert.equal(record.usbIp, null, "the persisted IP is never reused without fresh traffic evidence");
+});
+
+test("a discovery-command failure does not clear a previously attached phone's network mapping", async () => {
+  const { enrollment, usbNetworkStorePath } = makeEnrollment({
+    attached: [{ id: "x", udid: UDID_A, label: "Phone A" }], members: ["en5"],
+  });
+  const logicalId = discoveredDeviceId(UDID_A);
+  await enrollment.tick();
+  enrollment.discoverIosDevices = () => ({ ok: false, devices: [], error: { code: "D102" } });
+
+  await enrollment.tick();
+
+  assert.equal(getUsbNetworkRecord(usbNetworkStorePath, logicalId).usbIface, "en5");
+});
+
+test("a real detach clears transient mapping so reconnect performs enrollment again", async () => {
+  let attached = [{ id: "x", udid: UDID_A, label: "Phone A" }];
+  const { enrollment, usbNetworkStorePath } = makeEnrollment({ attached, members: ["en5"] });
+  enrollment.discoverIosDevices = () => attached;
+  const logicalId = discoveredDeviceId(UDID_A);
+  await enrollment.tick();
+  assert.equal(getUsbNetworkRecord(usbNetworkStorePath, logicalId).usbIface, "en5");
+
+  attached = [];
+  await enrollment.tick();
+  assert.equal(getUsbNetworkRecord(usbNetworkStorePath, logicalId), null);
+  assert.equal(enrollment.getStatus(logicalId).state, "disconnected");
+
+  attached = [{ id: "x", udid: UDID_A, label: "Phone A" }];
+  await enrollment.tick();
+  assert.equal(getUsbNetworkRecord(usbNetworkStorePath, logicalId).usbIface, "en5");
 });
 
 test("IP discovery runs automatically after enrollment and records the resolved address", async () => {

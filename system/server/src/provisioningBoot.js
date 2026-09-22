@@ -7,7 +7,7 @@
 
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { discoverIosDevices } from "./deviceDiscovery.js";
+import { discoverIosDevicesResult } from "./deviceDiscovery.js";
 import { runHostPreflight } from "./hostPreflight.js";
 import { resolvePortRange, resolveMjpegPortRange } from "./portAllocator.js";
 import { WdaProcessManager } from "./wdaProcessManager.js";
@@ -21,7 +21,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 // `deps` exists so a test can observe what would be used without running Xcode.
 const REAL = {
   runPreflight: runHostPreflight,
-  discover: discoverIosDevices,
+  discover: discoverIosDevicesResult,
   createWdaManager: options => new WdaProcessManager(options),
   createIproxyManager: options => new IProxyManager(options),
   createProvisioner: options => new DeviceProvisioner(options),

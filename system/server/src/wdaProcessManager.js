@@ -39,6 +39,7 @@ export class WdaProcessManager {
 
   on(...args) { this.group.on(...args); return this; }
   isRunning(udid) { return this.group.isRunning(udid); }
+  getStatus(udid) { return this.group.getStatus(udid); }
   getLog(udid) { return this.group.getLog(udid); }
   stop(udid) { this.group.stop(udid); }
   stopAll() { this.group.stopAll(); }

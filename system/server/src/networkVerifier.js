@@ -30,6 +30,7 @@
 
 import { egressIdentity } from "./deviceNetworkConfig.js";
 import { isIP } from "node:net";
+import { diagnosticError } from "./errorCatalog.js";
 
 const DEFAULT_TIMEOUT_MS = 5000;
 
@@ -46,6 +47,11 @@ function emptyStatus() {
     networkProxyHealthy: null,
     networkBandwidthMbps: null,
     networkRouteMatch: null,
+    networkVerificationLevel: null,
+    networkProtectionState: "UNCONFIGURED",
+    networkVerificationMessage: null,
+    networkLatestError: null,
+    networkDiagnosticEvents: [],
   };
 }
 
@@ -96,8 +102,16 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS,
         ? body.bandwidthMbps : null;
     } catch (err) {
       onError(err);
+      const diagnostic = diagnosticError("V201", {
+        why: "PF-Software could not complete the device egress request.",
+        technical: { reason: err?.code || err?.name, timeoutMs },
+      });
       const entry = { ...emptyStatus(), networkCheckedAt: checkedAt(), networkVerified: false,
-        networkMismatchReason: "network check failed" };
+        networkMismatchReason: "network check failed", networkProtectionState: "FAILED",
+        networkVerificationMessage: diagnostic.why,
+        networkLatestError: diagnostic,
+        networkDiagnosticEvents: [{ type: "NETWORK_VERIFY_STARTED", at: diagnostic.at },
+          { type: "NETWORK_DEGRADED", at: diagnostic.at, errorCode: diagnostic.code }] };
       status.set(deviceId, entry);
       return entry;
     }
@@ -112,9 +126,15 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS,
     if (network?.expectedIpv6Policy === "blocked" && observedIpv6) mismatches.push("IPv6 was observed but policy requires it blocked");
     if (network?.expectedIpv6Policy === "required" && !observedIpv6) mismatches.push("IPv6 was not observed but policy requires it");
     if (proxyHealthy === false) mismatches.push("proxy health endpoint reported unhealthy");
+    const errorCode = observedIpv6 && network?.expectedIpv6Policy === "blocked" ? "V203"
+      : network?.expectedPublicIpv4 && network.expectedPublicIpv4 !== observedIp ? "V202"
+        : mismatches.length ? "V204" : null;
+    const latestError = errorCode ? diagnosticError(errorCode, { why: mismatches.join("; "),
+      technical: { observedIpv6: Boolean(observedIpv6), mismatchCount: mismatches.length } }) : null;
+    const eventAt = checkedAt();
     const entry = {
       networkObservedIp: observedIp,
-      networkCheckedAt: checkedAt(),
+      networkCheckedAt: eventAt,
       networkVerified: mismatches.length === 0,
       networkMismatch: mismatches.length > 0,
       networkMismatchReason: mismatches.length ? mismatches.join("; ") : null,
@@ -124,6 +144,15 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS,
       networkProxyHealthy: proxyHealthy,
       networkBandwidthMbps: bandwidthMbps,
       networkRouteMatch: mismatches.length === 0,
+      networkVerificationLevel: "configured-egress-endpoint",
+      networkProtectionState: mismatches.length === 0 ? "PROTECTED" : "FAILED",
+      networkVerificationMessage: mismatches.length === 0 ? "End-to-end egress verification passed." : mismatches.join("; "),
+      networkLatestError: latestError,
+      networkDiagnosticEvents: [{ type: "NETWORK_VERIFY_STARTED", at: eventAt }, {
+        type: mismatches.length === 0 ? "NETWORK_PROTECTED" : "NETWORK_DEGRADED",
+        at: eventAt,
+        ...(latestError ? { errorCode: latestError.code } : {}),
+      }],
     };
     status.set(deviceId, entry);
 
@@ -132,19 +161,60 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS,
     // be corrected too, or it would keep reporting a stale "verified: true".
     if (collision) {
       const other = status.get(collision);
+      const collisionError = diagnosticError("V204", {
+        why: `The observed egress is shared with a differently assigned phone (${deviceId}).`,
+        technical: { collision: true },
+      });
       status.set(collision, {
         ...other,
         networkVerified: false,
         networkMismatch: true,
         networkMismatchReason: `shares egress IP ${observedIp} with device "${deviceId}", which is on a different network assignment`,
         networkRouteMatch: false,
+        networkProtectionState: "FAILED",
+        networkVerificationMessage: `shares egress IP ${observedIp} with device "${deviceId}", which is on a different network assignment`,
+        networkLatestError: collisionError,
+        networkDiagnosticEvents: [
+          ...(other?.networkDiagnosticEvents || []),
+          { type: "NETWORK_DEGRADED", at: collisionError.at, errorCode: collisionError.code },
+        ].slice(-20),
       });
     }
 
     return entry;
   }
 
-  return { checkDevice, getStatus };
+  function recordInfrastructureCheck(deviceId, { proxyResult, route }) {
+    const routeReady = route?.state === "routed";
+    const message = routeReady
+      ? "The proxy and local route are healthy. A device-originated egress probe is still required before this phone can be marked protected."
+      : "The proxy is healthy, but this phone does not currently have a verified active route.";
+    const entry = {
+      ...emptyStatus(),
+      networkObservedIp: proxyResult.publicIpv4,
+      networkCheckedAt: proxyResult.checkedAt,
+      networkVerified: false,
+      networkMismatch: routeReady ? false : true,
+      networkMismatchReason: message,
+      networkObservedRegion: proxyResult.country,
+      networkDnsStatus: "resolved",
+      networkProxyHealthy: proxyResult.status === "healthy",
+      networkRouteMatch: routeReady,
+      networkVerificationLevel: "proxy-and-host-route",
+      networkProtectionState: routeReady ? "VERIFYING" : "FAILED",
+      networkVerificationMessage: message,
+      networkLatestError: routeReady ? null : diagnosticError("V204", { why: message }),
+      networkDiagnosticEvents: [{ type: "PROXY_TEST_SUCCEEDED", at: proxyResult.checkedAt }, {
+        type: routeReady ? "NETWORK_VERIFY_STARTED" : "NETWORK_DEGRADED",
+        at: proxyResult.checkedAt,
+        ...(routeReady ? {} : { errorCode: "V204" }),
+      }],
+    };
+    status.set(deviceId, entry);
+    return entry;
+  }
+
+  return { checkDevice, getStatus, recordInfrastructureCheck };
 }
 
 export { createNetworkVerifier };

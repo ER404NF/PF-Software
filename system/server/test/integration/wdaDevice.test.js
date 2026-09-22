@@ -53,7 +53,7 @@ async function getHistory() {
   return fetch(`${BASE_URL}/debug/history`).then((r) => r.json()).then((b) => b.history);
 }
 
-test("WDA remains offline until a readiness probe succeeds and does not overwrite ownership", async () => {
+test("one transient readiness failure degrades a healthy WDA without declaring the phone offline", async () => {
   const device = new WdaDevice("wda-1", "Test iPhone", { port: PORT });
   assert.equal(device.status, "offline");
   assert.equal(await device.checkReadiness(), true);
@@ -63,10 +63,34 @@ test("WDA remains offline until a readiness probe succeeds and does not overwrit
   await fetch(`${BASE_URL}/debug/ready`, { method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ ready: false }) });
   assert.equal(await device.checkReadiness(), false);
-  assert.equal(device.status, "offline");
+  assert.equal(device.status, "idle");
+  assert.equal(device.readiness.state, "SUSPECT");
+  assert.equal(device.readiness.consecutiveFailures, 1);
+  assert.equal(device.readiness.lastError.code, "W204");
   device.status = "in-use";
   assert.equal(await device.checkReadiness(), false);
   assert.equal(device.status, "in-use");
+});
+
+test("repeated readiness failures cross the threshold and a success fully recovers", async () => {
+  const device = new WdaDevice("wda-1", "Test iPhone", { port: PORT });
+  assert.equal(await device.checkReadiness(), true);
+  await fetch(`${BASE_URL}/debug/ready`, { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ready: false }) });
+  assert.equal(await device.checkReadiness(), false);
+  assert.equal(await device.checkReadiness(), false);
+  assert.equal(device.status, "idle");
+  assert.equal(device.readiness.state, "DEGRADED");
+  assert.equal(await device.checkReadiness(), false);
+  assert.equal(device.status, "offline");
+  assert.equal(device.readiness.state, "FAILED");
+
+  await fetch(`${BASE_URL}/debug/ready`, { method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ready: true }) });
+  assert.equal(await device.checkReadiness(), true);
+  assert.equal(device.status, "idle");
+  assert.equal(device.readiness.state, "HEALTHY");
+  assert.equal(device.readiness.consecutiveFailures, 0);
 });
 
 test("tap sends normalized coordinates scaled to the window size", async () => {

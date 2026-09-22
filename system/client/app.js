@@ -155,6 +155,7 @@ const proxyPoolUsernameEl = document.getElementById("proxy-pool-username");
 const proxyPoolPasswordEl = document.getElementById("proxy-pool-password");
 const proxyPoolCountryEl = document.getElementById("proxy-pool-country");
 const proxyPoolLabelEl = document.getElementById("proxy-pool-label");
+const proxyPoolTestButtonEl = document.getElementById("proxy-pool-test-button");
 const proxyPoolMessageEl = document.getElementById("proxy-pool-message");
 const proxyPoolListEl = document.getElementById("proxy-pool-list");
 const proxyPoolEmptyEl = document.getElementById("proxy-pool-empty");
@@ -1754,7 +1755,14 @@ function renderFleetSummary(devices) {
       ? "You can view the fleet, but no phones are assigned to you."
       : "Your assigned phones are currently offline, in use, or controlled by AI.";
   }
+  const healthy = systemHealthCounts(devices);
   const counts = [
+    ["Physical devices", `${healthy.physical}/${devices.length}`],
+    ["Device control", `${healthy.control}/${devices.length}`],
+    ["WDA", `${healthy.wda}/${devices.length}`],
+    ["iproxy", `${healthy.iproxy}/${devices.length}`],
+    ["Proxy tunnels", `${healthy.tunnels}/${devices.length}`],
+    ["Protected routes", `${healthy.protectedRoutes}/${devices.length}`],
     ["Total", devices.length],
     ["Available to you", devices.filter(device => device.canOpen).length],
     ["In use", devices.filter(device => device.status === "in-use").length],
@@ -1769,6 +1777,20 @@ function renderFleetSummary(devices) {
     card.append(count, document.createTextNode(label));
     fleetSummaryEl.append(card);
   }
+}
+
+function systemHealthCounts(devices) {
+  const values = { physical: 0, control: 0, wda: 0, iproxy: 0, tunnels: 0, protectedRoutes: 0 };
+  for (const device of devices) {
+    const health = device.componentHealth;
+    if (health ? health.deviceAttachment === "CONNECTED" : device.status !== "offline") values.physical += 1;
+    if (health ? health.control === "READY" : device.status !== "offline") values.control += 1;
+    if (health ? health.wdaProcess === "RUNNING" && health.wdaEndpoint === "HEALTHY" : device.status !== "offline") values.wda += 1;
+    if (health?.iproxy === "RUNNING") values.iproxy += 1;
+    if ((device.networkRouteHealth || device.routing)?.state === "routed") values.tunnels += 1;
+    if (device.networkProtectionState === "PROTECTED" && device.networkVerified === true) values.protectedRoutes += 1;
+  }
+  return values;
 }
 
 function fleetMatchesFilter(device) {
@@ -1944,6 +1966,7 @@ function buildRetryProvisioningButton(device) {
   button.type = "button";
   button.className = "network-check-button";
   button.textContent = "Retry automatic setup";
+  button.title = "Restarts WebDriverAgent and USB forwarding for this phone. Keeps its proxy, user assignment, identity, and audit history.";
   button.addEventListener("click", async () => {
     button.disabled = true;
     selectErrorEl.textContent = `Retrying setup for ${device.label}…`;
@@ -2220,7 +2243,9 @@ function renderDeviceFacts(device) {
     actions.append(buildNetworkCheckButton(device, detailMessageEl));
     secondary.append(actions);
   }
-  detailDeviceFactsEl.append(primary, secondary);
+  detailDeviceFactsEl.append(primary, secondary, buildComponentHealthPanel(device));
+  const errorCard = buildDeviceErrorCard(device, detailMessageEl);
+  if (errorCard) detailDeviceFactsEl.append(errorCard);
 }
 
 // "warning" is a rendering-layer read of two already-existing fields
@@ -2316,6 +2341,133 @@ function phoneStatePresentation(device) {
   };
 }
 
+function deviceComponentRows(device) {
+  const health = device?.componentHealth || {};
+  const proxyHealth = device?.poolProxy?.health?.ok;
+  const networkState = device?.networkProtectionState
+    || (device?.networkMismatch ? "FAILED" : device?.networkVerified ? "PROTECTED" : "UNVERIFIED");
+  return [
+    ["Device", health.deviceAttachment || (device?.status === "offline" ? "OFFLINE" : "ATTACHED")],
+    ["Control", health.control || (device?.status === "offline" ? "UNAVAILABLE" : "READY")],
+    ["WDA", [health.wdaProcess, health.wdaEndpoint].filter(Boolean).join(" / ") || "UNKNOWN"],
+    ["iproxy", health.iproxy || "UNKNOWN"],
+    ["Network", networkState],
+    ["Proxy", proxyHealth === true ? "HEALTHY"
+      : proxyHealth === false ? "FAILED"
+        : device?.networkProxyHealthy === true ? "HEALTHY"
+          : device?.networkProxyHealthy === false ? "FAILED" : "NOT CHECKED"],
+  ];
+}
+
+function diagnosticForDevice(device) {
+  return device?.componentHealth?.latestError || device?.routing?.latestError || device?.networkLatestError || null;
+}
+
+function buildComponentHealthPanel(device, { compact = false } = {}) {
+  const panel = document.createElement("div");
+  panel.className = `component-health${compact ? " compact" : ""}`;
+  for (const [label, stateValue] of deviceComponentRows(device)) {
+    const state = String(stateValue || "UNKNOWN").toUpperCase();
+    const row = document.createElement("div");
+    row.className = "component-health-row";
+    const name = document.createElement("span");
+    name.textContent = label;
+    const value = document.createElement("strong");
+    value.textContent = state.replaceAll("_", " ");
+    value.dataset.state = /FAILED|OFFLINE|UNAVAILABLE|MISMATCH|LOST|ERROR/.test(state) ? "error"
+      : /SUSPECT|DEGRADED|RECOVERING|VERIFYING|UNKNOWN|NOT CHECKED|UNVERIFIED/.test(state) ? "warning" : "healthy";
+    row.append(name, value);
+    panel.appendChild(row);
+  }
+  return panel;
+}
+
+async function retryDeviceDiagnostic(device, button, statusEl) {
+  const diagnostic = diagnosticForDevice(device);
+  button.disabled = true;
+  try {
+    if (["device-discovery", "wda-process", "wda-endpoint", "iproxy", "device-reconciler"].includes(diagnostic?.component)
+      && can(UI_CAPABILITIES.MANAGE_DEVICES)) {
+      await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/retry-provisioning`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      });
+      statusEl.textContent = `Retrying automatic setup for ${device.label}.`;
+      return;
+    }
+    if (can(UI_CAPABILITIES.RUN_NETWORK_CHECK)) {
+      await requestJson(`/api/devices/${encodeURIComponent(device.id)}/network-check`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      }, { timeoutMs: 30_000, uncertain: true });
+      statusEl.textContent = `Network diagnostics completed for ${device.label}.`;
+      return;
+    }
+    statusEl.textContent = diagnostic?.operatorAction || "Contact your manager for help with this phone.";
+  } catch (error) {
+    statusEl.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function buildDeviceErrorCard(device, statusEl = selectErrorEl) {
+  const error = diagnosticForDevice(device);
+  if (!error) return null;
+  const details = document.createElement("details");
+  details.className = "device-error-card";
+  const heading = document.createElement("summary");
+  heading.textContent = `${error.name || "Device error"} · ${error.code || "Unknown code"}`;
+  details.appendChild(heading);
+
+  const fields = [
+    ["Error name", error.name],
+    ["Location", error.location || [error.sourceFunction, error.sourceFile].filter(Boolean).join(" · ")],
+    ["Why", error.why || error.publicMessage],
+    ["How to fix", error.operatorAction],
+    ["Error code", error.code],
+    ["Safe state", error.safeState],
+  ];
+  for (const [label, fieldValue] of fields) {
+    if (!fieldValue) continue;
+    const row = document.createElement("p");
+    const name = document.createElement("strong");
+    name.textContent = `${label}: `;
+    row.append(name, document.createTextNode(fieldValue));
+    details.appendChild(row);
+  }
+
+  const actions = document.createElement("div");
+  actions.className = "device-error-actions";
+  if (error.retryable && (can(UI_CAPABILITIES.MANAGE_DEVICES) || can(UI_CAPABILITIES.RUN_NETWORK_CHECK))) {
+    const retry = document.createElement("button");
+    retry.type = "button";
+    retry.textContent = "Retry";
+    retry.addEventListener("click", () => void retryDeviceDiagnostic(device, retry, statusEl));
+    actions.appendChild(retry);
+  }
+  if (can(UI_CAPABILITIES.MANAGE_DEVICES)) {
+    const diagnostics = document.createElement("button");
+    diagnostics.type = "button";
+    diagnostics.textContent = "Diagnostics";
+    const output = document.createElement("pre");
+    output.hidden = true;
+    diagnostics.addEventListener("click", async () => {
+      diagnostics.disabled = true;
+      try {
+        const { body } = await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/diagnostics`);
+        output.textContent = JSON.stringify(body, null, 2);
+        output.hidden = false;
+      } catch (requestError) {
+        statusEl.textContent = requestError.message;
+      } finally {
+        diagnostics.disabled = false;
+      }
+    });
+    actions.append(diagnostics, output);
+  }
+  if (actions.children.length) details.appendChild(actions);
+  return details;
+}
+
 function renderDeviceCard(d, task, lastAction) {
   const isAiMode = d.controllerMode && d.controllerMode !== "HUMAN";
   const isMine = d.id === currentDeviceId;
@@ -2394,6 +2546,9 @@ function renderDeviceCard(d, task, lastAction) {
     : d.networkVerified ? "Network verified" : "Network not verified";
   networkState.textContent = `${egress} · ${verification} · ${formatLastSeen(d.lastSeenAt)}`;
   card.appendChild(networkState);
+  card.appendChild(buildComponentHealthPanel(d, { compact: true }));
+  const errorCard = buildDeviceErrorCard(d);
+  if (errorCard) card.appendChild(errorCard);
 
   if (can(UI_CAPABILITIES.MANAGE_PROXY) && isProxyEgress(d.network?.egress)) {
     card.appendChild(buildProxySwitch(d));
@@ -3768,7 +3923,37 @@ function renderProxyPool(proxies) {
 
     card.append(heading, identity);
 
+    if (proxy.health) {
+      const health = document.createElement("p");
+      health.className = "user-identity";
+      health.textContent = proxy.health.status === "healthy"
+        ? `Tested ${formatDate(proxy.health.checkedAt)} · ${proxy.health.publicIpv4 || "IP unavailable"}`
+          + (proxy.health.country ? ` · ${proxy.health.country}` : "")
+          + (Number.isFinite(proxy.health.latencyMs) ? ` · ${proxy.health.latencyMs} ms` : "")
+        : `Test failed ${formatDate(proxy.health.checkedAt)} · ${proxy.health.errorCode || "P111"} ${proxy.health.errorName || ""}`;
+      card.appendChild(health);
+    }
+
     if (mayManage) {
+      const testButton = document.createElement("button");
+      testButton.type = "button";
+      testButton.textContent = "Test Proxy";
+      testButton.addEventListener("click", async () => {
+        testButton.disabled = true;
+        proxyPoolMessageEl.textContent = `Testing ${proxy.label}…`;
+        try {
+          const { body } = await requestJson(`/api/admin/proxies/${encodeURIComponent(proxy.id)}/test`, { method: "POST" });
+          proxyPoolMessageEl.textContent = `${proxy.label} works through ${body.result.publicIpv4}`
+            + (body.result.country ? ` (${body.result.country})` : "") + ` in ${body.result.latencyMs} ms.`;
+          await refreshProxyPool();
+        } catch (error) {
+          proxyPoolMessageEl.textContent = error.message;
+          await refreshProxyPool();
+        } finally {
+          testButton.disabled = false;
+        }
+      });
+      card.appendChild(testButton);
       const deleteButton = document.createElement("button");
       deleteButton.type = "button";
       deleteButton.textContent = "Delete";
@@ -3836,6 +4021,31 @@ proxyPoolCreateFormEl.addEventListener("submit", async event => {
     proxyPoolMessageEl.textContent = error.message;
   } finally {
     submit.disabled = false;
+  }
+});
+
+proxyPoolTestButtonEl.addEventListener("click", async () => {
+  proxyPoolMessageEl.textContent = "Testing proxy fields…";
+  proxyPoolTestButtonEl.disabled = true;
+  try {
+    const { body } = await requestJson("/api/admin/proxies/test", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        protocol: proxyPoolProtocolEl.value,
+        host: proxyPoolHostEl.value,
+        port: Number(proxyPoolPortEl.value),
+        username: proxyPoolUsernameEl.value,
+        password: proxyPoolPasswordEl.value,
+        country: proxyPoolCountryEl.value,
+      }),
+    });
+    proxyPoolMessageEl.textContent = `Proxy works through ${body.result.publicIpv4}`
+      + (body.result.country ? ` (${body.result.country})` : "") + ` in ${body.result.latencyMs} ms. You can add it now.`;
+  } catch (error) {
+    proxyPoolMessageEl.textContent = error.message;
+  } finally {
+    proxyPoolTestButtonEl.disabled = false;
   }
 });
 

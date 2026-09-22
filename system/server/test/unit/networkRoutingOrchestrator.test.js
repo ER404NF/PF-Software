@@ -59,7 +59,9 @@ class FakeTunManager {
   isRunning(deviceId) { return this.runningDeviceIds.has(deviceId); }
 }
 
-function makeOrchestrator({ proxyPoolStorePath, testResult, inspectOutput, peerResult = { localIp: "10.0.0.2", peerIp: "10.0.0.1" }, interfaces = ["lo0", "en0"] } = {}) {
+function makeOrchestrator({ proxyPoolStorePath, testResult, inspectOutput,
+  peerResult = { localIp: "10.0.0.2", peerIp: "10.0.0.1" }, interfaces = ["lo0", "en0"],
+  recoveryDelayMs, setTimeoutFn, clearTimeoutFn } = {}) {
   const tunManager = new FakeTunManager();
   const privilegedOps = new FakePrivilegedOps({ testResult, inspectOutput });
   const changes = [];
@@ -78,6 +80,9 @@ function makeOrchestrator({ proxyPoolStorePath, testResult, inspectOutput, peerR
       ? async () => { throw peerResult; }
       : async () => peerResult,
     onStateChanged: (deviceId, route) => changes.push({ deviceId, route }),
+    ...(recoveryDelayMs === undefined ? {} : { recoveryDelayMs }),
+    ...(setTimeoutFn ? { setTimeoutFn } : {}),
+    ...(clearTimeoutFn ? { clearTimeoutFn } : {}),
   });
   return { orchestrator, tunManager, privilegedOps, changes };
 }
@@ -213,7 +218,9 @@ test("a failure after PF is loaded rolls back the device rule before stopping it
   );
 
   assert.equal(tunManager.isRunning("mock-1"), false);
-  assert.equal(privilegedOps.loadCalls.length, 1, "the device rule was installed before the late failure");
+  assert.equal(privilegedOps.loadCalls.length, 2, "the routed rule is replaced by a fail-closed block after the late failure");
+  assert.match(privilegedOps.loadCalls[0], /route-to .*192\.168\.2\.10/);
+  assert.match(privilegedOps.loadCalls[1], /block in quick on bridge0 inet from 192\.168\.2\.10 to any/);
   assert.equal(privilegedOps.clearAnchorCalls, 1, "the installed rule must be removed during rollback");
   assert.equal(orchestrator.getRoute("mock-1").state, ROUTING_STATES.TUN_ERROR);
 });
@@ -368,7 +375,8 @@ test("checkHealth marks a device route_lost when its tunnel process has died out
 
   const route = orchestrator.getRoute("mock-1");
   assert.equal(route.state, ROUTING_STATES.ROUTE_LOST);
-  assert.match(route.lastError, /tunnel process is no longer running/);
+  assert.equal(route.latestError.code, "T206");
+  assert.equal(route.internetBlocked, true);
 });
 
 test("checkHealth marks a device route_lost when its PF rule has vanished from the anchor", async () => {
@@ -384,7 +392,116 @@ test("checkHealth marks a device route_lost when its PF rule has vanished from t
 
   const route = orchestrator.getRoute("mock-1");
   assert.equal(route.state, ROUTING_STATES.ROUTE_LOST);
-  assert.match(route.lastError, /no longer loaded/);
+  assert.equal(route.latestError.code, "F203");
+  assert.equal(route.internetBlocked, true);
+});
+
+test("route loss blocks and rebuilds only the affected phone", async () => {
+  const storePath = tempStorePath();
+  const proxyA = createProxy(storePath, samplePayload({ label: "A" }), MASTER_KEY);
+  const proxyB = createProxy(storePath, samplePayload({ label: "B" }), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxyA.id });
+  assignProxyToDevice(storePath, { deviceId: "mock-2", proxyId: proxyB.id });
+  const timers = [];
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({
+    proxyPoolStorePath: storePath,
+    inspectOutput: [inspectFor("192.168.2.10", 1), inspectFor("192.168.2.11", 1)].join("\n"),
+    recoveryDelayMs: 0,
+    setTimeoutFn: fn => { timers.push(fn); return { unref() {} }; },
+    clearTimeoutFn() {},
+  });
+  await orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" });
+  await orchestrator.startRouting("mock-2", { usbIp: "192.168.2.11" });
+  tunManager.simulateCrash("mock-1");
+
+  await orchestrator.checkHealth();
+
+  assert.equal(orchestrator.getRoute("mock-1").state, ROUTING_STATES.ROUTE_LOST);
+  assert.equal(orchestrator.getRoute("mock-1").internetBlocked, true);
+  assert.equal(orchestrator.getRoute("mock-2").state, ROUTING_STATES.ROUTED);
+  const blockedRules = privilegedOps.loadCalls.at(-1);
+  assert.match(blockedRules, /block in quick on bridge0 inet from 192\.168\.2\.10 to any/);
+  assert.match(blockedRules, /route-to .*from 192\.168\.2\.11/);
+  assert.equal(timers.length, 1);
+
+  await timers.shift()();
+
+  assert.equal(orchestrator.getRoute("mock-1").state, ROUTING_STATES.ROUTED);
+  assert.equal(orchestrator.getRoute("mock-2").state, ROUTING_STATES.ROUTED);
+  assert.equal(tunManager.starts.filter(start => start.deviceId === "mock-1").length, 2);
+  assert.equal(tunManager.starts.filter(start => start.deviceId === "mock-2").length, 1);
+  assert.equal(privilegedOps.loadCalls.at(-1).includes("block in quick on bridge0 inet from 192.168.2.10"), false);
+});
+
+test("route recovery stops after the bounded retry budget and remains fail-closed", async () => {
+  const storePath = tempStorePath();
+  const proxy = createProxy(storePath, samplePayload(), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxy.id });
+  const timers = [];
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({
+    proxyPoolStorePath: storePath,
+    inspectOutput: inspectFor("192.168.2.10", 1),
+    recoveryDelayMs: 0,
+    setTimeoutFn: fn => { timers.push(fn); return { unref() {} }; },
+    clearTimeoutFn() {},
+  });
+  await orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" });
+  tunManager.simulateCrash("mock-1");
+  await orchestrator.checkHealth();
+  privilegedOps.loadRuleset = async text => {
+    privilegedOps.loadCalls.push(text);
+    if (text.includes("route-to")) throw new Error("simulated route load failure");
+    return { ok: true };
+  };
+
+  await timers.shift()();
+  assert.equal(timers.length, 1, "the first failed recovery schedules the final attempt");
+  await timers.shift()();
+
+  const route = orchestrator.getRoute("mock-1");
+  assert.equal(route.state, ROUTING_STATES.ROUTE_LOST);
+  assert.equal(route.recoveryAttempts, 2);
+  assert.equal(route.internetBlocked, true);
+  assert.equal(route.protected, false);
+  assert.equal(timers.length, 0, "no restart loop continues after the bounded attempts");
+  assert.match(privilegedOps.loadCalls.at(-1), /block in quick on bridge0 inet from 192\.168\.2\.10 to any/);
+});
+
+test("an end-to-end verification mismatch quarantines only that phone and stops its tunnel", async () => {
+  const storePath = tempStorePath();
+  const proxyA = createProxy(storePath, samplePayload({ label: "A" }), MASTER_KEY);
+  const proxyB = createProxy(storePath, samplePayload({ label: "B" }), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxyA.id });
+  assignProxyToDevice(storePath, { deviceId: "mock-2", proxyId: proxyB.id });
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({ proxyPoolStorePath: storePath });
+  await orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" });
+  await orchestrator.startRouting("mock-2", { usbIp: "192.168.2.11" });
+
+  await orchestrator.quarantineRoute("mock-1", { code: "V202", why: "Unexpected exit IP" });
+
+  const quarantined = orchestrator.getRoute("mock-1");
+  assert.equal(quarantined.state, ROUTING_STATES.ROUTE_LOST);
+  assert.equal(quarantined.latestError.code, "V202");
+  assert.equal(quarantined.internetBlocked, true);
+  assert.equal(tunManager.isRunning("mock-1"), false);
+  assert.equal(orchestrator.getRoute("mock-2").state, ROUTING_STATES.ROUTED);
+  assert.equal(tunManager.isRunning("mock-2"), true);
+  assert.match(privilegedOps.loadCalls.at(-1), /block in quick on bridge0 inet from 192\.168\.2\.10 to any/);
+  assert.match(privilegedOps.loadCalls.at(-1), /route-to .*from 192\.168\.2\.11/);
+});
+
+test("verification quarantine stops the tunnel even when the fail-closed PF reload fails", async () => {
+  const storePath = tempStorePath();
+  const proxy = createProxy(storePath, samplePayload(), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxy.id });
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({ proxyPoolStorePath: storePath });
+  await orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" });
+  privilegedOps.loadRuleset = async () => { throw new Error("pfctl unavailable"); };
+
+  await assert.rejects(() => orchestrator.quarantineRoute("mock-1"), /pfctl unavailable/);
+
+  assert.equal(tunManager.isRunning("mock-1"), false);
+  assert.equal(orchestrator.getRoute("mock-1").protected, false);
 });
 
 test("checkHealth never fails a device over a transient inspectRules error — it just skips the PF check that tick", async () => {

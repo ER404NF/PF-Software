@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { discoverIosDevices, discoveredDeviceId } from "../../src/deviceDiscovery.js";
+import { discoverIosDevices, discoverIosDevicesResult, discoveredDeviceId } from "../../src/deviceDiscovery.js";
 
 test("Mac discovery reads connected UDIDs and their current iPhone names", () => {
   const calls = [];
@@ -20,6 +20,19 @@ test("Mac discovery reads connected UDIDs and their current iPhone names", () =>
 test("discovery is empty away from macOS or when libimobiledevice is unavailable", () => {
   assert.deepEqual(discoverIosDevices({ platform: "win32", execFile: () => { throw new Error("must not run"); } }), []);
   assert.deepEqual(discoverIosDevices({ platform: "darwin", execFile: () => { throw new Error("missing"); } }), []);
+});
+
+test("structured discovery distinguishes a failed command from zero attached phones", () => {
+  const failed = discoverIosDevicesResult({
+    platform: "darwin",
+    execFile: () => { throw Object.assign(new Error("service unavailable"), { code: "EPIPE" }); },
+  });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.error.code, "D102");
+  assert.equal(failed.error.reason, "EPIPE");
+
+  const empty = discoverIosDevicesResult({ platform: "darwin", execFile: () => "" });
+  assert.deepEqual(empty, { ok: true, devices: [] });
 });
 
 test("discovery uses resolved absolute libimobiledevice binaries", () => {

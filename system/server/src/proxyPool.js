@@ -56,7 +56,7 @@ export function flagForCountry(countryCode) {
   return String.fromCodePoint(...[...countryCode].map(char => 127397 + char.charCodeAt(0)));
 }
 
-function validateFields({ provider, protocol, host, port, username, country, label }) {
+function validateFields({ provider, protocol, host, port, username, password, country, label }) {
   if (typeof provider !== "string" || !provider.trim() || provider.length > 100) {
     throw poolError("provider is required (max 100 characters)", 400);
   }
@@ -64,6 +64,7 @@ function validateFields({ provider, protocol, host, port, username, country, lab
   if (typeof host !== "string" || !host.trim() || host.length > 255) throw poolError("host is required", 400);
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw poolError("port must be an integer from 1 to 65535", 400);
   if (typeof username !== "string" || !username.trim() || username.length > 200) throw poolError("username is required", 400);
+  if (typeof password !== "string" || !password || password.length > 1000) throw poolError("password is required (max 1000 characters)", 400);
   if (typeof country !== "string" || !COUNTRY_CODE_RE.test(country.toUpperCase())) {
     throw poolError("country must be a 2-letter ISO code", 400);
   }
@@ -159,6 +160,25 @@ export function proxyForDevice(storePath, deviceId) {
   return Object.values(loadProxyRecords(storePath)).find(record => record.leasedToDeviceId === deviceId) ?? null;
 }
 
+export function updateProxyHealth(storePath, proxyId, health) {
+  const raw = readRaw(storePath);
+  const record = raw.proxies[proxyId];
+  if (!record) throw poolError("unknown proxy", 404);
+  const safe = health ? {
+    status: health.status,
+    checkedAt: health.checkedAt,
+    publicIpv4: health.publicIpv4 ?? null,
+    country: health.country ?? null,
+    latencyMs: Number.isFinite(health.latencyMs) ? health.latencyMs : null,
+    provider: health.provider ?? null,
+    errorCode: health.errorCode ?? null,
+    errorName: health.errorName ?? null,
+  } : null;
+  raw.proxies[proxyId] = { ...record, health: safe, updatedAt: new Date().toISOString() };
+  writeRaw(storePath, raw);
+  return raw.proxies[proxyId];
+}
+
 // Safe shape for any HTTP response: no host, port, username, or password —
 // "the UI should never use proxy credentials as a unique ID" and "do not
 // display passwords" (Architecture guide §2.3, §13).
@@ -174,6 +194,7 @@ export function publicProxy(record) {
     leasedToDeviceId: record.leasedToDeviceId,
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
+    health: record.health ? { ...record.health } : null,
   };
 }
 

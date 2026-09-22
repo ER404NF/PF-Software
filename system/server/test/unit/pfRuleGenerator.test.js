@@ -40,6 +40,23 @@ test("an empty device list still produces a valid (empty-of-device-rules) rulese
   assert.equal(rules.includes("route-to"), false);
 });
 
+test("a failed device gets an IPv4 fail-closed block without affecting routed peers", () => {
+  const rules = generatePfRuleset({
+    bridgeIface: "bridge0",
+    devices: [ONE_DEVICE],
+    blockedIps: ["192.168.2.11"],
+  });
+  assert.match(rules, /route-to \(utun7 10\.0\.0\.1\).*from 192\.168\.2\.10/);
+  assert.match(rules, /block in quick on bridge0 inet from 192\.168\.2\.11 to any/);
+});
+
+test("one USB IP cannot be routed and fail-closed at the same time", () => {
+  assert.throws(
+    () => generatePfRuleset({ bridgeIface: "bridge0", devices: [ONE_DEVICE], blockedIps: [ONE_DEVICE.usbIp] }),
+    /both routed and blocked/,
+  );
+});
+
 test("regenerating with fewer devices drops the missing device's rules entirely (full-replace, not append)", () => {
   const two = generatePfRuleset({ bridgeIface: "bridge0", devices: [ONE_DEVICE, { usbIp: "192.168.2.11", tunIface: "utun8", tunPeer: "10.0.0.2" }] });
   assert.equal((two.match(/route-to/g) || []).length, 4);

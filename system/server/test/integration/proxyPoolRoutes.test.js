@@ -95,6 +95,27 @@ test("every proxy-pool route requires authentication", async () => {
   assert.equal(post.status, 401);
   const patch = await fetch(`${httpUrl}/api/admin/devices/mock-1/proxy-assignment`, { method: "PATCH" });
   assert.equal(patch.status, 401);
+  const testUnsaved = await fetch(`${httpUrl}/api/admin/proxies/test`, { method: "POST" });
+  assert.equal(testUnsaved.status, 401);
+  const testSaved = await fetch(`${httpUrl}/api/admin/proxies/missing/test`, { method: "POST" });
+  assert.equal(testSaved.status, 401);
+});
+
+test("proxy-test routes enforce role access and return stable validation errors before any connection", async () => {
+  const manager = await fetch(`${httpUrl}/api/admin/proxies/test`, {
+    method: "POST", headers: { "Content-Type": "application/json", Cookie: managerCookie }, body: "{}",
+  });
+  assert.equal(manager.status, 403);
+  const invalid = await fetch(`${httpUrl}/api/admin/proxies/test`, {
+    method: "POST", headers: { "Content-Type": "application/json", Cookie: adminCookie },
+    body: JSON.stringify(samplePayload({ host: "bad host name" })),
+  });
+  assert.equal(invalid.status, 400);
+  assert.equal((await invalid.json()).code, "P101");
+  const missing = await fetch(`${httpUrl}/api/admin/proxies/not-here/test`, {
+    method: "POST", headers: { Cookie: adminCookie },
+  });
+  assert.equal(missing.status, 404);
 });
 
 test("only Admin/Manager may view the pool; only Admin may create or delete entries", async () => {

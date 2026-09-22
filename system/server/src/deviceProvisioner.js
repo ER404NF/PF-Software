@@ -3,8 +3,11 @@ import { WdaDevice } from "./wdaDevice.js";
 import { discoveredDeviceId } from "./deviceDiscovery.js";
 import { allocatePort, resolveMjpegPortRange, resolvePortRange } from "./portAllocator.js";
 import { upsertProvisioningRecord, loadProvisioningRecords } from "./deviceProvisioningStore.js";
+import { diagnosticError } from "./errorCatalog.js";
 
 const DEFAULT_POLL_INTERVAL_MS = 5000;
+const DEFAULT_RECOVERY_COOLDOWN_MS = 15_000;
+const MAX_ENDPOINT_RECOVERIES = 2;
 
 // Matches the specific, previously-observed failure modes from the
 // Automation Architecture guide §11 that need a human action on the phone
@@ -52,6 +55,8 @@ export class DeviceProvisioner {
     portRange = resolvePortRange(),
     mjpegPortRange = resolveMjpegPortRange(),
     pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
+    recoveryCooldownMs = DEFAULT_RECOVERY_COOLDOWN_MS,
+    now = () => Date.now(),
     onDeviceListChanged = () => {},
   }) {
     this.devices = devices;
@@ -64,14 +69,20 @@ export class DeviceProvisioner {
     this.portRange = portRange;
     this.mjpegPortRange = mjpegPortRange;
     this.pollIntervalMs = pollIntervalMs;
+    this.recoveryCooldownMs = recoveryCooldownMs;
+    this.now = now;
     this.onDeviceListChanged = onDeviceListChanged;
-    this.runtime = new Map(); // udid -> { logicalId, wdaDevice, port, mjpegPort, derivedDataPath }
+    this.runtime = new Map(); // udid -> device runtime and bounded recovery bookkeeping
     this.udidByLogicalId = new Map(); // logicalId -> udid, so routes/clients only ever handle the logical id (never the raw UDID — CLAUDE.md §14.8)
     this.timer = null;
 
     this.wdaProcessManager.on("exit", ({ key, log }) => this._onProcessExit("WDA", key, log));
+    this.wdaProcessManager.on("starting", ({ key }) => this._onProcessStarting("WDA", key));
+    this.wdaProcessManager.on("stable", ({ key }) => this._onProcessStable("WDA", key));
     this.wdaProcessManager.on("restart-limit-exceeded", ({ key, log }) => this._onRestartLimitExceeded("WDA", key, log));
     this.iproxyManager.on("exit", ({ key, log }) => this._onProcessExit("iproxy", key, log));
+    this.iproxyManager.on("starting", ({ key }) => this._onProcessStarting("iproxy", key));
+    this.iproxyManager.on("stable", ({ key }) => this._onProcessStable("iproxy", key));
     this.iproxyManager.on("restart-limit-exceeded", ({ key, log }) => this._onRestartLimitExceeded("iproxy", key, log));
   }
 
@@ -94,7 +105,18 @@ export class DeviceProvisioner {
     try {
       attached = this.discoverIosDevices();
     } catch (error) {
-      console.error("device discovery poll failed:", error?.message || error);
+      this._onDiscoveryFailure(error);
+      return;
+    }
+    if (attached && !Array.isArray(attached) && typeof attached === "object") {
+      if (attached.ok !== true) {
+        this._onDiscoveryFailure(attached.error);
+        return;
+      }
+      attached = attached.devices;
+    }
+    if (!Array.isArray(attached)) {
+      this._onDiscoveryFailure(new Error("device discovery returned an invalid result"));
       return;
     }
     const attachedUdids = new Set(attached.map(d => d.udid));
@@ -106,7 +128,7 @@ export class DeviceProvisioner {
     for (const udid of this.runtime.keys()) {
       if (!attachedUdids.has(udid) && !this.manualUdids.has(udid)) this._onDetach(udid);
     }
-    this._reconcileReadiness();
+    await this._reconcileReadiness();
   }
 
   _onAttach(discovered) {
@@ -137,7 +159,19 @@ export class DeviceProvisioner {
     wdaDevice.discoveryState = "provisioning";
     wdaDevice.discoveryStateMessage = "Starting WDA. Starting the USB tunnel. Waiting for device readiness. This can take a minute.";
     wdaDevice.status = "offline";
-    this.runtime.set(udid, { logicalId, wdaDevice, port, mjpegPort, derivedDataPath });
+    wdaDevice.setComponentHealth({
+      deviceAttachment: "CONNECTED",
+      wdaProcess: "STARTING",
+      iproxy: "STARTING",
+      wdaEndpoint: "UNKNOWN",
+      control: "UNAVAILABLE",
+      recovery: "IDLE",
+    });
+    wdaDevice.recordDiagnosticEvent("DEVICE_DISCOVERED", { deviceId: logicalId });
+    this.runtime.set(udid, {
+      logicalId, wdaDevice, port, mjpegPort, derivedDataPath,
+      recovery: { stage: null, attempts: 0, lastAttemptAt: 0 },
+    });
     this.udidByLogicalId.set(logicalId, udid);
 
     try {
@@ -154,10 +188,23 @@ export class DeviceProvisioner {
     const entry = this.runtime.get(udid);
     this.wdaProcessManager.stop(udid);
     this.iproxyManager.stop(udid);
-    if (entry?.wdaDevice && entry.wdaDevice.status !== "in-use") {
-      entry.wdaDevice.status = "offline";
+    if (entry?.wdaDevice) {
+      // Keep an in-flight ownership/action lock intact until the action path
+      // settles, while still reporting the physical truth immediately.
+      // Component health must never claim an unplugged phone is attached.
+      if (entry.wdaDevice.status !== "in-use") entry.wdaDevice.status = "offline";
       entry.wdaDevice.discoveryState = "disconnected";
       entry.wdaDevice.discoveryStateMessage = "Unplugged. Reconnect the cable to resume automatic setup.";
+      entry.wdaDevice.setComponentHealth({
+        deviceAttachment: "DISCONNECTED",
+        wdaProcess: "UNKNOWN",
+        iproxy: "UNKNOWN",
+        wdaEndpoint: "UNKNOWN",
+        control: "UNAVAILABLE",
+        recovery: "WAITING_FOR_DEVICE",
+      });
+      entry.wdaDevice.readiness.lastError = diagnosticError("D101");
+      entry.wdaDevice.recordDiagnosticEvent("DEVICE_DETACHED", { error: entry.wdaDevice.readiness.lastError });
     }
     // Drop the runtime entry (not the WdaDevice itself, which stays in the
     // live `devices` map and in the persisted provisioning store) so a
@@ -170,22 +217,106 @@ export class DeviceProvisioner {
     this.onDeviceListChanged();
   }
 
-  _reconcileReadiness() {
+  async _reconcileReadiness() {
     let changed = false;
-    for (const entry of this.runtime.values()) {
+    for (const [udid, entry] of this.runtime) {
       const { wdaDevice } = entry;
+      const wdaState = this._managerState(this.wdaProcessManager, udid);
+      const iproxyState = this._managerState(this.iproxyManager, udid);
+      wdaDevice.setComponentHealth({
+        deviceAttachment: "CONNECTED",
+        wdaProcess: processHealthState(wdaState),
+        iproxy: processHealthState(iproxyState),
+      });
       if (wdaDevice.discoveryState === "provisioning" && wdaDevice.status !== "offline") {
         wdaDevice.discoveryState = null;
         wdaDevice.discoveryStateMessage = null;
+        entry.recovery = { stage: null, attempts: 0, lastAttemptAt: 0 };
         changed = true;
+      }
+      if (wdaDevice.readiness?.state === "HEALTHY" && entry.recovery.attempts > 0) {
+        wdaDevice.recordDiagnosticEvent("WDA_RECOVERED", { component: entry.recovery.stage });
+        entry.recovery = { stage: null, attempts: 0, lastAttemptAt: 0 };
+        wdaDevice.setComponentHealth({ recovery: "IDLE" });
+        changed = true;
+      } else if (wdaDevice.readiness?.state === "FAILED"
+        && wdaState === "running" && iproxyState === "running") {
+        changed = await this._recoverEndpoint(udid, entry) || changed;
       }
     }
     if (changed) this.onDeviceListChanged();
   }
 
+  _managerState(manager, udid) {
+    if (typeof manager.getStatus === "function") return manager.getStatus(udid)?.state ?? "unknown";
+    return manager.isRunning?.(udid) ? "running" : "stopped";
+  }
+
+  async _recoverEndpoint(udid, entry) {
+    const recovery = entry.recovery;
+    if (this.now() - recovery.lastAttemptAt < this.recoveryCooldownMs) return false;
+    if (recovery.attempts >= MAX_ENDPOINT_RECOVERIES) {
+      const error = diagnosticError("R201", { technical: { attempts: recovery.attempts } });
+      entry.wdaDevice.discoveryState = "provisioning_error";
+      entry.wdaDevice.discoveryStateMessage = `${error.name}. ${error.operatorAction}`;
+      entry.wdaDevice.readiness.lastError = error;
+      entry.wdaDevice.setComponentHealth({ recovery: "EXHAUSTED", control: "UNAVAILABLE" });
+      entry.wdaDevice.recordDiagnosticEvent("WDA_RECOVERY_FAILED", { error });
+      return true;
+    }
+    recovery.lastAttemptAt = this.now();
+    recovery.attempts += 1;
+    if (recovery.stage !== "IPROXY") {
+      recovery.stage = "IPROXY";
+      const error = diagnosticError("I202", { technical: { attempt: recovery.attempts } });
+      entry.wdaDevice.readiness.lastError = error;
+      entry.wdaDevice.beginRecovery("IPROXY");
+      this.iproxyManager.stop(udid);
+      this.iproxyManager.start({ udid, localPort: entry.port, mjpegLocalPort: entry.mjpegPort });
+    } else {
+      recovery.stage = "WDA";
+      entry.wdaDevice.beginRecovery("WDA");
+      this.wdaProcessManager.stop(udid);
+      this.wdaProcessManager.start({ udid, derivedDataPath: entry.derivedDataPath });
+    }
+    return true;
+  }
+
+  _onDiscoveryFailure(error) {
+    console.error("device discovery poll failed:", error?.reason || error?.code || error?.message || "unknown error");
+    for (const entry of this.runtime.values()) {
+      const detail = diagnosticError("D102", { technical: { reason: error?.reason || error?.code || error?.name } });
+      entry.wdaDevice.setComponentHealth({ deviceAttachment: "UNKNOWN" });
+      entry.wdaDevice.readiness.lastError = detail;
+      entry.wdaDevice.recordDiagnosticEvent("DEVICE_DISCOVERY_FAILED", { error: detail });
+    }
+    this.onDeviceListChanged();
+  }
+
+  _onProcessStarting(kind, udid) {
+    const entry = this.runtime.get(udid);
+    if (!entry) return;
+    entry.wdaDevice.setComponentHealth(kind === "WDA" ? { wdaProcess: "RUNNING" } : { iproxy: "RUNNING" });
+    entry.wdaDevice.recordDiagnosticEvent(`${kind === "WDA" ? "WDA" : "IPROXY"}_STARTING`);
+    this.onDeviceListChanged();
+  }
+
+  _onProcessStable(kind, udid) {
+    const entry = this.runtime.get(udid);
+    if (!entry) return;
+    entry.wdaDevice.recordDiagnosticEvent(`${kind === "WDA" ? "WDA" : "IPROXY"}_STABLE`);
+  }
+
   _onProcessExit(kind, udid, log) {
     const entry = this.runtime.get(udid);
     if (!entry) return;
+    const code = kind === "WDA" ? "W202" : "I201";
+    const detail = diagnosticError(code);
+    entry.wdaDevice.readiness.lastError = detail;
+    entry.wdaDevice.setComponentHealth(kind === "WDA"
+      ? { wdaProcess: "RESTARTING", control: "DEGRADED" }
+      : { iproxy: "RESTARTING", control: "DEGRADED" });
+    entry.wdaDevice.recordDiagnosticEvent(`${kind === "WDA" ? "WDA" : "IPROXY"}_FAILED`, { error: detail });
     // classifyWdaFailure's patterns (untrusted cert, Developer Mode, App ID
     // limit) are all about Xcode/WDA app installation and don't apply to
     // iproxy (a USB port-forwarder) — misapplying them to an iproxy exit
@@ -195,9 +326,16 @@ export class DeviceProvisioner {
     if (kind !== "WDA") return;
     const known = classifyWdaFailure(log.join(""));
     if (!known) return;
+    const manualError = diagnosticError("W205", { why: known, operatorAction: known });
     entry.wdaDevice.discoveryState = "user_action_required";
     entry.wdaDevice.discoveryStateMessage = known;
     entry.wdaDevice.status = "offline";
+    entry.wdaDevice.readiness.lastError = manualError;
+    entry.wdaDevice.setComponentHealth({
+      wdaProcess: "FAILED", iproxy: "UNKNOWN", wdaEndpoint: "UNKNOWN",
+      control: "UNAVAILABLE", recovery: "USER_ACTION_REQUIRED",
+    });
+    entry.wdaDevice.recordDiagnosticEvent("WDA_USER_ACTION_REQUIRED", { error: manualError });
     // A known manual prerequisite shouldn't loop retries at the user —
     // stop trying until a human resolves it and retries explicitly.
     this.wdaProcessManager.stop(udid);
@@ -213,8 +351,14 @@ export class DeviceProvisioner {
     // signing identity, or command arguments. Device summaries are visible
     // to operators, so keep diagnostics in the host log and expose only a
     // stable recovery instruction here.
-    entry.wdaDevice.discoveryStateMessage = `${kind} failed to start after repeated attempts. An admin can review the host logs and retry.`;
+    const detail = diagnosticError(kind === "WDA" ? "W203" : "I203");
+    entry.wdaDevice.discoveryStateMessage = `${detail.name}. ${detail.operatorAction}`;
     entry.wdaDevice.status = "offline";
+    entry.wdaDevice.readiness.lastError = detail;
+    entry.wdaDevice.setComponentHealth(kind === "WDA"
+      ? { wdaProcess: "FAILED", control: "UNAVAILABLE", recovery: "EXHAUSTED" }
+      : { iproxy: "FAILED", control: "UNAVAILABLE", recovery: "EXHAUSTED" });
+    entry.wdaDevice.recordDiagnosticEvent(`${kind === "WDA" ? "WDA" : "IPROXY"}_RECOVERY_FAILED`, { error: detail });
     this.onDeviceListChanged();
   }
 
@@ -237,6 +381,12 @@ export class DeviceProvisioner {
     entry.wdaDevice.discoveryState = "provisioning";
     entry.wdaDevice.discoveryStateMessage = "Retrying automatic setup.";
     entry.wdaDevice.status = "offline";
+    entry.recovery = { stage: null, attempts: 0, lastAttemptAt: 0 };
+    entry.wdaDevice.setComponentHealth({
+      deviceAttachment: "CONNECTED", wdaProcess: "STARTING", iproxy: "STARTING",
+      wdaEndpoint: "UNKNOWN", control: "UNAVAILABLE", recovery: "MANUAL_RETRY",
+    });
+    entry.wdaDevice.recordDiagnosticEvent("WDA_RETRY_REQUESTED");
     this.wdaProcessManager.start({ udid, derivedDataPath: entry.derivedDataPath });
     this.iproxyManager.start({ udid, localPort: entry.port, mjpegLocalPort: entry.mjpegPort });
     this.onDeviceListChanged();
@@ -250,4 +400,12 @@ export class DeviceProvisioner {
   _saveRecord(udid, patch) {
     return upsertProvisioningRecord(this.provisioningStorePath, udid, patch);
   }
+}
+
+function processHealthState(state) {
+  if (state === "running") return "RUNNING";
+  if (state === "starting") return "STARTING";
+  if (state === "restarting") return "RESTARTING";
+  if (state === "failed") return "FAILED";
+  return "UNKNOWN";
 }

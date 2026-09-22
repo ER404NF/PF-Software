@@ -56,11 +56,16 @@ test("createProxy rejects invalid fields", () => {
   assert.throws(() => createProxy(storePath, sampleFields({ provider: "" }), MASTER_KEY), /provider is required/);
 });
 
+test("createProxy requires a password instead of persisting an unusable credential", () => {
+  const storePath = tempStorePath();
+  assert.throws(() => createProxy(storePath, sampleFields({ password: "" }), MASTER_KEY), /password is required/);
+});
+
 test("publicProxy never exposes host, port, username, or password", () => {
   const storePath = tempStorePath();
   const record = createProxy(storePath, sampleFields(), MASTER_KEY);
   const pub = publicProxy(record);
-  assert.deepEqual(Object.keys(pub).sort(), ["country", "createdAt", "flag", "id", "label", "leasedToDeviceId", "protocol", "provider", "updatedAt"]);
+  assert.deepEqual(Object.keys(pub).sort(), ["country", "createdAt", "flag", "health", "id", "label", "leasedToDeviceId", "protocol", "provider", "updatedAt"]);
   assert.equal(pub.flag, "🇺🇸");
 });
 

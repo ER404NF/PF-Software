@@ -53,6 +53,7 @@ export class TunManager {
 
   on(...args) { this.emitter.on(...args); return this; }
   isRunning(deviceId) { return this.group.isRunning(deviceId); }
+  getStatus(deviceId) { return this.group.getStatus(deviceId); }
   getLog(deviceId) { return this.group.getLog(deviceId).map(redactProxyCredentials); }
   stop(deviceId) { this.group.stop(deviceId); }
   stopAll() { this.group.stopAll(); }

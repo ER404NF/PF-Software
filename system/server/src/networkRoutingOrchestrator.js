@@ -1,6 +1,7 @@
 import { proxyForDevice, decryptProxyPassword } from "./proxyPool.js";
 import { allocateTunIface, listAllInterfaces as defaultListAllInterfaces, discoverTunPeer as defaultDiscoverTunPeer } from "./tunManager.js";
 import { generatePfRuleset, parsePfCounters } from "./pfRuleGenerator.js";
+import { diagnosticError } from "./errorCatalog.js";
 
 // Drives the automatable portion of the Automation Architecture guide's
 // §5 device state machine, for devices that already have a leased pool
@@ -37,6 +38,8 @@ export const ROUTING_STATES = Object.freeze({
 const PEER_DISCOVERY_ATTEMPTS = 5;
 const PEER_DISCOVERY_DELAY_MS = 500;
 const DEFAULT_HEALTH_CHECK_INTERVAL_MS = 30_000;
+const DEFAULT_RECOVERY_DELAY_MS = 1000;
+const MAX_AUTOMATIC_RECOVERIES = 2;
 
 function wait(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -54,6 +57,9 @@ export class NetworkRoutingOrchestrator {
     listAllInterfaces = defaultListAllInterfaces,
     discoverTunPeer = defaultDiscoverTunPeer,
     onStateChanged = () => {},
+    recoveryDelayMs = DEFAULT_RECOVERY_DELAY_MS,
+    setTimeoutFn = setTimeout,
+    clearTimeoutFn = clearTimeout,
   }) {
     if (!bridgeIface) throw new Error("bridgeIface is required");
     this.proxyPoolStorePath = proxyPoolStorePath;
@@ -66,10 +72,14 @@ export class NetworkRoutingOrchestrator {
     this.listAllInterfaces = listAllInterfaces;
     this.discoverTunPeer = discoverTunPeer;
     this.onStateChanged = onStateChanged;
+    this.recoveryDelayMs = recoveryDelayMs;
+    this.setTimeoutFn = setTimeoutFn;
+    this.clearTimeoutFn = clearTimeoutFn;
     this.routes = new Map(); // deviceId -> { state, usbIp, tunIface, tunPeer, proxyId, lastError, lastPackets?, lastHealthCheckAt? }
     this.startPromises = new Map(); // deviceId -> in-flight setup, shared by duplicate admin requests
     this.stopPromises = new Map(); // deviceId -> in-flight teardown, shared by duplicate admin requests
     this.healthCheckTimer = null;
+    this.recoveryTimers = new Map();
   }
 
   getRoute(deviceId) {
@@ -92,6 +102,17 @@ export class NetworkRoutingOrchestrator {
     return next;
   }
 
+  _recordEvent(deviceId, type, detail = {}) {
+    const current = this.routes.get(deviceId);
+    if (!current) return;
+    const diagnosticEvents = [...(current.diagnosticEvents || []), {
+      type,
+      at: new Date().toISOString(),
+      ...detail,
+    }].slice(-50);
+    this.routes.set(deviceId, { ...current, diagnosticEvents });
+  }
+
   // Full-replace regeneration for every device currently at PF_APPLYING or
   // ROUTED (guide §6: "PF rules should be generated from the full current
   // desired state ... rather than incrementally appending ad hoc lines").
@@ -107,8 +128,18 @@ export class NetworkRoutingOrchestrator {
     return devices;
   }
 
-  async _applyPfRuleset(devices) {
-    const ruleset = generatePfRuleset({ bridgeIface: this.bridgeIface, devices });
+  _desiredBlockedIps(excludeDeviceId = null) {
+    const ips = [];
+    for (const [deviceId, route] of this.routes) {
+      if (deviceId === excludeDeviceId || !route.usbIp) continue;
+      if ([ROUTING_STATES.ROUTE_LOST, ROUTING_STATES.TUN_ERROR, ROUTING_STATES.PF_SYNTAX_ERROR,
+        ROUTING_STATES.PF_CLEANUP_ERROR].includes(route.state)) ips.push(route.usbIp);
+    }
+    return ips;
+  }
+
+  async _applyPfRuleset(devices, blockedIps = this._desiredBlockedIps()) {
+    const ruleset = generatePfRuleset({ bridgeIface: this.bridgeIface, devices, blockedIps });
     const test = await this.privilegedOps.testRuleset(ruleset);
     if (!test.ok) {
       const error = new Error(`PF syntax check failed: ${test.error}`);
@@ -120,8 +151,9 @@ export class NetworkRoutingOrchestrator {
 
   async _removeDeviceFromPf(deviceId) {
     const remaining = this._desiredPfDevices(deviceId);
-    if (remaining.length > 0) {
-      await this._applyPfRuleset(remaining);
+    const blocked = this._desiredBlockedIps(deviceId);
+    if (remaining.length > 0 || blocked.length > 0) {
+      await this._applyPfRuleset(remaining, blocked);
     } else {
       await this.privilegedOps.clearAnchor();
     }
@@ -148,12 +180,14 @@ export class NetworkRoutingOrchestrator {
     if (typeof usbIp !== "string" || !usbIp) throw new Error("startRouting requires a known usbIp");
 
     const active = this.routes.get(deviceId);
+    const wasRecovering = active?.state === ROUTING_STATES.ROUTE_LOST;
     if (active?.state === ROUTING_STATES.ROUTED) {
       if (active.usbIp === usbIp) return active;
       const error = new Error("routing is already active for this device; stop it before changing its USB IP");
       error.status = 409;
       throw error;
     }
+    if (active) this.tunManager.stop(deviceId);
 
     const proxyRecord = proxyForDevice(this.proxyPoolStorePath, deviceId);
     if (!proxyRecord) throw new Error("no pool proxy is assigned to this device — assign one before starting routing");
@@ -171,6 +205,7 @@ export class NetworkRoutingOrchestrator {
         existingIfaces, preferred: previousTunIface, rangeStart: this.tunPortRangeStart, rangeEnd: this.tunPortRangeEnd,
       });
       this._setState(deviceId, ROUTING_STATES.TUN_STARTING, { usbIp, proxyId: proxyRecord.id, tunIface });
+      this._recordEvent(deviceId, "TUNNEL_STARTING");
 
       const password = decryptProxyPassword(proxyRecord, this.proxyCredentialEncryptionKey);
       this.tunManager.start({
@@ -188,13 +223,22 @@ export class NetworkRoutingOrchestrator {
         }
       }
       if (!peer) throw new Error(`tunnel interface ${tunIface} never reported a peer address`);
+      this._recordEvent(deviceId, "TUNNEL_READY");
 
       this._setState(deviceId, ROUTING_STATES.PF_APPLYING, { usbIp, proxyId: proxyRecord.id, tunIface, tunPeer: peer.peerIp });
+      this._recordEvent(deviceId, "PF_APPLY_STARTED");
       await this._applyPfRuleset(this._desiredPfDevices());
       pfLoaded = true;
+      this._recordEvent(deviceId, "PF_APPLY_SUCCEEDED");
       await this.privilegedOps.clearState(usbIp);
 
-      return this._setState(deviceId, ROUTING_STATES.ROUTED, { usbIp, proxyId: proxyRecord.id, tunIface, tunPeer: peer.peerIp });
+      const routed = this._setState(deviceId, ROUTING_STATES.ROUTED, {
+        usbIp, proxyId: proxyRecord.id, tunIface, tunPeer: peer.peerIp,
+        failClosed: true, recoveryAttempts: 0, protected: false,
+      });
+      this._recordEvent(deviceId, wasRecovering ? "NETWORK_RECOVERED" : "NETWORK_ROUTE_READY",
+        { verification: "device_egress_required" });
+      return this.routes.get(deviceId) ?? routed;
     } catch (error) {
       let reportedError = error;
       let state = error.pfSyntaxError ? ROUTING_STATES.PF_SYNTAX_ERROR : ROUTING_STATES.TUN_ERROR;
@@ -211,6 +255,9 @@ export class NetworkRoutingOrchestrator {
       }
       this.tunManager.stop(deviceId);
       this._setError(deviceId, state, reportedError.message);
+      this._recordEvent(deviceId, state === ROUTING_STATES.PF_SYNTAX_ERROR || pfLoaded
+        ? "PF_APPLY_FAILED" : "TUNNEL_FAILED", { errorCode: state === ROUTING_STATES.PF_SYNTAX_ERROR ? "F201" : "T202" });
+      try { await this._applyFailClosed(deviceId); } catch { /* the original setup error remains primary */ }
       throw reportedError;
     }
   }
@@ -235,13 +282,22 @@ export class NetworkRoutingOrchestrator {
 
   async _stopRouting(deviceId) {
     const route = this.routes.get(deviceId);
-    this.tunManager.stop(deviceId);
-    if (!route) return;
+    if (!route) {
+      // A supervisor/process-manager race can leave a tunnel alive after its
+      // in-memory route record has already disappeared. Stopping an unknown
+      // route is therefore also a cheap defensive process cleanup.
+      this.tunManager.stop(deviceId);
+      return;
+    }
     // Keep the route until privileged cleanup succeeds. STOPPING is ignored
     // by both health checks and desired-PF generation, so concurrent work
     // cannot resurrect it or retain its rule. If cleanup fails, preserving
     // the route makes a later stopRouting() call able to retry the removal.
     this._setState(deviceId, ROUTING_STATES.STOPPING);
+    const recoveryTimer = this.recoveryTimers.get(deviceId);
+    if (recoveryTimer) this.clearTimeoutFn(recoveryTimer);
+    this.recoveryTimers.delete(deviceId);
+    this.tunManager.stop(deviceId);
     try {
       await this._removeDeviceFromPf(deviceId);
       if (route.usbIp) await this.privilegedOps.clearState(route.usbIp);
@@ -278,20 +334,112 @@ export class NetworkRoutingOrchestrator {
       const route = this.routes.get(deviceId);
       if (!route || route.state !== ROUTING_STATES.ROUTED) continue; // an earlier iteration this same tick already moved it
 
-      if (!this.tunManager.isRunning(deviceId)) {
-        this._setError(deviceId, ROUTING_STATES.ROUTE_LOST, "tunnel process is no longer running");
+      const tunnelState = this.tunManager.getStatus?.(deviceId)?.state;
+      if ((tunnelState && tunnelState !== "running") || (!tunnelState && !this.tunManager.isRunning(deviceId))) {
+        await this._handleRouteLost(deviceId, "T206", "tunnel process is no longer running");
         continue;
       }
       if (counters === null) continue;
 
       const entry = counters.find(c => c.usbIp === route.usbIp);
       if (!entry) {
-        this._setError(deviceId, ROUTING_STATES.ROUTE_LOST, "this device's PF rule is no longer loaded in the anchor");
+        await this._handleRouteLost(deviceId, "F203", "this device's PF rule is no longer loaded in the anchor");
         continue;
       }
       this.routes.set(deviceId, { ...route, lastPackets: entry.packets, lastHealthCheckAt: new Date().toISOString() });
       this.onStateChanged(deviceId, this.routes.get(deviceId));
     }
+  }
+
+  async _applyFailClosed(deviceId) {
+    const route = this.routes.get(deviceId);
+    if (!route?.usbIp) return;
+    const routed = this._desiredPfDevices(deviceId);
+    const blocked = [...new Set([...this._desiredBlockedIps(deviceId), route.usbIp])];
+    await this._applyPfRuleset(routed, blocked);
+    const current = this.routes.get(deviceId);
+    if (current) {
+      this.routes.set(deviceId, { ...current, failClosed: true, internetBlocked: true, protected: false });
+      this.onStateChanged(deviceId, this.routes.get(deviceId));
+      this._recordEvent(deviceId, "INTERNET_FAIL_CLOSED");
+    }
+  }
+
+  async _handleRouteLost(deviceId, code, message) {
+    const route = this.routes.get(deviceId);
+    if (!route || route.state !== ROUTING_STATES.ROUTED) return;
+    const detail = diagnosticError(code, { why: message, technical: { usbIp: route.usbIp } });
+    this._setError(deviceId, ROUTING_STATES.ROUTE_LOST, detail.name);
+    this.routes.set(deviceId, {
+      ...this.routes.get(deviceId), latestError: detail, protected: false,
+      recoveryAttempts: route.recoveryAttempts ?? 0,
+    });
+    this._recordEvent(deviceId, "NETWORK_DEGRADED", { errorCode: code });
+    try {
+      await this._applyFailClosed(deviceId);
+    } catch (error) {
+      const pf = diagnosticError("F202", { why: error.message });
+      this.routes.set(deviceId, { ...this.routes.get(deviceId), latestError: pf, internetBlocked: false });
+      this.onStateChanged(deviceId, this.routes.get(deviceId));
+      return;
+    }
+    this._scheduleRecovery(deviceId);
+  }
+
+  async quarantineRoute(deviceId, { code = "V204", why = "End-to-end verification could not prove the protected route." } = {}) {
+    const route = this.routes.get(deviceId);
+    if (!route?.usbIp) return null;
+    const detail = diagnosticError(code, { why, technical: { routeState: route.state } });
+    this._setError(deviceId, ROUTING_STATES.ROUTE_LOST, detail.name);
+    this.routes.set(deviceId, {
+      ...this.routes.get(deviceId),
+      latestError: detail,
+      protected: false,
+      recoveryAttempts: route.recoveryAttempts ?? 0,
+    });
+    this._recordEvent(deviceId, "NETWORK_DEGRADED", { errorCode: detail.code });
+    try {
+      await this._applyFailClosed(deviceId);
+    } finally {
+      // Even if PF itself is unavailable, stop the tunnel so an existing
+      // route-to rule cannot keep forwarding through an unverified exit.
+      this.tunManager.stop(deviceId);
+    }
+    this.onStateChanged(deviceId, this.routes.get(deviceId));
+    return this.routes.get(deviceId);
+  }
+
+  _scheduleRecovery(deviceId) {
+    if (this.recoveryTimers.has(deviceId)) return;
+    const route = this.routes.get(deviceId);
+    if (!route || route.state !== ROUTING_STATES.ROUTE_LOST) return;
+    const attempts = route.recoveryAttempts ?? 0;
+    if (attempts >= MAX_AUTOMATIC_RECOVERIES) return;
+    const timer = this.setTimeoutFn(async () => {
+      this.recoveryTimers.delete(deviceId);
+      const current = this.routes.get(deviceId);
+      if (!current || current.state !== ROUTING_STATES.ROUTE_LOST) return;
+      this.routes.set(deviceId, { ...current, recoveryAttempts: attempts + 1 });
+      this._recordEvent(deviceId, "NETWORK_RECOVERY_STARTED", { attempt: attempts + 1 });
+      this.tunManager.stop(deviceId);
+      try {
+        await this.startRouting(deviceId, { usbIp: current.usbIp });
+      } catch (error) {
+        const latest = this.routes.get(deviceId) ?? current;
+        this.routes.set(deviceId, {
+          ...latest,
+          state: ROUTING_STATES.ROUTE_LOST,
+          recoveryAttempts: attempts + 1,
+          lastError: error.message,
+          protected: false,
+        });
+        try { await this._applyFailClosed(deviceId); } catch { /* remains explicitly unprotected */ }
+        this.onStateChanged(deviceId, this.routes.get(deviceId));
+        this._scheduleRecovery(deviceId);
+      }
+    }, this.recoveryDelayMs);
+    timer.unref?.();
+    this.recoveryTimers.set(deviceId, timer);
   }
 
   startHealthChecks({ intervalMs = DEFAULT_HEALTH_CHECK_INTERVAL_MS } = {}) {
@@ -306,5 +454,7 @@ export class NetworkRoutingOrchestrator {
   stopHealthChecks() {
     if (this.healthCheckTimer) clearInterval(this.healthCheckTimer);
     this.healthCheckTimer = null;
+    for (const timer of this.recoveryTimers.values()) this.clearTimeoutFn(timer);
+    this.recoveryTimers.clear();
   }
 }

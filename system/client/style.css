@@ -297,6 +297,30 @@ body {
 .device-access span,
 .device-safe-status { color: #8e8e93; line-height: 1.35; }
 .device-safe-status { margin-top: 9px; font-size: 11px; }
+.component-health {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(100px, 1fr));
+  gap: 6px;
+  width: 100%;
+  margin-top: 10px;
+}
+.component-health.compact { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.component-health-row { display: flex; justify-content: space-between; gap: 6px; padding: 5px 7px; border: 1px solid #3a3a3c; border-radius: 6px; font-size: 10px; }
+.component-health-row span { color: #8e8e93; }
+.component-health-row strong { overflow-wrap: anywhere; text-align: right; }
+.component-health-row strong[data-state="healthy"] { color: #30d158; }
+.component-health-row strong[data-state="warning"] { color: #ffcc00; }
+.component-health-row strong[data-state="error"] { color: #ff6961; }
+.device-error-card { margin-top: 10px; padding: 8px 9px; border: 1px solid #8b2b25; border-radius: 7px; background: #321b1a; font-size: 11px; }
+.device-error-card summary { color: #ff8a80; cursor: pointer; font-weight: 700; }
+.device-error-card p { margin: 7px 0; color: #e5e5ea; line-height: 1.4; overflow-wrap: anywhere; }
+.device-error-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 8px; }
+.device-error-actions button { border: 0; border-radius: 6px; padding: 6px 9px; background: #0a84ff; color: #fff; cursor: pointer; }
+.device-error-actions pre { flex-basis: 100%; max-height: 240px; overflow: auto; margin: 3px 0 0; padding: 8px; background: #111; color: #d1f7c4; border-radius: 5px; white-space: pre-wrap; }
+.device-error-actions pre[hidden] { display: none; }
+@media (max-width: 760px) {
+  .component-health { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 .open-device-button {
   width: 100%;
   margin-top: 11px;

@@ -62,3 +62,11 @@ export function setUsbIp(storePath, deviceId, usbIp) {
   writeRaw(storePath, raw);
   return raw.devices[deviceId];
 }
+
+export function clearUsbNetworkRecord(storePath, deviceId) {
+  const raw = readRaw(storePath);
+  if (!(deviceId in raw.devices)) return false;
+  delete raw.devices[deviceId];
+  writeRaw(storePath, raw);
+  return true;
+}

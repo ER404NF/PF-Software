@@ -86,7 +86,25 @@ test("getStatus for a never-checked device returns all-null defaults", () => {
     networkProxyHealthy: null,
     networkBandwidthMbps: null,
     networkRouteMatch: null,
+    networkVerificationLevel: null,
+    networkProtectionState: "UNCONFIGURED",
+    networkVerificationMessage: null,
+    networkLatestError: null,
+    networkDiagnosticEvents: [],
   });
+});
+
+test("proxy and host-route checks remain VERIFYING until a device-originated egress probe passes", () => {
+  const verifier = makeVerifier([{ id: "d1", network: { egress: "commercial-proxy", profileId: "p1", controlIface: "usb" } }]);
+  const result = verifier.recordInfrastructureCheck("d1", {
+    proxyResult: { status: "healthy", publicIpv4: "198.51.100.10", country: "US", checkedAt: new Date().toISOString() },
+    route: { state: "routed" },
+  });
+  assert.equal(result.networkProxyHealthy, true);
+  assert.equal(result.networkRouteMatch, true);
+  assert.equal(result.networkVerified, false);
+  assert.equal(result.networkProtectionState, "VERIFYING");
+  assert.match(result.networkVerificationMessage, /device-originated/);
 });
 
 test("two devices on different SIMs sharing an observed IP are both flagged as a mismatch", async () => {
@@ -109,6 +127,12 @@ test("two devices on different SIMs sharing an observed IP are both flagged as a
   assert.equal(d1Status.networkVerified, false);
   assert.equal(d1Status.networkMismatch, true);
   assert.match(d1Status.networkMismatchReason, /device "d2"/);
+  assert.equal(d1Status.networkLatestError.code, "V204");
+  assert.deepEqual(d1Status.networkDiagnosticEvents.at(-1), {
+    type: "NETWORK_DEGRADED",
+    at: d1Status.networkLatestError.at,
+    errorCode: "V204",
+  });
 });
 
 test("two devices on the SAME vlanId sharing an observed IP is expected, not a mismatch", async () => {
