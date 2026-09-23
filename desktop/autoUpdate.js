@@ -100,6 +100,32 @@ async function fetchReleases({ fetchImpl = fetch, apiUrl = RELEASES_API, timeout
   }
 }
 
+async function fetchReleaseAssets(release, { fetchImpl = fetch, timeoutMs = 15_000 } = {}) {
+  const trusted = trustedHttpsUrl(release?.assets_url);
+  if (!trusted || trusted.hostname !== "api.github.com" ||
+      !/^\/repos\/ER404NF\/PF-Software\/releases\/\d+\/assets$/.test(trusted.pathname)) {
+    throw new Error("The release asset service URL is not trusted.");
+  }
+  trusted.searchParams.set("per_page", "100");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const response = await fetchImpl(trusted, {
+      headers: { Accept: "application/vnd.github+json", "User-Agent": "Phone-Farm-Desktop" },
+      signal: controller.signal,
+    });
+    if (!response.ok) throw new Error(`The release asset service returned HTTP ${response.status}.`);
+    const assets = await response.json();
+    if (!Array.isArray(assets)) throw new Error("The release asset service returned an invalid response.");
+    return assets;
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error("The release asset check timed out.");
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function expectedDigest(asset) {
   const match = String(asset?.digest || "").match(/^sha256:([a-fA-F0-9]{64})$/);
   return match?.[1].toLowerCase() || null;
@@ -201,7 +227,13 @@ async function enforceReleaseVersion({
       const available = normalizedVersion(release.tag_name);
       if (compareVersions(current, available) === 0) return { allowed: true, status: "current", version: current.text };
 
-      const asset = selectInstallerAsset(release, platform, arch);
+      let asset = selectInstallerAsset(release, platform, arch);
+      if (!asset && release.assets_url) {
+        // GitHub's release-list cache can briefly lag behind an asset upload.
+        // The dedicated asset collection is authoritative and carries the digest.
+        const assets = await fetchReleaseAssets(release, { fetchImpl });
+        asset = selectInstallerAsset({ ...release, assets }, platform, arch);
+      }
       if (!asset) throw new Error(`Phone Farm ${available.text} has no installer for this computer yet.`);
       const answer = await dialog.showMessageBox({
         type: "warning",
@@ -242,6 +274,7 @@ module.exports = {
   downloadInstaller,
   enforceReleaseVersion,
   expectedDigest,
+  fetchReleaseAssets,
   fetchReleases,
   installerCandidates,
   normalizedVersion,

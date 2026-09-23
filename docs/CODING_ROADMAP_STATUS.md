@@ -15,7 +15,7 @@ than Git-tracked files; CI still owns the platform-specific build, test, and pac
 
 Automated tests cover version ordering, platform asset selection, digest/size enforcement, acceptance and
 decline paths, failure-closed handling, and Electron lifecycle events attempting to bypass a denied gate.
-Windows-local validation: desktop **158/158**, server **1,143/1,143**, both dependency audit gates clean,
+Windows-local validation: desktop **159/159**, server **1,143/1,143**, both dependency audit gates clean,
 and `Phone-Farm-Windows.exe` built with its packaged runtime verified. The v0.2.0 macOS package was not
 built on this Windows host. This is packaging/update automation only: no physical Mac mini or iPhone
 acceptance is claimed here.

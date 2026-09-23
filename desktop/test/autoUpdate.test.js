@@ -137,3 +137,28 @@ test("an unverifiable installer fails closed", async () => {
   assert.equal(quits, 1);
   assert.match(prompts[1].detail, /SHA-256 digest/);
 });
+
+test("a stale release list falls back to GitHub's dedicated asset collection", async () => {
+  const installer = asset("Phone-Farm-Windows.exe");
+  const latest = {
+    ...release("0.2.2"),
+    assets_url: "https://api.github.com/repos/ER404NF/PF-Software/releases/123/assets",
+  };
+  const requested = [];
+  const result = await enforceReleaseVersion({
+    app: { isPackaged: true, getVersion: () => "0.2.1", quit() {} },
+    dialog: { showMessageBox: async () => ({ response: 1 }) },
+    shell: { openPath: async () => assert.fail("declined before download") },
+    logger: { info() {}, warn() {}, error() {} },
+    platform: "win32",
+    fetchImpl: async url => {
+      requested.push(String(url));
+      return requested.length === 1
+        ? response(null, { json: [latest] })
+        : response(null, { json: [installer] });
+    },
+  });
+  assert.equal(result.status, "declined");
+  assert.equal(requested.length, 2);
+  assert.match(requested[1], /\/releases\/123\/assets\?per_page=100$/);
+});
