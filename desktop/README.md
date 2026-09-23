@@ -72,6 +72,8 @@ enabled by desktop startup.
   checks the public GitHub Releases API. If the newest stable published version differs, the operator must choose
   **Update now**; **No — exit** closes the app. The downloaded platform installer is accepted only from
   trusted GitHub HTTPS hosts, with the declared byte length and GitHub-provided SHA-256 digest verified.
+  If GitHub's release-list cache has not yet included a newly uploaded installer, the gate reads that
+  release's dedicated asset collection before reporting it missing.
   A check or verification error offers Retry or Exit and never starts the application. Source/development
   runs skip this gate.
 
