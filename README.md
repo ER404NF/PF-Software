@@ -34,7 +34,7 @@ uses to control iPhones — is already inside the app.
 Real-Mac, real-iPhone acceptance steps: [docs/MAC_INSTALLER_ACCEPTANCE.md](docs/MAC_INSTALLER_ACCEPTANCE.md).
 How a maintainer publishes a release: [docs/MAC_RELEASE.md](docs/MAC_RELEASE.md).
 
-At packaged-app startup, Phone Farm compares its application version with the newest published release.
+At packaged-app startup, Phone Farm compares its application version with the newest stable published release.
 When they differ it offers to download the correct installer, verifies GitHub's SHA-256 digest, and opens
 the installer. Declining or failing that required update exits before a host, agent, or client window starts.
 Development runs from source do not use this release gate.

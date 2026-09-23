@@ -10,6 +10,7 @@ const childProcess = require("node:child_process");
 const { pathToFileURL } = require("node:url");
 
 const desktopDir = path.resolve(__dirname, "..", "..");
+const desktopVersion = require("../../package.json").version;
 
 function loadMain(options = {}) {
   // The real prerequisite checks (Xcode, iPhone tools) depend on the machine the tests run on: a clean macOS CI runner
@@ -52,7 +53,7 @@ function loadMain(options = {}) {
     app: {
       isPackaged: options.isPackaged === true,
       getPath: name => (name === "logs" ? logsDir : name === "temp" ? os.tmpdir() : userData),
-      getVersion: () => options.version || "0.2.0",
+      getVersion: () => options.version || desktopVersion,
       requestSingleInstanceLock: () => true,
       whenReady: () => Promise.resolve(),
       on: (name, handler) => { appEvents.set(name, handler); },

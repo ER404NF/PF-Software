@@ -36,11 +36,11 @@ function response(body, { json, url = "https://api.github.com/repos/ER404NF/PF-S
   };
 }
 
-test("versions are normalized and the highest non-draft release is selected", () => {
+test("versions are normalized and the highest stable non-draft release is selected", () => {
   assert.equal(normalizedVersion("v1.2.3").text, "1.2.3");
   assert.ok(compareVersions("1.10.0", "1.9.9") > 0);
   assert.ok(compareVersions("2.0.0", "2.0.0-beta.2") > 0);
-  assert.equal(selectRelease([release("0.2.0"), release("1.0.0-beta.1"), { ...release("9.0.0"), draft: true }]).tag_name, "v1.0.0-beta.1");
+  assert.equal(selectRelease([release("0.2.0"), release("1.0.0-beta.1"), { ...release("9.0.0"), draft: true }]).tag_name, "v0.2.0");
 });
 
 test("platform installer selection prefers stable direct-download aliases", () => {

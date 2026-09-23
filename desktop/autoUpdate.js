@@ -36,7 +36,7 @@ function compareVersions(left, right) {
 
 function selectRelease(releases) {
   const eligible = Array.isArray(releases)
-    ? releases.filter(release => !release?.draft && normalizedVersion(release?.tag_name))
+    ? releases.filter(release => !release?.draft && !release?.prerelease && normalizedVersion(release?.tag_name))
     : [];
   return eligible.sort((left, right) => compareVersions(right.tag_name, left.tag_name))[0] || null;
 }

@@ -69,7 +69,7 @@ enabled by desktop startup.
 - **Checking a release.** `npm run check:release` lists everything about the installer that can be verified
   without a Mac and whether it is committed; see [docs/MAC_RELEASE.md](../docs/MAC_RELEASE.md).
 - **Required version gate.** Before any packaged host, site agent, or client UI starts, `autoUpdate.js`
-  checks the public GitHub Releases API. If the newest published version differs, the operator must choose
+  checks the public GitHub Releases API. If the newest stable published version differs, the operator must choose
   **Update now**; **No — exit** closes the app. The downloaded platform installer is accepted only from
   trusted GitHub HTTPS hosts, with the declared byte length and GitHub-provided SHA-256 digest verified.
   A check or verification error offers Retry or Exit and never starts the application. Source/development
