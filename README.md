@@ -2,18 +2,20 @@
 
 ## DOWNLOAD PHONE FARM
 
-Installers are release downloads, not scripts in the source repository:
+Installers are release downloads or CI artifacts, not scripts in the source repository:
 
-- [Download Phone Farm for macOS](https://github.com/ER404NF/PF-Software/releases/latest/download/Phone-Farm-macOS.pkg) (signed/notarized public release)
 - [Download Phone Farm for Windows](https://github.com/ER404NF/PF-Software/releases/latest/download/Phone-Farm-Windows.exe)
+- macOS: the [latest verified Apple-silicon test package](https://github.com/ER404NF/PF-Software/actions/runs/35893483741)
+  is available under **Artifacts → phone-farm-pkg-arm64**. It is unsigned and macOS will warn. The stable
+  `Phone-Farm-macOS.pkg` release link will be added only after Apple signing and notarization are configured.
 - [See all releases and checksums](https://github.com/ER404NF/PF-Software/releases/latest)
 
-On macOS, double-click `Phone-Farm-macOS.pkg`; on Windows, double-click
+On macOS, unzip the CI artifact and double-click its `.pkg`; on Windows, double-click
 `Phone-Farm-Windows.exe`. The release workflows build and verify these files. Installer binaries are
 deliberately not committed into Git history, so pulling the source repository does not download a stale
 100+ MB executable.
 
-You do **not** need the source code, Node.js, npm, Terminal, or this repository.
+Installing either package does **not** require the source code, Node.js, npm, Terminal, or this repository.
 Everything Phone Farm needs to run — including its server and the WebDriverAgent it
 uses to control iPhones — is already inside the app.
 

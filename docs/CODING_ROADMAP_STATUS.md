@@ -8,17 +8,20 @@ site-agent, or client window. When the installed and published versions differ, 
 closed. The downloaded `.pkg`/`.exe` is constrained to trusted GitHub HTTPS hosts and is opened only after
 its declared size and GitHub-provided SHA-256 digest match. Source/development launches skip this gate.
 
-Release artifacts now have stable user-facing names: `Phone-Farm-macOS.pkg` and
-`Phone-Farm-Windows.exe`. The three root `BUILD_PHONE_FARM_INSTALLER.*` developer wrappers were removed so
-they cannot be mistaken for the application. The actual large binaries remain GitHub Release assets rather
-than Git-tracked files; CI still owns the platform-specific build, test, and packaging steps.
+The Windows release artifact now has the stable user-facing name `Phone-Farm-Windows.exe`. The macOS
+workflow reserves `Phone-Farm-macOS.pkg` for a signed/notarized package; until Apple credentials are
+configured, the verified Apple-silicon package is a clearly marked unsigned Actions artifact rather than a
+misleading stable Release download. The three root `BUILD_PHONE_FARM_INSTALLER.*` developer wrappers were
+removed so they cannot be mistaken for the application. The actual large binaries remain release/CI assets
+rather than Git-tracked files; CI still owns the platform-specific build, test, and packaging steps.
 
 Automated tests cover version ordering, platform asset selection, digest/size enforcement, acceptance and
 decline paths, failure-closed handling, and Electron lifecycle events attempting to bypass a denied gate.
 Windows-local validation: desktop **159/159**, server **1,143/1,143**, both dependency audit gates clean,
-and `Phone-Farm-Windows.exe` built with its packaged runtime verified. The v0.2.0 macOS package was not
-built on this Windows host. This is packaging/update automation only: no physical Mac mini or iPhone
-acceptance is claimed here.
+and `Phone-Farm-Windows.exe` built with its packaged runtime verified. GitHub Actions run 35893483741 built,
+installed, boot-tested, and uploaded the v0.2.2 arm64 unsigned `.pkg` on macOS; run 35893483864 built and
+verified the Windows installer. This is packaging/update automation only: no physical Mac mini or iPhone
+acceptance is claimed here, and the macOS stable Release asset remains blocked on Apple signing/notarization.
 
 ## 2026-09-21 — larger phone view and low-latency transport decision
 
