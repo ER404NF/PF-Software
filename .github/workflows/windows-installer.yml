@@ -1,4 +1,4 @@
-# Builds the Windows installer for remote operators:  Phone-Farm-Setup-<version>.exe
+# Builds the Windows installer for remote operators:  Phone-Farm-Windows.exe
 #
 # Operators on Windows PCs download this, run it, choose "Connect to an existing
 # Phone Farm host" and type the hub address. (The Mac-only host and site modes are

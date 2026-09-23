@@ -7,6 +7,7 @@ const fs = require("node:fs");
 const net = require("node:net");
 const path = require("node:path");
 const { loadMain } = require("./helpers/mainHarness.js");
+const desktopVersion = require("../package.json").version.replaceAll(".", "\\.");
 
 const app = loadMain();
 const { handlers, appEvents, windows, clipboardWrites, blockers, menus, shown, loginItems, spawned, trusted, stranger, wait, until, responds, readLog } = app;
@@ -25,7 +26,7 @@ async function freePort() {
 test("the setup window opens on a fresh install and the log records the start", () => {
   assert.equal(windows.length, 1);
   assert.match(windows[0].file, /first-run\.html$/);
-  assert.match(readLog(), /Phone Farm 0\.1\.0 starting/);
+  assert.match(readLog(), new RegExp(`Phone Farm ${desktopVersion} starting`));
 });
 
 test("every desktop channel the page can call is handled, and none answers anyone but the setup page", async () => {
@@ -51,7 +52,7 @@ test("diagnostics are copied to the clipboard and hold no secret", async () => {
   assert.match(report, /^Phone Farm diagnostics/);
   assert.match(report, /Saved settings: launchAtLogin, sessionSecret, siteToken/);
   assert.doesNotMatch(report, /MUST-NOT-LEAK|MUSTNOTLEAK/);
-  assert.match(report, /Phone Farm 0\.1\.0 starting/, "the recent log is included");
+  assert.match(report, new RegExp(`Phone Farm ${desktopVersion} starting`), "the recent log is included");
   fs.rmSync(configFile);
 });
 

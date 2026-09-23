@@ -3,7 +3,7 @@
 End users download **one file** from GitHub Releases and double-click it:
 
 ```text
-https://github.com/ER404NF/PF-Software/releases/latest   ->   Phone-Farm-<version>-arm64.pkg
+https://github.com/ER404NF/PF-Software/releases/latest   ->   Phone-Farm-macOS.pkg
 ```
 
 They never clone the repository, install Node.js, run npm, open Terminal, or run tests. Tests gate the
@@ -56,8 +56,11 @@ if it is the app that misbehaves).
    ```
 
 3. `.github/workflows/mac-installer.yml` runs. It fails if the tag and `desktop/package.json` disagree.
-4. On success the Release **Phone Farm v0.2.0** contains `Phone-Farm-0.2.0-arm64.pkg`,
-   `Phone-Farm-0.2.0-universal.pkg` (best effort) and `SHA256SUMS.txt`.
+4. On success the signed/notarized Release **Phone Farm v0.2.0** contains the stable download
+   `Phone-Farm-macOS.pkg`, versioned architecture packages (universal is best effort), and
+   `SHA256SUMS.txt`. The Windows workflow adds `Phone-Farm-Windows.exe` to the same release.
+   An explicitly allowed unsigned prerelease keeps only its clearly marked `-UNSIGNED` or
+   `-NOT-NOTARIZED` filename; it never receives the stable macOS alias.
 
 Branch pushes and pull requests build and verify the same way but publish nothing (the package is an
 Actions artifact for 30 days). **Run workflow** (manual) can also build the universal package.
@@ -100,5 +103,5 @@ license, and rebuild. `prepare-wda.cjs` refuses a tag that does not resolve to t
 ## Local build (developers)
 
 `cd desktop && npm ci && npm test && npm run dist:mac` on a Mac (unsigned unless credentials are in the
-environment; see `desktop/README.md`). The root `BUILD_PHONE_FARM_INSTALLER.command` wraps this and is a
-developer tool, not something to hand to users.
+environment; see `desktop/README.md`). These maintainer commands are intentionally kept inside `desktop/`;
+there are no installer-looking build commands at repository root.

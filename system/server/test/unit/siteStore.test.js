@@ -86,3 +86,15 @@ test("update and remove work, and lastSeenAt is recorded", () => {
   assert.equal(store.remove(site.id), false);
   assert.equal(store.list().length, 0);
 });
+
+test("a failed remove write restores the live site and its token", t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-site-remove-"));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const storePath = path.join(directory, "sites.json");
+  const store = new SiteStore(storePath);
+  const { site, token } = store.create({ name: "Durable Site" });
+  store._save = () => { throw new Error("disk full"); };
+  assert.throws(() => store.remove(site.id), /disk full/);
+  assert.equal(store.get(site.id).name, "Durable Site");
+  assert.ok(store.verifyToken(site.id, token));
+});

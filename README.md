@@ -1,21 +1,23 @@
 # Phone Farm — Dual-Mode Human VA / Future AI VA Control System
 
-## DOWNLOAD PHONE FARM FOR MAC
+## DOWNLOAD PHONE FARM
 
-**Get the installer from [GitHub Releases](https://github.com/ER404NF/PF-Software/releases/latest)** (once a release has been published; until then, use the newest run's **Artifacts** under [GitHub Actions](https://github.com/ER404NF/PF-Software/actions/workflows/mac-installer.yml), see [docs/MAC_RELEASE.md](docs/MAC_RELEASE.md)) and download the single file:
+Installers are release downloads, not scripts in the source repository:
 
-```text
-Phone-Farm-<version>-arm64.pkg        (Apple silicon Macs)
-```
+- [Download Phone Farm for macOS](https://github.com/ER404NF/PF-Software/releases/latest/download/Phone-Farm-macOS.pkg) (signed/notarized public release)
+- [Download Phone Farm for Windows](https://github.com/ER404NF/PF-Software/releases/latest/download/Phone-Farm-Windows.exe)
+- [See all releases and checksums](https://github.com/ER404NF/PF-Software/releases/latest)
 
-Then **double-click it** in Finder. macOS Installer opens; click **Continue**, then
-**Install**. Phone Farm appears in **Applications**; open it like any other app.
+On macOS, double-click `Phone-Farm-macOS.pkg`; on Windows, double-click
+`Phone-Farm-Windows.exe`. The release workflows build and verify these files. Installer binaries are
+deliberately not committed into Git history, so pulling the source repository does not download a stale
+100+ MB executable.
 
 You do **not** need the source code, Node.js, npm, Terminal, or this repository.
 Everything Phone Farm needs to run — including its server and the WebDriverAgent it
 uses to control iPhones — is already inside the app.
 
-- A file named `...-UNSIGNED.pkg` or `...-NOT-NOTARIZED.pkg` is a development build made without
+- A versioned file named `...-UNSIGNED.pkg` or `...-NOT-NOTARIZED.pkg` is a development build made without
   complete Apple signing credentials. macOS Gatekeeper will warn about it (Control-click → Open, or
   allow it in System Settings → Privacy & Security). Only the plain `Phone-Farm-<version>-arm64.pkg`
   is the signed and notarized public installer.
@@ -32,20 +34,10 @@ uses to control iPhones — is already inside the app.
 Real-Mac, real-iPhone acceptance steps: [docs/MAC_INSTALLER_ACCEPTANCE.md](docs/MAC_INSTALLER_ACCEPTANCE.md).
 How a maintainer publishes a release: [docs/MAC_RELEASE.md](docs/MAC_RELEASE.md).
 
-### For developers only: building the installer from source
-
-`BUILD_PHONE_FARM_INSTALLER.command` (macOS) / `BUILD_PHONE_FARM_INSTALLER.cmd` (Windows) are
-**developer tools, not the Phone Farm installer**. They need Node.js 20+, install the exact locked
-dependencies, run the server and desktop test suites, and build a local installer into `desktop/dist/`.
-Releases are normally produced by GitHub Actions (`.github/workflows/mac-installer.yml`) so that the
-tests gate the build and the package is signed and notarized; ordinary users should never run these files.
-
-```sh
-cd desktop
-npm ci
-npm test
-npm run dist:mac        # macOS only -> dist/Phone-Farm-<version>-arm64[-UNSIGNED].pkg
-```
+At packaged-app startup, Phone Farm compares its application version with the newest published release.
+When they differ it offers to download the correct installer, verifies GitHub's SHA-256 digest, and opens
+the installer. Declining or failing that required update exits before a host, agent, or client window starts.
+Development runs from source do not use this release gate.
 
 ## Product goal
 

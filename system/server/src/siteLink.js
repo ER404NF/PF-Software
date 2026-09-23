@@ -111,6 +111,9 @@ export class SiteLinkHub {
   // ---- messages from the agent --------------------------------------------------
 
   _onMessage(connection, data, isBinary) {
+    // A replaced connection, or a connection whose site was just deleted, may
+    // still have an already-buffered message. It must never repopulate the fleet.
+    if (this.connections.get(connection.site.id) !== connection || !this.siteStore.get(connection.site.id)) return;
     if (isBinary) {
       const packet = unpackFrame(data);
       const want = packet && this.wanted.get(packet.streamId);

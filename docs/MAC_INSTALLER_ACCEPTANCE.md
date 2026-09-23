@@ -6,8 +6,8 @@
 |---|---|
 | Server suite, desktop suite, dependency audits | pass on the Windows development host (see `docs/CODING_ROADMAP_STATUS.md`) |
 | Packaged-app layout: runtime + `node_modules` present, dependencies resolve, server boots from the packaged executable, bundle unmodified | **verified on Windows** with an unpacked electron-builder build; re-run automatically on macOS in CI |
-| `Phone-Farm-<version>-arm64.pkg` **built** | **not yet** — needs macOS; produced by `.github/workflows/mac-installer.yml` |
-| `.pkg` installed with macOS Installer and the installed server booted | **not yet** — happens in that workflow on a clean macOS runner |
+| `Phone-Farm-<version>-arm64.pkg` **built** | **automated CI verified** on a GitHub macOS runner (run 35707854622); the stable release alias is `Phone-Farm-macOS.pkg` |
+| `.pkg` installed with macOS Installer and the installed server booted | **automated CI verified** on that runner; not yet accepted on the physical Mac mini |
 | Package signed with Developer ID Installer / app with Developer ID Application | **not yet** — needs your Apple credentials |
 | Notarized and stapled | **not yet** — needs your Apple credentials |
 | Real iPhones (WDA, iproxy, control, recovery) | **not yet** — needs a Mac and phones |
@@ -28,7 +28,7 @@ Do **not** mark the steps below as passed until they have been executed on macOS
 
 1. Start from a Mac with **no PF-Software repository** open or cloned.
 2. Node.js and npm are **not** installed (or at least not used).
-3. Download **only** `Phone-Farm-<version>-arm64.pkg` from the GitHub Release.
+3. Download **only** `Phone-Farm-macOS.pkg` from the GitHub Release.
 4. Double-click it in Finder.
 5. macOS **Installer.app** opens.
 6. Continue through the wizard (Introduction → Read Me → Install → Summary).

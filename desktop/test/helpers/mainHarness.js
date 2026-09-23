@@ -11,7 +11,7 @@ const { pathToFileURL } = require("node:url");
 
 const desktopDir = path.resolve(__dirname, "..", "..");
 
-function loadMain() {
+function loadMain(options = {}) {
   // The real prerequisite checks (Xcode, iPhone tools) depend on the machine the tests run on: a clean macOS CI runner
   // has no iPhone tools and would refuse to start the host. The tests are about the app's behaviour, not that machine.
   process.env.PHONE_FARM_SKIP_HOST_PREFLIGHT = "1";
@@ -26,6 +26,9 @@ function loadMain() {
   const shown = [];
   const loginItems = [];
   const spawned = [];
+  const quitCalls = [];
+  const openedPaths = [];
+  const dialogResponses = [...(options.dialogResponses || [])];
 
   class FakeWindow {
     constructor(options) {
@@ -47,22 +50,22 @@ function loadMain() {
 
   const fakeElectron = {
     app: {
-      isPackaged: false,
-      getPath: name => (name === "logs" ? logsDir : userData),
-      getVersion: () => "0.1.0",
+      isPackaged: options.isPackaged === true,
+      getPath: name => (name === "logs" ? logsDir : name === "temp" ? os.tmpdir() : userData),
+      getVersion: () => options.version || "0.2.0",
       requestSingleInstanceLock: () => true,
       whenReady: () => Promise.resolve(),
       on: (name, handler) => { appEvents.set(name, handler); },
-      quit() {},
+      quit: () => quitCalls.push(Date.now()),
       setLoginItemSettings: settings => loginItems.push(settings),
     },
     BrowserWindow: FakeWindow,
     Menu: { buildFromTemplate: template => { menus.push(template); return template; }, setApplicationMenu() {} },
     clipboard: { writeText: text => clipboardWrites.push(text) },
-    dialog: { showMessageBox: async options => { shown.push(options); } },
+    dialog: { showMessageBox: async settings => { shown.push(settings); return dialogResponses.shift() || { response: 0 }; } },
     ipcMain: { handle: (channel, handler) => { handlers.set(channel, handler); } },
     powerSaveBlocker: { start: type => { blockers.started.push(type); return blockers.started.length; }, stop: id => { blockers.stopped.push(id); } },
-    shell: { showItemInFolder() {} },
+    shell: { showItemInFolder() {}, openPath: async target => { openedPaths.push(target); return ""; } },
   };
 
   const realSpawn = childProcess.spawn;
@@ -73,14 +76,16 @@ function loadMain() {
   };
   const originalLoad = Module._load;
   Module._load = function patched(request, ...rest) {
-    return request === "electron" ? fakeElectron : originalLoad.call(this, request, ...rest);
+    if (request === "electron") return fakeElectron;
+    if (request === "./autoUpdate" && options.autoUpdate) return options.autoUpdate;
+    return originalLoad.call(this, request, ...rest);
   };
   require("../../main.js");
   Module._load = originalLoad;
 
   const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
   return {
-    desktopDir, userData, logsDir, handlers, appEvents, windows, clipboardWrites, blockers, menus, shown, loginItems, spawned, wait,
+    desktopDir, userData, logsDir, handlers, appEvents, windows, clipboardWrites, blockers, menus, shown, loginItems, spawned, quitCalls, openedPaths, wait,
     // An event as Electron would deliver it from the first-run page / from anywhere else.
     trusted: () => ({ sender: windows[0].webContents, senderFrame: { url: pathToFileURL(path.join(desktopDir, "first-run.html")).toString() } }),
     stranger: { sender: { not: "the setup window" }, senderFrame: { url: "https://example.com/" } },

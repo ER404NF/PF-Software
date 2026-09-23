@@ -77,8 +77,8 @@ Operators need only a browser and an account on the hub.
 | Any computer or tablet | Open `https://<hub>` in Chrome, Edge, Safari or Firefox. |
 | Android phone/tablet | Open the hub in Chrome → menu → **Install app** (installable web app). |
 | iPhone / iPad | Open the hub in Safari → Share → **Add to Home Screen**. |
-| Windows PC | Download `Phone-Farm-Setup-<version>.exe` from the GitHub Release; choose *Connect to an existing Phone Farm host*. |
-| Mac | The `.pkg` from the release; choose *Connect to an existing Phone Farm host*. |
+| Windows PC | Download `Phone-Farm-Windows.exe` from the GitHub Release; choose *Connect to an existing Phone Farm host*. |
+| Mac | Download `Phone-Farm-macOS.pkg` from the GitHub Release; choose *Connect to an existing Phone Farm host*. |
 
 Store apps (Google Play / App Store) are a thin wrapper around the same web app; see
 `mobile/README.md`. The installable web app works today without them.

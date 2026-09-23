@@ -1,4 +1,24 @@
-# Roadmap Status Report — updated 2026-09-21
+# Roadmap Status Report — updated 2026-09-23
+
+## 2026-09-23 — required desktop version gate and direct release installers
+
+Packaged desktop builds now check the public Phone Farm GitHub Releases feed before opening any host,
+site-agent, or client window. When the installed and published versions differ, the operator must choose
+**Update now**. Choosing **No — exit**, or exiting after a failed check/download, leaves the application
+closed. The downloaded `.pkg`/`.exe` is constrained to trusted GitHub HTTPS hosts and is opened only after
+its declared size and GitHub-provided SHA-256 digest match. Source/development launches skip this gate.
+
+Release artifacts now have stable user-facing names: `Phone-Farm-macOS.pkg` and
+`Phone-Farm-Windows.exe`. The three root `BUILD_PHONE_FARM_INSTALLER.*` developer wrappers were removed so
+they cannot be mistaken for the application. The actual large binaries remain GitHub Release assets rather
+than Git-tracked files; CI still owns the platform-specific build, test, and packaging steps.
+
+Automated tests cover version ordering, platform asset selection, digest/size enforcement, acceptance and
+decline paths, failure-closed handling, and Electron lifecycle events attempting to bypass a denied gate.
+Windows-local validation: desktop **158/158**, server **1,143/1,143**, both dependency audit gates clean,
+and `Phone-Farm-Windows.exe` built with its packaged runtime verified. The v0.2.0 macOS package was not
+built on this Windows host. This is packaging/update automation only: no physical Mac mini or iPhone
+acceptance is claimed here.
 
 ## 2026-09-21 — larger phone view and low-latency transport decision
 

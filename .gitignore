@@ -21,8 +21,7 @@ system/operators.config.json
 /system/test-*.txt
 /artifacts/ui-role-review/
 
-# electron-builder output (installers/unpacked builds) — regenerate with
-# `npm run dist:win`/`dist:mac` inside desktop/, never commit the binary.
+# Installer binaries and unpacked builds belong on GitHub Releases, not in Git history.
 /desktop/dist/
 
 /desktop/build/runtime/

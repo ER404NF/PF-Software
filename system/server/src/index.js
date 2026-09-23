@@ -1890,8 +1890,11 @@ app.post("/api/admin/sites/:siteId/rotate-token", requireCapability(CAPABILITIES
 app.delete("/api/admin/sites/:siteId", requireCapability(CAPABILITIES.MANAGE_SITES), (req, res) => {
   const site = siteStore.get(req.params.siteId);
   if (!site) return res.status(404).json({ error: "Unknown site.", code: "unknown_site" });
-  siteLinkHub.removeSite(site.id);
+  // Revoke the token before closing the socket. Otherwise the agent can reconnect
+  // in the small window between close() and durable removal, re-registering phones
+  // after removeSite() has already swept the fleet.
   siteStore.remove(site.id);
+  siteLinkHub.removeSite(site.id);
   auditLog.logEvent({ operator: req.currentOperator.username, type: "site_removed", detail: { siteId: site.id, name: site.name } });
   res.json({ ok: true });
 });

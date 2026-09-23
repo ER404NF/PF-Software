@@ -9,7 +9,7 @@ This map describes the active implementation after the device-reliability and ne
 | `system/server/src/index.js` | Main HTTP/WebSocket control plane, session/auth middleware, live device registry, device summaries, human ownership, task queue wiring, network routes | Device registry, provisioning boot, WDA readiness loop, proxy pool, network verifier, routing orchestrator, auto network enrollment | Indirectly owns WDA, iproxy, tun2proxy and PF work through injected managers | Sessions, audit, queue, assignments, proxy pool, USB mapping, research and account stores |
 | `system/server/src/agentMain.js` | Remote site-agent process | Device registry, discovery, automatic provisioning, `SiteAgent` | WDA and iproxy through `DeviceProvisioner` | Site-agent configuration plus provisioning state |
 | `desktop/main.js` | Electron lifecycle and first-run/host setup | Host prerequisite checks, managed WDA copy, local server/site agent supervision, diagnostics window | Node server or site-agent child | Electron user-data settings, logs, copied WDA checkout |
-| `BUILD_PHONE_FARM_INSTALLER.mjs` | Developer build gate | Locked installs, full server tests, desktop tests, platform installer build | npm/electron-builder | Build output under `desktop/dist/` |
+| `desktop/autoUpdate.js` | Packaged desktop version gate | Release lookup, platform installer selection, verified download, installer launch | GitHub Releases over HTTPS | Verified installer under the OS temporary directory |
 
 ## Authoritative state owners
 

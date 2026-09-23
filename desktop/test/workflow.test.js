@@ -107,6 +107,8 @@ test("the release job publishes the .pkg files to a GitHub Release, only for ver
   assert.match(script, /SHA256SUMS/);
   assert.match(script, /UNSIGNED/, "unsigned packages must be flagged on the release");
   assert.match(script, /--prerelease/);
+  assert.match(script, /Phone-Farm-macOS\.pkg/, "the release must include a stable direct-download name");
+  assert.match(script, /Never hide an unsigned\/not-notarized build/, "an unsigned package must retain its warning filename");
 });
 
 test("the universal installer is optional; the arm64 installer is not", () => {
@@ -146,6 +148,8 @@ test("the Windows workflow installs from lockfiles, verifies and uploads the .ex
   assert.equal(windowsWorkflow.jobs.release.permissions.contents, "write");
   assert.equal(windowsWorkflow.permissions.contents, "read", "least privilege by default");
   assert.match(windowsText, /must match the app version|does not match desktop\/package\.json version/);
+  const packageJson = JSON.parse(fs.readFileSync(path.join(repoRoot, "desktop", "package.json"), "utf8"));
+  assert.equal(packageJson.build.win.artifactName, "Phone-Farm-Windows.${ext}");
 });
 
 test("the setup page hides the Mac-only modes on Windows", () => {

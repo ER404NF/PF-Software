@@ -248,9 +248,22 @@ jobs:
           set -euo pipefail
           cd release
           ls -l
+          primary="Phone-Farm-${GITHUB_REF_NAME#v}-arm64.pkg"
+          download="${primary}"
+          if [[ -f "${primary}" ]]; then
+            cp "${primary}" Phone-Farm-macOS.pkg
+            download="Phone-Farm-macOS.pkg"
+          else
+            # Never hide an unsigned/not-notarized build behind the trusted stable name.
+            download="$(find . -maxdepth 1 -type f -name 'Phone-Farm-*-arm64*.pkg' | head -n 1 | sed 's#^./##')"
+          fi
+          if [[ -z "${download}" ]]; then
+            echo "The arm64 installer is missing." >&2
+            exit 1
+          fi
           shasum -a 256 ./*.pkg | sed 's# \./# #' > SHA256SUMS.txt
           prerelease=()
-          notes="Download **Phone-Farm-${GITHUB_REF_NAME#v}-arm64.pkg** below, double-click it, and follow the installer. You do not need Node.js, npm, Terminal or the source code.
+          notes="Download **${download}** below, double-click it, and follow the installer. You do not need Node.js, npm, Terminal or the source code.
 
           Which file: \`arm64\` = Apple silicon Macs; \`universal\` = Apple silicon and Intel Macs.
           Verify the download with \`SHA256SUMS.txt\`."

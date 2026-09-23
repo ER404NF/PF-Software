@@ -29,6 +29,7 @@ const {
 const { applyFix } = require("./hostFixes");
 const { createRestartPolicy, findFreePort } = require("./serverSupervisor");
 const { buildDiagnosticsReport, createLogger } = require("./diagnostics");
+const { enforceReleaseVersion } = require("./autoUpdate");
 
 // The app is opened from Finder, so console output is invisible. Everything worth knowing goes to a rotating
 // log file (~/Library/Logs/Phone Farm on a Mac) that "Help > Copy Diagnostics" can hand to whoever is helping.
@@ -47,6 +48,7 @@ let agentStatus = { state: "stopped", detail: "" };
 let activeHostSecrets = null;
 let activeHostResolution = null;
 let startupState = { mode: "choice", preflight: null, error: null };
+let startupUnlocked = false;
 
 // Supervision: a farm host has to ride out a crash, a sleep and a reboot without anyone noticing.
 let hostServerWanted = false;       // true while the local server should be running
@@ -753,14 +755,20 @@ if (!gotSingleInstanceLock) {
     if (window) {
       if (window.isMinimized()) window.restore();
       window.focus();
-    } else {
+    } else if (startupUnlocked) {
       void launch();
     }
   });
-  app.whenReady().then(() => {
-    buildMenu();
+  app.whenReady().then(async () => {
     logger.info(`Phone Farm ${app.getVersion()} starting (Electron ${process.versions.electron}, ${process.platform} ${process.arch})`);
+    const update = await enforceReleaseVersion({ app, dialog, shell, logger });
+    if (!update.allowed) return;
+    startupUnlocked = true;
+    buildMenu();
     return launch();
+  }).catch(error => {
+    logger.error(`desktop startup failed: ${error?.stack || error}`);
+    app.quit();
   });
 }
 app.on("before-quit", () => {
@@ -770,4 +778,4 @@ app.on("before-quit", () => {
   logger.info("Phone Farm quitting");
 });
 app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(); });
-app.on("activate", () => { if (BrowserWindow.getAllWindows().length === 0) void launch(); });
+app.on("activate", () => { if (startupUnlocked && BrowserWindow.getAllWindows().length === 0) void launch(); });

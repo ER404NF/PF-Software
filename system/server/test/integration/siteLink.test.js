@@ -386,6 +386,8 @@ test("site administration API: create, list with live status, update, delete rem
   await until(() => devices.get("rome-studio__m1"), { label: "Rome phone registered" });
   assert.equal((await adminApi("DELETE", "/api/admin/sites/rome-studio")).status, 200);
   assert.equal(devices.has("rome-studio__m1"), false, "removing a site removes its phones");
+  await sleep(250);
+  assert.equal(devices.has("rome-studio__m1"), false, "a reconnect race cannot restore a deleted site's phones");
   assert.equal((await adminApi("DELETE", "/api/admin/sites/rome-studio")).status, 404);
   const events = auditLog.listEvents().map(event => event.type);
   for (const type of ["site_created", "site_updated", "site_removed"]) assert.ok(events.includes(type), type);

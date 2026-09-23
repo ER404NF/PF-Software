@@ -117,9 +117,16 @@ export class SiteStore {
   }
 
   remove(id) {
-    const existed = this.sites.delete(id);
-    if (existed) this._save();
-    return existed;
+    const previous = this.sites.get(id);
+    if (!previous) return false;
+    this.sites.delete(id);
+    try {
+      this._save();
+      return true;
+    } catch (error) {
+      this.sites.set(id, previous);
+      throw error;
+    }
   }
 
   // Constant-time comparison of the presented token against the stored hash.

@@ -1,6 +1,6 @@
 # Phone Farm desktop app
 
-Users get this as a ready-made installer — `Phone-Farm-<version>-arm64.pkg` from
+Users get this as a ready-made installer — `Phone-Farm-macOS.pkg` or `Phone-Farm-Windows.exe` from
 [GitHub Releases](https://github.com/ER404NF/PF-Software/releases/latest) — and never
 build anything. This directory is the source of that app and of the pipeline that
 builds and verifies the installer.
@@ -68,6 +68,12 @@ enabled by desktop startup.
   tests set it, and the installed app never does.
 - **Checking a release.** `npm run check:release` lists everything about the installer that can be verified
   without a Mac and whether it is committed; see [docs/MAC_RELEASE.md](../docs/MAC_RELEASE.md).
+- **Required version gate.** Before any packaged host, site agent, or client UI starts, `autoUpdate.js`
+  checks the public GitHub Releases API. If the newest published version differs, the operator must choose
+  **Update now**; **No — exit** closes the app. The downloaded platform installer is accepted only from
+  trusted GitHub HTTPS hosts, with the declared byte length and GitHub-provided SHA-256 digest verified.
+  A check or verification error offers Retry or Exit and never starts the application. Source/development
+  runs skip this gate.
 
 ## Building the installer
 
@@ -101,8 +107,11 @@ An unsigned/un-notarized package triggers Gatekeeper warnings and is **not** equ
 public installer. A release build (`--release`) fails unless it is notarized, unless
 `PHONE_FARM_ALLOW_UNSIGNED=true` explicitly allows the clearly-named fallback.
 
-The root `BUILD_PHONE_FARM_INSTALLER.command`/`.cmd` are developer conveniences that run the same
-steps (plus the test suites); they are **not** an installer for users.
+The repository root no longer contains command files that can be mistaken for installers. Public binaries
+are attached to a versioned GitHub Release under the stable names `Phone-Farm-macOS.pkg` and
+`Phone-Farm-Windows.exe`; the stable macOS name is created only for a signed/notarized package, never for a
+development package whose filename must retain `UNSIGNED` or `NOT-NOTARIZED`. Maintainers can still use
+the scripts in this directory when diagnosing CI.
 
 ## Verification
 
