@@ -1,4 +1,798 @@
-# Roadmap Status Report — updated 2026-09-23
+# Roadmap Status Report — updated 2026-09-26
+
+## 2026-09-26 (latest) — P3 complete for all 9 available domains; 2 more real bugs found
+
+Extended P3 (started with sites — see the entry below) to every remaining domain that has a Postgres
+adapter: assignments, platform accounts/policies, task queue/runs/checkpoints, approvals, interventions,
+proxy pool, audit, and research. Each got the same treatment as sites: a migration script reusing the real
+file store's own loading logic (never a hand-rolled parser), a real-PostgreSQL test against realistic
+fixtures, and CI wiring — 9 scripts, 9 test files, 41 sub-tests total. Devices/hosts and leases remain
+skipped (no Postgres adapter exists for either yet, already documented in `M05_DURABLE_DOMAIN_MIGRATION.md`).
+None of the 9 domains had its actual cutover (step 4 — switching `index.js` to read Postgres) flipped: that
+needs a real deployment to "watch run correctly for a while" first, per the handout's own explicit
+instruction and its "no big-bang cutover" safety rule.
+
+**Two more real bugs, on top of sites' own** (full detail in
+[docs/productionization/P3_DOMAIN_CUTOVER.md](productionization/P3_DOMAIN_CUTOVER.md)):
+
+- **A genuine cross-test-file bug, found only by running the *entire* suite together, not any file in
+  isolation:** `automation.task_queue_snapshots` has exactly one row per organization by design — unlike
+  every other domain's tables, there's no random per-test id to prevent collisions. The new task-queue
+  migration test saved a real snapshot for the shared default organization and never cleaned it up,
+  silently breaking a *different*, pre-existing test file's "nothing has been saved yet" precondition
+  whenever both happened to run in the same `npm test` invocation. Fixed with a proper cleanup hook. This is
+  exactly the kind of interaction bug that only running the whole suite together — not just the file you
+  just touched — can ever surface, and why "run the full suite after every change" has been the standing
+  practice all along.
+- A test-fixture-only issue in the approvals migration test (a fixed past `expiresAt` that real lazy
+  expiration correctly aged out by the time the test ran) — same root lesson as sites' `rotated_at` mistake:
+  model fixtures on what the real system actually produces, not on what merely looks plausible.
+
+Full local server suite: **164 files, 1,554 tests, 1,554 passed, 0 failed, 0 skipped** — the whole suite,
+which is what caught the cross-file bug above; no individual new test file would have. This closes out P3
+for every domain currently reachable without a real deployment. Full write-up in
+[docs/productionization/P3_DOMAIN_CUTOVER.md](productionization/P3_DOMAIN_CUTOVER.md).
+
+## 2026-09-26 — P3 begins: sites domain migration script, another real bug found
+
+Started `PHASE1_TEAM_ROLLOUT_HANDOUT.md`'s P3 (move durable data off files, one domain at a time), following
+its required order. Devices/hosts is skipped — `M05_DURABLE_DOMAIN_MIGRATION.md` already documented that it
+needs its own design pass and has no Postgres adapter to cut over to yet; that's a pre-existing gap, not a
+new decision.
+
+**Sites domain**: wrote `system/server/scripts/migrate-sites-to-postgres.js`, a one-time, safe-to-re-run
+(upsert by id) script that reads the real file-backed `sites.json` and writes matching rows into
+`fleet.sites`, reporting before/after counts. The one subtlety that mattered: it preserves the **token hash**
+exactly rather than generating a fresh one — neither the file nor Postgres store ever persists the plaintext
+token, so a real site agent's already-saved token must keep verifying against whatever hash the migration
+writes, or every Mac mini would need re-enrolling by hand the moment this ran for real.
+
+**Another real bug, found by the migration's own test on its first run**: the test's fixture modeled a "never
+rotated" site as `rotatedAt: null` — but `fleet.sites.rotated_at` is `NOT NULL DEFAULT now()`, and the real
+file store never actually produces that state either (`siteStore.js`'s own `create()` always sets
+`rotatedAt: now`, the same as `createdAt`, at creation — "never rotated" means *equal to created_at*, not
+absent). Fixed the test fixture to match the real system's actual invariant, and separately hardened the
+migration script itself with a defensive `rotatedAt ?? createdAt` coalesce, since the file store's own loader
+doesn't validate every field's presence — a genuinely malformed legacy record shouldn't crash a one-time
+migration either. A dedicated test proves the coalesce.
+
+**Step 4 (the actual cutover — switching `index.js` to read Postgres instead of the file) is deliberately not
+done.** The handout's own instruction is to watch the domain run correctly for a while post-cutover before
+removing the file fallback — an operational observation step that requires a real deployment with real
+traffic, which doesn't exist in this environment. Flipping a flag without that would be exactly the
+"no big-bang cutover" mistake the handout's own safety rules (§2) exist to prevent. Full reasoning in
+[docs/productionization/P3_DOMAIN_CUTOVER.md](productionization/P3_DOMAIN_CUTOVER.md).
+
+Full local server suite: **156 files, 1,516 tests, 1,516 passed, 0 failed, 0 skipped.** Next: repeat this
+same pattern (migration script + test, no cutover yet) for assignments, platform accounts/policies, task
+queue/runs, approvals/interventions, research, proxy pool, and audit.
+
+## 2026-09-26 — P2 fuzzing (2 more real bugs) + P4 decision recorded
+
+Fuzzed every JSON-bodied cloud API route and every authenticated route, mounted for real, with malformed
+JSON, `null`, bare arrays, wrong-typed fields, prototype-pollution shapes, oversized bodies, and hostile
+Bearer tokens — 62 sub-tests in new `cloudApiFuzz.test.js`. Found and fixed **two more real bugs**:
+`POST /login` and `POST /password-reset/request` both crashed with a 500 (`email.trim is not a function`)
+when sent a non-string `email`, since both only checked `if (!email)` (a falsy check a truthy non-string
+sails past) before calling straight into `userRepository.getByEmail()`. Fixed with an explicit
+`typeof email !== "string"` check in both routes — for `/password-reset/request` specifically, this
+preserves its own deliberate uniform-202 response for malformed input, it just stops the crash. Also caught
+and corrected two test-only false positives along the way: expecting a 4xx from `/password-reset/request`'s
+own intentionally-uniform 202 response, and a "hostile" Authorization header that Node's own `fetch()`
+refused to even transmit (a raw UTF-16 surrogate half / control bytes aren't legal HTTP header content for
+any real client either).
+
+Added a real coverage gap closer: `GET /organizations/:id/members`'s own wrong-organization rejection
+(the one route gated by `requireMembership()` alone, no specific permission — a different middleware
+configuration than the two already fully matrix-tested).
+
+**P4 (Redis: decide, don't assume) — decision recorded in
+[M06_REDIS_FOUNDATION.md](productionization/M06_REDIS_FOUNDATION.md):** do not build out Redis-backed
+presence/locks for Phase 1. At 5–8 devices behind one hub process, there's no multi-instance coordination
+problem for Redis to solve yet; the device-lease race stays a PostgreSQL-level lock once that domain moves to
+Postgres in P3. Revisit only if the owner wants multiple hub processes (e.g. zero-downtime deploys) or the
+fleet outgrows a single hub's in-memory state — the M06 foundation is already there and proven (P1) for when
+that day comes.
+
+Full local server suite: **155 files, 1,510 tests, 1,510 passed, 0 failed, 0 skipped.** Full write-up in
+[docs/productionization/P2_REAL_LOGIN_MOUNTED.md](productionization/P2_REAL_LOGIN_MOUNTED.md). This closes
+out P1, P2 (including its step 5 fuzzing requirement), and P4. Remaining Phase 1 work (P2b real SMTP, P3
+per-domain cutover, P5 real deployment, P6 further bug-hunting) is either owner-account-gated (real SMTP
+provider, real Railway/hosting account, real Mac minis) or large enough to warrant its own dedicated pass.
+
+## 2026-09-26 — P2: real login mounted into index.js, a second real bug found
+
+Per `PHASE1_TEAM_ROLLOUT_HANDOUT.md`'s P2 task: mounted the M04 identity/organization system (built and
+verified in earlier sessions, but never wired into the running server) into `system/server/src/index.js`,
+behind `process.env.CLOUD_API_ENABLED === "true"`, at `/api/cloud` — additive, alongside the existing
+file-backed operator login, which is completely untouched either way. Added `allowOrganizationSignup` to
+`createCloudApi.js` (default `true`, so every existing caller keeps working) so Phase 1's mount can pass
+`false` and 404 the one route (`POST /signup`) that creates a brand-new organization — Phase 1 has exactly
+one, created once at startup via `ensureDefaultOrganization()`, and no public "create an account" route
+should exist. Recorded the required role-model decision explicitly (P2 step 6): this identity layer replaces
+only account lifecycle; device-control authorization (`roleCapabilities.js`) is untouched, the handout's own
+recommended default.
+
+**Doing this — actually mounting for real, not just testing `createCloudApi()` as its own standalone app —
+found a second real, serious bug**, in `docs/productionization/P2_REAL_LOGIN_MOUNTED.md`: the cloud API's
+`authenticate` middleware set `req.session = <bearer-token session row>` — but `index.js` already runs
+`express-session` globally, which owns `req.session` as its own `Session` instance with a real `.touch()`
+method, and depends on that object surviving to the end of the response. The two independent "session"
+concepts collided the instant both existed on the same request, throwing `req.session.touch is not a
+function` deep inside `express-session`'s own response hook. No standalone test of `createCloudApi()` could
+ever have caught this — it only exists at the intersection of the two systems. Fixed by renaming the cloud
+API's own property to `req.identitySession` everywhere it's set or read.
+
+Added `system/server/test/integration/db/cloudApiMountedInIndex.test.js`: boots the **actual**
+`system/server/src/index.js` with `CLOUD_API_ENABLED=true` against a real database and runs a complete,
+real, end-to-end sequence over real HTTP — invite a VA by email, accept the invite, log in, enroll real TOTP
+two-factor (computing a genuine code from the returned secret, not a stub), confirm it, log out, and confirm
+the session is actually revoked afterward — plus confirms the legacy `/api/login` route is completely
+unshadowed by the new mount. This is P2's own required proof ("an invite, real login, and a live two-factor
+setup completed end to end — not a log line claiming it worked"), satisfied for real.
+
+Full local server suite re-run after both fixes: **154 files, 1,447 tests, 1,447 passed, 0 failed, 0
+skipped.** Full write-up in
+[docs/productionization/P2_REAL_LOGIN_MOUNTED.md](productionization/P2_REAL_LOGIN_MOUNTED.md). Next:
+finish the remaining authorization-matrix cells, fuzz every cloud-facing route, then P2b (real SMTP).
+
+## 2026-09-26 — P1: real PostgreSQL + Redis verification, 7 real bugs found and fixed
+
+Per `docs/productionization/PHASE1_TEAM_ROLLOUT_HANDOUT.md`'s P1 task: brought up a real, disposable
+PostgreSQL 16.14 (via `embedded-postgres`, no Docker/admin rights needed) and a real Redis-compatible server
+(Memurai via `redis-memory-server`) as local dev tooling, then ran the full migration set and the entire
+server suite against them for the first time in this project's history — every one of the 19 previously
+CI-only/always-skipped real-database/Redis tests had, per the handout's own account, never actually executed
+anywhere, including in GitHub Actions.
+
+Doing so surfaced **7 real, previously-invisible bugs**, full detail in
+[docs/productionization/P1_REAL_DATABASE_VERIFICATION.md](productionization/P1_REAL_DATABASE_VERIFICATION.md):
+
+1. **Systemic RLS defect (the serious one):** once a custom Postgres GUC (`app.current_organization_id`/
+   `app.current_user_id`) has been set via `SET LOCAL` and that transaction commits, `current_setting(name,
+   true)` returns `''` — not `NULL` — for the rest of that session, even after `RESET`. Every RLS policy in
+   this codebase compared that value directly against `::uuid`, so any query on a pooled connection that had
+   previously served a `withTransaction()` call, run *without* a fresh transaction context, threw a raw
+   Postgres exception instead of failing closed. Fixed with `NULLIF(current_setting(...), '')::uuid` across
+   all 31 occurrences in 12 migration files — a real production-reliability defect, invisible to any mock,
+   only reproducible against a real connection pool.
+2. Seed data bug: the `manager` role was never actually granted `member:manage` (only `member:invite`),
+   contradicting the route and test's own intent — one line missing from
+   `1758838500000_seed-permissions-and-roles.js`.
+3. `researchStore.js`'s cross-run dedup index keys use a `\u0000` join — fine in a JSON file, a hard Postgres
+   error in `jsonb`. Fixed by base64-encoding/decoding those specific keys at the Postgres storage boundary
+   only (`postgresResearchRunRepository.js`), leaving the shared dedup logic and the file store untouched.
+4–5. Two test files (`postgresApprovalRepository.test.js`, `postgresAssignmentRepository.test.js`) share one
+   mutable fake clock across many sequential sub-tests; several assertions depended on the clock having moved
+   relative to fixture dates that it hadn't yet — the adapters were correct throughout; only the tests' own
+   chronology was wrong.
+6. `cloudApi.test.js` asserted RLS blocks a query run through the test's own connection pool — which connects
+   as the Postgres **superuser**, and superusers bypass RLS unconditionally regardless of any policy or GUC
+   context. Replaced with a real check (membership *is* visible with correct tenant context); the actual
+   fail-closed property is already proven properly elsewhere via genuine non-superuser roles.
+7. `redis/client.js`'s `enableOfflineQueue: false` rejected any command sent before ioredis's asynchronous
+   connection handshake completed — including the very first health check after construction — causing
+   `redisFoundation.test.js` to hang indefinitely the first time it ever ran against a real server. Removed;
+   `connectTimeout`/`commandTimeout`/`health.js`'s own timeout wrapper already bound the cases that setting
+   was meant to guard against.
+
+**Final result: server suite 153 files, 1,443 tests, 1,443 passed, 0 failed, 0 skipped — the first time
+every test in this project has ever run and passed for real, not skipped.** Desktop suite unaffected: 159
+passed, 0 failed. Full migration round trip (up → down 0 → up) re-verified clean after every schema change.
+
+This closes out Phase 1 task P1. Next: P2 (mount real login into the running server behind a flag).
+
+## 2026-09-26 — M05 part 10: account policies, unblocked by a new shared sync-cache utility
+
+Built `server/src/syncCache.js` — a generic, in-memory synchronously-readable cache backed by any durable
+store — specifically to unblock platform accounts/policies (`policyStore.js`), which turned out to have the
+exact same "read from a never-awaited hot path" constraint as background authorization: `index.js` feeds
+`policyStore.effective(...).get(accountId)` straight into `actionPolicy.js`'s `validateAction()` gate, called
+inline with no `await`. A naive per-call-query Postgres adapter would have satisfied an M02 contract's method
+names while silently breaking the moment it was wired in for real — caught during design, not after shipping
+a broken adapter. The cache loads the full snapshot once at construction, updates immediately on every local
+write (before the durable write is even sent), and supports an optional poll-based refresh for picking up
+another process's writes — deliberately poll-based, not push-based invalidation, since there's no real
+multi-instance deployment here to test push-based invalidation against.
+
+Built the M02 port (`persistence/policyRepository.js` + `persistence/filePolicyRepository.js`, no port existed
+for this domain before now), the migration (`automation.account_policies`), and
+`postgresPolicyRepository.js`, which loads the whole override table into a `syncCache` and keeps
+`set()`/`clear()` returning the exact same plain object/void `PolicyStore` already returns — never a Promise
+— while persisting to Postgres in the background.
+
+Real-PostgreSQL test proves the interesting part directly: a write is visible to `effective()`/`describe()`
+on the very next line in the *same* process, but a *separate* repository instance (simulating another
+process/pod) only sees it after an explicit `refresh()` — the eventual-consistency boundary is demonstrated,
+not just asserted in a comment. Also covers validation parity, config-then-default fallback, and tenant
+isolation through a non-superuser role. 10 new pure unit tests cover the cache mechanism itself with no
+database needed (load formats, write-before-persist-settles ordering, error reporting without breaking the
+sync contract, refresh success/failure). Wired into `.github/workflows/db-migrations.yml` as the seventeenth
+PostgreSQL CI step.
+
+**Correction made before any further code was written:** background authorization
+(`persistence/backgroundAuthorizationRepository.js`) has the identical synchronous-read constraint, but its
+file adapter resolves through `authStore.js`'s own operator registry — the same data source
+`operatorIdentityRepository.js`/`operatorAccountRepository.js` already read, and the same one already flagged
+as needing an owner decision on reconciling with `identity.users` before any of it moves to Postgres.
+`syncCache.js` is a necessary piece of that domain's eventual solution, but doesn't unblock it alone — the
+identity-reconciliation decision is still the real gate. Full write-up in
+[docs/productionization/M05_DURABLE_DOMAIN_MIGRATION.md](productionization/M05_DURABLE_DOMAIN_MIGRATION.md).
+Full local server suite re-run after this addition: **153 files, 1,312 tests, 1,293 passed, 0 failed, 19
+skipped** (the 19 skips are every PostgreSQL/Redis-gated test, correctly skipping without a live database or
+Redis).
+
+## 2026-09-26 — M06 begins: Redis foundation (client, health check, key schema)
+
+With every cleanly-fitting M05 domain done (see the entry below) and the rest genuinely blocked on design/
+owner decisions, moved to M06 per the master prompt rather than spinning further on M05. Installed
+`ioredis@^5` (0 vulnerabilities), then built the foundation layer only — deliberately not migrating any real
+domain yet, mirroring how M03 (Postgres foundation) preceded M04/M05's actual domain work:
+
+- `system/server/src/redis/client.js` — `createRedisClient()`, mirroring `db/pool.js`'s shape
+  (`REDIS_URL`, timeouts, TLS-verification-must-be-explicit, a required client-level error handler,
+  `enableOfflineQueue: false` so a caller finds out immediately when Redis is unreachable instead of hanging).
+- `system/server/src/redis/health.js` — `checkRedisHealth()`, a bounded-timeout `PING`.
+- `system/server/src/redis/keys.js` — the actual substance of
+  [ADR-0003](productionization/adrs/ADR-0003-redis-ephemeral.md)'s action item 1: `orgKey()` builds the ADR's
+  own `pf:org:{organizationId}:...` tenant-scoped format (UUID-validated, so a bad value can't collide with
+  another tenant's namespace — the same guarantee Postgres RLS gives at the database layer, expressed as a
+  naming convention since Redis has no RLS equivalent), and `assertBoundedPayload()` gives "no raw secrets or
+  unbounded payloads in Redis" a real enforced ceiling (16 KiB) instead of leaving it as an unenforced
+  sentence in the ADR. Deliberately did **not** add a speculative `globalKey()` helper or a generic
+  `setWithTtl()` wrapper — no real caller needs either yet, and adding them now would be exactly the kind of
+  ungrounded design this project avoids.
+
+Real-Redis test (`system/server/test/integration/redis/redisFoundation.test.js`, new
+`.github/workflows/redis-foundation.yml` with a `redis:7` service container) covers: health check
+healthy/unhealthy (with a bounded wait, not a hang); an `orgKey()` value round-tripping through a real
+`SET`/`GET` with a confirmed TTL; two organizations' keys never colliding. 6 pure unit tests
+(`redisKeys.test.js`) cover `orgKey()`'s validation and the payload limit with no Redis required. Full write-up
+in [docs/productionization/M06_REDIS_FOUNDATION.md](productionization/M06_REDIS_FOUNDATION.md). Full local
+server suite re-run after this addition: **150 files, 1,298 tests, 1,280 passed, 0 failed, 18 skipped** (the
+18 skips are every PostgreSQL/Redis-gated test, correctly skipping without a live database or Redis).
+
+**Nothing real runs on Redis yet** — presence (`presenceStore.js`, currently in-process `Map`s) is the
+concrete next candidate per ADR-0003's own stated use case, but that's real design work for its own slice, not
+bundled into the foundation.
+
+## 2026-09-26 — M05 part 9: research runs — closes out every cleanly-fitting domain
+
+Added `automation.research_accounts` and `postgresResearchRunRepository.js`, satisfying
+`persistence/researchRunRepository.js`'s 8-method contract. This was the most complex domain in M05 so far:
+`researchStore.js` keeps one JSON file per (workspace, account) holding both a run's candidates and a
+cross-run dedup index (`byContentId`/`byUrl`) that lets a later run recognize a previously-seen post and carry
+its human review decision forward instead of resetting to "pending." Rather than redesigning that index as
+live relational queries, the migration mirrors the file shape exactly — one row per
+`(organization_id, workspace_id, account)` holding `{runs, candidateIndex}` as one `jsonb` blob, same
+reasoning as the task queue snapshot. Critically, the dedup/merge algorithm itself (`candidateRecord`,
+`findIndexEntry`, `upsertIndexEntry`, `mergeCandidate`, `indexCandidate`, `normalizePlatformAction`,
+`samePlatformAction`) was exported from `researchStore.js` — these were already pure functions, so this was
+an additive `export` keyword each, not a rewrite — and the Postgres adapter calls them in the identical
+sequence the file store does. The cross-run dedup logic literally cannot drift between backends because it's
+the same function calls in both. Re-ran `researchStore.js`'s existing 40 unit/integration tests after the
+exports and confirmed nothing observable changed.
+
+Real-PostgreSQL test proves the whole point of the cross-run index: a second run re-observing a post a human
+already reviewed in an earlier run carries that `confirmed`/`removed` decision forward rather than
+re-surfacing it as pending. Also covers invalid-key handling, candidate merge-not-duplicate, `locateCandidate`,
+idempotent `recordPlatformAction`, `finalizeRun` validation, `setCandidateStatus` value restriction, tenant
+scoping, and real tenant isolation through a non-superuser role. Wired into `.github/workflows/db-migrations.yml`
+as the sixteenth PostgreSQL CI step.
+
+**This closes out every M05 domain identified as fitting the migration pattern cleanly.** What's left —
+platform accounts/policies (needs an M02 wrapper first), research evidence/device media (object storage per
+ADR-0004, not Postgres), background authorization (needs a synchronous cached-snapshot design), operator
+identity/accounts (needs an owner decision on reconciling with M04's identity model), leases and devices
+(each needs its own design pass) — every remaining domain needs a design or owner decision before further
+implementation, not just more mirroring. Full write-up in
+[docs/productionization/M05_DURABLE_DOMAIN_MIGRATION.md](productionization/M05_DURABLE_DOMAIN_MIGRATION.md).
+Full local server suite re-run after this addition: **148 files, 1,291 tests, 1,274 passed, 0 failed, 17
+skipped** (the 17 skips are every PostgreSQL-gated test, correctly skipping without a live database).
+
+## 2026-09-26 — M05 part 8: proxy pool, plus scope triage for the remaining domains
+
+Added `automation.proxy_pool` and `postgresProxyPoolRepository.js`, satisfying
+`persistence/proxyPoolRepository.js`'s 8-method contract. Reused `proxyPool.js`'s own `publicProxy()`/
+`decryptProxyPassword()` pure transforms rather than duplicating them (per that module's own header comment),
+and exported its previously-internal `validateFields()` for the same reason — re-ran its existing unit test
+to confirm the export change was behavior-preserving. A partial unique index
+(`organization_id, leased_to_device_id WHERE ... IS NOT NULL`) gives the "one leased proxy per device"
+invariant a real database-level backstop on top of the application-code check.
+
+**Triaged the rest of the master prompt's remaining M05 domains** rather than migrating them all
+mechanically: research evidence and device media wrap *binary* file storage, which this repo's own
+[ADR-0004](../docs/productionization/adrs/ADR-0004-object-storage.md) already assigns to object storage, not
+PostgreSQL — out of scope for this migration pattern entirely. Background authorization
+(`persistence/backgroundAuthorizationRepository.js`) is documented as synchronous by design (dispatch-loop
+callers need an immediate, non-awaited answer) — a naive `async` adapter would satisfy the method-name
+contract but violate that real constraint, so it needs a caching/snapshot design pass, not a direct port.
+Operator identity/accounts are the two halves of the legacy `authStore.js` operator system — migrating the
+*accounts themselves* (not just references to them) to Postgres would either fork a second permanent
+identity/credential store next to `identity.users` or force reconciling the two, which is an owner decision
+on the same order as the "one default organization" call already made, not something to default into
+silently. That leaves **research runs** as the one cleanly-fitting domain still open.
+
+Real-PostgreSQL test covers field validation, at-rest encryption, the exclusive per-device lease (assign,
+reassign displacing the prior lease, release), `remove()`'s leased-proxy guard, `updateHealth()`'s safe-field
+filtering, `publicList()`'s credential-free shape, tenant scoping, and real tenant isolation through a
+non-superuser role. Wired into `.github/workflows/db-migrations.yml` as the fifteenth PostgreSQL CI step. Full
+write-up in
+[docs/productionization/M05_DURABLE_DOMAIN_MIGRATION.md](productionization/M05_DURABLE_DOMAIN_MIGRATION.md).
+Full local server suite re-run after this addition: **147 files, 1,290 tests, 1,274 passed, 0 failed, 16
+skipped** (the 16 skips are every PostgreSQL-gated test, correctly skipping without a live database).
+
+## 2026-09-26 — M05 part 7: audit events
+
+Added `automation.audit_events` and `postgresAuditEventRepository.js`, satisfying
+`persistence/auditEventRepository.js`'s two-method contract (`logEvent`/`listEvents`) — the domain
+`CLAUDE.md` §3 names as "audit events, observability." Mirrors `auditLog.js` exactly: `operator`/`deviceId`
+stay plain text, `detail` stays a round-tripped `jsonb` blob (redaction remains the caller's job, not this
+layer's), and `listEvents()`'s "filter by operator/deviceId, newest first, then cap at limit" semantics are
+expressed directly in SQL (`WHERE` + `ORDER BY at DESC` + `LIMIT`) rather than the file store's in-memory
+filter/reverse/slice pipeline — same result, different mechanism.
+
+Real-PostgreSQL test covers the full entry shape and exact `detail` round-tripping, newest-first ordering,
+operator/deviceId filtering independently and combined, `limit` handling, an empty result for an organization
+with nothing logged, tenant scoping, and real tenant isolation through a non-superuser role. Wired into
+`.github/workflows/db-migrations.yml` as the fourteenth PostgreSQL CI step. This closes out the third domain
+identified in the M02-persistence-port discovery (notifications, task queue snapshot, audit events); remaining
+identified domains are research evidence, research runs, proxy pool, device media, background authorization,
+and operator identity/accounts — plus platform accounts/policies, which still needs its own M02 wrapper
+first. Full write-up in
+[docs/productionization/M05_DURABLE_DOMAIN_MIGRATION.md](productionization/M05_DURABLE_DOMAIN_MIGRATION.md).
+Full local server suite re-run after this addition: **146 files, 1,289 tests, 1,274 passed, 0 failed, 15
+skipped** (the 15 skips are every PostgreSQL-gated test, correctly skipping without a live database).
+
+## 2026-09-26 — M05 part 6: task queue snapshot (command-queue restart survival)
+
+Added `automation.task_queue_snapshots` and `postgresTaskQueueSnapshotRepository.js`, satisfying
+`persistence/taskQueueSnapshotRepository.js`'s two-method contract (`load`/`save`). This is the domain the
+master prompt names directly — `CLAUDE.md` §7's "queue state survives process restarts." Per the port's own
+design intent, the snapshot is one opaque `jsonb` blob per organization, not per-task rows — `taskQueue.js`
+keeps all scheduling/dispatch/retry/checkpoint domain logic; only the read/write boundary moved.
+
+The one piece of real logic in this domain — legacy bare-array migration and crash recovery for tasks that
+were `RUNNING`/`DISPATCHED` when the process died — was extracted into an exported pure function,
+`normalizeQueueSnapshot()`, in the contract module itself, so both the file and Postgres adapters share
+exactly one copy rather than risking drift between two reimplementations of restart-recovery logic. The file
+adapter's existing unit test was re-run after the extraction and passed unchanged.
+
+Real-PostgreSQL test covers an empty snapshot before any save, exact round-tripping of tasks/paused/
+humanHolds, `save()` upserting a single row per organization, RUNNING-task recovery into QUEUED within its
+retry policy (and that a second `load()` doesn't double-apply the recovery), legacy bare-array migration
+persisting the migrated shape, tenant scoping, and real tenant isolation through a non-superuser role. Wired
+into `.github/workflows/db-migrations.yml` as the thirteenth PostgreSQL CI step. Full write-up in
+[docs/productionization/M05_DURABLE_DOMAIN_MIGRATION.md](productionization/M05_DURABLE_DOMAIN_MIGRATION.md).
+Full local server suite re-run after this addition: **145 files, 1,288 tests, 1,274 passed, 0 failed, 14
+skipped** (the 14 skips are every PostgreSQL-gated test, correctly skipping without a live database).
+
+## 2026-09-26 — M05 part 5: account notifications, and a discovery about remaining scope
+
+Added `automation.account_notifications` and `postgresNotificationRepository.js`, mirroring
+`accountNotificationStore.js` exactly (queue/list/deliveryContent/markCommitted/markAborted/markSent/
+markFailed/canSecureRecovery). The AES-256-GCM encrypt/decrypt logic for recovery bodies was extracted out of
+the file store's closures into exported, key-parameterized functions (`encryptNotificationBody`/
+`decryptNotificationBody`) that both adapters now import, rather than duplicating security-sensitive crypto
+code — re-verified the file store's own unit test still passes unchanged after the extraction. The schema
+enforces the file store's "recovery bodies are never at rest in plaintext" guarantee directly with a `CHECK`
+constraint tying `body`/`secure_payload` to `kind`, not just in application code.
+
+**Scope discovery while picking this slice:** `system/server/src/persistence/` already contains a formalized
+M02 repository-port layer (`assertXRepository()` + `fileXRepository.js`) for far more domains than this
+status file had been tracking — research evidence, research runs, task queue snapshots, proxy pool, device
+media, background authorization, operator identity, operator accounts, and audit events all already have one,
+and `index.js` already calls through these ports rather than constructing the underlying stores directly. That
+means most of the master prompt's remaining M05 domains are now Postgres-adapter-only work (no new M02
+contract design needed) — the one exception found so far is platform accounts/policies (`policyStore.js`),
+which `index.js` still constructs directly and has no M02 port yet.
+
+Real-PostgreSQL test covers queue/list ordering, the `holdForCommit` → `markCommitted`/`markAborted` path
+(idempotent on repeat calls), `markSent`/`markFailed`'s "only advance a still-queued item" guard, `mark*()` on
+an unknown id returning `null`, recovery notifications being encrypted at rest and decrypted only through
+`deliveryContent()`, `canSecureRecovery()` requiring no DB access, tenant scoping, and real tenant isolation
+through a non-superuser role. Wired into `.github/workflows/db-migrations.yml` as the twelfth PostgreSQL CI
+step. Full write-up in
+[docs/productionization/M05_DURABLE_DOMAIN_MIGRATION.md](productionization/M05_DURABLE_DOMAIN_MIGRATION.md).
+Full local server suite re-run after this addition: **144 files, 1,287 tests, 1,274 passed, 0 failed, 13
+skipped** (the 13 skips are every PostgreSQL-gated test, correctly skipping without a live database).
+
+## 2026-09-26 — M05 part 4: assignments
+
+The complex domain flagged in the previous entry. Added `automation.assignments` (mirrors `assignmentStore.js`
+exactly plus `organization_id`) and `postgresAssignmentRepository.js`, implementing all 8 contract methods
+(`list`, `get`, `create`, `setStatus`, `reassign`, `renamePrincipal`, `reschedule`, `expireDue`). The
+identity-mapping question flagged last entry was resolved the same way as approvals/interventions:
+`assignee`/`createdBy` stay plain text tied to the file-backed `authStore.js` operator system, not
+`identity.users` — reconciling that with M04's user model is a separate decision this slice does not force.
+Timestamps are real `timestamptz` (unlike approvals'/interventions' bigint epoch-ms), explicitly re-serialized
+back to ISO strings in the row mapper so the contract keeps returning what the file store always returned.
+Recurrence reuses `zonedRecurrence.js` unchanged.
+
+Two bugs found and fixed during this slice's own "check for errors, fix, check again" pass, not by CI (no
+local database exists to run the real test against):
+
+1. **`expireDue()` frozen-snapshot divergence** — the file store's `assertNoOverlap` closes over a pre-tick
+   snapshot of all assignments, so within one batch tick every overlap check sees the same frozen state, never
+   a sibling row already advanced earlier in the same tick. A first draft using a live DB query per row inside
+   one shared transaction would have let an earlier row's update leak into a later row's overlap check —
+   fixed by fetching one snapshot query up front and checking candidates against that static array instead.
+2. **A tautological test assertion** in the conflict-isolation test that would pass regardless of the actual
+   value — found on a self-review of the test file, replaced with real assertions on the expected `status` and
+   `startAt`.
+
+Real-PostgreSQL test covers create/list/get, overlap rejection and non-overlap success, `setStatus` state
+transitions and history, recurring-completion window advancement, `reassign`/`renamePrincipal`/`reschedule`,
+plain and recurring-with-conflict-isolation `expireDue` cases, tenant scoping, and real tenant isolation
+through a non-superuser role. Wired into `.github/workflows/db-migrations.yml` as the eleventh PostgreSQL CI
+step. This closes out the four M05 domains attempted so far (sites, approvals, interventions, assignments);
+remaining M05 domains (leases, platform accounts/policies, task queue/runs/checkpoints, research metadata,
+notifications, proxy/network metadata, audit metadata) are not started. Full write-up in
+[docs/productionization/M05_DURABLE_DOMAIN_MIGRATION.md](productionization/M05_DURABLE_DOMAIN_MIGRATION.md).
+Full local server suite re-run after this addition: **143 files, 1,286 tests, 1,274 passed, 0 failed, 12
+skipped** (the 12 skips are every PostgreSQL-gated test, correctly skipping without a live database).
+
+## 2026-09-26 — M05 part 3: interventions
+
+Same shape and reasoning as approvals — `InterventionQueue` is exactly the same kind of small, self-contained,
+already-tested class with a stable M02 contract. Added `automation.interventions` (mirrors its exact fields
+plus `organization_id`) and `postgresInterventionRepository.js`, reusing the file store's own
+`classifyIntervention()` reason-to-kind heuristic rather than reimplementing it, and throwing the identical
+plain `Error` messages the file store throws (`InterventionQueue` has no custom error class, unlike
+`ApprovalStore`/`SiteStore` — parity means matching that, not adding one it never had).
+
+One deliberate non-parity decision, recorded rather than silently applied: this adapter does **not** replicate
+`InterventionQueue`'s own `_trim()` (capping `RESOLVED` items to bound JSON file size) — a database table
+doesn't have the unbounded-file-growth problem that only existed because of the old storage format; real
+retention/pruning is a policy decision for later, not something to force into parity with a workaround that no
+longer applies.
+
+Real-PostgreSQL test proves task+kind deduplication (with auto-classification), claim/resolve state
+transitions including the identical "Already claimed by X" rejection message, resolve-on-already-resolved
+being a safe no-op that doesn't overwrite who resolved it first, `resolveForTask()` closing every open item at
+once, and — same as sites/approvals — genuine tenant isolation through a non-superuser role. Wired into
+`.github/workflows/db-migrations.yml` as the tenth PostgreSQL CI step. This closes out every M05 domain that
+fits the "small, self-contained, already-tested class" shape; **assignments** is next and is meaningfully more
+complex (recurrence, overlap detection, a JSON history array, and its own identity-mapping question, since its
+`assignee`/`createdBy` fields are plain operator-username strings tied to the file-backed `authStore.js`
+system, not `identity.users`). Full write-up in
+[docs/productionization/M05_DURABLE_DOMAIN_MIGRATION.md](productionization/M05_DURABLE_DOMAIN_MIGRATION.md).
+Full local server suite: **142 files, 1,285 tests, 1,274 passed, 0 failed, 11 skipped** (the 11 skips are
+every PostgreSQL-gated test, correctly skipping without a live database).
+
+## 2026-09-26 — M05 part 2: approvals (and why devices was skipped for now)
+
+Before starting "devices" (next in the master prompt's suggested M05 order), repository inspection found a
+real reason to reorder: `deviceRegistry.js` is a 77-line pure transform, not a stateful store like `SiteStore`
+— device state is deeply live (connection status, capabilities, health reconstructed from actual USB/WDA
+discovery on every restart), not simple CRUD data. Forcing that into today's "swap the persistence adapter
+behind an unchanged contract" pattern would misrepresent what's actually happening. `approvalStore.js`, by
+contrast, is exactly `SiteStore`'s shape — a small, self-contained, already-tested class with a stable M02
+contract — so it became the second M05 domain instead, per the master prompt's own "follow this order unless
+repository inspection proves a dependency requires adjustment."
+
+Added `automation.approvals` (mirrors `ApprovalStore`'s exact fields plus `organization_id`; timestamps stored
+as `bigint` epoch-ms, not `timestamptz`, deliberately matching the file store's `Date.now()`-based values
+exactly rather than silently changing the adapter's return shape) and
+`postgresApprovalRepository.js` — reuses `ApprovalStore`'s own `ApprovalError`/`approvalFingerprint`/
+`APPROVAL_STATES` rather than reimplementing them, and replicates its lazy-expire-on-every-operation semantics
+exactly (every method expires stale `PENDING`/`APPROVED` rows before doing its own work).
+
+Real-PostgreSQL test proves fingerprint deduplication, approve/reject/consume semantics (including that a
+double-consume returns `null` rather than consuming twice), identical `ApprovalError` codes for every rejected
+case the file store rejects, lazy expiry actually firing on read (not silently vanishing), and — same as
+sites — genuine tenant isolation through a non-superuser role. Wired into `.github/workflows/db-migrations.yml`
+as the ninth PostgreSQL CI step. Full write-up in
+[docs/productionization/M05_DURABLE_DOMAIN_MIGRATION.md](productionization/M05_DURABLE_DOMAIN_MIGRATION.md).
+Full local server suite: **141 files, 1,284 tests, 1,274 passed, 0 failed, 10 skipped** (the 10 skips are
+every PostgreSQL-gated test, correctly skipping without a live database).
+
+## 2026-09-26 — M05 begins: durable domain migration, sites (owner decision resolved)
+
+Before starting M05 (migrating the existing file-backed domains — sites, devices, assignments, queue, etc. —
+into PostgreSQL), hit a real fork rather than guessing through it: every migrated row needs an
+`organization_id` per the master prompt's schema, but M04's cloud identity system is separate, parallel
+infrastructure with no connection to the existing single-tenant site/device data. Asked directly: **the
+existing deployment wraps in one auto-created default organization** (not left tenant-less). Recorded in
+[docs/productionization/M05_DURABLE_DOMAIN_MIGRATION.md](productionization/M05_DURABLE_DOMAIN_MIGRATION.md)
+since it shapes every subsequent M05 domain, not just this one.
+
+Built the pattern each future domain should follow: `db/defaultOrganization.js` (idempotent bootstrap, `ON
+CONFLICT ... DO UPDATE ... RETURNING`, not check-then-insert — safe against two processes racing on a fresh
+database), a `fleet.sites` migration mirroring the existing file-backed `SiteStore`'s exact fields plus
+`organization_id`, and `postgresSiteRepository.js` — satisfying the identical M02 `siteRepository.js` contract
+(same methods, same `SiteError`/`duplicate_site`/`unknown_site` codes) so a caller never needs to know which
+adapter is active. **`index.js` still uses the file adapter exclusively — nothing was cut over, no real site
+data was migrated.** This is the "new implementation behind interface" step of the migration principle, not
+the cutover.
+
+Real-PostgreSQL test proves parity with the file adapter (identical create/rotate/verify/error-code behavior)
+plus genuine tenant isolation on the new table through a non-superuser role — a different organization's
+context sees nothing of the default organization's sites. Wired into `.github/workflows/db-migrations.yml` as
+the eighth PostgreSQL CI step. Full local server suite: **140 files, 1,283 tests, 1,274 passed, 0 failed, 9
+skipped** (the 9 skips are every PostgreSQL-gated test, correctly skipping without a live database).
+
+## 2026-09-26 — M04 part 6c: member suspension/reactivation
+
+Closed the *suspension* half of the "suspension/deletion lifecycle" gap (hard deletion stays out of scope —
+M16's GDPR-style anonymization work, not this milestone's). The enforcement already existed by construction:
+`requireMembership()` already 403s a non-active membership and `authenticate()` already 401s a non-active
+user, on every request. What was missing was the admin-facing way to actually change that status. Added
+`GET /organizations/:id/members` (any active member can see the roster — no dedicated `member:view`
+permission exists, matching the common default that team visibility isn't itself privileged) and
+`PATCH /organizations/:id/members/:membershipId` (gated by `member:manage`, deliberately refusing to let a
+caller change their own membership through this route — the simplest way to prevent an org locking itself out
+of its own management, rather than building unverified "at least one active owner" invariant logic).
+
+The real-PostgreSQL/real-HTTP test proves the enforcement is genuinely immediate, not just theoretically so: a
+target user's session works, a manager suspends them, and that *same still-valid, unrevoked* session is
+rejected on the very next request — no session revocation needed, because membership status is checked fresh
+on every request already. Also covers wrong-role rejection, an invalid status value, self-targeting, and a
+membership id from a different organization (400/400/404). Full write-up in
+[docs/productionization/M04_ORGANIZATION_IDENTITY.md](productionization/M04_ORGANIZATION_IDENTITY.md). Full
+local server suite: **138 files, 1,280 tests, 1,272 passed, 0 failed, 8 skipped** (unchanged counts — the new
+subtests live inside the already PostgreSQL-gated `cloudApi.test.js`).
+
+## 2026-09-26 — M04 part 6b: signup-from-invitation, real email delivery, password validation
+
+Closed out three items part 6 had left open. `POST /signup-from-invitation` lets someone with no existing
+account complete an invitation in one step — creates the user under the invitation's own email (never a
+client-supplied one), marks it verified immediately (completing an *emailed* invitation link already proves
+control of that address), then accepts. `createCloudApi()` gained optional `mailSender`/`companyEmail`
+parameters (default `null` — every flow still works without them, just logs locally instead of sending,
+matching `accountNotificationStore.js`'s own established convention); `/signup`, `/organizations/:id/invitations`,
+and `/password-reset/request` now actually call `mailSender.js`, fire-and-forget so a slow or failing SMTP
+call never adds latency to the HTTP response — matching this codebase's existing password-recovery-route
+precedent for exactly that timing-side-channel reason. Also exported and wired in `authStore.js`'s existing
+`validatePassword` (12-character minimum) to `/signup`, `/signup-from-invitation`, and `/password-reset/confirm`
+— previously `/signup` accepted a password of any length, including empty.
+
+New real-PostgreSQL/real-HTTP test coverage: signup-from-invitation creates a real, immediately-usable
+account+session and rejects a reused token; a fake `mailSender` (recording calls) proves the three routes
+above call it with the right recipient/content and that an unknown email triggers no send; an unknown
+organization id 404s rather than 403ing; `/me/mfa/enroll` demonstrates `authenticate` behaves identically on a
+route with no membership/permission layer. Full write-up in
+[docs/productionization/M04_ORGANIZATION_IDENTITY.md](productionization/M04_ORGANIZATION_IDENTITY.md). Full
+local server suite: **138 files, 1,280 tests, 1,272 passed, 0 failed, 8 skipped** (unchanged file/test counts
+from part 6 — the new subtests all live inside the same PostgreSQL-gated `cloudApi.test.js`, which node:test
+skips as one unit locally, same as every other DB-gated file).
+
+## 2026-09-26 — M04 part 6: a real HTTP API and the required authorization matrix
+
+Built `system/server/src/cloudApi/createCloudApi.js` — a self-contained Express app (signup, login with TOTP
+MFA check, logout, `/me`, invitations, MFA enroll/confirm, password reset, email verification), deliberately
+**not mounted into `system/server/src/index.js`**: it's new infrastructure for the master prompt's future
+multi-tenant "Cloud Control Plane," architecturally separate from the existing single-tenant Human VA Mode
+server. Every route is a thin translation to the already-tested service layer.
+
+Building `GET /me` (list every organization a user belongs to) surfaced a real RLS gap: the existing tenant
+policy only ever makes one `organization_id` visible per transaction, which would have hidden this
+legitimately cross-tenant, self-scoped read entirely. Fixed with a new migration adding a second, SELECT-only
+permissive policy keyed on a new `app.current_user_id` GUC (Postgres OR's multiple permissive policies
+together — documented behavior) — deliberately not `FOR ALL`, since allowing writes under "user_id = me" would
+let anyone insert a membership row for an organization they don't belong to. `withTransaction()` gained a
+matching `userId` option.
+
+Then built the master prompt's actual required authorization test matrix — anonymous / wrong organization /
+wrong role / correct role / disabled user / expired session / revoked session — against a real, `.listen()`-ed
+instance of the app, driven with real `fetch` calls, on `POST /organizations/:id/invitations`. All seven cases
+pass locally against the mocked middleware layer; the real-HTTP-plus-real-Postgres version is wired into
+`.github/workflows/db-migrations.yml` and awaits that workflow's first run, same as everything else in M04.
+
+This is the deepest point M04 reaches this session: full write-up, what's deliberately NOT covered (email
+delivery, the matrix on every *other* endpoint, where this API actually deploys), and the open decisions in
+[docs/productionization/M04_ORGANIZATION_IDENTITY.md](productionization/M04_ORGANIZATION_IDENTITY.md). Full
+local server suite: **138 files, 1,280 tests, 1,272 passed, 0 failed, 8 skipped** (the 8 skips are every
+PostgreSQL-gated test, correctly skipping without a live database).
+
+## 2026-09-26 — M04 part 5: email verification and password reset
+
+Added `identity.email_action_tokens` (one new table backing both flows — they're nearly mechanically identical:
+hashed, expiring, single-use tokens tied to a `purpose`) via a new migration, plus
+`emailActionTokenRepository.js`/`emailActionService.js`. Requesting a new verification or reset token
+invalidates any still-live one for the same user/purpose, so an old unread email link goes inert. A
+password-reset token can't be replayed as a verification token or vice versa (checked at resolution time, not
+just trusted from issuance). `resetPassword()` reuses `authStore.js`'s `hashPassword` and, when given a
+session repository, revokes every existing session for that user — a reset is a security event that should
+end other sessions, not coexist with a possibly-compromised one. Neither flow sends email yet;
+`mailSender.js` already handles delivery for the file-backed system and is next in line to wire up, not
+reinvent.
+
+This closes out every M04 organization/identity sub-domain the master prompt named except signup-from-
+invitation, WebAuthn, and — the big remaining one — **any actual HTTP route**, which is where the master
+prompt's real authorization test matrix (anonymous/wrong-org/wrong-role/disabled/expired/revoked per sensitive
+endpoint) becomes buildable and required. 9 new mocked unit tests plus a real-PostgreSQL integration test
+(verification marks the real `user_emails.verified_at`, reset updates the real hash and revokes a real
+session, a second reset request invalidates the first), wired into `.github/workflows/db-migrations.yml` as
+the sixth PostgreSQL CI step. Full write-up in
+[docs/productionization/M04_ORGANIZATION_IDENTITY.md](productionization/M04_ORGANIZATION_IDENTITY.md). Full
+local server suite: **136 files, 1,268 tests, 1,261 passed, 0 failed, 7 skipped** (the 7 skips are every
+PostgreSQL-gated test, correctly skipping without a live database).
+
+## 2026-09-26 — M04 part 4: TOTP MFA and recovery codes
+
+Added `identityMfaRepository.js`/`identityMfaService.js` against `identity.mfa_methods`/`recovery_codes`,
+reusing `twoFactor.js`'s existing TOTP/AES-GCM/recovery-code implementation (already relied on elsewhere in
+this codebase for proxy credential encryption) rather than a second crypto implementation — this only adds
+the PostgreSQL persistence shape: enroll (stores the encrypted secret, returns the plaintext secret and QR URI
+once), confirm (a real authenticator code moves the method from pending to verified and issues 10 recovery
+codes, only their hashes persisted), verify-login (checks only *verified* methods — a pending enrollment can
+never authenticate), single-use recovery-code consumption, disable.
+
+9 mocked unit tests isolate the service's own logic against fake crypto; the real-PostgreSQL integration test
+deliberately uses the REAL `twoFactor.js` functions (not fakes) so the actual encrypt/decrypt/TOTP round trip
+through real storage is what gets verified once CI runs it — a genuinely generated code confirms enrollment
+and later logs in, a stale code is rejected, a real recovery code is confirmed hashed at rest and single-use.
+Wired into `.github/workflows/db-migrations.yml` as the fifth PostgreSQL CI step. Full scope, what's still open
+(email verification/password reset, signup-from-invitation, WebAuthn), and everything else in
+[docs/productionization/M04_ORGANIZATION_IDENTITY.md](productionization/M04_ORGANIZATION_IDENTITY.md). Full
+local server suite: **134 files, 1,258 tests, 1,252 passed, 0 failed, 6 skipped** (the 6 skips are every
+PostgreSQL-gated test, correctly skipping without a live database).
+
+## 2026-09-26 — M04 part 3: invitations
+
+Added invitation issuance/acceptance against `identity.invitations`. A small additive migration
+(`1758839400000_add-role-to-invitations.js`) adds a `role_key` column the original schema design didn't
+include — recorded up front as a deliberate schema disagreement, not a silent workaround. `invite()` validates
+the role exists before creating anything; `acceptInvitation()` runs the accepted-state re-check, membership
+creation, and role assignment inside one transaction, so two concurrent acceptance attempts of the same
+invitation can't both succeed and a failure anywhere leaves nothing behind. Deliberately scoped to adding an
+*existing* user to an organization — signup-from-invitation (creating a brand-new account) needs a password-
+choosing flow this pass didn't build, and is called out as follow-up work rather than glossed over.
+
+10 new mocked-repository unit tests plus a real-PostgreSQL integration test (accepted role grants exactly the
+right permissions, double-acceptance rejected without disturbing the first membership, revoked invitations
+rejected), wired into `.github/workflows/db-migrations.yml` as the fourth and final PostgreSQL CI step so far.
+Full scope and open items in
+[docs/productionization/M04_ORGANIZATION_IDENTITY.md](productionization/M04_ORGANIZATION_IDENTITY.md). Full
+local server suite: **132 files, 1,248 tests, 1,243 passed, 0 failed, 5 skipped** (the 5 skips are every
+PostgreSQL-gated test, correctly skipping without a live database).
+
+## 2026-09-26 — M04 part 2: identity sessions
+
+Added `identitySessionRepository.js`/`identitySessionService.js` against `identity.sessions`: issue/verify/
+revoke/revoke-all/list-active, tokens hashed at rest using the same `crypto.randomBytes` + sha256 convention
+already proven in `siteStore.js`'s enrollment tokens, raw token returned exactly once from `issueSession()`.
+A validity check (`verifySession`) never touches `last_seen_at` itself, so probing a token can't masquerade as
+real activity — callers call `touchSession()` explicitly for that. 8 new mocked-repository unit tests plus a
+real-PostgreSQL integration test (issue/verify, revoke blocks verification without deleting the audit row,
+revoke-all scoped correctly to one user, a session id can't be substituted for its token), wired into
+`.github/workflows/db-migrations.yml` after the M04-part-1 test. Full details in
+[docs/productionization/M04_ORGANIZATION_IDENTITY.md](productionization/M04_ORGANIZATION_IDENTITY.md), status
+still **PASS WITH KNOWN LIMITATIONS** pending that workflow's first real run. Full local server suite:
+**130 files, 1,237 tests, 1,233 passed, 0 failed, 4 skipped** (the 4 skips are every PostgreSQL-gated test,
+correctly skipping without a live database).
+
+## 2026-09-26 — M04 part 1: organization/user/membership/RBAC core
+
+Built the first slice of M04 (organizations, users, memberships, roles/permissions) as a Postgres-backed
+service layer alongside — not replacing — the existing file-backed `authStore.js`/`operators.config.json`
+system. A second migration seeds the master prompt §4's 21-permission catalog and 7 system-template roles
+(owner/administrator/manager/va_operator/researcher/reviewer/billing_admin); `organizationIdentityService.js`
+composes `db/repositories/{organization,user,membership,role}Repository.js` inside real transactions —
+`createOrganizationWithOwner()` creates an org, its first user, and an owner-role membership atomically, reusing
+`authStore.js`'s own `hashPassword`/`verifyPassword` rather than a second password implementation.
+
+Found and fixed a real bug while wiring the CI test for this in: the first draft of the seed migration passed
+array parameters to node-pg-migrate's `pgm.sql()`, assuming Postgres-style `$1`/`$2` positional binding — that
+function actually does its own `{name}`-style text substitution (checked against the installed package's own
+type declarations, since nothing here can run it to find out empirically) and would have silently done the
+wrong thing. Rewrote to use `pgm.db.query()`, which does take real parameterized SQL. Separately, discovered
+node-pg-migrate's `down` reverts only the single most-recently-applied migration by default — with two
+migrations now, the M03 tenant-isolation test's "down must remove the identity schema" assertion needed an
+explicit `down 0` (revert everything) or it would have quietly tested the wrong thing.
+
+Full scope, what's explicitly NOT built yet (sessions, MFA, email verification, invitations, any HTTP route),
+and the open product decisions this deliberately did not guess at (Owner vs. Administrator distinction, how
+this reconciles with the existing 5-role `roleCapabilities.js` model) are in
+[docs/productionization/M04_ORGANIZATION_IDENTITY.md](productionization/M04_ORGANIZATION_IDENTITY.md). Status:
+**PASS WITH KNOWN LIMITATIONS, PART 1 ONLY** — real verification is a new PostgreSQL integration test
+(`organizationIdentity.test.js`) wired into `.github/workflows/db-migrations.yml`, which has not run in CI yet.
+
+Locally verifiable pieces: 11 new mocked-pool unit tests for the repositories/service passed; both
+PostgreSQL-gated test files confirmed to skip (not silently pass) without `TEST_DATABASE_URL`; `node --check`
+passed on every new file. Full local server suite: **128 files, 1,228 tests, 1,225 passed, 0 failed, 3
+skipped** (the 3 skips are the PostgreSQL-gated tests, correctly skipping without a live database).
+
+## 2026-09-26 — M03: PostgreSQL foundation (unverified locally; CI-verified only)
+
+Added the migration framework (`node-pg-migrate`), connection pool/health-check/transaction helpers
+(`system/server/src/db/`), and the first migration — the identity/organization schema recommended by
+[DATABASE_GAP_ANALYSIS.md](productionization/DATABASE_GAP_ANALYSIS.md)'s "first database slice" section, with
+Row-Level Security on every tenant-scoped table. **No application code reads or writes this schema** — that is
+a separate, not-yet-started milestone (M04).
+
+This environment has no PostgreSQL, Docker, or database client installed, so none of this could be run against
+a live database directly. Instead, [`.github/workflows/db-migrations.yml`](../.github/workflows/db-migrations.yml)
+runs it for real against an ephemeral `postgres:16` GitHub Actions service container: migrate up, a genuine
+tenant-isolation test through a non-superuser role (Org A/Org B cross-tenant SELECT/INSERT/UPDATE/DELETE
+negative tests, plus a fail-closed check with no tenant context set), then migrate down and verifies the schema
+is actually gone. **That workflow has not run yet as of this writing** — full details, exact scope decisions,
+and what remains before M04 can start are in
+[docs/productionization/M03_POSTGRES_FOUNDATION.md](productionization/M03_POSTGRES_FOUNDATION.md). Status is
+recorded there as **PASS WITH KNOWN LIMITATIONS**, not PASS, until that workflow is confirmed green.
+
+Locally verifiable pieces: 15 new unit tests for the pool/health/transaction helpers (mocked, no live database)
+passed; `node --check` passed on every new file; `npm audit` is 0 vulnerabilities after pinning
+`node-pg-migrate` to `^9.0.0` (an earlier `^7.0.0` resolution pulled in a `glob` version with a published high
+severity advisory).
+
+## 2026-09-25 — M02: remaining persistence-interface slices complete
+
+Closed out every domain named in [M02_MODULARIZATION.md](productionization/M02_MODULARIZATION.md)'s remaining-slices
+list with the same pattern as the slices before it: a repository contract, a file adapter that delegates to the
+existing, still-authoritative implementation unchanged, and direct unit tests. Five slices landed in this pass:
+
+1. **Sites and site credentials** — `siteRepository.js`/`fileSiteRepository.js` wrap `SiteStore`.
+2. **Device assignments** — `assignmentRepository.js`/`fileAssignmentRepository.js` wrap `createAssignmentStore`.
+   Device *leases* stayed out of scope: `deviceLease.js` is in-process controller-mode state with no file store
+   behind it to wrap.
+3. **Task queue snapshot** — `taskQueueSnapshotRepository.js`/`fileTaskQueueSnapshotRepository.js` extract
+   the queue's atomic snapshot read/write and restart-recovery logic out of `taskQueue.js`; its scheduling/
+   dispatch/retry mechanics stayed put since that's domain logic, not persistence.
+4. **Approvals, interventions, research runs/evidence** — four repository/adapter pairs wrapping `ApprovalStore`,
+   `InterventionQueue`, `researchStore.js`, and `researchEvidenceStore.js`, now used consistently by both the
+   HTTP routes and `researchTaskRunner.js`'s dependency injection (previously the runner silently fell back to
+   raw module imports instead of the same instances the routes used).
+5. **Notifications, proxy pool, device media, research evidence** — `notificationRepository.js`,
+   `proxyPoolRepository.js` (binds `proxyPoolStorePath` once instead of threading it through 9 call sites),
+   `deviceMediaRepository.js`, and `researchEvidenceRepository.js` (screenshot save/resolve).
+
+Every slice kept its existing file store authoritative, migrated no data, and changed no HTTP/WebSocket
+behavior — see [M02_MODULARIZATION.md](productionization/M02_MODULARIZATION.md) for the exact scoping decisions
+(what stayed a direct import and why) and the "M02 status" section for what this does and does not unblock:
+M03 (PostgreSQL foundation) still requires the identity/organization schema and tenant-negative tests, which are
+separate, not-yet-started M04-adjacent work.
+
+Verification: full server suite run after every slice, culminating at **122 files, 1,199 tests, 1,199 passed, 0
+failed, 0 skipped**. `node --check` passed on every changed entry point; `git diff --check` passed throughout.
+Nothing in this pass was committed — left for manual review per the working session's instruction.
+
+## 2026-09-25 — M02: background task/assignment/research authorization boundary
+
+A fifth M02 slice moved the task queue's dispatch predicate, assignment target validation, and background
+task-access checks off direct `authStore.js`/`researchAccess.js` imports and onto one named, synchronous
+authorization boundary (`system/server/src/services/backgroundAuthorizationService.js` and its repository
+contract/file adapter). Unlike the identity/session slices, this boundary stays synchronous by design — the
+task queue's dispatch loop and the assignment routes' inline validation both need an immediate answer — and
+that tradeoff, along with what a future async-backed identity source would need to do instead (publish a
+refreshed snapshot behind the same boundary rather than making dispatch itself async), is written down in
+[`docs/productionization/M02_MODULARIZATION.md`](productionization/M02_MODULARIZATION.md#background-task-assignment-and-research-authorization-identity-resolution).
+`researchTaskRunner.js` also gained an injectable `canAccessDevice` parameter, matching its two existing
+injected authorization resolvers instead of importing the third directly. No operator data was migrated;
+`operators.config.json` remains authoritative, and no HTTP/WebSocket request-scoped authorization check was
+touched. New file: `system/server/test/unit/backgroundAuthorizationService.test.js`.
+
+## 2026-09-25 — productionization baseline and proposed architecture
+
+The productionization program now has a source-and-test baseline plus an M01 architecture package under
+[`docs/productionization/`](productionization/README.md). The package records the cloud/site execution
+boundary, PostgreSQL authority, ephemeral Redis use, object storage, secret references/KMS, tenant and identity
+models, billing abstraction, transactional outbox/audit model, and deployment topology. It also includes the
+domain model and ERD, trust boundaries, data classification, threat model, and a table-by-table reconciliation
+of the proposed database schema.
+
+This milestone changes documentation only. It does not switch persistence, enable a cloud service, migrate
+customer data, or alter device/runtime behavior. Organization/workspace semantics, identity provider, billing
+provider/prices, cloud/regions, retention, licensing, legal identity, and native-mobile launch scope remain
+explicit owner decisions. M02 service and persistence interfaces must preserve current behavior before any
+database migration begins.
+
+M01 was subsequently accepted as the direction for incremental implementation. M02 is now in progress. Its first
+bounded slice introduces an audit-event repository contract, keeps the existing JSONL adapter authoritative, and
+moves device-grant-aware audit reads into an audit service. No audit data was migrated and no API behavior was
+intentionally changed. A second bounded slice now places the existing file session store behind the callback
+contract required by both Express and WebSocket upgrades; its atomic files and revocation tombstones remain
+authoritative. A third slice routes administrative account lifecycle operations through an async-first service and
+repository while retaining `operators.config.json` as authority. A fourth slice now routes password login, pending MFA
+identity reads, HTTP authentication/capability middleware, stored-session checks, and delayed network-check
+reauthorization through an async-first identity service. The live `operators.config.json` projection remains
+authoritative. Signup, recovery, and MFA persistence now use that same async boundary while delegating to the
+existing atomic file implementation. WebSocket upgrade and per-message/session authorization now use an
+async-refreshed, generation-ordered socket identity snapshot, preserving synchronous device authorization callbacks
+and fail-closed mid-action revocation. Account updates now reconcile both controlled-device and read-only-watch
+sessions before their response completes. Background queue/scheduler authorization remains bounded follow-up work. See
+[`docs/productionization/M02_MODULARIZATION.md`](productionization/M02_MODULARIZATION.md).
 
 ## 2026-09-23 — required desktop version gate and direct release installers
 

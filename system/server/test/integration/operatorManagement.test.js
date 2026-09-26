@@ -405,6 +405,49 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
     assert.deepEqual(updatedVaProfile.allowedDevices, []);
     assert.equal("passwordHash" in updatedVaProfile, false);
 
+    // Account reconciliation must revoke read-only watches too, not only
+    // controlled-device selections. The PATCH response must not complete
+    // while the old device grant is still usable on an open socket.
+    for (const account of [
+      { username: "watch-owner", password: "watch-owner-password", role: "va", teamId: "team-a" },
+      { username: "watch-admin", password: "watch-admin-password", role: "admin", teamId: null },
+    ]) {
+      const createdWatcherAccount = await request(baseUrl, "/api/admin/users", {
+        cookie: adminCookie,
+        method: "POST",
+        body: { ...account, allowedDevices: ["mock-1"], allowedResearchWorkspaces: [] },
+      });
+      assert.equal(createdWatcherAccount.status, 201);
+    }
+    const watchOwnerCookie = await enrollAndLogin(baseUrl, "watch-owner", "watch-owner-password");
+    const watchAdminCookie = await enrollAndLogin(baseUrl, "watch-admin", "watch-admin-password");
+    const watchOwnerWs = await openSocket(address, watchOwnerCookie);
+    const watchAdminWs = await openSocket(address, watchAdminCookie);
+    const ownerFrame = waitForMessage(watchOwnerWs,
+      message => message.type === "frame" && message.deviceId === "mock-1");
+    watchOwnerWs.send(JSON.stringify({ type: "select_device", deviceId: "mock-1" }));
+    await ownerFrame;
+    const watchStarted = waitForMessage(watchAdminWs,
+      message => message.type === "watch_started" && message.deviceId === "mock-1");
+    watchAdminWs.send(JSON.stringify({ type: "watch_device", deviceId: "mock-1" }));
+    await watchStarted;
+    const watchRevoked = waitForMessage(watchAdminWs,
+      message => message.type === "watch_stopped" && message.deviceId === "mock-1");
+    const watcherGrantRemoved = await request(baseUrl, "/api/admin/users/watch-admin", {
+      cookie: adminCookie,
+      method: "PATCH",
+      body: { allowedDevices: [] },
+    });
+    assert.equal(watcherGrantRemoved.status, 200);
+    assert.match((await watchRevoked).message, /no longer available/);
+    assert.equal((await request(baseUrl, "/api/admin/users/watch-admin", {
+      cookie: adminCookie,
+      method: "PATCH",
+      body: { role: "editor" },
+    })).status, 200);
+    watchAdminWs.close();
+    watchOwnerWs.close();
+
     const managerWs = await openSocket(address, managerCookie);
     const managerSelected = waitForMessage(managerWs,
       message => message.type === "frame" && message.deviceId === "mock-1");

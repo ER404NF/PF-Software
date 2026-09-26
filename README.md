@@ -216,12 +216,14 @@ Use these files in order:
 
 1. `README.md`
 2. `Architecture Baseline.md`
-3. `docs/FUTURE_AI_VA_SPEC.md`
-4. `docs/COMMAND_QUEUE_SPEC.md`
-5. `docs/PLATFORM_CAPABILITY_MATRIX.md`
-6. `docs/ROADMAP.md`
-7. `system/README.md`
-8. active code under `system/`
+3. `docs/productionization/README.md` for the proposed commercial cloud/site architecture, ADRs, domain model,
+   trust boundaries, data classification, threat model, and database reconciliation
+4. `docs/FUTURE_AI_VA_SPEC.md`
+5. `docs/COMMAND_QUEUE_SPEC.md`
+6. `docs/PLATFORM_CAPABILITY_MATRIX.md`
+7. `docs/ROADMAP.md`
+8. `system/README.md`
+9. active code under `system/`
 
 `source-material/`, `archive/`, `research/`, and `graphify-out/` are background/non-canonical unless a task explicitly names them.
 

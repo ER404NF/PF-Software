@@ -1,0 +1,87 @@
+# Verifies the Redis foundation (system/server/src/redis/) for real, against
+# an ephemeral Redis service container — this is the only place it is
+# actually run. No Redis is available in the environment that authored it;
+# do not treat anything in redis/ as verified based on anything other than
+# this workflow being green.
+
+name: Redis foundation
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "system/server/src/redis/**"
+      - "system/server/test/**/redis/**"
+      - "system/package.json"
+      - "system/package-lock.json"
+      - ".github/workflows/redis-foundation.yml"
+  pull_request:
+    paths:
+      - "system/server/src/redis/**"
+      - "system/server/test/**/redis/**"
+      - "system/package.json"
+      - "system/package-lock.json"
+      - ".github/workflows/redis-foundation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: redis-foundation-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "24"
+
+defaults:
+  run:
+    shell: bash
+    working-directory: system
+
+jobs:
+  redis:
+    name: Real Redis — client, health check, key schema
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: system/package-lock.json
+
+      - name: Install server dependencies (lockfile)
+        run: npm ci
+
+      - name: Production dependency audit (server)
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Dependency audit gate (what each finding can reach)
+        working-directory: .
+        run: node desktop/scripts/audit-gate.cjs --dir system
+
+      - name: Real Redis test — client, health check, key schema (M06)
+        run: node --test test/integration/redis/redisFoundation.test.js
+        env:
+          TEST_REDIS_URL: redis://127.0.0.1:6379
+
+      - name: Changed JavaScript entry points pass node --check
+        run: |
+          for f in server/src/redis/*.js; do
+            node --check "$f"
+          done

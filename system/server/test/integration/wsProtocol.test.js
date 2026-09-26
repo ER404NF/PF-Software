@@ -1156,9 +1156,9 @@ test("a manager cannot perform AI-controller actions on any device, over WS or t
 // live for hours) kept its OLD privileges no matter what operators.config.json
 // said, until it happened to log out — a promotion never took effect early,
 // and a demotion/revocation never took effect AT ALL for that session. Fixed
-// by re-resolving the operator from the live registry (authStore.js's
-// resolveOperator) on every request/message, the same way researchAccess.js's
-// researchWorkspaceFor already did for research grants specifically.
+// by re-resolving the operator through the identity service on every HTTP
+// request and WebSocket message/session validation, the same way
+// researchAccess.js already treated research grants as live authority.
 test("an operator's role change takes effect on their next request, without needing to re-login (HTTP)", async () => {
   const cookie = await loginCookie("test-plain-va", TEST_PASSWORD);
   const deniedFirst = await fetch(`${httpUrl}/api/queue`, { headers: { Cookie: cookie } });

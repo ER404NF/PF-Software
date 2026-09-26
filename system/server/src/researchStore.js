@@ -95,7 +95,10 @@ function strings(value) {
 // does not execute or authorize any platform action.
 // One platform-visible action mirrored into the research record (MS9.3/MS10). `text`
 // is a comment exactly as it was sent.
-function normalizePlatformAction(action) {
+// Exported so the Postgres research run repository (M05) can reuse the same
+// dedup/merge/normalization logic instead of duplicating it — see that
+// adapter's own header comment.
+export function normalizePlatformAction(action) {
   return {
     action: action.action,
     status: text(action.status),
@@ -107,12 +110,12 @@ function normalizePlatformAction(action) {
   };
 }
 
-function samePlatformAction(a, b) {
+export function samePlatformAction(a, b) {
   return a.action === b.action && (a.text ?? null) === (b.text ?? null) && (a.task_id ?? null) === (b.task_id ?? null)
     && (a.status ?? null) === (b.status ?? null);
 }
 
-function candidateRecord(input, context) {
+export function candidateRecord(input, context) {
   const c = input && typeof input === "object" && !Array.isArray(input) ? input : {};
   const canonicalUrl = webUrl(c.canonical_url ?? c.url);
   return {
@@ -157,13 +160,13 @@ function candidateRecord(input, context) {
 // prior review_state/first_seen_at forward, mirroring the OR-based identity
 // check the in-run merge above already uses (platform_content_id, else
 // canonical_url).
-function findIndexEntry(index, c) {
+export function findIndexEntry(index, c) {
   const contentKey = c.platform_content_id ? `${c.platform}\u0000${c.platform_content_id}` : null;
   if (contentKey && index.byContentId[contentKey]) return index.byContentId[contentKey];
   if (c.canonical_url && index.byUrl[c.canonical_url]) return index.byUrl[c.canonical_url];
   return null;
 }
-function upsertIndexEntry(index, entry) {
+export function upsertIndexEntry(index, entry) {
   const prior = findIndexEntry(index, entry);
   entry = { ...prior, ...entry,
     platform_content_id: entry.platform_content_id ?? prior?.platform_content_id ?? null,
@@ -180,7 +183,7 @@ function upsertIndexEntry(index, entry) {
   if (entry.canonical_url) index.byUrl[entry.canonical_url] = entry;
 }
 
-function mergeCandidate(duplicate, candidate) {
+export function mergeCandidate(duplicate, candidate) {
   duplicate.evidence_refs = [...new Set([...duplicate.evidence_refs, ...candidate.evidence_refs])];
   duplicate.tags = [...new Set([...duplicate.tags, ...candidate.tags])];
   for (const action of candidate.platform_actions) {
@@ -195,7 +198,7 @@ function mergeCandidate(duplicate, candidate) {
   return duplicate;
 }
 
-function indexCandidate(index, candidate, runId, now) {
+export function indexCandidate(index, candidate, runId, now) {
   const existing = findIndexEntry(index, candidate);
   // Observations may arrive for an older run after a newer human review.
   // Only setCandidateStatus can change an established shared decision.
@@ -383,4 +386,11 @@ export function setCandidateStatus(workspaceId, account, runId, candidateId, sta
   return candidate;
 }
 
-export { safeAccountId };
+// readAccount is exported so the P3 research-runs data migration
+// (scripts/migrate-research-to-postgres.js) can read the exact
+// {runs, candidateIndex} shape for a given account directly, rather than
+// reconstructing candidateIndex by replaying every run through
+// indexCandidate() (which risks losing state a real file may have accrued
+// that a naive replay wouldn't reproduce, e.g. across renamePrincipal-style
+// edits this store doesn't have but a future one might).
+export { safeAccountId, readAccount };

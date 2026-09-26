@@ -1,0 +1,276 @@
+# Verifies the PostgreSQL migrations (system/server/migrations/) for real,
+# against an ephemeral PostgreSQL service container — this is the only place
+# they are actually run. No PostgreSQL is available in the environment that
+# authored them; do not treat migrations or their RLS policies as verified
+# based on anything other than this workflow being green.
+#
+# Runs: migrate up, a real tenant-isolation test (see
+# test/integration/db/tenantIsolation.test.js) through a non-superuser role,
+# migrate down, then migrate up again to prove the round trip is clean.
+
+name: Database migrations
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "system/server/migrations/**"
+      - "system/server/src/db/**"
+      # Every M04 identity/organization service, not the M02 file-backed
+      # ones (auditService.js etc.) — but simpler to over-trigger on an
+      # unrelated services/ change than to keep hand-maintaining one path
+      # entry per new identity service file.
+      - "system/server/src/services/organizationIdentityService.js"
+      - "system/server/src/services/identitySessionService.js"
+      - "system/server/src/services/invitationService.js"
+      - "system/server/src/services/identityMfaService.js"
+      - "system/server/src/services/emailActionService.js"
+      - "system/server/src/cloudApi/**"
+      - "system/server/test/**/db/**"
+      - "system/server/test/unit/cloudApi/**"
+      - "system/package.json"
+      - "system/package-lock.json"
+      - ".github/workflows/db-migrations.yml"
+  pull_request:
+    paths:
+      - "system/server/migrations/**"
+      - "system/server/src/db/**"
+      - "system/server/src/services/organizationIdentityService.js"
+      - "system/server/src/services/identitySessionService.js"
+      - "system/server/src/services/invitationService.js"
+      - "system/server/src/services/identityMfaService.js"
+      - "system/server/src/services/emailActionService.js"
+      - "system/server/src/cloudApi/**"
+      - "system/server/test/**/db/**"
+      - "system/server/test/unit/cloudApi/**"
+      - "system/package.json"
+      - "system/package-lock.json"
+      - ".github/workflows/db-migrations.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: db-migrations-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "24"
+  PGUSER: postgres
+  PGPASSWORD: postgres
+  PGDATABASE: phonefarm_test
+  PGHOST: localhost
+  PGPORT: "5432"
+
+defaults:
+  run:
+    shell: bash
+    working-directory: system
+
+jobs:
+  migrate:
+    name: Migrate up / tenant isolation / migrate down / up again
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: phonefarm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: system/package-lock.json
+
+      - name: Install server dependencies (lockfile)
+        run: npm ci
+
+      - name: Production dependency audit (server)
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Dependency audit gate (what each finding can reach)
+        working-directory: .
+        run: node desktop/scripts/audit-gate.cjs --dir system
+
+      - name: Migrate up
+        run: npm run migrate up
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      # Exercises tenant isolation through a real non-superuser role, then
+      # migrates down (fully — see the test file for why "down" alone isn't
+      # enough with more than one migration) and back up again itself,
+      # asserting the identity schema is actually gone in between. Must run
+      # before the organization-identity test below, which needs the
+      # migration 2 seed data this leaves freshly re-applied.
+      - name: Real PostgreSQL test — tenant isolation and migration round trip
+        run: node --test test/integration/db/tenantIsolation.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — organization/identity/RBAC service (M04 part 1)
+        run: node --test test/integration/db/organizationIdentity.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — session issuance/verification/revocation (M04 part 2)
+        run: node --test test/integration/db/identitySession.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — invitations (M04 part 3)
+        run: node --test test/integration/db/invitation.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — MFA/recovery codes with real crypto (M04 part 4)
+        run: node --test test/integration/db/identityMfa.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — email verification and password reset (M04 part 5)
+        run: node --test test/integration/db/emailAction.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — cloud API authorization matrix, real HTTP (M04 part 6)
+        run: node --test test/integration/db/cloudApi.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — sites, parity with file adapter + tenant isolation (M05)
+        run: node --test test/integration/db/postgresSiteRepository.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — approvals, parity + lazy expiry + tenant isolation (M05)
+        run: node --test test/integration/db/postgresApprovalRepository.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — interventions, parity + tenant isolation (M05)
+        run: node --test test/integration/db/postgresInterventionRepository.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — assignments, parity + recurrence + overlap conflicts (M05)
+        run: node --test test/integration/db/postgresAssignmentRepository.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — account notifications, parity + recovery encryption + tenant isolation (M05)
+        run: node --test test/integration/db/postgresNotificationRepository.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — task queue snapshot, parity + crash recovery + tenant isolation (M05)
+        run: node --test test/integration/db/postgresTaskQueueSnapshotRepository.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — audit events, parity + tenant isolation (M05)
+        run: node --test test/integration/db/postgresAuditEventRepository.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — proxy pool, parity + exclusive device lease + tenant isolation (M05)
+        run: node --test test/integration/db/postgresProxyPoolRepository.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — research runs, parity + cross-run dedup + tenant isolation (M05)
+        run: node --test test/integration/db/postgresResearchRunRepository.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — account policies, sync-cache parity + tenant isolation (M05)
+        run: node --test test/integration/db/postgresPolicyRepository.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — cloud API mounted in index.js, real end-to-end (Phase 1 P2)
+        run: node --test test/integration/db/cloudApiMountedInIndex.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — cloud API fuzzing, hostile input on every route (Phase 1 P2)
+        run: node --test test/integration/db/cloudApiFuzz.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — sites data migration script (Phase 1 P3)
+        run: node --test test/integration/db/migrateSitesToPostgres.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — assignments data migration script (Phase 1 P3)
+        run: node --test test/integration/db/migrateAssignmentsToPostgres.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — platform policies data migration script (Phase 1 P3)
+        run: node --test test/integration/db/migratePoliciesToPostgres.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — task queue data migration script (Phase 1 P3)
+        run: node --test test/integration/db/migrateTaskQueueToPostgres.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — approvals data migration script (Phase 1 P3)
+        run: node --test test/integration/db/migrateApprovalsToPostgres.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — interventions data migration script (Phase 1 P3)
+        run: node --test test/integration/db/migrateInterventionsToPostgres.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — proxy pool data migration script (Phase 1 P3)
+        run: node --test test/integration/db/migrateProxyPoolToPostgres.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — audit log data migration script (Phase 1 P3)
+        run: node --test test/integration/db/migrateAuditLogToPostgres.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Real PostgreSQL test — research data migration script (Phase 1 P3)
+        run: node --test test/integration/db/migrateResearchToPostgres.test.js
+        env:
+          TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
+
+      - name: Changed JavaScript entry points pass node --check
+        run: |
+          for f in server/src/db/pool.js server/src/db/health.js server/src/db/transaction.js \
+                   server/src/db/defaultOrganization.js \
+                   server/src/db/repositories/*.js server/src/services/organizationIdentityService.js \
+                   server/src/services/identitySessionService.js server/src/services/invitationService.js \
+                   server/src/services/identityMfaService.js server/src/services/emailActionService.js \
+                   server/src/cloudApi/createCloudApi.js server/src/cloudApi/middleware/*.js \
+                   server/migrations/*.js server/scripts/migrate-sites-to-postgres.js \
+                   server/scripts/migrate-assignments-to-postgres.js server/scripts/migrate-policies-to-postgres.js \
+                   server/scripts/migrate-task-queue-to-postgres.js server/scripts/migrate-approvals-to-postgres.js \
+                   server/scripts/migrate-interventions-to-postgres.js server/scripts/migrate-proxy-pool-to-postgres.js \
+                   server/scripts/migrate-audit-log-to-postgres.js server/scripts/migrate-research-to-postgres.js; do
+            node --check "$f"
+          done

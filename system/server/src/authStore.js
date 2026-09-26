@@ -170,7 +170,7 @@ export function assertValidUsername(username) {
   return validateUsername(username);
 }
 
-function validatePassword(password) {
+export function validatePassword(password) {
   if (typeof password !== "string" || password.length < PASSWORD_MIN_LENGTH || password.length > PASSWORD_MAX_LENGTH) {
     throw accountError(`password must be ${PASSWORD_MIN_LENGTH}-${PASSWORD_MAX_LENGTH} characters`);
   }

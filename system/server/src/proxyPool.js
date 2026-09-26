@@ -56,7 +56,10 @@ export function flagForCountry(countryCode) {
   return String.fromCodePoint(...[...countryCode].map(char => 127397 + char.charCodeAt(0)));
 }
 
-function validateFields({ provider, protocol, host, port, username, password, country, label }) {
+// Exported so the Postgres proxy pool repository (M05) can validate
+// incoming fields identically before insert, without duplicating this
+// logic.
+export function validateFields({ provider, protocol, host, port, username, password, country, label }) {
   if (typeof provider !== "string" || !provider.trim() || provider.length > 100) {
     throw poolError("provider is required (max 100 characters)", 400);
   }

@@ -2,34 +2,44 @@ import fs from "fs";
 import path from "path";
 import crypto from "crypto";
 
+// Exported so the Postgres notification repository (M05) can encrypt/decrypt
+// recovery bodies identically, without duplicating AES-GCM handling.
+export function encryptNotificationBody(body, encryptionKey) {
+  if (typeof encryptionKey !== "string" || !encryptionKey) return null;
+  const key = crypto.createHash("sha256").update(encryptionKey).digest();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const ciphertext = Buffer.concat([cipher.update(body, "utf8"), cipher.final()]);
+  return {
+    algorithm: "aes-256-gcm",
+    iv: iv.toString("base64"),
+    tag: cipher.getAuthTag().toString("base64"),
+    ciphertext: ciphertext.toString("base64"),
+  };
+}
+
+export function decryptNotificationBody(payload, encryptionKey) {
+  if (!payload || payload.algorithm !== "aes-256-gcm" || typeof encryptionKey !== "string" || !encryptionKey) {
+    throw new Error("secure account notification storage is not configured");
+  }
+  const key = crypto.createHash("sha256").update(encryptionKey).digest();
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(payload.iv, "base64"));
+  decipher.setAuthTag(Buffer.from(payload.tag, "base64"));
+  return Buffer.concat([
+    decipher.update(Buffer.from(payload.ciphertext, "base64")),
+    decipher.final(),
+  ]).toString("utf8");
+}
+
 export function createAccountNotificationStore({ storePath, companyEmail = null, encryptionKey = null } = {}) {
   if (typeof storePath !== "string" || !storePath) throw new Error("notification store path is required");
 
   function encryptBody(body) {
-    if (typeof encryptionKey !== "string" || !encryptionKey) return null;
-    const key = crypto.createHash("sha256").update(encryptionKey).digest();
-    const iv = crypto.randomBytes(12);
-    const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
-    const ciphertext = Buffer.concat([cipher.update(body, "utf8"), cipher.final()]);
-    return {
-      algorithm: "aes-256-gcm",
-      iv: iv.toString("base64"),
-      tag: cipher.getAuthTag().toString("base64"),
-      ciphertext: ciphertext.toString("base64"),
-    };
+    return encryptNotificationBody(body, encryptionKey);
   }
 
   function decryptBody(payload) {
-    if (!payload || payload.algorithm !== "aes-256-gcm" || typeof encryptionKey !== "string" || !encryptionKey) {
-      throw new Error("secure account notification storage is not configured");
-    }
-    const key = crypto.createHash("sha256").update(encryptionKey).digest();
-    const decipher = crypto.createDecipheriv("aes-256-gcm", key, Buffer.from(payload.iv, "base64"));
-    decipher.setAuthTag(Buffer.from(payload.tag, "base64"));
-    return Buffer.concat([
-      decipher.update(Buffer.from(payload.ciphertext, "base64")),
-      decipher.final(),
-    ]).toString("utf8");
+    return decryptNotificationBody(payload, encryptionKey);
   }
 
   function read() {

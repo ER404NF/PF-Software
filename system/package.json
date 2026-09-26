@@ -10,13 +10,17 @@
     "soak": "node server/scripts/soak-test.js",
     "demo": "node server/scripts/demo.js",
     "bench": "node server/bench/run.js",
-    "agent": "node server/src/agentMain.js"
+    "agent": "node server/src/agentMain.js",
+    "migrate": "node-pg-migrate --migrations-dir server/migrations"
   },
   "dependencies": {
     "express": "^4.19.2",
     "express-session": "^1.19.0",
+    "ioredis": "^5.11.1",
     "multer": "^2.4.0",
+    "node-pg-migrate": "^9.0.0",
     "nodemailer": "^10.0.10",
+    "pg": "^8.23.0",
     "ws": "^8.18.0"
   },
   "overrides": {

@@ -1,4 +1,4 @@
-import { canAccessDevice } from "./authStore.js";
+import { canAccessDevice as defaultCanAccessDevice } from "./authStore.js";
 import { runResearchStep } from "./researchWorker.js";
 import { TASK_STATES } from "./taskSpec.js";
 import { createRun, appendCandidate, finalizeRun, getRun, locateCandidate, recordPlatformAction } from "./researchStore.js";
@@ -23,6 +23,7 @@ export function createResearchTaskRunner({
   skillForPlatform,
   operatorForUsername,
   workspaceForOperatorAccount,
+  canAccessDevice = defaultCanAccessDevice,
   canUseDevice = () => true,
   stepDelayMs = 1000,
   sleep = wait,
@@ -50,7 +51,7 @@ export function createResearchTaskRunner({
   pacingForTask = null,
 } = {}) {
   if (!taskQueue || !devices || !deviceLease) throw new Error("research task runner requires queue, devices and lease");
-  if (![providerForTask, skillForPlatform, operatorForUsername, workspaceForOperatorAccount, canUseDevice].every((fn) => typeof fn === "function")) {
+  if (![providerForTask, skillForPlatform, operatorForUsername, workspaceForOperatorAccount, canAccessDevice, canUseDevice].every((fn) => typeof fn === "function")) {
     throw new Error("research task runner requires provider, skill and authorization resolvers");
   }
   if (!Number.isFinite(stepDelayMs) || stepDelayMs < 0) throw new Error("stepDelayMs must be non-negative");

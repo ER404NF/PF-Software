@@ -9,9 +9,6 @@
 // platform logic into this generic queue.
 // does the actual work and reports back via reportResult().
 
-import fs from "fs";
-import path from "path";
-import crypto from "crypto";
 import {
   TASK_STATES,
   isTerminal,
@@ -22,6 +19,7 @@ import {
   hasExecutionExpired,
   validatePersistedTask,
 } from "./taskSpec.js";
+import { createFileTaskQueueSnapshotRepository } from "./persistence/fileTaskQueueSnapshotRepository.js";
 
 const PRIORITY_ORDER = { urgent: 0, high: 1, normal: 2, low: 3 };
 const REPORTABLE_OUTCOMES = new Set([
@@ -33,87 +31,14 @@ const REPORTABLE_OUTCOMES = new Set([
   TASK_STATES.NEEDS_HUMAN,
 ]);
 
-const replaceWaitArray = new Int32Array(new SharedArrayBuffer(4));
-function writeQueueSnapshot(storePath, tasks, paused, humanHolds = new Set()) {
-  fs.mkdirSync(path.dirname(storePath), { recursive: true });
-  const temporary = `${storePath}.${crypto.randomUUID()}.tmp`;
-  try {
-    fs.writeFileSync(temporary, JSON.stringify({ version: 2, paused, humanHolds: [...humanHolds], tasks }, null, 2), { flag: "wx" });
-    for (let attempt = 0; ; attempt++) {
-      try {
-        fs.renameSync(temporary, storePath);
-        break;
-      } catch (error) {
-        if (!["EPERM", "EBUSY"].includes(error?.code) || attempt >= 10) throw error;
-        Atomics.wait(replaceWaitArray, 0, 0, 5 * (attempt + 1));
-      }
-    }
-  } finally {
-    fs.rmSync(temporary, { force: true });
-  }
-}
-
-function loadQueueSnapshot(storePath) {
-  if (!fs.existsSync(storePath)) return { tasks: [], paused: false, humanHolds: new Set() };
-  const stored = JSON.parse(fs.readFileSync(storePath, "utf8"));
-  const isLegacyArray = Array.isArray(stored);
-  if (!isLegacyArray && (!stored || typeof stored !== "object" || !Array.isArray(stored.tasks))) {
-    throw new Error("invalid queue snapshot");
-  }
-  const tasks = isLegacyArray ? stored : stored.tasks;
-  const taskIds = new Set();
-  for (let index = 0; index < tasks.length; index += 1) {
-    const taskId = tasks[index]?.id;
-    if (typeof taskId !== "string" || !taskId) throw new Error(`invalid queue snapshot task[${index}].id`);
-    if (taskIds.has(taskId)) throw new Error(`invalid queue snapshot: duplicate task id ${taskId}`);
-    taskIds.add(taskId);
-  }
-  const paused = isLegacyArray ? false : stored.paused === true;
-  const humanHolds = new Set(isLegacyArray || !Array.isArray(stored.humanHolds)
-    ? []
-    : stored.humanHolds.filter((deviceId) => typeof deviceId === "string" && deviceId));
-  let changed = isLegacyArray || stored.version !== 2 || !Array.isArray(stored.humanHolds);
-  for (const task of tasks) {
-    // Legacy array snapshots predate these fields. Migrate only known absent
-    // fields; malformed present values are rejected below.
-    if (!("kind" in task)) { task.kind = "generic"; changed = true; }
-    if (!("maxDurationSec" in task)) { task.maxDurationSec = null; changed = true; }
-    // Migrate snapshots written before retry timing became durable. Keeping
-    // the normalized policy on every loaded task also prevents old files
-    // with an omitted policy from crashing during recovery/reporting.
-    const retryPolicy = normalizeRetryPolicy(task.retryPolicy ?? {});
-    if (JSON.stringify(task.retryPolicy) !== JSON.stringify(retryPolicy)) changed = true;
-    task.retryPolicy = retryPolicy;
-    if (!("retryNotBefore" in task)) {
-      task.retryNotBefore = null;
-      changed = true;
-    }
-    validatePersistedTask(task, tasks.indexOf(task));
-    // The process that was running this was killed or crashed — there is no
-    // way to know whether the last action actually completed, so this is
-    // never silently resumed or silently dropped. The 13 states in
-    // COMMAND_QUEUE_SPEC.md §5 don't include a dedicated "interrupted"
-    // state, so retry accounting (§10) decides the outcome directly here,
-    // the same as any other failure would.
-    if (task.state === TASK_STATES.RUNNING || task.state === TASK_STATES.DISPATCHED) {
-      const recoveredAt = new Date();
-      task.retryCount = (task.retryCount || 0) + 1;
-      task.state = task.retryCount <= task.retryPolicy.maxRetries ? TASK_STATES.QUEUED : TASK_STATES.FAILED_FINAL;
-      task.retryNotBefore = task.state === TASK_STATES.QUEUED && task.retryPolicy.backoffMs > 0
-        ? new Date(recoveredAt.getTime() + task.retryPolicy.backoffMs).toISOString()
-        : null;
-      task.result = { outcome: "interrupted_by_restart", at: recoveredAt.toISOString() };
-      task.updatedAt = task.result.at;
-      changed = true;
-    }
-  }
-  if (changed) writeQueueSnapshot(storePath, tasks, paused, humanHolds);
-  return { tasks, paused, humanHolds };
-}
-
-function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOnCreate = true, canDispatch = () => true }) {
-  fs.mkdirSync(path.dirname(storePath), { recursive: true });
-  const snapshot = loadQueueSnapshot(storePath);
+// Snapshot read/write (atomic write, legacy-format and interrupted-task
+// recovery on load) moved to persistence/fileTaskQueueSnapshotRepository.js
+// as part of the task-queue persistence slice. This factory still accepts
+// storePath directly for compatibility; pass `repository` instead to inject
+// a different persistence port (tests, or a future database-backed one).
+function createTaskQueue({ devices, deviceLease, auditLog, storePath, repository = createFileTaskQueueSnapshotRepository(storePath),
+  dispatchOnCreate = true, canDispatch = () => true }) {
+  const snapshot = repository.load();
   const tasks = snapshot.tasks;
   let paused = snapshot.paused;
   const humanHolds = snapshot.humanHolds;
@@ -121,12 +46,13 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
 
   function persist() {
     // A crash during a direct truncate/write can destroy the only durable
-    // queue snapshot. Write a complete sibling file and atomically replace
-    // the destination so restart recovery sees the old or new state only.
-    writeQueueSnapshot(storePath, tasks, paused, humanHolds);
+    // queue snapshot. The repository writes a complete sibling file and
+    // atomically replaces the destination so restart recovery sees the old
+    // or new state only.
+    repository.save(tasks, paused, humanHolds);
   }
 
-  // Restart recovery (COMMAND_QUEUE_SPEC.md §14): loadQueueSnapshot() above already
+  // Restart recovery (COMMAND_QUEUE_SPEC.md §14): repository.load() above already
   // requeued or failed any interrupted task per its retry policy — this is
   // what actually lets a requeued one resume immediately on a fresh device
   // set (every device starts HUMAN/idle on a new process) rather than
@@ -171,7 +97,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     // Admit the task durably before exposing it to the live scheduler. If
     // storage is unavailable, callers receive an error and no hidden task is
     // left in memory to dispatch on a later tick.
-    writeQueueSnapshot(storePath, [...tasks, task], paused, humanHolds);
+    repository.save([...tasks, task], paused, humanHolds);
     tasks.push(task);
     auditLog?.logEvent({
       operator: task.createdBy,
@@ -213,7 +139,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     const deviceId = task.deviceSelector?.deviceId;
     const wasHoldingDevice = task.state === TASK_STATES.RUNNING || task.state === TASK_STATES.PAUSED;
     const nextTask = { ...task, state: TASK_STATES.CANCELLED, updatedAt: new Date().toISOString() };
-    writeQueueSnapshot(storePath, tasks.map(candidate => candidate === task ? nextTask : candidate), paused, humanHolds);
+    repository.save(tasks.map(candidate => candidate === task ? nextTask : candidate), paused, humanHolds);
     Object.assign(task, nextTask);
     if (wasHoldingDevice && deviceId) releaseDevice(deviceId);
     auditLog?.logEvent({ type: "task_cancelled", detail: { taskId } });
@@ -231,11 +157,11 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     if (!task || task.state !== TASK_STATES.RUNNING) return null;
     const deviceId = task.deviceSelector?.deviceId;
     const nextTask = { ...task, state: TASK_STATES.PAUSED, updatedAt: new Date().toISOString() };
-    writeQueueSnapshot(storePath, tasks.map(candidate => candidate === task ? nextTask : candidate), paused, humanHolds);
+    repository.save(tasks.map(candidate => candidate === task ? nextTask : candidate), paused, humanHolds);
     try {
       if (deviceId) deviceLease.applyEvent(deviceId, "PAUSE_TASK");
     } catch (error) {
-      writeQueueSnapshot(storePath, tasks, paused, humanHolds);
+      repository.save(tasks, paused, humanHolds);
       throw error;
     }
     Object.assign(task, nextTask);
@@ -248,11 +174,11 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     if (!task || task.state !== TASK_STATES.PAUSED) return null;
     const deviceId = task.deviceSelector?.deviceId;
     const nextTask = { ...task, state: TASK_STATES.RUNNING, updatedAt: new Date().toISOString() };
-    writeQueueSnapshot(storePath, tasks.map(candidate => candidate === task ? nextTask : candidate), paused, humanHolds);
+    repository.save(tasks.map(candidate => candidate === task ? nextTask : candidate), paused, humanHolds);
     try {
       if (deviceId) deviceLease.applyEvent(deviceId, "RESUME_TASK");
     } catch (error) {
-      writeQueueSnapshot(storePath, tasks, paused, humanHolds);
+      repository.save(tasks, paused, humanHolds);
       throw error;
     }
     Object.assign(task, nextTask);
@@ -362,7 +288,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     if (humanHolds.has(deviceId)) {
       const nextHolds = new Set(humanHolds);
       nextHolds.delete(deviceId);
-      writeQueueSnapshot(storePath, tasks, paused, nextHolds);
+      repository.save(tasks, paused, nextHolds);
       humanHolds.delete(deviceId);
     }
     tryDispatch(new Date());
@@ -376,7 +302,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     const [task] = nextTasks.splice(idx, 1);
     const newTargetIdx = nextTasks.findIndex((t) => t.id === targetId);
     nextTasks.splice(relation === "before" ? newTargetIdx : newTargetIdx + 1, 0, task);
-    writeQueueSnapshot(storePath, nextTasks, paused, humanHolds);
+    repository.save(nextTasks, paused, humanHolds);
     tasks.splice(0, tasks.length, ...nextTasks);
     return true;
   }
@@ -385,19 +311,19 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     const task = getTask(taskId);
     if (!task) return null;
     const nextTask = { ...task, priority, updatedAt: new Date().toISOString() };
-    writeQueueSnapshot(storePath, tasks.map(candidate => candidate === task ? nextTask : candidate), paused, humanHolds);
+    repository.save(tasks.map(candidate => candidate === task ? nextTask : candidate), paused, humanHolds);
     Object.assign(task, nextTask);
     return task;
   }
 
   function pauseQueue() {
     if (paused) return;
-    writeQueueSnapshot(storePath, tasks, true, humanHolds);
+    repository.save(tasks, true, humanHolds);
     paused = true;
   }
   function resumeQueue() {
     if (!paused) return;
-    writeQueueSnapshot(storePath, tasks, false, humanHolds);
+    repository.save(tasks, false, humanHolds);
     paused = false;
   }
   function isPaused() {
@@ -409,7 +335,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     if (!task) throw new Error(`unknown task: ${taskId}`);
     const entry = { at: new Date().toISOString(), data };
     const nextTask = { ...task, checkpoints: [...task.checkpoints, entry], updatedAt: entry.at };
-    writeQueueSnapshot(storePath, tasks.map(candidate => candidate === task ? nextTask : candidate), paused, humanHolds);
+    repository.save(tasks.map(candidate => candidate === task ? nextTask : candidate), paused, humanHolds);
     Object.assign(task, nextTask);
     auditLog?.logEvent({
       operator: task.createdBy,
@@ -430,7 +356,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
     const changed = tasks.filter(task => task.createdBy === previous);
     if (!changed.length || previous === nextUsername) return [];
     const nextTasks = tasks.map(task => task.createdBy === previous ? { ...task, createdBy: nextUsername } : task);
-    writeQueueSnapshot(storePath, nextTasks, paused, humanHolds);
+    repository.save(nextTasks, paused, humanHolds);
     for (let index = 0; index < tasks.length; index += 1) {
       if (nextTasks[index] !== tasks[index]) Object.assign(tasks[index], nextTasks[index]);
     }
@@ -572,7 +498,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, dispatchOn
       if (nextTask !== task) transitions.push({ task, nextTask });
       return nextTask;
     });
-    if (transitions.length) writeQueueSnapshot(storePath, nextTasks, paused, humanHolds);
+    if (transitions.length) repository.save(nextTasks, paused, humanHolds);
     for (const { task, nextTask } of transitions) {
       const wasHolding = [TASK_STATES.RUNNING, TASK_STATES.PAUSED].includes(task.state);
       const deviceId = task.deviceSelector?.deviceId;

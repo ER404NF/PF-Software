@@ -11,44 +11,49 @@ import { isDirectExecution } from "./directExecution.js";
 import { WdaDevice } from "./wdaDevice.js";
 import { StreamHub } from "./streamHub.js";
 import { frameKind } from "./mjpegParser.js";
-import { SiteStore, SiteError } from "./siteStore.js";
+import { SiteError } from "./siteStore.js";
+import { createFileSiteRepository } from "./persistence/fileSiteRepository.js";
 import { SiteLinkHub } from "./siteLink.js";
-import { ApprovalStore, ApprovalError } from "./approvalStore.js";
+import { ApprovalError } from "./approvalStore.js";
+import { createFileApprovalRepository } from "./persistence/fileApprovalRepository.js";
 import { CommentLedger } from "./commentGuard.js";
 import { TemplateLibrary } from "./commentTemplates.js";
 import { PolicyStore } from "./policyStore.js";
-import { InterventionQueue } from "./interventionQueue.js";
+import { createFileInterventionRepository } from "./persistence/fileInterventionRepository.js";
 import { createFleetPolicy, fleetConfigFromEnv, SpendTracker } from "./fleetPolicy.js";
 import { ACTIONS as ALL_ACTIONS } from "./actionCatalog.js";
-import { ensureDeviceDir, STORAGE_ROOT, listFiles, resolveFile, deleteFile, safeFilename, safeDeviceId, assertMediaStorageIsolated } from "./fileStore.js";
-import { listRuns, getRun, createRun, setCandidateStatus } from "./researchStore.js";
+import { STORAGE_ROOT, safeFilename, safeDeviceId, assertMediaStorageIsolated } from "./fileStore.js";
+import { createFileDeviceMediaRepository } from "./persistence/fileDeviceMediaRepository.js";
+import { createFileResearchRunRepository } from "./persistence/fileResearchRunRepository.js";
 import { parseOptimizationConfig, createOptimizationRuntime } from "./optimizationRuntime.js";
 import { ResearchIndex } from "./optimization/researchIndex.js";
 import { analyzeInterventions } from "./optimization/interventionAnalytics.js";
 import {
-  canAccessDevice, publicOperator, resolveOperator, hasCapability, operators, verifyPassword,
-  listOperatorAccounts, createOperatorAccount, updateOperatorAccount, operatorByUsername,
-  invalidateOperatorSessions, createSignupAccount, setOperatorAccountStatus, renameOperatorAccount,
-  configureOperatorTwoFactor, verifyOperatorSecondFactor, createEmailRecoveryToken, completeEmailRecovery,
+  canAccessDevice, publicOperator, hasCapability, operators, verifyPassword,
+  listOperatorAccounts, createOperatorAccount,
   assertValidUsername,
-  resetOperatorSecondFactor,
-  prunePendingSignupAccounts,
   flagAndDeactivateOperator,
+  hashPassword, validatePassword,
 } from "./authStore.js";
 import { CAPABILITIES } from "./roleCapabilities.js";
 import { researchWorkspaceFor, researchAccounts, researchAccountDefinitions, researchActionPolicies } from "./researchAccess.js";
-import { createAuditLog } from "./auditLog.js";
-import { FileSessionStore } from "./fileSessionStore.js";
+import { createFileAuditEventRepository } from "./persistence/fileAuditEventRepository.js";
+import { createAuditService } from "./services/auditService.js";
+import { createFileSessionStore } from "./persistence/fileSessionStore.js";
+import { createFileOperatorAccountRepository } from "./persistence/fileOperatorAccountRepository.js";
+import { createOperatorAccountService } from "./services/operatorAccountService.js";
+import { createFileOperatorIdentityRepository } from "./persistence/fileOperatorIdentityRepository.js";
+import { createIdentityService } from "./services/identityService.js";
+import { createFileBackgroundAuthorizationRepository } from "./persistence/fileBackgroundAuthorizationRepository.js";
+import { createBackgroundAuthorizationService } from "./services/backgroundAuthorizationService.js";
 import * as deviceLease from "./deviceLease.js";
 import { createTaskQueue } from "./taskQueue.js";
 import { parseCommand } from "./commandParser.js";
 import { resolveSchedulingTimeZone } from "./schedulingTimeZone.js";
 import { loadDeviceNetworkMap, publicNetworkConfig } from "./deviceNetworkConfig.js";
 import { isProxyEgress, setDeviceProxyEnabled } from "./deviceNetworkStore.js";
-import {
-  createProxy, deleteProxy, assignProxyToDevice, publicProxy, publicProxies,
-  getProxyRecord, decryptProxyPassword, updateProxyHealth,
-} from "./proxyPool.js";
+import { publicProxy, decryptProxyPassword } from "./proxyPool.js";
+import { createFileProxyPoolRepository } from "./persistence/fileProxyPoolRepository.js";
 import { testProxy } from "./proxyTester.js";
 import { createNetworkVerifier } from "./networkVerifier.js";
 import { resolveNetworkCheckTarget } from "./networkCheckTarget.js";
@@ -58,16 +63,38 @@ import { providers, defaultProviderName, getProvider } from "./providerRegistry.
 import { getPlatformSkill } from "./platformSkillRegistry.js";
 import { createResearchTaskRunner } from "./researchTaskRunner.js";
 import { createModelSelection } from "./modelSelection.js";
-import { resolveResearchEvidence } from "./researchEvidenceStore.js";
+import { createFileResearchEvidenceRepository } from "./persistence/fileResearchEvidenceRepository.js";
 import { createPresenceStore } from "./presenceStore.js";
-import { createAssignmentStore, ASSIGNMENT_STATUSES } from "./assignmentStore.js";
+import { ASSIGNMENT_STATUSES } from "./assignmentStore.js";
+import { createFileAssignmentRepository } from "./persistence/fileAssignmentRepository.js";
 import { OPERATOR_ROLES } from "./roleCapabilities.js";
 import { monitorState } from "./monitorContract.js";
-import { createAccountNotificationStore } from "./accountNotificationStore.js";
+import { createFileNotificationRepository } from "./persistence/fileNotificationRepository.js";
 import { createMailSender } from "./mailSender.js";
 import { createAuthenticationThrottle, createRecoveryThrottle } from "./recoveryThrottle.js";
 import { createSchedulerGuard } from "./schedulerGuard.js";
-import { decryptTotpSecret, encryptTotpSecret, generateRecoveryCodes, generateTotpSecret, otpauthUri, recoveryCodeDigest, verifyTotp } from "./twoFactor.js";
+import { decryptTotpSecret, encryptTotpSecret, generateRecoveryCodes, generateTotpSecret, otpauthUri, recoveryCodeDigest, verifyRecoveryCode, verifyTotp } from "./twoFactor.js";
+// Phase 1 (docs/productionization/PHASE1_TEAM_ROLLOUT_HANDOUT.md task P2):
+// the identity/organization system built in M04, mounted behind
+// CLOUD_API_ENABLED — additive, alongside the file-backed operator login
+// above, not a replacement for it.
+import { createPool } from "./db/pool.js";
+import { withTransaction } from "./db/transaction.js";
+import { ensureDefaultOrganization } from "./db/defaultOrganization.js";
+import { createOrganizationRepository } from "./db/repositories/organizationRepository.js";
+import { createUserRepository } from "./db/repositories/userRepository.js";
+import { createMembershipRepository } from "./db/repositories/membershipRepository.js";
+import { createRoleRepository } from "./db/repositories/roleRepository.js";
+import { createIdentitySessionRepository } from "./db/repositories/identitySessionRepository.js";
+import { createInvitationRepository } from "./db/repositories/invitationRepository.js";
+import { createIdentityMfaRepository } from "./db/repositories/identityMfaRepository.js";
+import { createEmailActionTokenRepository } from "./db/repositories/emailActionTokenRepository.js";
+import { createOrganizationIdentityService } from "./services/organizationIdentityService.js";
+import { createIdentitySessionService } from "./services/identitySessionService.js";
+import { createInvitationService } from "./services/invitationService.js";
+import { createIdentityMfaService } from "./services/identityMfaService.js";
+import { createEmailActionService } from "./services/emailActionService.js";
+import { createCloudApi } from "./cloudApi/createCloudApi.js";
 import { discoverIosDevices } from "./deviceDiscovery.js";
 import { loadDeviceConfig } from "./deviceConfigLoader.js";
 import { loadDevices } from "./deviceRegistry.js";
@@ -122,9 +149,17 @@ assertMediaStorageIsolated([
   process.env.RESEARCH_STORE_DIR || path.join(__dirname, "../../storage/research"),
   process.env.RESEARCH_EVIDENCE_DIR || path.join(__dirname, "../../storage/research-evidence"),
 ]);
-const auditLog = createAuditLog(auditLogPath);
+const auditEventRepository = createFileAuditEventRepository(auditLogPath);
+const auditLog = createAuditService({ repository: auditEventRepository, canAccessDevice });
+const deviceMediaRepository = createFileDeviceMediaRepository();
+const operatorAccountRepository = createFileOperatorAccountRepository();
+const operatorAccountService = createOperatorAccountService({ repository: operatorAccountRepository });
+const operatorIdentityRepository = createFileOperatorIdentityRepository();
+const identityService = createIdentityService({ repository: operatorIdentityRepository, verifyPassword });
+const backgroundAuthorizationRepository = createFileBackgroundAuthorizationRepository();
+const backgroundAuthorization = createBackgroundAuthorizationService({ repository: backgroundAuthorizationRepository });
 const twoFactorMasterKey = process.env.TWO_FACTOR_MASTER_KEY || null;
-const accountNotificationStore = createAccountNotificationStore({
+const accountNotificationStore = createFileNotificationRepository({
   storePath: process.env.ACCOUNT_NOTIFICATION_STORE_PATH || path.join(__dirname, "../../storage/notifications/accounts.json"),
   companyEmail: process.env.COMPANY_FROM_EMAIL || null,
   encryptionKey: process.env.ACCOUNT_NOTIFICATION_ENCRYPTION_KEY || twoFactorMasterKey,
@@ -159,10 +194,14 @@ async function deliverAccountNotification(id) {
 // convention as accountNotificationStore above.
 const proxyPoolStorePath = process.env.PROXY_POOL_STORE_PATH || path.join(__dirname, "../../storage/proxy-pool.json");
 const proxyCredentialEncryptionKey = process.env.PROXY_CREDENTIAL_ENCRYPTION_KEY || twoFactorMasterKey;
+// proxyPoolStorePath itself stays available: the network-routing subsystem
+// below (NetworkRoutingOrchestrator, AutoNetworkEnrollment) constructs its
+// own proxyPool.js access directly and is out of scope for this repository.
+const proxyPoolRepository = createFileProxyPoolRepository(proxyPoolStorePath);
 // Cached like `deviceNetwork` below, not re-read from disk on every
 // summary() call — refreshed explicitly after each pool mutation route.
-let proxyPoolCache = publicProxies(proxyPoolStorePath);
-function refreshProxyPoolCache() { proxyPoolCache = publicProxies(proxyPoolStorePath); }
+let proxyPoolCache = proxyPoolRepository.publicList();
+function refreshProxyPoolCache() { proxyPoolCache = proxyPoolRepository.publicList(); }
 function poolProxyForDevice(deviceId) { return proxyPoolCache.find(p => p.leasedToDeviceId === deviceId) ?? null; }
 const usbNetworkStorePath = process.env.USB_NETWORK_STORE_PATH || path.join(__dirname, "../../storage/usb-network.json");
 // Ephemeral, not persisted: the "before" bridge-member snapshot only needs
@@ -197,7 +236,7 @@ const SESSION_SECRET = deployment.sessionSecret;
 if (!process.env.SESSION_SECRET && !isMain) {
   console.warn("SESSION_SECRET not set — using an insecure default. Set it before running beyond local dev.");
 }
-const sessionStore = new FileSessionStore(sessionStoreDir);
+const sessionStore = createFileSessionStore(sessionStoreDir);
 const presenceStore = createPresenceStore();
 const sessionParser = session({
   store: sessionStore,
@@ -233,13 +272,8 @@ function saveSessionThenRespond(req, res, next, status, body) {
   });
 }
 
-function pendingAuthOperator(req) {
-  const challenge = req.session?.pendingAuth;
-  if (!challenge || Date.parse(challenge.expiresAt) <= Date.now()) return null;
-  const operator = operators.get(challenge.username);
-  if (!operator || operator.active === false || (operator.accountStatus ?? "approved") !== "approved"
-    || operator.authVersion !== challenge.authVersion) return null;
-  return operator;
+async function pendingAuthOperator(req) {
+  return identityService.resolvePendingAuthentication(req.session?.pendingAuth);
 }
 
 function rejectSecondFactorAttempt(req, res, message) {
@@ -255,15 +289,15 @@ function rejectSecondFactorAttempt(req, res, message) {
   return res.status(401).json({ error: message });
 }
 
-app.post("/api/signup", (req, res, next) => {
+app.post("/api/signup", async (req, res, next) => {
   try {
     const identifier = req.body?.email || req.body?.username;
     if (signupThrottle.blocked({ identifier, ip: req.ip })) {
       return res.status(429).json({ error: "too many account applications; try again later" });
     }
-    const capacity = prunePendingSignupAccounts({ maxAgeMs: pendingSignupMaxAgeMs, maxPending: maxPendingSignups });
+    const capacity = await identityService.prunePendingSignupAccounts({ maxAgeMs: pendingSignupMaxAgeMs, maxPending: maxPendingSignups });
     if (capacity.atCapacity) return res.status(503).json({ error: "account applications are temporarily closed" });
-    const operator = createSignupAccount(req.body);
+    const operator = await identityService.createSignupAccount(req.body);
     signupThrottle.fail({ identifier, ip: req.ip });
     auditLog.logEvent({ operator: operator.username, type: "signup_submitted" });
     res.status(201).json({
@@ -295,7 +329,7 @@ function isLoopbackAddress(address) {
   return normalized === "127.0.0.1" || normalized === "::1" || normalized === "localhost";
 }
 
-app.post("/api/setup/create-admin", (req, res, next) => {
+app.post("/api/setup/create-admin", async (req, res, next) => {
   try {
     if (!isLoopbackAddress(req.socket?.remoteAddress)) {
       return res.status(404).json({ error: "not found" });
@@ -303,7 +337,9 @@ app.post("/api/setup/create-admin", (req, res, next) => {
     const hasApprovedAdmin = listOperatorAccounts().some(user => user.role === OPERATOR_ROLES.ADMIN
       && user.active !== false && (user.accountStatus ?? "approved") === "approved");
     if (hasApprovedAdmin) {
-      const current = req.session?.operator ? resolveOperator(req.session.operator) : null;
+      const current = req.session?.operator
+        ? await identityService.resolveSessionPrincipal(req.session.operator)
+        : null;
       if (current && current.role !== OPERATOR_ROLES.ADMIN) {
         const flagged = flagAndDeactivateOperator(
           current.username,
@@ -336,68 +372,77 @@ app.post("/api/setup/create-admin", (req, res, next) => {
   }
 });
 
-app.post("/api/login", (req, res, next) => {
-  const { username, password } = req.body || {};
-  if (typeof username !== "string" || typeof password !== "string" || username.length > 100) {
-    return res.status(400).json({ error: "username and password are required" });
-  }
-  if (passwordLoginThrottle.blocked({ identifier: username, ip: req.ip })) {
-    auditLog.logEvent({ operator: username, type: "login_rate_limited" });
-    return res.status(429).json({ error: "too many sign-in attempts; try again later" });
-  }
-  const operator = operators.get(username);
-  if (!operator || !verifyPassword(password, operator.passwordHash)) {
-    auditLog.logEvent({ operator: username, type: "login_failed" });
-    if (passwordLoginThrottle.fail({ identifier: username, ip: req.ip })) {
+app.post("/api/login", async (req, res, next) => {
+  try {
+    const { username, password } = req.body || {};
+    if (typeof username !== "string" || typeof password !== "string" || username.length > 100) {
+      return res.status(400).json({ error: "username and password are required" });
+    }
+    if (passwordLoginThrottle.blocked({ identifier: username, ip: req.ip })) {
+      auditLog.logEvent({ operator: username, type: "login_rate_limited" });
       return res.status(429).json({ error: "too many sign-in attempts; try again later" });
     }
-    return res.status(401).json({ error: "invalid credentials" });
-  }
-  passwordLoginThrottle.succeed({ identifier: username });
-  if (operator.accountStatus === "pending") return res.status(403).json({ code: "approval_pending", error: "account approval is pending" });
-  if (operator.accountStatus === "rejected") return res.status(403).json({ code: "account_rejected", error: "account application was not accepted" });
-  if (operator.active === false) return res.status(401).json({ error: "invalid credentials" });
-  if (operator.twoFactorRequired) {
-    if (secondFactorThrottle.blocked({ identifier: operator.username, ip: req.ip })) {
-      return res.status(429).json({ error: "too many two-factor attempts; try again later" });
+    const operator = await identityService.authenticatePassword(username, password);
+    if (!operator) {
+      auditLog.logEvent({ operator: username, type: "login_failed" });
+      if (passwordLoginThrottle.fail({ identifier: username, ip: req.ip })) {
+        return res.status(429).json({ error: "too many sign-in attempts; try again later" });
+      }
+      return res.status(401).json({ error: "invalid credentials" });
     }
-    req.session.pendingAuth = {
-      username: operator.username,
-      authVersion: operator.authVersion ?? 0,
-      expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
-    };
-    return saveSessionThenRespond(req, res, next, 202, operator.twoFactorSecret
-      ? { requiresTwoFactor: true }
-      : { requiresTwoFactorSetup: true });
+    passwordLoginThrottle.succeed({ identifier: username });
+    if (operator.accountStatus === "pending") return res.status(403).json({ code: "approval_pending", error: "account approval is pending" });
+    if (operator.accountStatus === "rejected") return res.status(403).json({ code: "account_rejected", error: "account application was not accepted" });
+    if (operator.active === false) return res.status(401).json({ error: "invalid credentials" });
+    if (operator.twoFactorRequired) {
+      if (secondFactorThrottle.blocked({ identifier: operator.username, ip: req.ip })) {
+        return res.status(429).json({ error: "too many two-factor attempts; try again later" });
+      }
+      req.session.pendingAuth = {
+        username: operator.username,
+        authVersion: operator.authVersion ?? 0,
+        expiresAt: new Date(Date.now() + 5 * 60_000).toISOString(),
+      };
+      return saveSessionThenRespond(req, res, next, 202, operator.twoFactorSecret
+        ? { requiresTwoFactor: true }
+        : { requiresTwoFactorSetup: true });
+    }
+    completeLogin(req, res, operator);
+  } catch (error) {
+    next(error);
   }
-  completeLogin(req, res, operator);
 });
 
-app.post("/api/2fa/setup", (req, res, next) => {
-  const operator = pendingAuthOperator(req);
-  if (!operator) return res.status(401).json({ error: "password verification has expired" });
-  if (operator.twoFactorSecret) return res.status(409).json({ error: "2FA is already configured" });
-  if (!twoFactorMasterKey) return res.status(503).json({ error: "2FA enrollment is unavailable until TWO_FACTOR_MASTER_KEY is configured" });
-  const secret = generateTotpSecret();
-  req.session.twoFactorEnrollmentSecret = secret;
-  saveSessionThenRespond(req, res, next, 200,
-    { secret, otpauthUri: otpauthUri({ secret, email: operator.email || operator.username }) });
-});
-
-app.post("/api/2fa/confirm", (req, res, next) => {
+app.post("/api/2fa/setup", async (req, res, next) => {
   try {
-    const operator = pendingAuthOperator(req);
+    const operator = await pendingAuthOperator(req);
+    if (!operator) return res.status(401).json({ error: "password verification has expired" });
+    if (operator.twoFactorSecret) return res.status(409).json({ error: "2FA is already configured" });
+    if (!twoFactorMasterKey) return res.status(503).json({ error: "2FA enrollment is unavailable until TWO_FACTOR_MASTER_KEY is configured" });
+    const secret = generateTotpSecret();
+    req.session.twoFactorEnrollmentSecret = secret;
+    saveSessionThenRespond(req, res, next, 200,
+      { secret, otpauthUri: otpauthUri({ secret, email: operator.email || operator.username }) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/2fa/confirm", async (req, res, next) => {
+  try {
+    const operator = await pendingAuthOperator(req);
     const secret = req.session?.twoFactorEnrollmentSecret;
     if (!operator || !secret) return res.status(401).json({ error: "2FA enrollment has expired" });
     if (!verifyTotp(secret, req.body?.code)) return rejectSecondFactorAttempt(req, res, "invalid authenticator code");
     const recoveryCodes = generateRecoveryCodes();
-    configureOperatorTwoFactor(
+    await identityService.configureTwoFactor(
       operator.username,
       encryptTotpSecret(secret, twoFactorMasterKey),
       recoveryCodes.map(recoveryCodeDigest),
     );
     auditLog.logEvent({ operator: operator.username, type: "two_factor_enabled" });
-    const current = operators.get(operator.username);
+    const current = await identityService.getIdentityRecord(operator.username);
+    if (!current) return res.status(401).json({ error: "2FA enrollment has expired" });
     req.session.twoFactorRecoveryReceipt = encryptTotpSecret(JSON.stringify(recoveryCodes), twoFactorMasterKey);
     delete req.session.twoFactorEnrollmentSecret;
     saveSessionThenRespond(req, res, next, 200, { operator: publicOperator(current), recoveryCodes });
@@ -407,8 +452,13 @@ app.post("/api/2fa/confirm", (req, res, next) => {
   }
 });
 
-app.get("/api/2fa/recovery-receipt", (req, res) => {
-  const operator = pendingAuthOperator(req);
+app.get("/api/2fa/recovery-receipt", async (req, res, next) => {
+  let operator;
+  try {
+    operator = await pendingAuthOperator(req);
+  } catch (error) {
+    return next(error);
+  }
   const encrypted = req.session?.twoFactorRecoveryReceipt;
   if (!operator || !encrypted || !twoFactorMasterKey) return res.status(401).json({ error: "2FA recovery-code receipt has expired" });
   try {
@@ -420,55 +470,65 @@ app.get("/api/2fa/recovery-receipt", (req, res) => {
   }
 });
 
-app.post("/api/2fa/acknowledge-recovery", (req, res) => {
-  const operator = pendingAuthOperator(req);
-  if (!operator || !req.session?.twoFactorRecoveryReceipt) {
-    return res.status(401).json({ error: "2FA recovery-code receipt has expired" });
+app.post("/api/2fa/acknowledge-recovery", async (req, res, next) => {
+  try {
+    const operator = await pendingAuthOperator(req);
+    if (!operator || !req.session?.twoFactorRecoveryReceipt) {
+      return res.status(401).json({ error: "2FA recovery-code receipt has expired" });
+    }
+    auditLog.logEvent({ operator: operator.username, type: "two_factor_recovery_acknowledged" });
+    completeLogin(req, res, operator, { secondFactor: "enrollment" });
+  } catch (error) {
+    next(error);
   }
-  auditLog.logEvent({ operator: operator.username, type: "two_factor_recovery_acknowledged" });
-  completeLogin(req, res, operator, { secondFactor: "enrollment" });
 });
 
-app.post("/api/2fa/verify", (req, res, next) => {
+app.post("/api/2fa/verify", async (req, res, next) => {
   try {
-    const operator = pendingAuthOperator(req);
+    const operator = await pendingAuthOperator(req);
     if (!operator) return res.status(401).json({ error: "password verification has expired" });
-    const result = verifyOperatorSecondFactor(operator.username, req.body?.code, twoFactorMasterKey);
+    const result = await identityService.verifySecondFactor(operator.username, req.body?.code, twoFactorMasterKey);
     if (!result) return rejectSecondFactorAttempt(req, res, "invalid two-factor code");
-    completeLogin(req, res, operators.get(operator.username), { secondFactor: result.method });
+    const current = await identityService.getIdentityRecord(operator.username);
+    if (!current) return res.status(401).json({ error: "password verification has expired" });
+    completeLogin(req, res, current, { secondFactor: result.method });
   } catch (error) {
     if (error?.status) return res.status(error.status).json({ error: error.message });
     next(error);
   }
 });
 
-app.post("/api/recovery/request", (req, res) => {
-  const identifier = req.body?.identifier;
-  const allowed = recoveryThrottle.allow({ identifier, ip: req.ip });
-  const recovery = allowed && accountNotificationStore.canSecureRecovery()
-    ? createEmailRecoveryToken(identifier)
-    : null;
-  if (recovery?.token) {
-    const item = accountNotificationStore.queue({
-      to: recovery.operator.email,
-      fullName: recovery.operator.fullName || recovery.operator.username,
-      username: recovery.operator.username,
-      status: "recovery",
-      recoveryToken: recovery.token,
-    });
-    // Deliberately not awaited: awaiting a real SMTP round-trip here would
-    // make a matching identifier's response measurably slower than a
-    // non-matching one, turning this endpoint's identical response message
-    // into an account-enumeration timing side channel. deliverAccountNotification
-    // never rejects (its own try/catch marks the notification failed instead).
-    deliverAccountNotification(item.id);
+app.post("/api/recovery/request", async (req, res, next) => {
+  try {
+    const identifier = req.body?.identifier;
+    const allowed = recoveryThrottle.allow({ identifier, ip: req.ip });
+    const recovery = allowed && accountNotificationStore.canSecureRecovery()
+      ? await identityService.createEmailRecoveryToken(identifier)
+      : null;
+    if (recovery?.token) {
+      const item = accountNotificationStore.queue({
+        to: recovery.operator.email,
+        fullName: recovery.operator.fullName || recovery.operator.username,
+        username: recovery.operator.username,
+        status: "recovery",
+        recoveryToken: recovery.token,
+      });
+      // Deliberately not awaited: awaiting a real SMTP round-trip here would
+      // make a matching identifier's response measurably slower than a
+      // non-matching one, turning this endpoint's identical response message
+      // into an account-enumeration timing side channel. deliverAccountNotification
+      // never rejects (its own try/catch marks the notification failed instead).
+      deliverAccountNotification(item.id);
+    }
+    res.json({ ok: true, message: "If the account is eligible, recovery instructions have been queued." });
+  } catch (error) {
+    next(error);
   }
-  res.json({ ok: true, message: "If the account is eligible, recovery instructions have been queued." });
 });
 
-app.post("/api/recovery/complete", (req, res, next) => {
+app.post("/api/recovery/complete", async (req, res, next) => {
   try {
-    const operator = completeEmailRecovery(req.body?.token, req.body?.password, req.body?.passwordConfirmation);
+    const operator = await identityService.completeEmailRecovery(req.body?.token, req.body?.password, req.body?.passwordConfirmation);
     auditLog.logEvent({ operator: operator.username, type: "account_recovered" });
     revokeLiveOperatorSessions(operator.username);
     res.json({ ok: true, requiresTwoFactorSetup: true });
@@ -498,7 +558,7 @@ app.get("/api/me", requireAuth, (req, res) => {
   res.json(publicOperator(req.currentOperator));
 });
 
-// Resolves `req.currentOperator` fresh from the live operator registry on
+// Resolves `req.currentOperator` fresh through the identity service on
 // every request, rather than trusting whatever authStore.authenticate()
 // returned at login time and express-session cached from then on — real bug
 // this fixes: a role/allowedDevices change (or an operator being removed
@@ -508,13 +568,17 @@ app.get("/api/me", requireAuth, (req, res) => {
 // in authStore.js. req.session.operator itself is left untouched (still
 // fine for audit-log usernames, which don't change) — only the fields that
 // drive authorization decisions need to be fresh.
-function requireAuth(req, res, next) {
-  if (!req.session?.operator) return res.status(401).json({ error: "not logged in" });
-  const current = resolveOperator(req.session.operator);
-  if (!current) return res.status(401).json({ error: "not logged in" }); // operator removed since login — fail closed, not stale-allow
-  req.currentOperator = current;
-  presenceStore.touchSession({ sessionId: req.sessionID, username: current.username, expiresAt: req.session.cookie.expires });
-  next();
+async function requireAuth(req, res, next) {
+  try {
+    if (!req.session?.operator) return res.status(401).json({ error: "not logged in" });
+    const current = await identityService.resolveSessionPrincipal(req.session.operator);
+    if (!current) return res.status(401).json({ error: "not logged in" }); // operator removed since login — fail closed, not stale-allow
+    req.currentOperator = current;
+    presenceStore.touchSession({ sessionId: req.sessionID, username: current.username, expiresAt: req.session.cookie.expires });
+    next();
+  } catch (error) {
+    next(error);
+  }
 }
 
 function currentStoredOperator(req) {
@@ -523,7 +587,7 @@ function currentStoredOperator(req) {
     sessionStore.get(req.sessionID, (error, stored) => {
       if (error) return reject(error);
       if (!stored?.operator || stored.operator.username !== req.session?.operator?.username) return resolve(null);
-      resolve(resolveOperator(stored.operator));
+      identityService.resolveSessionPrincipal(stored.operator).then(resolve, reject);
     });
   });
 }
@@ -553,22 +617,26 @@ function flagSelfEscalationIfTargeted(req, current, label) {
 // phone. Missing/legacy roles normalize to VA in authStore.js, so old session
 // data never gains admin rights by accident.
 function requireCapability(capability, { flagSelfEscalation = false } = {}) {
-  return (req, res, next) => {
-    if (!req.session?.operator) return res.status(401).json({ error: "not logged in" });
-    const current = resolveOperator(req.session.operator);
-    if (!current) return res.status(401).json({ error: "not logged in" });
-    req.currentOperator = current;
-    if (!hasCapability(current, capability)) {
-      auditLog.logEvent({
-        operator: req.session.operator.username,
-        type: "capability_access_denied",
-        detail: { method: req.method, path: req.path, capability },
-      });
-      if (flagSelfEscalation) flagSelfEscalationIfTargeted(req, current, capability);
-      return res.status(403).json({ error: `${capability} capability required` });
+  return async (req, res, next) => {
+    try {
+      if (!req.session?.operator) return res.status(401).json({ error: "not logged in" });
+      const current = await identityService.resolveSessionPrincipal(req.session.operator);
+      if (!current) return res.status(401).json({ error: "not logged in" });
+      req.currentOperator = current;
+      if (!hasCapability(current, capability)) {
+        auditLog.logEvent({
+          operator: req.session.operator.username,
+          type: "capability_access_denied",
+          detail: { method: req.method, path: req.path, capability },
+        });
+        if (flagSelfEscalation) flagSelfEscalationIfTargeted(req, current, capability);
+        return res.status(403).json({ error: `${capability} capability required` });
+      }
+      presenceStore.touchSession({ sessionId: req.sessionID, username: current.username, expiresAt: req.session.cookie.expires });
+      next();
+    } catch (error) {
+      next(error);
     }
-    presenceStore.touchSession({ sessionId: req.sessionID, username: current.username, expiresAt: req.session.cookie.expires });
-    next();
   };
 }
 
@@ -576,22 +644,26 @@ function requireAnyCapability(...args) {
   const flagSelfEscalation = args.length && typeof args[args.length - 1] === "object" && args[args.length - 1] !== null;
   const capabilities = flagSelfEscalation ? args.slice(0, -1) : args;
   const options = flagSelfEscalation ? args[args.length - 1] : {};
-  return (req, res, next) => {
-    if (!req.session?.operator) return res.status(401).json({ error: "not logged in" });
-    const current = resolveOperator(req.session.operator);
-    if (!current) return res.status(401).json({ error: "not logged in" });
-    req.currentOperator = current;
-    if (!capabilities.some(capability => hasCapability(current, capability))) {
-      auditLog.logEvent({
-        operator: current.username,
-        type: "capability_access_denied",
-        detail: { method: req.method, path: req.path, capabilities },
-      });
-      if (options.flagSelfEscalation) flagSelfEscalationIfTargeted(req, current, capabilities.join("|"));
-      return res.status(403).json({ error: "user-management capability required" });
+  return async (req, res, next) => {
+    try {
+      if (!req.session?.operator) return res.status(401).json({ error: "not logged in" });
+      const current = await identityService.resolveSessionPrincipal(req.session.operator);
+      if (!current) return res.status(401).json({ error: "not logged in" });
+      req.currentOperator = current;
+      if (!capabilities.some(capability => hasCapability(current, capability))) {
+        auditLog.logEvent({
+          operator: current.username,
+          type: "capability_access_denied",
+          detail: { method: req.method, path: req.path, capabilities },
+        });
+        if (options.flagSelfEscalation) flagSelfEscalationIfTargeted(req, current, capabilities.join("|"));
+        return res.status(403).json({ error: "user-management capability required" });
+      }
+      presenceStore.touchSession({ sessionId: req.sessionID, username: current.username, expiresAt: req.session.cookie.expires });
+      next();
+    } catch (error) {
+      next(error);
     }
-    presenceStore.touchSession({ sessionId: req.sessionID, username: current.username, expiresAt: req.session.cookie.expires });
-    next();
   };
 }
 
@@ -603,12 +675,7 @@ app.use("/api/research", requireAuth);
 // Raw audit history is an admin/dev oversight surface. VAs still generate
 // audit events through normal device work but cannot read the global log.
 function authorizedAuditEvents(operator, { operator: operatorFilter, deviceId, limit = 200 } = {}) {
-  const boundedLimit = Math.min(Number(limit) || 200, 1000);
-  return auditLog.listEvents({
-    operator: typeof operatorFilter === "string" ? operatorFilter : undefined,
-    deviceId: typeof deviceId === "string" ? deviceId : undefined,
-    limit: 1000,
-  }).filter(event => !event.deviceId || canAccessDevice(operator, event.deviceId)).slice(0, boundedLimit);
+  return auditLog.listAuthorizedEvents(operator, { operator: operatorFilter, deviceId, limit });
 }
 
 app.get("/api/audit", requireCapability(CAPABILITIES.VIEW_AUDIT), (req, res) => {
@@ -646,6 +713,68 @@ app.get("/api/people", requireCapability(CAPABILITIES.VIEW_PEOPLE), (req, res) =
   res.json({ people: publicPeople(req.currentOperator) });
 });
 
+// Phase 1 (docs/productionization/PHASE1_TEAM_ROLLOUT_HANDOUT.md task P2):
+// the identity/organization system mounted alongside the file-backed
+// operator login above — not a replacement for it, and off by default.
+// Device-control authorization (roleCapabilities.js/requireCapability
+// above) is unchanged either way; this only replaces account lifecycle
+// (invite/accept/login/logout/MFA) sitting in front of it, per the
+// handout's own recommended default (§4 task P2, step 6).
+if (process.env.CLOUD_API_ENABLED === "true") {
+  if (!process.env.DATABASE_URL) {
+    throw new Error("CLOUD_API_ENABLED=true requires DATABASE_URL to be set");
+  }
+  const cloudPool = createPool();
+  await ensureDefaultOrganization(cloudPool);
+
+  const cloudOrganizationRepository = createOrganizationRepository(cloudPool);
+  const cloudUserRepository = createUserRepository(cloudPool);
+  const cloudMembershipRepository = createMembershipRepository(cloudPool);
+  const cloudRoleRepository = createRoleRepository(cloudPool);
+  const cloudSessionRepository = createIdentitySessionRepository(cloudPool);
+  const cloudInvitationRepository = createInvitationRepository(cloudPool);
+  const cloudMfaRepository = createIdentityMfaRepository(cloudPool);
+  const cloudEmailActionTokenRepository = createEmailActionTokenRepository(cloudPool);
+
+  const cloudOrganizationIdentityService = createOrganizationIdentityService({
+    pool: cloudPool, withTransaction, organizationRepository: cloudOrganizationRepository,
+    userRepository: cloudUserRepository, membershipRepository: cloudMembershipRepository,
+    roleRepository: cloudRoleRepository, hashPassword,
+  });
+  const cloudIdentitySessionService = createIdentitySessionService({ repository: cloudSessionRepository });
+  const cloudInvitationService = createInvitationService({
+    pool: cloudPool, withTransaction, invitationRepository: cloudInvitationRepository,
+    membershipRepository: cloudMembershipRepository, roleRepository: cloudRoleRepository,
+  });
+  const cloudIdentityMfaService = createIdentityMfaService({
+    repository: cloudMfaRepository, masterKey: twoFactorMasterKey,
+    generateTotpSecret, verifyTotp, encryptTotpSecret, decryptTotpSecret,
+    generateRecoveryCodes, recoveryCodeDigest, verifyRecoveryCode, otpauthUri,
+  });
+  const cloudEmailActionService = createEmailActionService({
+    pool: cloudPool, withTransaction, emailActionTokenRepository: cloudEmailActionTokenRepository,
+    userRepository: cloudUserRepository, sessionRepository: cloudSessionRepository, hashPassword,
+  });
+
+  const cloudApi = createCloudApi({
+    pool: cloudPool, withTransaction,
+    organizationRepository: cloudOrganizationRepository, userRepository: cloudUserRepository,
+    membershipRepository: cloudMembershipRepository, roleRepository: cloudRoleRepository,
+    organizationIdentityService: cloudOrganizationIdentityService,
+    identitySessionService: cloudIdentitySessionService,
+    invitationService: cloudInvitationService,
+    identityMfaService: cloudIdentityMfaService,
+    emailActionService: cloudEmailActionService,
+    verifyPassword, hashPassword, validatePassword,
+    mailSender, companyEmail: process.env.COMPANY_FROM_EMAIL || null,
+    // Phase 1: exactly one organization, invite-only — no public
+    // organization-signup route (PHASE1_TEAM_ROLLOUT_HANDOUT.md §3/§4 P2.3).
+    allowOrganizationSignup: false,
+  });
+  app.use("/api/cloud", cloudApi);
+  if (isMain) console.log("Cloud identity API mounted at /api/cloud (CLOUD_API_ENABLED=true)");
+}
+
 const server = createServer(app);
 // noServer: true — the upgrade is completed manually below, after checking
 // the session, instead of ws accepting every upgrade unconditionally.
@@ -672,14 +801,32 @@ server.on("upgrade", (request, socket, head) => {
   // client-side fetch/body-timing race — see the comment on client/app.js's
   // login handler), but there's no reason to hand a fragile stub to code
   // that expects a real response object when a real one costs nothing here.
-  sessionParser(request, new ServerResponse(request), () => {
-    if (!request.session?.operator || !resolveOperator(request.session.operator)) {
+  sessionParser(request, new ServerResponse(request), (sessionError) => {
+    if (sessionError) {
+      console.error("WebSocket session resolution failed:", sessionError?.code || sessionError?.name || "Error");
+      socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    if (!request.session?.operator) {
       socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
       socket.destroy();
       return;
     }
-    wss.handleUpgrade(request, socket, head, (ws) => {
-      wss.emit("connection", ws, request);
+    void identityService.resolveSessionPrincipal(request.session.operator).then((current) => {
+      if (!current) {
+        socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+      request.currentOperator = current;
+      wss.handleUpgrade(request, socket, head, (ws) => {
+        wss.emit("connection", ws, request);
+      });
+    }).catch((error) => {
+      console.error("WebSocket identity resolution failed:", error?.code || error?.name || "Error");
+      socket.write("HTTP/1.1 503 Service Unavailable\r\n\r\n");
+      socket.destroy();
     });
   });
 });
@@ -723,7 +870,7 @@ for (const discovered of discoveredIosDevices) {
 }
 
 // ---- sites: other locations that link their phones to this hub ----------------------
-const siteStore = new SiteStore(process.env.SITE_STORE_PATH || path.join(STORAGE_ROOT, "sites.json"),
+const siteStore = createFileSiteRepository(process.env.SITE_STORE_PATH || path.join(STORAGE_ROOT, "sites.json"),
   { defaultTimeZone: schedulingTimeZone });
 const siteLinkHub = new SiteLinkHub({
   siteStore,
@@ -765,47 +912,55 @@ function revokeLiveOperatorSessions(username) {
   broadcastPresence();
 }
 
-function reconcileLiveOperatorAccess(username) {
+async function reconcileLiveOperatorAccess(username, { authorizationChanged = true } = {}) {
+  const reconciliations = [];
   for (const ws of wss.clients) {
     if (ws.operatorUsername !== username) continue;
-    const current = ws.currentOperator?.();
-    if (current && ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({ type: "operator_profile", operator: publicOperator(current) }));
-    }
-    ws.releaseUnauthorizedSelection?.("operator_updated");
+    if (authorizationChanged) ws.suspendCurrentOperator?.();
+    reconciliations.push((async () => {
+      const current = await ws.refreshCurrentOperator?.();
+      if (current && ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify({ type: "operator_profile", operator: publicOperator(current) }));
+      }
+      ws.releaseUnauthorizedSelection?.("operator_updated");
+      ws.releaseUnauthorizedWatch?.("operator_updated");
+    })());
   }
+  await Promise.all(reconciliations);
 }
 
-app.get("/api/admin/users", requireAnyCapability(CAPABILITIES.MANAGE_USERS, CAPABILITIES.MANAGE_TEAM_MEMBERS), (req, res) => {
-  expireAssignments();
-  const people = new Map(publicPeople(req.currentOperator).map(person => [person.username, person]));
-  const visibleAssignments = assignmentStore.list().filter(item => canViewAssignment(item, req.currentOperator));
-  const allUsers = listOperatorAccounts();
-  const activeAdminCount = allUsers.filter(user => user.active !== false
-    && (user.accountStatus ?? "approved") === "approved"
-    && user.role === OPERATOR_ROLES.ADMIN).length;
-  const visibleUsers = allUsers.filter(user => canManagePerson(req.currentOperator, user.username));
-  res.json({ users: visibleUsers.map(user => ({
-    ...user,
-    canRename: req.currentOperator.role === OPERATOR_ROLES.ADMIN || user.username !== req.currentOperator.username,
-    canReview: user.username !== req.currentOperator.username
-      && !(user.role === OPERATOR_ROLES.ADMIN && user.active !== false
-        && (user.accountStatus ?? "approved") === "approved" && activeAdminCount === 1),
-    actionReason: user.username === req.currentOperator.username
-      ? req.currentOperator.role === OPERATOR_ROLES.MANAGER
-        ? "You cannot rename or review the account you are currently using."
-        : "You cannot reject the account you are currently using."
-      : user.role === OPERATOR_ROLES.ADMIN && user.active !== false
-          && (user.accountStatus ?? "approved") === "approved" && activeAdminCount === 1
-        ? "This is the last active admin account. Create or activate another admin first."
-        : null,
-    presence: people.get(user.username) ?? { online: false, activeSessions: 0, currentPhones: [], lastSeenAt: null },
-    assignments: visibleAssignments.filter(item => item.assignee === user.username || item.createdBy === user.username),
-    recentAudit: hasCapability(req.currentOperator, CAPABILITIES.VIEW_AUDIT)
-      ? auditLog.listEvents({ operator: user.username, limit: 200 })
-        .filter(event => !event.deviceId || canAccessDevice(req.currentOperator, event.deviceId)).slice(0, 10)
-      : [],
-  })) });
+app.get("/api/admin/users", requireAnyCapability(CAPABILITIES.MANAGE_USERS, CAPABILITIES.MANAGE_TEAM_MEMBERS), async (req, res, next) => {
+  try {
+    expireAssignments();
+    const people = new Map(publicPeople(req.currentOperator).map(person => [person.username, person]));
+    const visibleAssignments = assignmentStore.list().filter(item => canViewAssignment(item, req.currentOperator));
+    const allUsers = await operatorAccountService.listAccounts();
+    const activeAdminCount = allUsers.filter(user => user.active !== false
+      && (user.accountStatus ?? "approved") === "approved"
+      && user.role === OPERATOR_ROLES.ADMIN).length;
+    const visibleUsers = allUsers.filter(user => canManagePerson(req.currentOperator, user.username));
+    res.json({ users: visibleUsers.map(user => ({
+      ...user,
+      canRename: req.currentOperator.role === OPERATOR_ROLES.ADMIN || user.username !== req.currentOperator.username,
+      canReview: user.username !== req.currentOperator.username
+        && !(user.role === OPERATOR_ROLES.ADMIN && user.active !== false
+          && (user.accountStatus ?? "approved") === "approved" && activeAdminCount === 1),
+      actionReason: user.username === req.currentOperator.username
+        ? req.currentOperator.role === OPERATOR_ROLES.MANAGER
+          ? "You cannot rename or review the account you are currently using."
+          : "You cannot reject the account you are currently using."
+        : user.role === OPERATOR_ROLES.ADMIN && user.active !== false
+            && (user.accountStatus ?? "approved") === "approved" && activeAdminCount === 1
+          ? "This is the last active admin account. Create or activate another admin first."
+          : null,
+      presence: people.get(user.username) ?? { online: false, activeSessions: 0, currentPhones: [], lastSeenAt: null },
+      assignments: visibleAssignments.filter(item => item.assignee === user.username || item.createdBy === user.username),
+      recentAudit: hasCapability(req.currentOperator, CAPABILITIES.VIEW_AUDIT)
+        ? auditLog.listEvents({ operator: user.username, limit: 200 })
+          .filter(event => !event.deviceId || canAccessDevice(req.currentOperator, event.deviceId)).slice(0, 10)
+        : [],
+    })) });
+  } catch (error) { next(error); }
 });
 
 app.patch("/api/admin/users/:username/status", requireAnyCapability(CAPABILITIES.MANAGE_USERS, CAPABILITIES.MANAGE_TEAM_MEMBERS, { flagSelfEscalation: true }), async (req, res, next) => {
@@ -819,7 +974,7 @@ app.patch("/api/admin/users/:username/status", requireAnyCapability(CAPABILITIES
     if (req.body?.status === "rejected" && req.params.username === req.currentOperator.username) {
       return res.status(403).json({ error: "you cannot reject the account you are currently using" });
     }
-    const target = operators.get(req.params.username);
+    const target = await operatorAccountService.getAccount(req.params.username);
     if (!target?.email) return res.status(409).json({ error: "account must have a Gmail address before review" });
     const notification = accountNotificationStore.queue({
       to: target.email,
@@ -829,7 +984,7 @@ app.patch("/api/admin/users/:username/status", requireAnyCapability(CAPABILITIES
       holdForCommit: true,
     });
     let operator;
-    try { operator = setOperatorAccountStatus(req.params.username, req.body?.status); }
+    try { operator = await operatorAccountService.setAccountStatus(req.params.username, req.body?.status); }
     catch (error) {
       try { accountNotificationStore.markAborted(notification.id); }
       catch (abortError) { console.error("Account review outbox abort failed:", abortError); }
@@ -857,7 +1012,7 @@ app.patch("/api/admin/users/:username/status", requireAnyCapability(CAPABILITIES
   }
 });
 
-app.patch("/api/admin/users/:username/rename", requireAnyCapability(CAPABILITIES.MANAGE_USERS, CAPABILITIES.MANAGE_TEAM_MEMBERS), (req, res, next) => {
+app.patch("/api/admin/users/:username/rename", requireAnyCapability(CAPABILITIES.MANAGE_USERS, CAPABILITIES.MANAGE_TEAM_MEMBERS), async (req, res, next) => {
   const previousUsername = req.params.username;
   const nextUsername = req.body?.username;
   let tasksMigrated = false;
@@ -883,12 +1038,12 @@ app.patch("/api/admin/users/:username/rename", requireAnyCapability(CAPABILITIES
       return res.status(403).json({ error: "a manager cannot rename their own account" });
     }
     assertValidUsername(nextUsername);
-    if (operators.has(nextUsername)) return res.status(409).json({ error: "username already exists" });
+    if (await operatorAccountService.usernameExists(nextUsername)) return res.status(409).json({ error: "username already exists" });
     taskQueue.renamePrincipal(previousUsername, nextUsername);
     tasksMigrated = true;
     assignmentStore.renamePrincipal(previousUsername, nextUsername, req.currentOperator.username);
     assignmentsMigrated = true;
-    const operator = renameOperatorAccount(previousUsername, nextUsername);
+    const operator = await operatorAccountService.renameAccount(previousUsername, nextUsername);
     accountMigrated = true;
     try {
       auditLog.logEvent({ operator: req.currentOperator.username, type: "operator_renamed",
@@ -921,11 +1076,11 @@ app.get("/api/admin/account-notifications", requireCapability(CAPABILITIES.MANAG
   })) });
 });
 
-app.post("/api/admin/users", requireCapability(CAPABILITIES.MANAGE_USERS), (req, res, next) => {
+app.post("/api/admin/users", requireCapability(CAPABILITIES.MANAGE_USERS), async (req, res, next) => {
   try {
     const resourceError = validateOperatorResources(req.body);
     if (resourceError) return res.status(400).json({ error: resourceError });
-    const operator = createOperatorAccount({ ...req.body, twoFactorRequired: true });
+    const operator = await operatorAccountService.createAccount({ ...req.body, twoFactorRequired: true });
     auditLog.logEvent({
       operator: req.currentOperator.username,
       type: "operator_created",
@@ -940,11 +1095,11 @@ app.post("/api/admin/users", requireCapability(CAPABILITIES.MANAGE_USERS), (req,
   }
 });
 
-app.patch("/api/admin/users/:username", requireCapability(CAPABILITIES.MANAGE_USERS, { flagSelfEscalation: true }), (req, res, next) => {
+app.patch("/api/admin/users/:username", requireCapability(CAPABILITIES.MANAGE_USERS, { flagSelfEscalation: true }), async (req, res, next) => {
   try {
     const resourceError = validateOperatorResources(req.body);
     if (resourceError) return res.status(400).json({ error: resourceError });
-    const result = updateOperatorAccount(req.params.username, req.body);
+    const result = await operatorAccountService.updateAccount(req.params.username, req.body);
     auditLog.logEvent({
       operator: req.currentOperator.username,
       type: "operator_updated",
@@ -952,7 +1107,9 @@ app.patch("/api/admin/users/:username", requireCapability(CAPABILITIES.MANAGE_US
     });
     if (result.invalidatesSessions) revokeLiveOperatorSessions(result.operator.username);
     else {
-      reconcileLiveOperatorAccess(result.operator.username);
+      const authorizationChanged = ["role", "allowedDevices", "allowedResearchWorkspaces", "teamId"]
+        .some(field => Object.hasOwn(req.body, field));
+      await reconcileLiveOperatorAccess(result.operator.username, { authorizationChanged });
       broadcastPresence();
     }
     broadcastDeviceList();
@@ -963,9 +1120,9 @@ app.patch("/api/admin/users/:username", requireCapability(CAPABILITIES.MANAGE_US
   }
 });
 
-app.post("/api/admin/users/:username/revoke-sessions", requireCapability(CAPABILITIES.MANAGE_USERS), (req, res, next) => {
+app.post("/api/admin/users/:username/revoke-sessions", requireCapability(CAPABILITIES.MANAGE_USERS), async (req, res, next) => {
   try {
-    const operator = invalidateOperatorSessions(req.params.username);
+    const operator = await operatorAccountService.invalidateSessions(req.params.username);
     auditLog.logEvent({
       operator: req.currentOperator.username,
       type: "operator_sessions_revoked",
@@ -979,9 +1136,9 @@ app.post("/api/admin/users/:username/revoke-sessions", requireCapability(CAPABIL
   }
 });
 
-app.post("/api/admin/users/:username/2fa/reset", requireCapability(CAPABILITIES.MANAGE_USERS), (req, res, next) => {
+app.post("/api/admin/users/:username/2fa/reset", requireCapability(CAPABILITIES.MANAGE_USERS), async (req, res, next) => {
   try {
-    const operator = resetOperatorSecondFactor(req.params.username);
+    const operator = await operatorAccountService.resetSecondFactor(req.params.username);
     auditLog.logEvent({
       operator: req.currentOperator.username,
       type: "operator_two_factor_reset",
@@ -1033,11 +1190,13 @@ for (const discovered of discoveredIosDevices) {
 // storage/queue/.
 // ---- AI research: approvals, comment safety, policy overrides, fleet (MS9-MS12) -----------------
 const researchStoreFile = (envName, name) => process.env[envName] || path.join(STORAGE_ROOT, name);
-const approvalStore = new ApprovalStore({ filePath: researchStoreFile("APPROVAL_STORE_PATH", "research-approvals.json") });
+const approvalStore = createFileApprovalRepository({ filePath: researchStoreFile("APPROVAL_STORE_PATH", "research-approvals.json") });
 const commentLedger = new CommentLedger({ filePath: researchStoreFile("COMMENT_LEDGER_PATH", "comment-ledger.json") });
 const templateLibrary = new TemplateLibrary({ filePath: researchStoreFile("COMMENT_TEMPLATES_PATH", "comment-templates.json") });
 const policyStore = new PolicyStore({ filePath: researchStoreFile("ACTION_POLICY_OVERRIDES_PATH", "action-policy-overrides.json") });
-const interventionQueue = new InterventionQueue({ filePath: researchStoreFile("INTERVENTION_STORE_PATH", "interventions.json") });
+const interventionQueue = createFileInterventionRepository({ filePath: researchStoreFile("INTERVENTION_STORE_PATH", "interventions.json") });
+const researchRunRepository = createFileResearchRunRepository();
+const researchEvidenceRepository = createFileResearchEvidenceRepository();
 const spendTracker = new SpendTracker();
 // The validator sees configured policy with any runtime override applied on top, looked up
 // afresh for every action so a change takes effect on the very next step.
@@ -1047,10 +1206,10 @@ let fleetPolicy = null; // created below, once the queue exists
 const queueStorePath = process.env.QUEUE_STORE_PATH || path.join(__dirname, "../../storage/queue/tasks.json");
 const taskQueue = createTaskQueue({ devices, deviceLease, auditLog, storePath: queueStorePath, dispatchOnCreate: false,
   canDispatch: (task, deviceId) => {
-    const operator = operatorByUsername(task.createdBy);
-    return canAccessDevice(operator, deviceId)
+    const operator = backgroundAuthorization.operatorForUsername(task.createdBy);
+    return backgroundAuthorization.canAccessDevice(operator, deviceId)
       && networkDecision(deviceId).allowed
-      && (task.kind !== "research" || !!researchWorkspaceFor(operator, task.accountSelector?.accountId))
+      && (task.kind !== "research" || !!backgroundAuthorization.researchWorkspaceFor(operator, task.accountSelector?.accountId))
       && (fleetPolicy?.canDispatch(task, deviceId) ?? true);
   } });
 const modelSelectionStorePath = process.env.MODEL_SELECTION_STORE_PATH
@@ -1065,7 +1224,7 @@ fleetPolicy = createFleetPolicy({
 });
 const assignmentStorePath = process.env.ASSIGNMENT_STORE_PATH
   || path.join(__dirname, "../../storage/assignments/assignments.json");
-const assignmentStore = createAssignmentStore({ storePath: assignmentStorePath });
+const assignmentStore = createFileAssignmentRepository({ storePath: assignmentStorePath });
 
 function expireAssignments(at = new Date()) {
   const expired = assignmentStore.expireDue(at);
@@ -1121,7 +1280,7 @@ function assignmentScopeAllowed(assignment, operator) {
 }
 
 function assigneeScopeAllowed(assignment, username) {
-  const assignee = operatorByUsername(username);
+  const assignee = backgroundAuthorization.operatorForUsername(username);
   return Boolean(assignee) && assignmentScopeAllowed(assignment, assignee);
 }
 
@@ -1165,7 +1324,7 @@ app.post("/api/assignments", requireCapability(CAPABILITIES.MANAGE_ASSIGNMENTS),
   try {
     expireAssignments();
     const { assignee, instructions } = req.body || {};
-    if (typeof assignee !== "string" || !operatorByUsername(assignee)) return res.status(400).json({ error: "unknown or inactive assignee" });
+    if (typeof assignee !== "string" || !backgroundAuthorization.operatorForUsername(assignee)) return res.status(400).json({ error: "unknown or inactive assignee" });
     if (!canManagePerson(req.currentOperator, assignee)) return res.status(403).json({ error: "not authorized to assign this person" });
     const scope = validateAssignmentScope(req.body || {}, req.currentOperator);
     if (scope.error) return res.status(scope.status).json({ error: scope.error });
@@ -1220,7 +1379,7 @@ app.patch("/api/assignments/:assignmentId", requireCapability(CAPABILITIES.VIEW_
     let assignment;
     if (wantsReassign) {
       if (!hasManage) return res.status(403).json({ error: "assignment management capability required" });
-      if (typeof req.body.assignee !== "string" || !operatorByUsername(req.body.assignee)) return res.status(400).json({ error: "unknown or inactive assignee" });
+      if (typeof req.body.assignee !== "string" || !backgroundAuthorization.operatorForUsername(req.body.assignee)) return res.status(400).json({ error: "unknown or inactive assignee" });
       if (!canManagePerson(req.currentOperator, req.body.assignee)) return res.status(403).json({ error: "not authorized to assign this person" });
       if (!assigneeScopeAllowed(current, req.body.assignee)) {
         return res.status(403).json({ error: "assignee is not authorized for the referenced phone or account" });
@@ -1272,14 +1431,22 @@ const researchTaskRunner = createResearchTaskRunner({
   templates: templateLibrary,
   interventions: interventionQueue,
   spend: spendTracker,
+  createRunRecord: researchRunRepository.createRun,
+  appendCandidateRecord: researchRunRepository.appendCandidate,
+  finalizeRunRecord: researchRunRepository.finalizeRun,
+  locateCandidateRecord: researchRunRepository.locateCandidate,
+  recordPlatformActionRecord: researchRunRepository.recordPlatformAction,
+  getRunRecord: researchRunRepository.getRun,
+  saveEvidenceRecord: researchEvidenceRepository.save,
   providerForTask: (task, { workspaceId, deviceId }) => {
     const name = modelSelection.resolve({ taskId: task.id, workspaceId, deviceId });
     return name ? optimizationRuntime.providerFor(name, task.accountSelector?.platform) : null;
   },
   skillForPlatform: (platform) => optimizationRuntime.skillFor(platform),
   pacingForTask: () => optimizationRuntime.pacingFor(),
-  operatorForUsername: operatorByUsername,
-  workspaceForOperatorAccount: researchWorkspaceFor,
+  operatorForUsername: backgroundAuthorization.operatorForUsername,
+  workspaceForOperatorAccount: backgroundAuthorization.researchWorkspaceFor,
+  canAccessDevice: backgroundAuthorization.canAccessDevice,
   canUseDevice: (deviceId) => networkDecision(deviceId).allowed,
 });
 // Without this, a task dispatching or completing on its own — via the
@@ -1573,7 +1740,7 @@ const mediaQuota = createMediaQuotaManager({
   minFreeBytes: mediaByteSetting("MEDIA_MIN_FREE_BYTES", DEFAULT_MEDIA_MIN_FREE_BYTES),
 });
 const upload = multer({
-  storage: createQuotaStorage({ ensureDeviceDir, safeFilename, quotaManager: mediaQuota }),
+  storage: createQuotaStorage({ ensureDeviceDir: deviceMediaRepository.ensureDeviceDir, safeFilename, quotaManager: mediaQuota }),
   limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2GB — generous for source video
 });
 
@@ -1587,7 +1754,7 @@ app.get("/api/devices/:deviceId/files", (req, res) => {
   if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
     return res.status(403).json({ error: "not authorized for this device" });
   }
-  res.json({ files: listFiles(req.params.deviceId) });
+  res.json({ files: deviceMediaRepository.listFiles(req.params.deviceId) });
 });
 
 app.post("/api/devices/:deviceId/files", (req, res, next) => {
@@ -1638,7 +1805,7 @@ app.get("/api/devices/:deviceId/files/:filename", (req, res) => {
   if (!hasCapability(req.currentOperator, CAPABILITIES.ACCESS_MEDIA)) return res.status(403).end();
   if (!knownDevice(req.params.deviceId)) return res.status(404).end();
   if (!canAccessDevice(req.currentOperator, req.params.deviceId)) return res.status(403).end();
-  const full = resolveFile(req.params.deviceId, req.params.filename);
+  const full = deviceMediaRepository.resolveFile(req.params.deviceId, req.params.filename);
   if (!full) return res.status(404).end();
   auditLog.logEvent({
     operator: req.session.operator.username,
@@ -1653,7 +1820,7 @@ app.delete("/api/devices/:deviceId/files/:filename", (req, res) => {
   if (!hasCapability(req.currentOperator, CAPABILITIES.ACCESS_MEDIA)) return res.status(403).end();
   if (!knownDevice(req.params.deviceId)) return res.status(404).end();
   if (!canAccessDevice(req.currentOperator, req.params.deviceId)) return res.status(403).end();
-  const deleted = deleteFile(req.params.deviceId, req.params.filename);
+  const deleted = deviceMediaRepository.deleteFile(req.params.deviceId, req.params.filename);
   auditLog.logEvent({
     operator: req.session.operator.username,
     type: "file_deleted",
@@ -1698,7 +1865,7 @@ app.post("/api/devices/:deviceId/network-check", (req, res) => {
     if (!proxyCredentialEncryptionKey) {
       return res.status(503).json({ error: "proxy verification is unavailable until the credential encryption key is configured", code: "V201" });
     }
-    const record = getProxyRecord(proxyPoolStorePath, assigned.id);
+    const record = proxyPoolRepository.get(assigned.id);
     if (!record) return res.status(409).json({ error: "the assigned proxy no longer exists", code: "V201" });
     checkUrl = null;
     void (async () => {
@@ -1706,21 +1873,21 @@ app.post("/api/devices/:deviceId/network-check", (req, res) => {
         protocol: record.protocol, host: record.host, port: record.port, username: record.username,
         password: decryptProxyPassword(record, proxyCredentialEncryptionKey), country: record.country,
       });
-      updateProxyHealth(proxyPoolStorePath, record.id, proxyResult);
+      proxyPoolRepository.updateHealth(record.id, proxyResult);
       refreshProxyPoolCache();
       await networkRoutingOrchestrator?.checkHealth();
       return networkVerifier.recordInfrastructureCheck(req.params.deviceId, {
         proxyResult,
         route: networkRoutingOrchestrator?.getRoute(req.params.deviceId) ?? null,
       });
-    })().then((result) => {
+    })().then(async (result) => {
       const access = networkDecision(req.params.deviceId);
       if (!access.allowed) {
         taskQueue.stopDevice(req.params.deviceId, "network_policy");
         for (const client of wss.clients) client.releaseUnauthorizedSelection?.("network_policy");
       }
       broadcastDeviceList();
-      const current = resolveOperator(req.session?.operator);
+      const current = await identityService.resolveSessionPrincipal(req.session?.operator);
       if (!current) return res.status(401).json({ error: "authentication required" });
       if (!hasCapability(current, CAPABILITIES.RUN_NETWORK_CHECK)
         || !canAccessDevice(current, req.params.deviceId)) return res.status(403).json({ error: "network verification is not permitted" });
@@ -1756,7 +1923,7 @@ app.post("/api/devices/:deviceId/network-check", (req, res) => {
       // after that await and before returning IP/region/health data or writing
       // requester-attributed audit detail. A stale request snapshot is not
       // authority to receive the result.
-      const current = resolveOperator(req.session?.operator);
+      const current = await identityService.resolveSessionPrincipal(req.session?.operator);
       if (!current) return res.status(401).json({ error: "authentication required" });
       if (!hasCapability(current, CAPABILITIES.RUN_NETWORK_CHECK)) {
         return res.status(403).json({ error: "network verification is not permitted for this role" });
@@ -1908,7 +2075,7 @@ app.post("/api/admin/proxies", requireCapability(CAPABILITIES.MANAGE_PROXY), (re
     return res.status(503).json({ error: "the proxy pool is unavailable until TWO_FACTOR_MASTER_KEY (or PROXY_CREDENTIAL_ENCRYPTION_KEY) is configured" });
   }
   try {
-    const record = createProxy(proxyPoolStorePath, {
+    const record = proxyPoolRepository.create({
       provider: req.body?.provider,
       protocol: req.body?.protocol,
       host: req.body?.host,
@@ -1964,21 +2131,21 @@ app.post("/api/admin/proxies/:proxyId/test", requireCapability(CAPABILITIES.MANA
   if (!proxyCredentialEncryptionKey) {
     return res.status(503).json({ error: "proxy testing is unavailable until the credential encryption key is configured" });
   }
-  const record = getProxyRecord(proxyPoolStorePath, req.params.proxyId);
+  const record = proxyPoolRepository.get(req.params.proxyId);
   if (!record) return res.status(404).json({ error: "unknown proxy" });
   try {
     const result = await testProxy({
       protocol: record.protocol, host: record.host, port: record.port, username: record.username,
       password: decryptProxyPassword(record, proxyCredentialEncryptionKey), country: record.country,
     });
-    updateProxyHealth(proxyPoolStorePath, record.id, result);
+    proxyPoolRepository.updateHealth(record.id, result);
     refreshProxyPoolCache();
     auditLog.logEvent({ operator: req.currentOperator.username, type: "proxy_test_succeeded",
       detail: { proxyId: record.id, publicIpv4: result.publicIpv4, country: result.country, latencyMs: result.latencyMs } });
-    res.json({ result, proxy: publicProxy(getProxyRecord(proxyPoolStorePath, record.id)) });
+    res.json({ result, proxy: publicProxy(proxyPoolRepository.get(record.id)) });
   } catch (error) {
     const diagnostic = error?.diagnostic;
-    updateProxyHealth(proxyPoolStorePath, record.id, {
+    proxyPoolRepository.updateHealth(record.id, {
       status: "failed", checkedAt: new Date().toISOString(),
       errorCode: diagnostic?.code || "P111", errorName: diagnostic?.name || "Proxy test failed",
     });
@@ -1991,7 +2158,7 @@ app.post("/api/admin/proxies/:proxyId/test", requireCapability(CAPABILITIES.MANA
 
 app.delete("/api/admin/proxies/:proxyId", requireCapability(CAPABILITIES.MANAGE_PROXY), (req, res) => {
   try {
-    const deleted = deleteProxy(proxyPoolStorePath, req.params.proxyId);
+    const deleted = proxyPoolRepository.remove(req.params.proxyId);
     if (!deleted) return res.status(404).json({ error: "unknown proxy" });
     refreshProxyPoolCache();
     auditLog.logEvent({
@@ -2016,7 +2183,7 @@ app.patch("/api/admin/devices/:deviceId/proxy-assignment", requireCapability(CAP
     return res.status(400).json({ error: "proxyId must be a string or null" });
   }
   try {
-    assignProxyToDevice(proxyPoolStorePath, { deviceId: req.params.deviceId, proxyId });
+    proxyPoolRepository.assignToDevice({ deviceId: req.params.deviceId, proxyId });
     refreshProxyPoolCache();
     auditLog.logEvent({
       operator: req.currentOperator.username,
@@ -2191,21 +2358,21 @@ app.use("/api/research/:account", (req, res, next) => {
 
 app.get("/api/research/:account/evidence/:evidenceId", (req, res) => {
   if (!hasCapability(req.currentOperator, CAPABILITIES.VIEW_RESEARCH)) return res.status(403).json({ error: "research access is not permitted for this role" });
-  const evidence = resolveResearchEvidence(req.researchWorkspaceId, req.params.account, req.params.evidenceId);
+  const evidence = researchEvidenceRepository.resolve(req.researchWorkspaceId, req.params.account, req.params.evidenceId);
   if (!evidence) return res.status(404).json({ error: "evidence not found" });
   res.type(evidence.mime).sendFile(evidence.file);
 });
 
 app.get("/api/research/:account/runs", (req, res) => {
   if (!hasCapability(req.currentOperator, CAPABILITIES.VIEW_RESEARCH)) return res.status(403).json({ error: "research access is not permitted for this role" });
-  const runs = listRuns(req.researchWorkspaceId, req.params.account);
+  const runs = researchRunRepository.listRuns(req.researchWorkspaceId, req.params.account);
   if (runs === null) return res.status(404).json({ error: "unknown account" });
   res.json({ runs });
 });
 
 app.get("/api/research/:account/runs/:runId", (req, res) => {
   if (!hasCapability(req.currentOperator, CAPABILITIES.VIEW_RESEARCH)) return res.status(403).json({ error: "research access is not permitted for this role" });
-  const run = getRun(req.researchWorkspaceId, req.params.account, req.params.runId);
+  const run = researchRunRepository.getRun(req.researchWorkspaceId, req.params.account, req.params.runId);
   if (!run) return res.status(404).json({ error: "run not found" });
   res.json({ run });
 });
@@ -2226,7 +2393,7 @@ app.post("/api/research/:account/runs", (req, res) => {
   if (candidates !== undefined && !Array.isArray(candidates)) {
     return res.status(400).json({ error: "candidates must be an array" });
   }
-  const run = createRun(req.researchWorkspaceId, req.params.account, { platform, timeWindow, overview, candidates });
+  const run = researchRunRepository.createRun(req.researchWorkspaceId, req.params.account, { platform, timeWindow, overview, candidates });
   auditLog.logEvent({ operator: req.session.operator.username, type: "research_run_created",
     detail: { workspaceId: req.researchWorkspaceId, account: req.params.account, runId: run.id } });
   res.json({ run });
@@ -2235,7 +2402,7 @@ app.post("/api/research/:account/runs", (req, res) => {
 app.patch("/api/research/:account/runs/:runId/candidates/:candidateId", (req, res) => {
   if (!hasCapability(req.currentOperator, CAPABILITIES.REVIEW_RESEARCH)) return res.status(403).json({ error: "research review is not permitted for this role" });
   const status = req.body?.status;
-  const candidate = setCandidateStatus(req.researchWorkspaceId, req.params.account, req.params.runId, req.params.candidateId, status);
+  const candidate = researchRunRepository.setCandidateStatus(req.researchWorkspaceId, req.params.account, req.params.runId, req.params.candidateId, status);
   if (!candidate) return res.status(400).json({ error: "invalid status, or run/candidate not found" });
   auditLog.logEvent({
     operator: req.session.operator.username,
@@ -2333,7 +2500,7 @@ app.post("/api/research/:account/approvals/:id/:decision(approve|reject)", (req,
 // MS13.4: search and near-duplicate lookup over this account's own recorded candidates.
 app.get("/api/research/:account/search", (req, res) => {
   if (denyUnless(req, res, CAPABILITIES.VIEW_RESEARCH, "research access is not permitted for this role")) return;
-  const runs = listRuns(req.researchWorkspaceId, req.params.account);
+  const runs = researchRunRepository.listRuns(req.researchWorkspaceId, req.params.account);
   if (runs === null) return res.status(404).json({ error: "unknown account" });
   const index = ResearchIndex.fromRuns(runs);
   const limit = Math.min(100, Math.max(1, Number.parseInt(req.query.limit, 10) || 20));
@@ -2349,7 +2516,7 @@ app.get("/api/research/:account/search", (req, res) => {
 
 app.get("/api/research/:account/runs/:runId/report", (req, res) => {
   if (denyUnless(req, res, CAPABILITIES.VIEW_RESEARCH, "research access is not permitted for this role")) return;
-  const run = getRun(req.researchWorkspaceId, req.params.account, req.params.runId);
+  const run = researchRunRepository.getRun(req.researchWorkspaceId, req.params.account, req.params.runId);
   if (!run) return res.status(404).json({ error: "run not found" });
   res.json({ report: run.session ?? null, outcome: run.outcome ?? null, finished: Boolean(run.completedAt) });
 });
@@ -2434,7 +2601,7 @@ function taskAccessError(taskId, operator) {
   const task = taskQueue.getTask(taskId);
   if (!task) return "unknown task";
   if (operator.role !== OPERATOR_ROLES.ADMIN && task.createdBy !== operator.username) {
-    const creator = operatorByUsername(task.createdBy);
+    const creator = backgroundAuthorization.operatorForUsername(task.createdBy);
     if (operator.role !== OPERATOR_ROLES.MANAGER || !operator.teamId
       || !creator?.teamId || creator.teamId !== operator.teamId) {
       return "not authorized for that task's team";
@@ -2845,14 +3012,15 @@ wss.on("connection", (ws, request) => {
   // handler above — this connection would never have been accepted
   // otherwise, so `operator` is always populated here. Kept for the
   // connection's lifetime purely as a stable identity (its `.username` for
-  // audit logging never changes); every actual authorization decision below
-  // instead calls currentOperator(), which re-resolves live on each call.
+  // audit logging never changes); every message/session validation refreshes
+  // the current identity asynchronously, while device authorization callbacks
+  // read that refreshed snapshot synchronously.
   // Real bug this fixes: a WS connection can live for hours or days (auto-
   // reconnect notwithstanding), so caching a role/allowedDevices decision at
   // handshake time was the single largest instance of the staleness bug
-  // fixed throughout this file — see resolveOperator's comment in
-  // authStore.js and requireAuth's comment above.
+  // fixed throughout this file — see requireAuth's comment above.
   const operator = request.session.operator;
+  let currentIdentity = request.currentOperator;
   ws.sessionId = request.sessionID;
   ws.operatorUsername = operator.username;
   ws.presenceConnectionId = randomUUID();
@@ -2868,21 +3036,57 @@ wss.on("connection", (ws, request) => {
     sessionActive = false;
     ws.close(1008, "Session is no longer active");
   };
-  ws.validateSession = () => new Promise(resolve => {
-    if (!sessionActive || ws.readyState !== ws.OPEN) return resolve(false);
-    sessionStore.get(ws.sessionId, (error, stored) => {
-      const expiry = Date.parse(stored?.cookie?.expires);
-      if (error || !sessionActive || stored?.operator?.username !== operator.username
-        || !Number.isFinite(expiry) || expiry <= Date.now()) {
-        ws.invalidateSession();
-        return resolve(false);
-      }
-      expiresAt = expiry;
-      presenceStore.touchSession({ sessionId: ws.sessionId, username: operator.username, expiresAt });
-      resolve(ws.readyState === ws.OPEN);
-    });
-  });
-  const currentOperator = () => sessionActive && expiresAt > Date.now() ? resolveOperator(operator) : null;
+  let identityRefreshGeneration = 0;
+  const currentOperator = () => sessionActive && expiresAt > Date.now() ? currentIdentity : null;
+  const refreshCurrentOperator = async (principal = operator) => {
+    const generation = ++identityRefreshGeneration;
+    const current = await identityService.resolveSessionPrincipal(principal);
+    // A slower, older read must never overwrite a newer authorization result.
+    if (generation !== identityRefreshGeneration) return currentOperator();
+    currentIdentity = current;
+    return currentOperator();
+  };
+  ws.suspendCurrentOperator = () => {
+    identityRefreshGeneration += 1;
+    currentIdentity = null;
+  };
+  let validationPromise = null;
+  ws.validateSession = () => {
+    if (!sessionActive || ws.readyState !== ws.OPEN) return Promise.resolve(false);
+    // Heartbeats, live frames and queued input can ask concurrently. Share one
+    // session/identity read so an older response cannot restore stale access.
+    if (validationPromise) return validationPromise;
+    validationPromise = new Promise((resolve) => {
+      sessionStore.get(ws.sessionId, (error, stored) => {
+        const expiry = Date.parse(stored?.cookie?.expires);
+        if (error || !sessionActive || stored?.operator?.username !== operator.username
+          || !Number.isFinite(expiry) || expiry <= Date.now()) {
+          ws.invalidateSession();
+          resolve(false);
+          return;
+        }
+        void refreshCurrentOperator(stored.operator).then((current) => {
+          if (!current || !sessionActive) {
+            // Preserve the established client contract: release ownership and
+            // deliver the explicit revocation notice before closing the socket.
+            ws.releaseUnauthorizedSelection?.("identity_revoked");
+            ws.releaseUnauthorizedWatch?.("identity_revoked");
+            ws.invalidateSession();
+            return resolve(false);
+          }
+          expiresAt = expiry;
+          presenceStore.touchSession({ sessionId: ws.sessionId, username: operator.username, expiresAt });
+          resolve(ws.readyState === ws.OPEN);
+        }).catch((identityError) => {
+          console.error("WebSocket identity refresh failed:", identityError?.code || identityError?.name || "Error");
+          ws.invalidateSession();
+          resolve(false);
+        });
+      });
+    }).finally(() => { validationPromise = null; });
+    return validationPromise;
+  };
+  ws.refreshCurrentOperator = refreshCurrentOperator;
   ws.currentOperator = currentOperator;
 
   // Direct WebSocket mode-management messages are admin/dev controls just
