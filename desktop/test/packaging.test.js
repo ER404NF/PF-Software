@@ -128,11 +128,11 @@ test("the macOS build produces a .pkg installer, signs with the hardened runtime
   assert.match(scripts["dist:mac"], /dist:mac:pkg/);
   assert.match(scripts["dist:mac:pkg"], /build-mac-pkg\.cjs --arch arm64/);
   assert.match(scripts["dist:mac:pkg:universal"], /--arch universal/);
-  assert.equal(build.mac.hardenedRuntime, true);
+  assert.equal(build.mac.sign.hardenedRuntime, true);
   assert.equal(build.mac.notarize, false, "notarization is done by build-mac-pkg.cjs so app and installer are notarized in one auditable place");
   assert.equal(build.mac.target.some(target => /dmg|pkg/.test(target.target ?? target)), false, "electron-builder only makes the .app; build-mac-pkg.cjs makes the installer");
-  assert.ok(fs.existsSync(path.join(desktopDir, build.mac.entitlements)));
-  assert.match(fs.readFileSync(path.join(desktopDir, build.mac.entitlements), "utf8"), /allow-jit/);
+  assert.ok(fs.existsSync(path.join(desktopDir, build.mac.sign.entitlements)));
+  assert.match(fs.readFileSync(path.join(desktopDir, build.mac.sign.entitlements), "utf8"), /allow-jit/);
   assert.equal(packageJson.productName, "Phone Farm");
   assert.match(packageJson.version, /^\d+\.\d+\.\d+$/);
 });

@@ -76,7 +76,7 @@ jobs:
         run: node desktop/scripts/audit-gate.cjs --dir system
 
       - name: Real Redis test — client, health check, key schema (M06)
-        run: node --test test/integration/redis/redisFoundation.test.js
+        run: node --test server/test/integration/redis/redisFoundation.test.js
         env:
           TEST_REDIS_URL: redis://127.0.0.1:6379
 
