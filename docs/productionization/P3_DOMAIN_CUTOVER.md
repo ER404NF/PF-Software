@@ -1,8 +1,9 @@
 # P3 — Move durable data off files, one domain at a time
 
-Status: **PASS WITH KNOWN LIMITATIONS — all 9 domains that have a Postgres adapter now have a working,
-tested migration script (steps 1–3); the actual cutover (step 4) is deliberately not flipped for any domain
-yet.** Builds on [P1_REAL_DATABASE_VERIFICATION.md](P1_REAL_DATABASE_VERIFICATION.md) and
+Status: **IN PROGRESS — all 9 domains that have a Postgres adapter have a working, tested migration script;
+the first reversible runtime cutover slice is now implemented for sites.** Set
+`SITE_REPOSITORY_BACKEND=postgres` together with `DATABASE_URL` only after running the site migration. The
+default remains `file`, and the other domains have not been wired yet. Builds on [P1_REAL_DATABASE_VERIFICATION.md](P1_REAL_DATABASE_VERIFICATION.md) and
 [P2_REAL_LOGIN_MOUNTED.md](P2_REAL_LOGIN_MOUNTED.md).
 
 Domains done: sites, assignments, platform accounts/policies, task queue/runs/checkpoints, approvals,
@@ -21,7 +22,7 @@ devices domain needs its own design pass before a Postgres adapter makes sense �
 for it yet. P3 cannot cut over a domain that has no adapter to cut over to. This is a pre-existing, already
 -documented gap, not a new decision made here; devices/hosts remains skipped until that design pass happens.
 
-## Domain 1: sites — done through step 2 (migration script), steps 3–4 deliberately deferred
+## Domain 1: sites — runtime cutover wiring complete; deployment observation pending
 
 Per-domain steps, and where each stands:
 
@@ -41,13 +42,15 @@ Per-domain steps, and where each stands:
    every M05 domain.
 4. **"Cut `index.js` over to the Postgres adapter for that domain behind the same flag as P2; keep the file
    store readable as a fallback until you've watched it run correctly for a while, then remove it."**
-   **Deliberately not done in this pass.** "Watched it run correctly for a while" is an operational
-   observation step nobody can perform without a real, running deployment with real traffic — doing it
-   without that would just be flipping a flag and hoping, which is exactly the "no big-bang cutover" safety
-   rule (handout §2) this whole task exists to prevent. The wiring itself (an `if` branch in `index.js`
-   choosing `createPostgresSiteRepository(pool)` vs. `createFileSiteRepository(path)` behind an env flag,
-   mirroring `CLOUD_API_ENABLED`'s own pattern from P2) is small, mechanical follow-on work once there is a
-   real environment to watch it in — see "Next steps."
+   **Wiring done; activation and observation pending.** `SITE_REPOSITORY_BACKEND=postgres` selects the real
+   adapter in the running server. Unknown values and a missing `DATABASE_URL` fail startup. Site admin routes
+   now await durable writes, and site-agent upgrade/message authorization supports the asynchronous adapter;
+   a database authorization error rejects the upgrade or closes the active link instead of falling back to
+   the file store. The same application pool is shared with `CLOUD_API_ENABLED` when both are active and is
+   closed on server shutdown. `postgresSiteMountedInIndex.test.js` proves the actual server mounting over
+   HTTP against `TEST_DATABASE_URL`; it skips on hosts without a disposable PostgreSQL instance. The file
+   source stays untouched for rollback. A real deployment still has to run the migration, enable the flag,
+   observe traffic, and explicitly decide when the old file source can be retired.
 
 ### A real bug found while writing the migration script (again, only visible for real)
 
@@ -85,13 +88,13 @@ Local verification: `node --check` passed; full local server suite re-run after 
 
 ## Domains 2–9: assignments, platform policies, task queue, approvals, interventions, proxy pool, audit, research
 
-Each follows the exact same shape as the sites domain above: a `scripts/migrate-<domain>-to-postgres.js`
+Each remaining domain follows the same shape as the sites domain above: a `scripts/migrate-<domain>-to-postgres.js`
 script that reuses the real file store's own loading (never a hand-rolled parser), upserts into the existing
 M05 Postgres schema preserving every field exactly, reports before/after counts, and is safe to re-run; a
 real-PostgreSQL test proving it against a realistic (not real-production — none exists in this environment)
-fixture; wiring into `.github/workflows/db-migrations.yml`. None of the 9 domains has had its cutover (step 4)
-flipped, for the same reason as sites: that requires a real deployment to watch run correctly for a while
-first.
+fixture; wiring into `.github/workflows/db-migrations.yml`. None of these remaining eight domains has had its
+cutover (step 4) flipped yet. Each will get its own explicit backend flag and mounted-server
+proof before any deployment enables it.
 
 | Domain | Script | Real bug found? |
 | --- | --- | --- |

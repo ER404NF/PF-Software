@@ -30,6 +30,19 @@ test("start spawns exactly once per key and records the call", () => {
   assert.equal(group.isRunning("udid-1"), true);
 });
 
+// wdaProcessManager.js relies on this to pass WDA's MJPEG tuning env vars
+// (production-readiness audit §5) — without it, `start()` had no way at all
+// to hand extra environment to the spawned process; it silently inherited
+// only process.env every time.
+test("an optional env is merged over process.env for the spawned process, and reused across restarts", () => {
+  const calls = [];
+  const spawn = (bin, args, options) => { calls.push(options); return fakeChild(); };
+  const group = new SupervisedProcessGroup({ spawn, restartBackoffMs: [10] });
+  group.start("udid-1", "xcodebuild", ["test"], { CUSTOM_VAR: "tuned" });
+  assert.equal(calls[0].env.CUSTOM_VAR, "tuned");
+  assert.equal(calls[0].env.PATH, process.env.PATH, "must still inherit the rest of the real environment");
+});
+
 test("stdout/stderr are captured into a bounded log ring", () => {
   let child;
   const spawn = () => { child = fakeChild(); return child; };

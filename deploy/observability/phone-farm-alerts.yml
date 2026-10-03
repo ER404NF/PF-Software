@@ -1,0 +1,62 @@
+groups:
+  - name: phone-farm
+    rules:
+      - record: phone_farm:http_requests:rate5m
+        expr: sum(rate(phone_farm_http_requests_total[5m]))
+
+      - record: phone_farm:http_server_errors:ratio5m
+        expr: |
+          sum(rate(phone_farm_http_requests_total{status_class="5xx"}[5m]))
+          /
+          clamp_min(phone_farm:http_requests:rate5m, 0.001)
+
+      - record: phone_farm:http_request_duration:average5m
+        expr: |
+          sum(rate(phone_farm_http_request_duration_seconds_sum[5m]))
+          /
+          clamp_min(phone_farm:http_requests:rate5m, 0.001)
+
+      - alert: PhoneFarmMetricsUnavailable
+        expr: up{job="phone-farm"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: Phone Farm metrics target is unavailable
+          runbook: docs/INCIDENT_RESPONSE.md#phonefarmmetricsunavailable
+
+      - alert: PhoneFarmHighServerErrorRatio
+        expr: phone_farm:http_server_errors:ratio5m > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: More than five percent of Phone Farm responses are server errors
+          runbook: docs/INCIDENT_RESPONSE.md#phonefarmhighservererrorratio
+
+      - alert: PhoneFarmProcessRestarted
+        expr: phone_farm_process_uptime_seconds < 300
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: Phone Farm process restarted recently
+          runbook: docs/INCIDENT_RESPONSE.md#phonefarmprocessrestarted
+
+      - alert: PhoneFarmRoutingUnverified
+        expr: phone_farm_routed_devices > phone_farm_protected_devices
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: One or more routed devices lack current device-originated protection evidence
+          runbook: docs/INCIDENT_RESPONSE.md#phonefarmroutingunverified
+
+      - alert: PhoneFarmOpenChallenge
+        expr: phone_farm_open_interventions{category="challenge"} > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: A device workflow is waiting for human challenge handling
+          runbook: docs/INCIDENT_RESPONSE.md#phonefarmopenchallenge

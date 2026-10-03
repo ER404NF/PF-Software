@@ -28,6 +28,19 @@ async function loadRegistry(config) {
   }
 }
 
+async function loadRegistryText(text) {
+  const configPath = path.join(root, `models-raw-${Date.now()}-${Math.random()}.json`);
+  fs.writeFileSync(configPath, text);
+  const previousPath = process.env.MODELS_CONFIG_PATH;
+  process.env.MODELS_CONFIG_PATH = configPath;
+  try {
+    return await import(`../../src/providerRegistry.js?${encodeURIComponent(configPath)}`);
+  } finally {
+    if (previousPath === undefined) delete process.env.MODELS_CONFIG_PATH;
+    else process.env.MODELS_CONFIG_PATH = previousPath;
+  }
+}
+
 test("loads a configured anthropic and openai-compatible provider, resolving credentials from env vars", async () => {
   process.env.TEST_ANTHROPIC_KEY = "anthropic-secret";
   process.env.TEST_DEEPSEEK_KEY = "deepseek-secret";
@@ -123,5 +136,48 @@ test("openai-compatible entry missing baseUrl is skipped with a warning, not a c
     });
     assert.equal(registry.providers.size, 0);
     assert.ok(warn.mock.calls.some((c) => c.arguments[0].includes("broken")));
+  } finally { warn.mock.restore(); }
+});
+
+test("malformed configuration fails closed without logging parser input", async () => {
+  const privateMarker = "PRIVATE_CONFIG_MARKER";
+  const warn = mock.method(console, "warn", () => {});
+  try {
+    const registry = await loadRegistryText(`{ "providers": [${privateMarker}`);
+    assert.equal(registry.providers.size, 0);
+    const output = warn.mock.calls.map((call) => call.arguments.join(" ")).join("\n");
+    assert.match(output, /unable to read provider configuration/);
+    assert.doesNotMatch(output, new RegExp(privateMarker));
+  } finally { warn.mock.restore(); }
+});
+
+test("a non-array providers value fails closed instead of aborting registry load", async () => {
+  const warn = mock.method(console, "warn", () => {});
+  try {
+    const registry = await loadRegistry({ providers: { name: "not-an-array" } });
+    assert.equal(registry.providers.size, 0);
+    assert.ok(warn.mock.calls.some((call) => call.arguments[0].includes("providers must be an array")));
+  } finally { warn.mock.restore(); }
+});
+
+test("unsafe provider fields are rejected without echoing their contents", async () => {
+  const privateName = "PRIVATE_NAME\nINJECTED";
+  const privateEnv = "PRIVATE_ENV=SECRET_VALUE";
+  const privateUrl = "https://user:PRIVATE_PASSWORD@example.test";
+  const warn = mock.method(console, "warn", () => {});
+  try {
+    const registry = await loadRegistry({
+      providers: [
+        null,
+        { name: privateName, kind: "anthropic", model: "x" },
+        { name: "bad-env", kind: "anthropic", model: "x", credentialEnv: privateEnv },
+        { name: "bad-url", kind: "openai-compatible", model: "x", baseUrl: privateUrl },
+        { name: "good", kind: "anthropic", model: "x" },
+      ],
+    });
+    assert.deepEqual([...registry.providers.keys()], ["good"]);
+    const output = warn.mock.calls.map((call) => call.arguments.join(" ")).join("\n");
+    assert.match(output, /invalid-provider/);
+    assert.doesNotMatch(output, /PRIVATE_NAME|PRIVATE_ENV|SECRET_VALUE|PRIVATE_PASSWORD/);
   } finally { warn.mock.restore(); }
 });

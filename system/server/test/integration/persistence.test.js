@@ -101,6 +101,7 @@ before(() => {
     RESEARCH_STORE_DIR: path.join(tmpDir, "research"),
     RESEARCH_EVIDENCE_DIR: path.join(tmpDir, "research-evidence"),
     FILE_STORE_DIR: path.join(tmpDir, "files"),
+    DEVICE_CONFIG_PATH: path.resolve("server/fixtures/network-devices.config.json"),
     SESSION_SECRET: "fixed-test-secret-for-this-run",
     PHONE_FARM_LOCAL_DEV: "true",
     AUTO_DISCOVER_IOS_DEVICES: "false",

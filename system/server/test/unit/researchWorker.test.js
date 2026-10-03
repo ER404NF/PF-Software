@@ -91,8 +91,17 @@ test("provider/observation and skill failures leave no zombie RUNNING task", asy
   recoveryFailure.skill.recover = async () => { throw new Error("recovery failed"); };
   const recoveryResult = await runResearchStep(recoveryFailure);
   assert.equal(recoveryResult.outcome, TASK_STATES.FAILED_RETRYABLE);
-  assert.equal(recoveryResult.recoveryError, "recovery failed");
+  assert.equal(recoveryResult.recoveryError, "skill recovery failed (Error)");
   assert.equal(recoveryFailure.taskQueue.results[0][1], TASK_STATES.FAILED_RETRYABLE);
+});
+
+test("provider exception details are not persisted in task results", async () => {
+  const ctx = setup();
+  ctx.provider.observeAndPlan = async () => { throw new Error("PRIVATE_PROVIDER_RESPONSE"); };
+  const result = await runResearchStep(ctx);
+  assert.equal(result.error, "research planning failed (Error)");
+  assert.equal(ctx.taskQueue.results[0][2].detail, "research planning failed (Error)");
+  assert.doesNotMatch(JSON.stringify({ result, persisted: ctx.taskQueue.results }), /PRIVATE_PROVIDER_RESPONSE/);
 });
 
 test("account access is checked at entry and again immediately before execution", async () => {

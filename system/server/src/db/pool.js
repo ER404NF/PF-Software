@@ -8,6 +8,7 @@
 // docs/productionization/DATABASE_GAP_ANALYSIS.md.
 
 import pg from "pg";
+import { logOperationalFailure } from "../safeOperationalLog.js";
 
 const { Pool } = pg;
 
@@ -57,7 +58,7 @@ export function createPool(options = {}) {
   // crash the process — it would otherwise surface as an unhandled 'error'
   // event, per the pg library's own documented requirement.
   pool.on("error", (error) => {
-    console.error("Unexpected PostgreSQL pool error on an idle client:", error.message);
+    logOperationalFailure("Unexpected PostgreSQL pool error on an idle client", error);
   });
   return pool;
 }

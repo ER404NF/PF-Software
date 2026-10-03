@@ -15,6 +15,8 @@
 // only by actually mounting this API inside the real server and hitting it
 // with a real HTTP request, not by testing this app in isolation.
 
+import { logOperationalFailure } from "../../safeOperationalLog.js";
+
 export function createAuthenticate({ identitySessionService, userRepository }) {
   if (!identitySessionService) throw new TypeError("authenticate middleware requires identitySessionService");
   if (!userRepository) throw new TypeError("authenticate middleware requires userRepository");
@@ -36,7 +38,7 @@ export function createAuthenticate({ identitySessionService, userRepository }) {
     // Fire-and-forget: a slow audit write must never add latency to every
     // authenticated request, and its failure must never fail the request.
     void identitySessionService.touchSession(session.id).catch((error) => {
-      console.error("Failed to record session activity:", error.message);
+      logOperationalFailure("Failed to record session activity", error);
     });
     next();
   };

@@ -3,30 +3,14 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import vm from "node:vm";
 const source = fs.readFileSync(new URL("../../../client/app.js", import.meta.url), "utf8");
+const peopleAssignmentsSource = fs.readFileSync(new URL("../../../client/peopleAssignmentsController.js", import.meta.url), "utf8");
 function section(start, end) { return source.slice(source.indexOf(start), source.indexOf(end, source.indexOf(start))); }
 function element() { return { children: [], append(...items) { this.children.push(...items); }, appendChild(item) { this.children.push(item); }, addEventListener(name, fn) { this[name] = fn; }, set innerHTML(value) { this.children = []; } }; }
 
 test("assignment choices use server eligibility and retain a stale target as disabled", () => {
-  const select = { value: "outside", options: [], replaceChildren(...items) { this.options = [...items]; }, append(item) { this.options.push(item); } };
-  const deviceSelect = { value: "", options: [], replaceChildren(...items) { this.options = [...items]; }, append(item) { this.options.push(item); } };
-  const context = vm.createContext({
-    assignmentAssigneeEl: select, assignmentDeviceEl: deviceSelect,
-    lastPeople: [
-      { username: "same-team", role: "va", canAssign: true },
-      { username: "outside", role: "va", canAssign: false },
-    ],
-    lastDevices: [], currentOperator: { allowedDevices: [] },
-    displayRole: role => role,
-    document: { createElement: tag => ({ tag, value: "", textContent: "", disabled: false }) },
-    Option: function Option(text, value, defaultSelected = false, selected = false) {
-      return { text, value, defaultSelected, selected, disabled: false };
-    },
-  });
-  vm.runInContext(section("function populateAssignmentForm(", "function assignmentNextStatuses"), context);
-  vm.runInContext("populateAssignmentForm({ unavailableAssignee: 'outside' })", context);
-  assert.deepEqual(select.options.map(option => option.value), ["same-team", "outside"]);
-  assert.equal(select.options[1].disabled, true);
-  assert.equal(select.options[1].selected, true);
+  assert.match(peopleAssignmentsSource, /if \(person\.canAssign !== true\) continue/);
+  assert.match(peopleAssignmentsSource, /\(no longer eligible\)/);
+  assert.match(peopleAssignmentsSource, /unavailable\.disabled = true/);
 });
 test("out-of-order file lists and detached delete buttons cannot target another device", async () => {
   const pending = [], deletes = [];
@@ -86,12 +70,14 @@ test("failed server logout clears local state and leaves a persistent retry warn
   let liveViewStops = 0;
   let streamResets = 0;
   let sitesCleared = 0;
+  let proxyClears = 0;
   const context = vm.createContext({
     signedOut: false, fileRequestGeneration: 0, currentDeviceId: "a", pendingDeviceId: "a",
     watchedDeviceId: "a", pendingWatchDeviceId: "a", pendingAiWorkspaceExitDeviceId: "a",
     lastDevices: [{ id: "a" }], watchRefreshTimerId: 1,
     clearTimeout() {}, clearAiWorkspace() {}, setBusy() {}, stopLiveView() { liveViewStops++; },
     resetStreamState() { streamResets++; }, clearSitesView() { sitesCleared++; }, fileListEl: { replaceChildren() {} },
+    proxyPoolController: { clear() { proxyClears++; } },
     deviceControlBarEl: {}, uploadFormEl: {}, releaseButtonEl: {},
     setOperatorProfile(value) { profile = value; }, showLogin() { loginShown++; },
     logoutRetryButtonEl: { hidden: true, disabled: false }, loginErrorEl: {},
@@ -109,6 +95,7 @@ test("failed server logout clears local state and leaves a persistent retry warn
   assert.equal(liveViewStops, 1, "sign-out must stop screenshot polling immediately");
   assert.equal(streamResets, 1, "sign-out must stop the live video and clear the picture immediately");
   assert.equal(sitesCleared, 1, "sign-out must remove any site token still on screen");
+  assert.equal(proxyClears, 1, "sign-out must remove proxy inventory and any typed password");
   assert.equal(pending, true);
   assert.equal(context.logoutRetryButtonEl.hidden, false);
   assert.match(context.loginErrorEl.textContent, /server could not confirm session revocation/);
@@ -203,11 +190,16 @@ for (const protocol of ["https:", "http:"]) test(`WebSocket URL follows ${protoc
   vm.runInContext("connect()", context);
   assert.equal(url, `${protocol === "https:" ? "wss:" : "ws:"}//phones.example:8443`);
 });
-test("the drawn picture keeps its own aspect ratio, so a click maps onto the phone without letterbox correction", () => {
+test("low-resolution phone frames request available space while preserving the canvas aspect ratio and input rectangle", () => {
   const css = fs.readFileSync(new URL("../../../client/style.css", import.meta.url), "utf8");
-  assert.match(css, /\.phone-canvas\s*\{[^}]*width: auto;[^}]*height: auto;/);
+  assert.match(css, /\.phone-canvas\s*\{[^}]*width: auto;[^}]*height: auto;[^}]*max-width: min\(480px, calc\(100vw - 96px\)\);[^}]*max-height:/);
+  assert.match(css, /#screen-panel:fullscreen \.phone-canvas\s*\{[^}]*max-width: calc\(100vw - 72px\);[^}]*max-height: calc\(100vh - 142px\);/);
   assert.doesNotMatch(css, /\.phone-canvas\s*\{[^}]*object-fit/);
   const stage = fs.readFileSync(new URL("../../../client/phoneStage.js", import.meta.url), "utf8");
+  assert.match(stage, /this\.canvas\.style\.width = `\$\{fitted\.width\}px`;/,
+    "the canvas must receive an explicit contain-fit width so intrinsic 90x160 frames upscale");
+  assert.match(stage, /this\.canvas\.style\.height = `\$\{fitted\.height\}px`;/,
+    "width and height must be fitted together so max-height cannot distort the phone");
   assert.match(stage, /displayRect\(\) \{\s*const target = this\.canvas \|\| this\.screenEl;/, "clicks are measured against the canvas itself");
 });
 
@@ -286,6 +278,35 @@ for (const code of [1008, 1006]) test(`expired session returns to login after cl
   assert.equal(context.signedOut, true);
 });
 
+test("a transient browser socket loss reconnects automatically while the session remains valid", async () => {
+  const sockets = [];
+  let reconnect;
+  let sessionChecks = 0;
+  const context = vm.createContext({
+    location: { protocol: "http:", host: "localhost" }, signedOut: false,
+    busy: false, watchedDeviceId: null, pendingWatchDeviceId: null,
+    watchRefreshTimerId: null, watchControlsEl: {}, filesPanelEl: {},
+    fleetGroupsEl: {}, selectErrorEl: {}, connectionStatusEl: {},
+    deselect() {}, setOperatorProfile() {}, showLogin() { assert.fail("a valid session must not return to login"); },
+    resetStreamState() {}, setConnectionState() {}, clearAiWorkspace() {}, markPresenceUnavailable() {},
+    setTimeout(fn) { reconnect = fn; return 1; }, clearTimeout() {},
+    requestJson: async () => { sessionChecks += 1; return { operator: { username: "va" } }; },
+    WebSocket: class {
+      constructor() { this.handlers = {}; sockets.push(this); }
+      addEventListener(name, fn) { this.handlers[name] = fn; }
+    },
+  });
+  vm.runInContext(section("function connect()", "checkSession();"), context);
+  vm.runInContext("connect()", context);
+  assert.equal(sockets.length, 1);
+  sockets[0].handlers.close({ code: 1006 });
+  assert.equal(typeof reconnect, "function", "an abnormal close schedules a reconnect");
+  await reconnect();
+  assert.equal(sessionChecks, 1, "the reconnect first confirms the HTTP session is still valid");
+  assert.equal(sockets.length, 2, "a fresh WebSocket is opened without requiring the retry button");
+  assert.equal(context.signedOut, false);
+});
+
 test("transient device error keeps selection and Release available", () => {
   const handlers = {}; let busy; let settled = false;
   const context = vm.createContext({ location: { protocol: "http:", host: "localhost" }, currentDeviceId: "a", pendingDeviceId: null,
@@ -349,12 +370,14 @@ test("live role updates clear privileged DOM before safe data is reloaded", () =
   let renderedAssignments = null;
   let assignmentRefreshes = 0;
   let sitesCleared = 0;
+  let proxyClearOptions = null;
   const context = vm.createContext({
     currentOperator: { username: "operator", role: "admin", capabilities: ["queue:manage", "users:manage"] },
     lastDevices: [{ authorizedOperators: ["private"] }], renderToken: 4,
     UI_CAPABILITIES: {
       VIEW_ASSIGNMENTS: "assignments:view", MANAGE_ASSIGNMENTS: "assignments:manage",
       VIEW_AUDIT: "audit:view-sensitive", MANAGE_USERS: "users:manage",
+      VIEW_PROXY_POOL: "proxy:view",
     },
     setOperatorProfile(profile) { context.currentOperator = profile; },
     can(capability) { return context.currentOperator.capabilities.includes(capability); },
@@ -373,6 +396,17 @@ test("live role updates clear privileged DOM before safe data is reloaded", () =
     usersListEl: cleared(), usersMessageEl: { textContent: "private" }, usersEmptyEl: {},
     proxyPoolCreateFormEl: { resetCalled: false, reset() { this.resetCalled = true; } },
     proxyPoolListEl: cleared(), proxyPoolMessageEl: { textContent: "private" }, proxyPoolEmptyEl: {},
+    proxyProviderListEl: cleared(), proxyProviderEmptyEl: {},
+    proxyPoolController: {
+      clear(options) {
+        proxyClearOptions = options;
+        context.proxyPoolCreateFormEl.reset();
+        context.proxyPoolListEl.replaceChildren();
+        context.proxyProviderListEl.replaceChildren();
+        context.proxyPoolMessageEl.textContent = "";
+      },
+      refresh() { throw new Error("demoted role must not refresh proxy data"); },
+    },
   });
   vm.runInContext(section("function applyLiveOperatorProfile(profile)", "// Every route below"), context);
   vm.runInContext(`applyLiveOperatorProfile({ username: "operator", role: "va", allowedDevices: [],
@@ -392,6 +426,8 @@ test("live role updates clear privileged DOM before safe data is reloaded", () =
   assert.equal(context.assignmentInstructionsEl.value, "");
   assert.equal(context.proxyPoolCreateFormEl.resetCalled, true);
   assert.deepEqual(context.proxyPoolListEl.children, []);
+  assert.deepEqual(context.proxyProviderListEl.children, []);
+  assert.equal(proxyClearOptions.unavailable, true);
 });
 
 test("a privileged response already in flight cannot repopulate UI after demotion", async () => {

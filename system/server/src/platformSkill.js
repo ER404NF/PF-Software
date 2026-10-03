@@ -3,6 +3,7 @@
 // branch on Instagram/Reddit/X details.
 
 import { ACTIONS } from "./actionPolicy.js";
+import { operationalErrorKind } from "./safeOperationalLog.js";
 
 const ACTION_SET = new Set(ACTIONS);
 const REQUIRED_METHODS = ["detectState", "availableActions", "execute", "verify", "recover"];
@@ -20,7 +21,7 @@ async function recoverSafely(skill, error, context, canExecute) {
   try {
     return { recovery: await skill.recover(error, context), recoveryError: null };
   } catch (recoveryError) {
-    return { recovery: null, recoveryError: recoveryError?.message || String(recoveryError) };
+    return { recovery: null, recoveryError: `skill recovery failed (${operationalErrorKind(recoveryError)})` };
   }
 }
 
@@ -91,7 +92,13 @@ export async function executeSkillAction({ skill, decision, observation, policyR
   } catch (error) {
     const { recovery, recoveryError } = await recoverSafely(skill, error,
       { ...context, state: state ?? null, decision, observation }, canExecute);
-    return { outcome: "FAILED", state: state ?? null, error: error?.message || String(error), recovery, recoveryError };
+    return {
+      outcome: "FAILED",
+      state: state ?? null,
+      error: `skill action failed (${operationalErrorKind(error)})`,
+      recovery,
+      recoveryError,
+    };
   }
 }
 

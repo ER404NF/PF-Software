@@ -11,7 +11,7 @@ const source = fs.readFileSync(fileURLToPath(new URL("../../../client/phoneStage
 // comparable with deepStrictEqual.
 vm.runInThisContext(source, { filename: "phoneStage.js" });
 const { PhoneStage } = globalThis;
-const { pointInRect, classifyGesture, wheelDragMessage, scrollDrag, keyAction, TextBatcher } = PhoneStage.helpers;
+const { pointInRect, classifyGesture, wheelDragMessage, scrollDrag, keyAction, TextBatcher, fitContain, fullscreenCanvasHeight } = PhoneStage.helpers;
 
 // ---- fake DOM ------------------------------------------------------------------
 
@@ -106,6 +106,25 @@ test("pointInRect maps client pixels to 0..1 and clamps outside the picture", ()
   assert.deepEqual(pointInRect(rect, 0, 9999), { x: 0, y: 1 });
   assert.equal(pointInRect({ left: 0, top: 0, width: 0, height: 10 }, 1, 1), null);
   assert.equal(pointInRect(null, 1, 1), null);
+});
+
+test("fitContain upscales portrait and landscape frames to the largest uncropped size", () => {
+  assert.deepEqual(fitContain(90, 160, 480, 604), { width: 339.75, height: 604 });
+  const landscape = fitContain(160, 90, 1464, 722);
+  assert.equal(landscape.height, 722);
+  assert.ok(Math.abs(landscape.width - 1283.5555555555557) < 1e-9);
+  assert.equal(fitContain(0, 160, 480, 604), null);
+});
+
+test("fullscreen height budget subtracts the real toolbar and bezel layout instead of a viewport guess", () => {
+  assert.equal(fullscreenCanvasHeight({
+    layoutBottom: 864,
+    frameTop: 77.6,
+    frameHeight: 682,
+    screenWrapHeight: 604,
+    paddingBottom: 12,
+  }), 696.4);
+  assert.equal(fullscreenCanvasHeight({ layoutBottom: 10, frameTop: 20, frameHeight: 5, screenWrapHeight: 5 }), null);
 });
 
 test("a short press without movement is a tap; a long one a long press; jitter still counts as a tap", () => {
@@ -388,6 +407,26 @@ test("binary frames for the current stream are drawn; stale streams and runts ar
   assert.equal(canvas.height, 160);
   assert.equal(canvas.drawn.length, 1);
   assert.ok(frame.classes.has("has-picture"));
+});
+
+test("a rotated frame is re-fitted from its new intrinsic dimensions", async () => {
+  const screen = new FakeElement();
+  const sizes = [{ width: 90, height: 160 }, { width: 160, height: 90 }];
+  const stage = new PhoneStage({
+    screenEl: screen,
+    send: () => 1,
+    createCanvas: fakeCanvas,
+    decode: async () => ({ ...sizes.shift(), close() {} }),
+    getComputedStyleFn: () => ({ maxWidth: "480px", maxHeight: "604px" }),
+  });
+  stage.showFrame(new Uint8Array([1]), 2);
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(screen.children[0].style.width, "339.75px");
+  assert.equal(screen.children[0].style.height, "604px");
+  stage.showFrame(new Uint8Array([2]), 2);
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(screen.children[0].style.width, "480px");
+  assert.equal(screen.children[0].style.height, "270px");
 });
 
 test("while a frame is decoding, only the newest waiting frame is kept", async () => {

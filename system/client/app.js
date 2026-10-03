@@ -106,6 +106,14 @@ const aiChatFormEl = document.getElementById("ai-chat-form");
 const aiChatInputEl = document.getElementById("ai-chat-input");
 const adminViewEl = document.getElementById("admin-view");
 const adminRefreshButtonEl = document.getElementById("admin-refresh-button");
+const operationsNavEl = document.getElementById("operations-nav");
+document.addEventListener("keydown", event => {
+  if (event.key === "Tab") document.body.classList.add("keyboard-navigation");
+});
+document.addEventListener("pointerdown", () => document.body.classList.remove("keyboard-navigation"));
+const operationsNavLinks = [...operationsNavEl.querySelectorAll("[data-operations-target]")];
+const operationsController = window.createOperationsController({ links: operationsNavLinks,
+  documentRef: document, locationRef: location, historyRef: history });
 const commandFormEl = document.getElementById("command-form");
 const commandInputEl = document.getElementById("command-input");
 const commandOutputEl = document.getElementById("command-output");
@@ -115,6 +123,11 @@ const queueBodyEl = document.getElementById("queue-body");
 const queueEmptyEl = document.getElementById("queue-empty");
 const usersPanelEl = document.getElementById("users-panel");
 const usersRefreshButtonEl = document.getElementById("users-refresh-button");
+const pendingPanelEl = document.getElementById("pending-panel");
+const pendingRefreshButtonEl = document.getElementById("pending-refresh-button");
+const pendingListEl = document.getElementById("pending-list");
+const pendingEmptyEl = document.getElementById("pending-empty");
+const pendingCountEl = document.getElementById("pending-count");
 const userCreateFormEl = document.getElementById("user-create-form");
 const userCreateFullNameEl = document.getElementById("user-create-full-name");
 const userCreateEmailEl = document.getElementById("user-create-email");
@@ -159,6 +172,8 @@ const proxyPoolTestButtonEl = document.getElementById("proxy-pool-test-button");
 const proxyPoolMessageEl = document.getElementById("proxy-pool-message");
 const proxyPoolListEl = document.getElementById("proxy-pool-list");
 const proxyPoolEmptyEl = document.getElementById("proxy-pool-empty");
+const proxyProviderListEl = document.getElementById("proxy-provider-list");
+const proxyProviderEmptyEl = document.getElementById("proxy-provider-empty");
 
 // currentDeviceId is only ever set once the server has confirmed a
 // selection (a "frame" arrives for it) — never optimistically. Otherwise a
@@ -181,6 +196,7 @@ let currentOperator = null;
 let operatorProfileGeneration = 0;
 
 const ROLE_LABELS = Object.freeze({
+  host: "Host",
   admin: "Admin",
   manager: "Manager",
   va: "VA",
@@ -380,6 +396,7 @@ let streamPausedForVisibility = false;
 const phoneStage = new window.PhoneStage({
   screenEl,
   frameEl: phoneFrameEl,
+  layoutEl: screenPanelEl,
   homeButtonEl: phoneHomeButtonEl,
   dotEl: touchDotEl,
   keyboardEl: keyboardCaptureEl,
@@ -523,6 +540,7 @@ function syncPhoneSizeButton() {
   const expanded = document.fullscreenElement === screenPanelEl;
   phoneSizeButtonEl.textContent = expanded ? "Exit full screen" : "Full screen";
   phoneSizeButtonEl.setAttribute("aria-pressed", String(expanded));
+  phoneStage.fitCanvas();
 }
 
 async function togglePhoneFullscreen() {
@@ -734,6 +752,7 @@ function clearLocalAuthenticatedState() {
   clearAiWorkspace();
   resetStreamState();
   clearSitesView();
+  proxyPoolController.clear({ unavailable: true });
   fileListEl.replaceChildren();
   deviceControlBarEl.hidden = true;
   uploadFormEl.hidden = true;
@@ -771,7 +790,9 @@ function setOperatorProfile(profile) {
     capabilities: Array.isArray(profile.capabilities) ? profile.capabilities.filter(value => typeof value === "string") : [],
     fullName: typeof profile.fullName === "string" ? profile.fullName : null,
     teamId: typeof profile.teamId === "string" ? profile.teamId : null,
+    isMainHost: profile.isMainHost === true,
   } : null;
+  syncCreateUserRoleOptions();
 
   whoamiEl.textContent = currentOperator ? `Signed in as ${currentOperator.username}` : "";
   roleBadgeEl.textContent = currentOperator ? displayRole(currentOperator.role) : "";
@@ -788,10 +809,12 @@ function setOperatorProfile(profile) {
   adminNavButtonEl.hidden = !canManageOperations();
   document.getElementById("audit-panel").hidden = !can(UI_CAPABILITIES.VIEW_AUDIT);
   usersPanelEl.hidden = !canManagePeople();
+  pendingPanelEl.hidden = !canManagePeople();
   userCreateFormEl.hidden = !can(UI_CAPABILITIES.MANAGE_USERS);
   proxyPoolPanelEl.hidden = !can(UI_CAPABILITIES.VIEW_PROXY_POOL);
   proxyPoolCreateFormEl.hidden = !can(UI_CAPABILITIES.MANAGE_PROXY);
   sitesPanelEl.hidden = !can(UI_CAPABILITIES.MANAGE_SITES);
+  syncOperationsNavigation();
   if (!can(UI_CAPABILITIES.MANAGE_SITES)) clearSitesView();
   assignmentCreateFormEl.hidden = !can(UI_CAPABILITIES.MANAGE_ASSIGNMENTS);
   const managesAssignments = can(UI_CAPABILITIES.MANAGE_ASSIGNMENTS);
@@ -813,6 +836,26 @@ function setOperatorProfile(profile) {
     stopWatching("Live watching is no longer permitted for this role.");
   }
   if (!can(UI_CAPABILITIES.CONTROL_DEVICE)) stopLiveView();
+}
+
+function syncOperationsNavigation() {
+  operationsController.sync(allowedOperationsPanels());
+}
+
+function allowedOperationsPanels() {
+  return new Map([
+    ["command-console-panel", canManageOperations()],
+    ["queue-panel", canManageOperations()],
+    ["pending-panel", canManagePeople()],
+    ["users-panel", canManagePeople()],
+    ["sites-panel", can(UI_CAPABILITIES.MANAGE_SITES)],
+    ["proxy-pool-panel", can(UI_CAPABILITIES.VIEW_PROXY_POOL)],
+    ["audit-panel", can(UI_CAPABILITIES.VIEW_AUDIT)],
+  ]);
+}
+
+function selectOperationsPanel(panelId, { focus = true } = {}) {
+  return operationsController.select(panelId, allowedOperationsPanels(), { focus });
 }
 
 function applyLiveOperatorProfile(profile) {
@@ -865,18 +908,9 @@ function applyLiveOperatorProfile(profile) {
     usersEmptyEl.textContent = "User management is not available for this role.";
   }
   // Re-fetched below under the new capability set, not merely hidden —
-  // stale lease/exclusivity data must not survive a demotion.
-  lastProxyPool = [];
-  proxyPoolLoaded = false;
-  if (!can(UI_CAPABILITIES.VIEW_PROXY_POOL)) {
-    proxyPoolCreateFormEl.reset();
-    proxyPoolListEl.replaceChildren();
-    proxyPoolMessageEl.textContent = "";
-    proxyPoolEmptyEl.hidden = false;
-    proxyPoolEmptyEl.textContent = "The proxy pool is not available for this role.";
-  } else {
-    void refreshProxyPool();
-  }
+  // stale lease/exclusivity data and password input must not survive a demotion.
+  proxyPoolController.clear({ unavailable: !can(UI_CAPABILITIES.VIEW_PROXY_POOL) });
+  if (can(UI_CAPABILITIES.VIEW_PROXY_POOL)) void proxyPoolController.refresh();
 }
 
 // Every route below this needs a session; a WS connection needs one too
@@ -1133,373 +1167,54 @@ function formatLastSeen(value) {
   return `Seen ${Math.round(minutes / 60)}h ago`;
 }
 
-let lastPeople = [];
-let peopleLastUpdatedAt = null;
+const peopleAssignmentsController = window.createPeopleAssignmentsController({
+  elements: {
+    peopleList: peopleListEl, peopleSummary: peopleSummaryEl, peopleError: peopleErrorEl,
+    peopleRefreshButton: peopleRefreshButtonEl, assignmentsRefreshButton: assignmentsRefreshButtonEl,
+    assignmentCreateForm: assignmentCreateFormEl, assignmentAssignee: assignmentAssigneeEl,
+    assignmentDevice: assignmentDeviceEl, assignmentAccount: assignmentAccountEl,
+    assignmentStart: assignmentStartEl, assignmentEnd: assignmentEndEl,
+    assignmentRecurrence: assignmentRecurrenceEl, assignmentExclusive: assignmentExclusiveEl,
+    assignmentInstructions: assignmentInstructionsEl, assignmentsMessage: assignmentsMessageEl,
+    assignmentsList: assignmentsListEl, assignmentsEmpty: assignmentsEmptyEl,
+  },
+  documentRef: document,
+  windowRef: window,
+  OptionCtor: Option,
+  requestJson,
+  getProfileGeneration: () => operatorProfileGeneration,
+  requestActive: profileRequestActive,
+  can,
+  capabilities: UI_CAPABILITIES,
+  getCurrentOperator: () => currentOperator,
+  getDevices: () => lastDevices,
+  displayRole,
+  formatLastSeen,
+  formatDate,
+  showSurfaceMessage,
+});
+const { renderPeople, markPresenceUnavailable, refreshPeople, populateAssignmentForm, renderAssignments,
+  refreshAssignments, updateAssignment, assignmentWindow } = peopleAssignmentsController;
 
-function renderPeople(people, { fresh = true, updatedAt = new Date() } = {}) {
-  lastPeople = people;
-  if (fresh) peopleLastUpdatedAt = updatedAt;
-  peopleListEl.replaceChildren();
-  const onlineCount = fresh ? people.filter(person => person.online).length : 0;
-  peopleSummaryEl.textContent = fresh
-    ? `${onlineCount} online · ${people.length} staff`
-    : `Presence unavailable while reconnecting.${peopleLastUpdatedAt ? ` Last updated ${peopleLastUpdatedAt.toLocaleTimeString()}.` : ""}`;
-  for (const person of people) {
-    const item = document.createElement("li");
-    const online = fresh && person.online;
-    item.className = `person-row ${online ? "online" : "offline"}${fresh ? "" : " stale"}`;
-
-    const dot = document.createElement("span");
-    dot.className = "presence-dot";
-    dot.setAttribute("aria-label", fresh ? (online ? "Online" : "Offline") : "Presence unavailable");
-
-    const details = document.createElement("div");
-    details.className = "person-details";
-    const name = document.createElement("strong");
-    name.textContent = person.username;
-    const meta = document.createElement("span");
-    const sessions = person.activeSessions > 1 ? ` · ${person.activeSessions} sessions` : "";
-    meta.textContent = `${displayRole(person.role)} · ${fresh ? formatLastSeen(person.lastSeenAt) : "Status unavailable"}${fresh ? sessions : ""}`;
-    details.append(name, meta);
-
-    if (Array.isArray(person.currentPhones) && person.currentPhones.length) {
-      const activity = document.createElement("span");
-      activity.className = "person-activity";
-      activity.textContent = `On ${person.currentPhones.map(phone => phone.label).join(", ")}`;
-      details.append(activity);
-    }
-    if (person.assignment) {
-      const assignment = document.createElement("span");
-      assignment.className = "person-assignment";
-      assignment.textContent = `${person.assignment.status.replaceAll("_", " ")}`
-        + (person.assignment.deviceId ? ` · ${person.assignment.deviceId}` : "")
-        + (person.assignment.startAt && person.assignment.endAt
-          ? ` · ${formatDate(person.assignment.startAt)} → ${formatDate(person.assignment.endAt)}` : "");
-      details.append(assignment);
-    }
-
-    item.append(dot, details);
-    peopleListEl.append(item);
-  }
-}
-
-function markPresenceUnavailable() {
-  renderPeople(lastPeople, { fresh: false });
-  peopleErrorEl.textContent = peopleLastUpdatedAt
-    ? `Presence unavailable while reconnecting. Last updated ${peopleLastUpdatedAt.toLocaleTimeString()}.`
-    : "Presence unavailable while reconnecting.";
-}
-
-async function refreshPeople() {
-  const generation = operatorProfileGeneration;
-  peopleErrorEl.textContent = "";
-  try {
-    const { body } = await requestJson("/api/people");
-    if (!profileRequestActive(generation, UI_CAPABILITIES.VIEW_PEOPLE)) return;
-    renderPeople(Array.isArray(body.people) ? body.people : [], { fresh: true });
-    if (can(UI_CAPABILITIES.MANAGE_ASSIGNMENTS)) populateAssignmentForm();
-  } catch (error) {
-    if (!profileRequestActive(generation, UI_CAPABILITIES.VIEW_PEOPLE)) return;
-    peopleErrorEl.textContent = error.message;
-  }
-}
-
-peopleRefreshButtonEl.addEventListener("click", refreshPeople);
-
-function populateAssignmentForm({ unavailableAssignee = null } = {}) {
-  const selectedAssignee = assignmentAssigneeEl.value;
-  assignmentAssigneeEl.replaceChildren();
-  for (const person of lastPeople) {
-    if (person.canAssign !== true) continue;
-    const option = document.createElement("option");
-    option.value = person.username;
-    option.textContent = `${person.username} (${displayRole(person.role)})`;
-    assignmentAssigneeEl.append(option);
-  }
-  if (unavailableAssignee && ![...assignmentAssigneeEl.options].some(option => option.value === unavailableAssignee)) {
-    const unavailable = new Option(`${unavailableAssignee} (no longer eligible)`, unavailableAssignee, true, true);
-    unavailable.disabled = true;
-    assignmentAssigneeEl.append(unavailable);
-  }
-  if ([...assignmentAssigneeEl.options].some(option => option.value === selectedAssignee)) {
-    assignmentAssigneeEl.value = selectedAssignee;
-  }
-
-  const selectedDevice = assignmentDeviceEl.value;
-  assignmentDeviceEl.replaceChildren(new Option("No phone", ""));
-  const allowed = currentOperator?.allowedDevices;
-  for (const device of lastDevices.filter(item => !Array.isArray(allowed) || allowed.includes(item.id))) {
-    assignmentDeviceEl.append(new Option(device.label, device.id));
-  }
-  assignmentDeviceEl.value = [...assignmentDeviceEl.options].some(option => option.value === selectedDevice) ? selectedDevice : "";
-}
-
-function assignmentNextStatuses(assignment) {
-  if (assignment.status === "assigned") {
-    const opensLater = assignment.startAt && Date.parse(assignment.startAt) > Date.now();
-    return opensLater ? ["cancelled"] : ["in_progress", "cancelled"];
-  }
-  if (assignment.status === "in_progress") return ["completed", "cancelled"];
-  return [];
-}
-
-function localInputToIso(value) {
-  if (!value) return null;
-  const date = new Date(value);
-  return Number.isFinite(date.getTime()) ? date.toISOString() : null;
-}
-
-function isoToLocalInput(value) {
-  if (!value) return "";
-  const date = new Date(value);
-  if (!Number.isFinite(date.getTime())) return "";
-  const local = new Date(date.getTime() - date.getTimezoneOffset() * 60_000);
-  return local.toISOString().slice(0, 16);
-}
-
-function assignmentWindow(assignment) {
-  if (!assignment.startAt || !assignment.endAt) return "Unscheduled";
-  return `${formatDate(assignment.startAt)} → ${formatDate(assignment.endAt)}${assignment.exclusive === false ? " · shared" : " · exclusive"}`;
-}
-
-function assignmentRecurrenceLabel(assignment) {
-  if (assignment.recurrence === "daily") return "Every day";
-  if (assignment.recurrence === "weekly") return "Every week";
-  return "Once";
-}
-
-function setAssignmentCardPending(card, value) {
-  if (!card) return;
-  card.setAttribute("aria-busy", String(value));
-  for (const control of card.querySelectorAll("button, input, select")) control.disabled = value;
-}
-
-function showAssignmentError(messageEl, message, retry) {
-  messageEl.replaceChildren(document.createTextNode(`${message} `));
-  if (retry) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.textContent = "Retry";
-    button.addEventListener("click", retry);
-    messageEl.append(button);
-  }
-}
-
-function renderAssignments(assignments) {
-  assignmentsListEl.replaceChildren();
-  assignmentsEmptyEl.hidden = assignments.length > 0;
-  for (const assignment of assignments) {
-    const card = document.createElement("article");
-    card.className = "assignment-card";
-    const heading = document.createElement("div");
-    heading.className = "assignment-card-heading";
-    const title = document.createElement("strong");
-    title.textContent = assignment.instructions;
-    const status = document.createElement("span");
-    status.className = `assignment-status ${assignment.status}`;
-    status.textContent = assignment.status.replaceAll("_", " ");
-    const recurrence = document.createElement("span");
-    recurrence.className = `assignment-recurrence ${assignment.recurrence || "once"}`;
-    recurrence.textContent = assignmentRecurrenceLabel(assignment);
-    const badges = document.createElement("div");
-    badges.className = "assignment-card-badges";
-    badges.append(recurrence, status);
-    heading.append(title, badges);
-
-    const meta = document.createElement("p");
-    meta.textContent = `Assigned to ${assignment.assignee} by ${assignment.createdBy}`
-      + (assignment.deviceId ? ` · Phone ${assignment.deviceId}` : "")
-      + (assignment.accountId ? ` · Account ${assignment.accountId}` : "")
-      + ` · ${assignmentWindow(assignment)}`
-      + ((assignment.occurrence ?? 1) > 1 ? ` · Occurrence ${assignment.occurrence}` : "");
-    const cardMessage = document.createElement("p");
-    cardMessage.className = "assignment-card-message";
-    cardMessage.setAttribute("role", "alert");
-    cardMessage.setAttribute("aria-live", "assertive");
-    card.append(heading, meta, cardMessage);
-
-    const controls = document.createElement("div");
-    controls.className = "assignment-controls";
-    const actions = document.createElement("div");
-    actions.className = "assignment-actions";
-    const nextStatuses = assignmentNextStatuses(assignment);
-    const mayManage = can(UI_CAPABILITIES.MANAGE_ASSIGNMENTS);
-    const mayProgressOwnTask = assignment.canProgress === true;
-    if (nextStatuses.length && (mayManage || mayProgressOwnTask)) {
-      for (const nextStatus of nextStatuses.filter(value => mayManage || value !== "cancelled")) {
-        const button = document.createElement("button");
-        button.type = "button";
-        button.textContent = nextStatus === "in_progress" ? "Start" : nextStatus === "completed" ? "Complete" : "Cancel";
-        button.addEventListener("click", () => {
-          if (nextStatus === "cancelled"
-            && !window.confirm(`Cancel this assignment for ${assignment.assignee}? Completed work and history will remain visible.`)) return;
-          void updateAssignment(assignment.id, { status: nextStatus }, { card, messageEl: cardMessage });
-        });
-        actions.append(button);
-      }
-    }
-    if (nextStatuses.length && mayManage) {
-      const manage = document.createElement("details");
-      manage.className = "assignment-manage";
-      const manageSummary = document.createElement("summary");
-      manageSummary.textContent = "Manage assignment";
-      const manageGrid = document.createElement("div");
-      manageGrid.className = "assignment-manage-grid";
-
-      const reassign = document.createElement("select");
-      reassign.setAttribute("aria-label", `Reassign ${assignment.instructions}`);
-      for (const option of assignmentAssigneeEl.options) reassign.append(option.cloneNode(true));
-      reassign.value = assignment.assignee;
-      const reassignField = document.createElement("label");
-      reassignField.textContent = "Assignee";
-      reassignField.append(reassign);
-      const saveAssignee = document.createElement("button");
-      saveAssignee.type = "button";
-      saveAssignee.textContent = "Save assignee";
-      saveAssignee.addEventListener("click", async () => {
-        const requestedAssignee = reassign.value;
-        if (!requestedAssignee || requestedAssignee === assignment.assignee) {
-          showAssignmentError(cardMessage, "Choose a different assignee before saving.");
-          return;
-        }
-        const updated = await updateAssignment(assignment.id, { assignee: requestedAssignee }, {
-          card,
-          messageEl: cardMessage,
-          onFailure: () => { reassign.value = assignment.assignee; },
-        });
-        if (!updated) reassign.value = assignment.assignee;
-      });
-
-      const scheduleStart = document.createElement("input");
-      scheduleStart.type = "datetime-local";
-      scheduleStart.value = isoToLocalInput(assignment.startAt);
-      scheduleStart.setAttribute("aria-label", `Start time for ${assignment.instructions}`);
-      const scheduleEnd = document.createElement("input");
-      scheduleEnd.type = "datetime-local";
-      scheduleEnd.value = isoToLocalInput(assignment.endAt);
-      scheduleEnd.setAttribute("aria-label", `End time for ${assignment.instructions}`);
-      const scheduleExclusive = document.createElement("input");
-      scheduleExclusive.type = "checkbox";
-      scheduleExclusive.checked = assignment.exclusive !== false;
-      scheduleExclusive.setAttribute("aria-label", `Exclusive schedule for ${assignment.instructions}`);
-      const startField = document.createElement("label");
-      startField.textContent = "Starts";
-      startField.append(scheduleStart);
-      const endField = document.createElement("label");
-      endField.textContent = "Ends";
-      endField.append(scheduleEnd);
-      const exclusiveField = document.createElement("label");
-      exclusiveField.className = "assignment-manage-checkbox";
-      exclusiveField.append(scheduleExclusive, "Exclusive time slot");
-      const reschedule = document.createElement("button");
-      reschedule.type = "button";
-      reschedule.textContent = "Update schedule";
-      reschedule.addEventListener("click", () => updateAssignment(assignment.id, {
-        startAt: localInputToIso(scheduleStart.value),
-        endAt: localInputToIso(scheduleEnd.value),
-        exclusive: scheduleExclusive.checked,
-      }, { card, messageEl: cardMessage }));
-      manageGrid.append(reassignField, saveAssignee, startField, endField, exclusiveField, reschedule);
-      manage.append(manageSummary, manageGrid);
-      controls.append(manage);
-    }
-    if (actions.childElementCount) controls.prepend(actions);
-    if (controls.childElementCount) card.append(controls);
-
-    const history = document.createElement("details");
-    history.className = "assignment-history";
-    const summary = document.createElement("summary");
-    summary.textContent = `History (${assignment.history.length})`;
-    const list = document.createElement("ol");
-    for (const event of assignment.history) {
-      const item = document.createElement("li");
-      item.textContent = `${new Date(event.at).toLocaleString()} · ${event.actor} · ${event.action.replaceAll("_", " ")}`;
-      list.append(item);
-    }
-    history.append(summary, list);
-    card.append(history);
-    assignmentsListEl.append(card);
-  }
-}
-
-async function refreshAssignments() {
-  const generation = operatorProfileGeneration;
-  assignmentsMessageEl.textContent = "";
-  try {
-    const { body } = await requestJson("/api/assignments");
-    if (!profileRequestActive(generation, UI_CAPABILITIES.VIEW_ASSIGNMENTS)) return;
-    renderAssignments(Array.isArray(body.assignments) ? body.assignments : []);
-  } catch (error) {
-    if (!profileRequestActive(generation, UI_CAPABILITIES.VIEW_ASSIGNMENTS)) return;
-    assignmentsMessageEl.textContent = error.message;
-  }
-}
-
-async function updateAssignment(id, change, {
-  card = null,
-  messageEl = assignmentsMessageEl,
-  onFailure = null,
-} = {}) {
-  showSurfaceMessage(messageEl, "");
-  setAssignmentCardPending(card, true);
-  try {
-    await requestJson(`/api/assignments/${encodeURIComponent(id)}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(change),
-    });
-    await refreshAssignments();
-    return true;
-  } catch (error) {
-    onFailure?.();
-    const retry = () => void updateAssignment(id, change, { card, messageEl, onFailure });
-    showAssignmentError(messageEl, `${error.message} The assignment was not changed.`, retry);
-    return false;
-  } finally {
-    setAssignmentCardPending(card, false);
-  }
-}
-
-assignmentsRefreshButtonEl.addEventListener("click", refreshAssignments);
-assignmentCreateFormEl.addEventListener("submit", async (event) => {
-  event.preventDefault();
-  assignmentsMessageEl.textContent = "";
-  const submit = assignmentCreateFormEl.querySelector('button[type="submit"]');
-  submit.disabled = true;
-  try {
-    await requestJson("/api/assignments", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        assignee: assignmentAssigneeEl.value,
-        instructions: assignmentInstructionsEl.value,
-        deviceId: assignmentDeviceEl.value || null,
-        accountId: assignmentAccountEl.value.trim() || null,
-        startAt: localInputToIso(assignmentStartEl.value),
-        endAt: localInputToIso(assignmentEndEl.value),
-        exclusive: assignmentExclusiveEl.checked,
-        recurrence: assignmentRecurrenceEl.value,
-        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
-      }),
-    });
-    assignmentInstructionsEl.value = "";
-    assignmentAccountEl.value = "";
-    assignmentStartEl.value = "";
-    assignmentEndEl.value = "";
-    assignmentRecurrenceEl.value = "once";
-    await refreshAssignments();
-  } catch (error) {
-    if (error.kind === "http" && error.status === 403) {
-      const unavailableAssignee = assignmentAssigneeEl.value;
-      await refreshPeople();
-      populateAssignmentForm({ unavailableAssignee });
-      assignmentsMessageEl.textContent = `${error.message} Eligibility changed; the form was preserved and choices were refreshed.`;
-    } else {
-      assignmentsMessageEl.textContent = `${error.message} The assignment was not created.`;
-    }
-  } finally {
-    submit.disabled = false;
-  }
+const proxyPoolController = window.createProxyPoolController({
+  elements: {
+    refreshButton: proxyPoolRefreshButtonEl, createForm: proxyPoolCreateFormEl,
+    providerInput: proxyPoolProviderEl, protocolInput: proxyPoolProtocolEl, hostInput: proxyPoolHostEl,
+    portInput: proxyPoolPortEl, usernameInput: proxyPoolUsernameEl, passwordInput: proxyPoolPasswordEl,
+    countryInput: proxyPoolCountryEl, labelInput: proxyPoolLabelEl, testButton: proxyPoolTestButtonEl,
+    message: proxyPoolMessageEl, poolList: proxyPoolListEl, poolEmpty: proxyPoolEmptyEl,
+    providerList: proxyProviderListEl, providerEmpty: proxyProviderEmptyEl,
+  },
+  documentRef: document,
+  requestJson,
+  getProfileGeneration: () => operatorProfileGeneration,
+  requestActive: profileRequestActive,
+  can,
+  capabilities: UI_CAPABILITIES,
+  formatDate,
+  onPoolChanged: () => {
+    if (lastDevices.length) void renderFleetSafely(lastDevices);
+  },
 });
 
 backToFleetButtonEl.addEventListener("click", () => {
@@ -1516,6 +1231,12 @@ fleetNavButtonEl.addEventListener("click", () => {
 });
 assignmentsNavButtonEl.addEventListener("click", () => showAssignmentsView());
 adminNavButtonEl.addEventListener("click", () => showAdminView());
+operationsNavEl.addEventListener("click", (event) => {
+  const link = event.target.closest("[data-operations-target]");
+  if (!link || link.hidden) return;
+  event.preventDefault();
+  selectOperationsPanel(link.dataset.operationsTarget);
+});
 
 function connect() {
   setConnectionState("loading", "Connecting");
@@ -1704,7 +1425,7 @@ async function renderFleetSafely(devices) {
   // Lazy, once-per-login load: the picker needs the full pool (to compute
   // exclusivity across devices), not just what device_list carries for one
   // device. refreshProxyPool() itself re-invokes this function once loaded.
-  if (can(UI_CAPABILITIES.VIEW_PROXY_POOL) && !proxyPoolLoaded) void refreshProxyPool();
+  if (can(UI_CAPABILITIES.VIEW_PROXY_POOL) && !proxyPoolController.isLoaded()) void proxyPoolController.refresh();
   if (watchedDeviceId) {
     const watchedSummary = devices.find(device => device.id === watchedDeviceId);
     if (!watchedSummary || !watchedSummary.canWatch) {
@@ -1993,7 +1714,7 @@ function buildRetryProvisioningButton(device) {
 // being an always-present element rather than a hover-only affordance.
 // Options are every pool proxy not currently leased to a DIFFERENT device
 // (Architecture guide §4.6 exclusivity), built from the separately-fetched
-// lastProxyPool — device.poolProxy alone only tells us this device's own
+// The controller's shared pool — device.poolProxy alone only tells us this device's own
 // assignment, not the pool-wide lease state needed to grey out the rest.
 function buildProxyPoolPicker(device) {
   const wrap = document.createElement("label");
@@ -2005,7 +1726,7 @@ function buildProxyPoolPicker(device) {
   const none = new Option("— None —", "");
   none.selected = !device.poolProxy;
   select.appendChild(none);
-  for (const proxy of lastProxyPool) {
+  for (const proxy of proxyPoolController.getPool()) {
     if (proxy.leasedToDeviceId && proxy.leasedToDeviceId !== device.id) continue; // leased elsewhere — not selectable here
     const option = new Option(`${proxy.flag ? `${proxy.flag} ` : ""}${proxy.country} · ${proxy.provider} · ${proxy.label}`, proxy.id);
     option.selected = proxy.id === device.poolProxy?.id;
@@ -2013,6 +1734,7 @@ function buildProxyPoolPicker(device) {
   }
 
   select.addEventListener("change", async () => {
+    const generation = operatorProfileGeneration;
     const requested = select.value || null;
     select.disabled = true;
     selectErrorEl.textContent = "";
@@ -2022,9 +1744,12 @@ function buildProxyPoolPicker(device) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ proxyId: requested }),
       });
+      if (!profileRequestActive(generation, UI_CAPABILITIES.ASSIGN_PROXY)) return;
       selectErrorEl.textContent = requested ? `Proxy assigned to ${device.label}.` : `Proxy released from ${device.label}.`;
-      await refreshProxyPool(); // re-renders the fleet, restoring select.disabled
+      await proxyPoolController.refresh(); // re-renders the fleet, restoring select.disabled
+      if (!profileRequestActive(generation, UI_CAPABILITIES.ASSIGN_PROXY)) return;
     } catch (error) {
+      if (!profileRequestActive(generation, UI_CAPABILITIES.ASSIGN_PROXY)) return;
       selectErrorEl.textContent = error.message;
       select.disabled = false;
       select.value = device.poolProxy?.id || "";
@@ -3414,13 +3139,32 @@ async function refreshAuditViewer() {
   }
 }
 
-const USER_ROLES = Object.freeze([
+const BASE_USER_ROLES = Object.freeze([
   ["va", "VA"],
   ["content_creator", "Content creator"],
   ["editor", "Editor"],
   ["manager", "Manager"],
   ["admin", "Admin"],
 ]);
+// "host" is a whole tier above admin (owns a hub, can grant admin/manager),
+// and only the main host is allowed to hand it out — see index.js's
+// maxAssignableRoles. Every other viewer, including a non-main host or a
+// plain admin, never sees it as an assignable option at all.
+function assignableUserRoles() {
+  return currentOperator?.isMainHost ? [...BASE_USER_ROLES, ["host", "Host"]] : BASE_USER_ROLES;
+}
+
+// The create-user form's role <select> is static HTML (index.html), unlike
+// roleSelect() below which builds a fresh one per user row — keep its
+// "Host" option in sync with the signed-in operator on every profile change.
+function syncCreateUserRoleOptions() {
+  const hasHostOption = [...userCreateRoleEl.options].some(option => option.value === "host");
+  if (currentOperator?.isMainHost && !hasHostOption) {
+    userCreateRoleEl.append(new Option("Host", "host"));
+  } else if (!currentOperator?.isMainHost && hasHostOption) {
+    userCreateRoleEl.remove([...userCreateRoleEl.options].findIndex(option => option.value === "host"));
+  }
+}
 
 function parseIdList(value) {
   return [...new Set(value.split(",").map(item => item.trim()).filter(Boolean))];
@@ -3428,7 +3172,7 @@ function parseIdList(value) {
 
 function roleSelect(selected) {
   const select = document.createElement("select");
-  for (const [value, label] of USER_ROLES) select.append(new Option(label, value, false, value === selected));
+  for (const [value, label] of assignableUserRoles()) select.append(new Option(label, value, false, value === selected));
   return select;
 }
 
@@ -3553,7 +3297,7 @@ function buildUserActionsMenu(user) {
     }
   }
 
-  for (const [value, label] of USER_ROLES) {
+  for (const [value, label] of assignableUserRoles()) {
     const roleButton = document.createElement("button");
     roleButton.type = "button";
     roleButton.className = "role-option";
@@ -3561,14 +3305,14 @@ function buildUserActionsMenu(user) {
     roleButton.disabled = value === user.role;
     if (value === user.role) roleButton.setAttribute("aria-current", "true");
     roleButton.addEventListener("click", () => {
-      if (value === "admin") {
+      if (value === "admin" || value === "host") {
         confirmView.replaceChildren();
         const prompt = document.createElement("p");
-        prompt.textContent = `Are you sure you want to assign admin role to ${user.username}?`;
+        prompt.textContent = `Are you sure you want to assign ${value} role to ${user.username}?`;
         const yes = document.createElement("button");
         yes.type = "button";
         yes.textContent = "Yes";
-        yes.addEventListener("click", () => applyRole("admin"));
+        yes.addEventListener("click", () => applyRole(value));
         const no = document.createElement("button");
         no.type = "button";
         no.textContent = "No";
@@ -3614,7 +3358,90 @@ function buildUserActionsMenu(user) {
   return wrap;
 }
 
+async function reviewAccountStatus(user, status, button, { confirmMessage = null } = {}) {
+  if (button.disabled) return;
+  if ((status === "rejected" || status === "banned") && confirmMessage && !window.confirm(confirmMessage)) return;
+  button.disabled = true;
+  usersMessageEl.textContent = "";
+  try {
+    const { body } = await requestJson(`/api/admin/users/${encodeURIComponent(user.username)}/status`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ status }),
+    });
+    const delivery = body.notification?.deliveryState == null
+      ? ""
+      : body.notification.deliveryState === "queued"
+        ? " The email notification is queued."
+        : " The notification is waiting for company email configuration.";
+    usersMessageEl.textContent = `${body.operator.username} ${status}.${delivery}`;
+    await refreshUsers();
+  } catch (error) {
+    usersMessageEl.textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function renderPendingUsers(users) {
+  const pending = users.filter(user => (user.accountStatus || (user.active ? "approved" : "inactive")) === "pending");
+  pendingListEl.replaceChildren();
+  pendingEmptyEl.hidden = pending.length !== 0;
+  pendingCountEl.textContent = pending.length ? String(pending.length) : "";
+  for (const user of pending) {
+    const card = document.createElement("article");
+    card.className = "user-card pending-card";
+
+    const heading = document.createElement("div");
+    heading.className = "user-card-heading";
+    const username = document.createElement("strong");
+    username.textContent = user.username;
+    const state = document.createElement("span");
+    state.className = "user-state pending";
+    state.textContent = "pending";
+    heading.append(username, state);
+
+    const identity = document.createElement("p");
+    identity.className = "user-identity";
+    identity.textContent = [user.fullName, user.email, user.teamId ? `Team ${user.teamId}` : "No team assigned", user.role]
+      .filter(Boolean).join(" · ");
+
+    const actions = document.createElement("div");
+    actions.className = "user-account-actions";
+    if (user.canReview !== false) {
+      const accept = document.createElement("button");
+      accept.type = "button";
+      accept.textContent = "Accept";
+      accept.addEventListener("click", () => reviewAccountStatus(user, "approved", accept));
+      const decline = document.createElement("button");
+      decline.type = "button";
+      decline.className = "danger";
+      decline.textContent = "Decline";
+      decline.addEventListener("click", () => reviewAccountStatus(user, "rejected", decline, {
+        confirmMessage: `Decline ${user.username}'s application? They will not be granted Phone Farm access.`,
+      }));
+      const ban = document.createElement("button");
+      ban.type = "button";
+      ban.className = "danger";
+      ban.textContent = "Ban";
+      ban.addEventListener("click", () => reviewAccountStatus(user, "banned", ban, {
+        confirmMessage: `Ban ${user.username}? This blocks their most recent IP addresses from signing in or applying again — use this only for security incidents, not a routine decline.`,
+      }));
+      actions.append(accept, decline, ban);
+    } else {
+      const note = document.createElement("p");
+      note.className = "user-action-note";
+      note.textContent = "Escalate to an admin to review this application.";
+      actions.append(note);
+    }
+
+    card.append(heading, identity, actions);
+    pendingListEl.append(card);
+  }
+}
+
 function renderUsers(users) {
+  renderPendingUsers(users);
   usersListEl.replaceChildren();
   usersEmptyEl.hidden = users.length !== 0;
   for (const user of users) {
@@ -3817,44 +3644,55 @@ function renderUsers(users) {
     });
     if (user.canRename !== false) accountActions.append(renameInput, renameButton);
 
-    async function reviewAccount(status, button) {
-      if (button.disabled) return;
-      if (status === "rejected"
-        && !window.confirm(`Reject ${user.username}? Their sessions will end and they will lose Phone Farm access.`)) return;
-      button.disabled = true;
-      usersMessageEl.textContent = "";
-      try {
-        const { body } = await requestJson(`/api/admin/users/${encodeURIComponent(user.username)}/status`, {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ status }),
-        });
-        const delivery = body.notification?.deliveryState === "queued"
-          ? " The email notification is queued."
-          : " The notification is waiting for company email configuration.";
-        usersMessageEl.textContent = `${body.operator.username} ${status}.${delivery}`;
-        await refreshUsers();
-      } catch (error) {
-        usersMessageEl.textContent = error.message;
-      } finally {
-        button.disabled = false;
-      }
-    }
-
-    if (user.canReview !== false && accountStatus !== "approved") {
+    if (user.canReview !== false && accountStatus !== "approved" && accountStatus !== "banned") {
       const approve = document.createElement("button");
       approve.type = "button";
       approve.textContent = "Accept account";
-      approve.addEventListener("click", () => reviewAccount("approved", approve));
+      approve.addEventListener("click", () => reviewAccountStatus(user, "approved", approve));
       accountActions.append(approve);
     }
-    if (user.canReview !== false && accountStatus !== "rejected") {
+    // Reject is onboarding-only: declining a still-pending application.
+    // Once someone is approved, only Kick (temporary, same-day-firing) or
+    // Ban (permanent, security-incident) apply — never a plain "reject".
+    if (user.canReview !== false && accountStatus === "pending") {
       const reject = document.createElement("button");
       reject.type = "button";
       reject.className = "danger";
-      reject.textContent = "Reject account";
-      reject.addEventListener("click", () => reviewAccount("rejected", reject));
+      reject.textContent = "Reject";
+      reject.addEventListener("click", () => reviewAccountStatus(user, "rejected", reject, {
+        confirmMessage: `Decline ${user.username}'s application? They will not be granted Phone Farm access.`,
+      }));
       accountActions.append(reject);
+    }
+    if (user.canReview !== false && accountStatus !== "banned") {
+      const ban = document.createElement("button");
+      ban.type = "button";
+      ban.className = "danger";
+      ban.textContent = "Ban";
+      ban.addEventListener("click", () => reviewAccountStatus(user, "banned", ban, {
+        confirmMessage: `Ban ${user.username}? This is for security incidents (e.g. stolen data/models) — it ends their sessions immediately, permanently blocks this account, and blocks their most recent IP addresses from signing in or applying again. Only a host can undo this.`,
+      }));
+      accountActions.append(ban);
+    }
+    if (user.canReview !== false && accountStatus === "banned" && currentOperator?.role === "host") {
+      const liftBan = document.createElement("button");
+      liftBan.type = "button";
+      liftBan.textContent = "Lift ban";
+      liftBan.addEventListener("click", () => reviewAccountStatus(user, "rejected", liftBan, {
+        confirmMessage: `Lift the ban on ${user.username}? Their account moves to rejected — accept it again to restore access.`,
+      }));
+      accountActions.append(liftBan);
+    }
+    if (accountStatus === "banned" && (user.bannedReason || user.bannedBy)) {
+      const banNote = document.createElement("p");
+      banNote.className = "user-action-note";
+      banNote.textContent = [
+        "Banned",
+        user.bannedBy ? `by ${user.bannedBy}` : null,
+        user.bannedAt ? formatDate(user.bannedAt) : null,
+        user.bannedReason ? `— ${user.bannedReason}` : null,
+      ].filter(Boolean).join(" ");
+      accountActions.append(banNote);
     }
     if (user.actionReason) {
       const actionReason = document.createElement("p");
@@ -3890,166 +3728,6 @@ function renderUsers(users) {
     usersListEl.append(card);
   }
 }
-
-// Phase B shared proxy pool (Architecture guide §4.6). `lastProxyPool`
-// backs both this admin list and buildProxyPoolPicker() on every fleet
-// card — a device's own `poolProxy` field (in `device_list`) only carries
-// its own assignment, not which OTHER proxies are free, so the picker
-// needs this separately-fetched full list to compute exclusivity.
-let lastProxyPool = [];
-let proxyPoolLoaded = false;
-
-function renderProxyPool(proxies) {
-  lastProxyPool = proxies;
-  proxyPoolListEl.replaceChildren();
-  proxyPoolEmptyEl.hidden = proxies.length !== 0;
-  const mayManage = can(UI_CAPABILITIES.MANAGE_PROXY);
-  for (const proxy of proxies) {
-    const card = document.createElement("article");
-    card.className = "user-card";
-
-    const heading = document.createElement("div");
-    heading.className = "user-card-heading";
-    const label = document.createElement("strong");
-    label.textContent = `${proxy.flag ? `${proxy.flag} ` : ""}${proxy.label}`;
-    const state = document.createElement("span");
-    state.className = `user-state ${proxy.leasedToDeviceId ? "approved" : "inactive"}`;
-    state.textContent = proxy.leasedToDeviceId ? `Assigned to ${proxy.leasedToDeviceId}` : "Available";
-    heading.append(label, state);
-
-    const identity = document.createElement("p");
-    identity.className = "user-identity";
-    identity.textContent = [proxy.provider, proxy.protocol, proxy.country].filter(Boolean).join(" · ");
-
-    card.append(heading, identity);
-
-    if (proxy.health) {
-      const health = document.createElement("p");
-      health.className = "user-identity";
-      health.textContent = proxy.health.status === "healthy"
-        ? `Tested ${formatDate(proxy.health.checkedAt)} · ${proxy.health.publicIpv4 || "IP unavailable"}`
-          + (proxy.health.country ? ` · ${proxy.health.country}` : "")
-          + (Number.isFinite(proxy.health.latencyMs) ? ` · ${proxy.health.latencyMs} ms` : "")
-        : `Test failed ${formatDate(proxy.health.checkedAt)} · ${proxy.health.errorCode || "P111"} ${proxy.health.errorName || ""}`;
-      card.appendChild(health);
-    }
-
-    if (mayManage) {
-      const testButton = document.createElement("button");
-      testButton.type = "button";
-      testButton.textContent = "Test Proxy";
-      testButton.addEventListener("click", async () => {
-        testButton.disabled = true;
-        proxyPoolMessageEl.textContent = `Testing ${proxy.label}…`;
-        try {
-          const { body } = await requestJson(`/api/admin/proxies/${encodeURIComponent(proxy.id)}/test`, { method: "POST" });
-          proxyPoolMessageEl.textContent = `${proxy.label} works through ${body.result.publicIpv4}`
-            + (body.result.country ? ` (${body.result.country})` : "") + ` in ${body.result.latencyMs} ms.`;
-          await refreshProxyPool();
-        } catch (error) {
-          proxyPoolMessageEl.textContent = error.message;
-          await refreshProxyPool();
-        } finally {
-          testButton.disabled = false;
-        }
-      });
-      card.appendChild(testButton);
-      const deleteButton = document.createElement("button");
-      deleteButton.type = "button";
-      deleteButton.textContent = "Delete";
-      deleteButton.disabled = Boolean(proxy.leasedToDeviceId);
-      deleteButton.title = proxy.leasedToDeviceId ? "Release it from its assigned device first." : "";
-      deleteButton.addEventListener("click", async () => {
-        deleteButton.disabled = true;
-        try {
-          await requestJson(`/api/admin/proxies/${encodeURIComponent(proxy.id)}`, { method: "DELETE" });
-          await refreshProxyPool();
-        } catch (error) {
-          proxyPoolMessageEl.textContent = error.message;
-          deleteButton.disabled = Boolean(proxy.leasedToDeviceId);
-        }
-      });
-      card.appendChild(deleteButton);
-    }
-    proxyPoolListEl.appendChild(card);
-  }
-}
-
-async function refreshProxyPool() {
-  if (!can(UI_CAPABILITIES.VIEW_PROXY_POOL)) return;
-  const generation = operatorProfileGeneration;
-  try {
-    const { body } = await requestJson("/api/admin/proxies");
-    if (!profileRequestActive(generation, UI_CAPABILITIES.VIEW_PROXY_POOL)) return;
-    renderProxyPool(Array.isArray(body.proxies) ? body.proxies : []);
-    proxyPoolLoaded = true;
-    // Pickers on every fleet card read lastProxyPool directly — refresh
-    // them now rather than waiting for the next unrelated device_list.
-    if (lastDevices.length) void renderFleetSafely(lastDevices);
-  } catch (error) {
-    if (!profileRequestActive(generation, UI_CAPABILITIES.VIEW_PROXY_POOL)) return;
-    proxyPoolListEl.replaceChildren();
-    proxyPoolEmptyEl.hidden = false;
-    proxyPoolEmptyEl.textContent = `Could not load the proxy pool: ${error.message}`;
-  }
-}
-
-proxyPoolCreateFormEl.addEventListener("submit", async event => {
-  event.preventDefault();
-  proxyPoolMessageEl.textContent = "";
-  const submit = proxyPoolCreateFormEl.querySelector("button[type=submit]");
-  submit.disabled = true;
-  try {
-    const { body } = await requestJson("/api/admin/proxies", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        provider: proxyPoolProviderEl.value,
-        protocol: proxyPoolProtocolEl.value,
-        host: proxyPoolHostEl.value,
-        port: Number(proxyPoolPortEl.value),
-        username: proxyPoolUsernameEl.value,
-        password: proxyPoolPasswordEl.value,
-        country: proxyPoolCountryEl.value,
-        label: proxyPoolLabelEl.value,
-      }),
-    });
-    proxyPoolMessageEl.textContent = `${body.proxy.label} added.`;
-    proxyPoolCreateFormEl.reset();
-    await refreshProxyPool();
-  } catch (error) {
-    proxyPoolMessageEl.textContent = error.message;
-  } finally {
-    submit.disabled = false;
-  }
-});
-
-proxyPoolTestButtonEl.addEventListener("click", async () => {
-  proxyPoolMessageEl.textContent = "Testing proxy fields…";
-  proxyPoolTestButtonEl.disabled = true;
-  try {
-    const { body } = await requestJson("/api/admin/proxies/test", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        protocol: proxyPoolProtocolEl.value,
-        host: proxyPoolHostEl.value,
-        port: Number(proxyPoolPortEl.value),
-        username: proxyPoolUsernameEl.value,
-        password: proxyPoolPasswordEl.value,
-        country: proxyPoolCountryEl.value,
-      }),
-    });
-    proxyPoolMessageEl.textContent = `Proxy works through ${body.result.publicIpv4}`
-      + (body.result.country ? ` (${body.result.country})` : "") + ` in ${body.result.latencyMs} ms. You can add it now.`;
-  } catch (error) {
-    proxyPoolMessageEl.textContent = error.message;
-  } finally {
-    proxyPoolTestButtonEl.disabled = false;
-  }
-});
-
-proxyPoolRefreshButtonEl.addEventListener("click", refreshProxyPool);
 
 // ---- Sites: other locations that link their phones to this hub ---------------------
 function clearSitesView() {
@@ -4197,6 +3875,8 @@ siteTokenDismissButtonEl.addEventListener("click", () => {
 });
 sitesRefreshButtonEl.addEventListener("click", refreshSites);
 
+pendingRefreshButtonEl.addEventListener("click", refreshUsers);
+
 async function refreshUsers() {
   if (!can(UI_CAPABILITIES.MANAGE_USERS) && !can(UI_CAPABILITIES.MANAGE_TEAM_MEMBERS)) return;
   const generation = operatorProfileGeneration;
@@ -4210,6 +3890,10 @@ async function refreshUsers() {
     usersListEl.replaceChildren();
     usersEmptyEl.hidden = false;
     usersEmptyEl.textContent = `Could not load users: ${error.message}`;
+    pendingListEl.replaceChildren();
+    pendingEmptyEl.hidden = false;
+    pendingEmptyEl.textContent = `Could not load applications: ${error.message}`;
+    pendingCountEl.textContent = "";
   }
 }
 
@@ -4272,7 +3956,7 @@ async function refreshAdminView() {
     refreshQueueViewer(),
     can(UI_CAPABILITIES.VIEW_AUDIT) ? refreshAuditViewer() : Promise.resolve(),
     canManagePeople() ? refreshUsers() : Promise.resolve(),
-    can(UI_CAPABILITIES.VIEW_PROXY_POOL) ? refreshProxyPool() : Promise.resolve(),
+    can(UI_CAPABILITIES.VIEW_PROXY_POOL) ? proxyPoolController.refresh() : Promise.resolve(),
     can(UI_CAPABILITIES.MANAGE_SITES) ? refreshSites() : Promise.resolve(),
   ]);
 }

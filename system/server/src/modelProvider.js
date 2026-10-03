@@ -138,7 +138,10 @@ export function parseDecisionJson(text, providerName) {
   try {
     return JSON.parse(text);
   } catch {
-    throw new Error(`${providerName}: response was not valid JSON: ${String(text).slice(0, 200)}`);
+    // Model output can echo private text from the phone observation. Never
+    // place the invalid response in an exception: worker failures are
+    // persisted in task state and can be returned by operator APIs.
+    throw new Error(`${providerName}: response was not valid JSON`);
   }
 }
 

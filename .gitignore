@@ -1,5 +1,13 @@
 node_modules/
 
+# Local environment files may contain credentials. Keep documented templates.
+**/.env
+**/.env.*
+!**/.env.example
+
+# Machine-local agent permissions are not project configuration.
+.claude/settings.local.json
+
 # Generated analysis and third-party research checkouts are local inputs, not
 # maintained project source. Keep the authored research notes themselves.
 graphify-out/

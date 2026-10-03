@@ -90,6 +90,33 @@ test("addTask with no window dispatches immediately to a free device", () => {
   assert.equal(deviceLease.getMode(task.deviceSelector.deviceId), "AI_RUNNING");
 });
 
+test("a task audit outage cannot replace a committed queue result or leak exception text", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-task-audit-fail-"));
+  const storePath = path.join(dir, "tasks.json");
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...values) => errors.push(values.map(String).join(" "));
+  try {
+    const auditFailure = new Error("postgres://private:password@audit/task-token");
+    auditFailure.code = "ECONNRESET";
+    const queue = createTaskQueue({
+      devices: makeDevices([]),
+      deviceLease: createMockDeviceLease(),
+      auditLog: { logEvent: () => { throw auditFailure; } },
+      storePath,
+      dispatchOnCreate: false,
+    });
+    const task = queue.addTask({ goal: "committed despite audit outage" });
+    assert.equal(queue.getTask(task.id), task);
+    assert.equal(JSON.parse(fs.readFileSync(storePath, "utf8")).tasks[0].id, task.id);
+  } finally {
+    console.error = originalError;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+  assert.deepEqual(errors, ["Task queue audit write failed: ECONNRESET"]);
+  assert.equal(errors.some(value => /private|password|token/.test(value)), false);
+});
+
 test("a task admission persistence failure leaves no hidden live task", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-task-admission-fail-"));
   const storePath = path.join(dir, "tasks.json");

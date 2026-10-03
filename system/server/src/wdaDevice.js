@@ -508,7 +508,7 @@ export class WdaDevice {
         } catch (error) {
           if (closed) break;
           reported = true;
-          onState("reconnecting", error?.name === "AbortError" ? "stream stalled" : error?.message);
+          onState("reconnecting", error?.name === "AbortError" ? "stream stalled" : "stream connection interrupted");
         } finally {
           clearTimeout(stallTimer);
         }

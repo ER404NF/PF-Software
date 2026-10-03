@@ -15,6 +15,7 @@ import express from "express";
 import { createAuthenticate } from "./middleware/authenticate.js";
 import { createRequireMembership } from "./middleware/requireMembership.js";
 import { createRequirePermission } from "./middleware/requirePermission.js";
+import { logOperationalFailure } from "../safeOperationalLog.js";
 
 function publicUser(user) {
   if (!user) return null;
@@ -57,13 +58,13 @@ export function createCloudApi({
   // documented interim shape, not a finished user experience.
   async function sendMail(to, subject, body) {
     if (!mailSender?.isConfigured?.()) {
-      console.log(`Cloud API: SMTP is not configured — not sending "${subject}" to ${to}`);
+      console.log("Cloud API: SMTP is not configured — notification not sent");
       return;
     }
     try {
       await mailSender.send({ to, from: companyEmail, subject, body });
     } catch (error) {
-      console.error(`Cloud API: failed to send "${subject}" to ${to}:`, error.message);
+      logOperationalFailure("Cloud API notification send failed", error);
     }
   }
 
@@ -294,7 +295,7 @@ export function createCloudApi({
     if (/unknown role key|unknown organization/.test(error?.message ?? "")) {
       return res.status(400).json({ error: error.message });
     }
-    console.error("Cloud API request failed:", error);
+    logOperationalFailure("Cloud API request failed", error);
     res.status(500).json({ error: "internal server error" });
   });
 

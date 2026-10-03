@@ -71,14 +71,18 @@ export function createAccountNotificationStore({ storePath, companyEmail = null,
     const accepted = status === "approved";
     const rejected = status === "rejected";
     const recovery = status === "recovery";
-    if (!accepted && !rejected && !recovery) throw new Error("unsupported account notification status");
+    const received = status === "received";
+    if (!accepted && !rejected && !recovery && !received) throw new Error("unsupported account notification status");
     const subject = recovery ? "Phone Farm account recovery"
+      : received ? "Your Phone Farm application was received"
       : accepted ? "Your Phone Farm account was accepted" : "Your Phone Farm account application was not accepted";
     const body = recovery
       ? `Hello ${fullName}, use this one-time recovery token within 30 minutes: ${recoveryToken}`
-      : accepted
-        ? `Hello ${fullName}, your Phone Farm account (${username}) was accepted. You can now sign in and complete two-factor setup.`
-        : `Hello ${fullName}, your Phone Farm account application (${username}) was not accepted.`;
+      : received
+        ? `Hello ${fullName}, we've received your application (${username}) to join Phone Farm. Your onboarding is being reviewed, and you'll be notified as soon as a decision is made.`
+        : accepted
+          ? `Hello ${fullName}, your Phone Farm account (${username}) was accepted. You can now sign in and complete two-factor setup.`
+          : `Hello ${fullName}, your Phone Farm account application (${username}) was not accepted.`;
     const notifications = read();
     const securePayload = recovery ? encryptBody(body) : null;
     if (recovery && !securePayload) throw new Error("secure recovery notification storage is not configured");

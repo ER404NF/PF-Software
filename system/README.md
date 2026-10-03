@@ -195,6 +195,16 @@ account transition, and only then makes the message eligible for delivery. A
 pre-commit outbox failure leaves the account unchanged; a later delivery-state
 or audit failure cannot skip session revocation and is reported as pending
 reconciliation instead of disguising a committed account change as a failed one.
+If recovery-token creation succeeds but its encrypted outbox write fails, the
+server clears only that exact token hash and keeps the public response generic;
+a later request can safely issue and deliver a fresh token. Successful login,
+bootstrap, recovery, account-security, and logout mutations also complete their
+session effects even when best-effort audit storage is unavailable.
+
+Recent login IPs are bounded server-private security data. They are used only to
+seed the signup IP blocklist when an account is banned and are never returned by
+the user-management API. Account-list responses expose only the explicit public
+account fields needed by Operations.
 
 Re-running the script for an existing username updates that operator's
 password, device list, and role. `operators.config.json` is gitignored — it's
@@ -260,6 +270,13 @@ npm.cmd start
   correctly reset to `idle` on their own. Persisting and restoring that
   field naively would risk the opposite bug: a device stuck "in-use" forever
   because the connection that once claimed it no longer exists to release it.
+- **Encrypted file backup/restore** — `npm run backup:files` and
+  `npm run restore:files` stream the file store through AES-256-GCM, verify
+  every restored file against its size and SHA-256 digest, require named
+  deployment secrets to be rebound, and publish only a fully verified new
+  restore directory. See [`docs/BACKUP_RESTORE.md`](../docs/BACKUP_RESTORE.md).
+  This is not a PostgreSQL/PITR solution or a production restore proof; the
+  hub must be quiesced and the owner must still approve RPO, RTO, and retention.
 
 Both `SESSION_STORE_DIR` and `AUDIT_LOG_PATH` are environment-overridable
 (defaulting to the `storage/` paths above) — used by the test suite to keep
@@ -269,11 +286,15 @@ for normal use.
 ## Devices are config-driven — `devices.config.json`
 
 The server reads device definitions at startup rather than hardcoding the fleet.
+The tracked repository file is intentionally `{ "devices": [] }`, so an
+ordinary checkout never advertises simulated phones as a real fleet. Use
+`npm run demo` for isolated mock phones. Desktop automatic mode discovers
+trusted iPhones without editing this file; advanced/manual runs can point
+`DEVICE_CONFIG_PATH` at an ignored local configuration.
 
 ```json
 {
   "devices": [
-    { "id": "mock-1", "label": "iPhone SE — Bench 1 (mock)", "type": "mock" },
     { "id": "iphone-1", "label": "Fallback label", "type": "wda", "port": 8100, "udid": "00008110-..." }
   ]
 }
@@ -422,6 +443,51 @@ This is unrelated to, and does not replace, the older Phase 0 per-device
 `network` config block below (`egress`/`enabled`, env-var-referenced
 credentials) — that mechanism predates the pool and still applies to
 manually configured `devices.config.json` proxy assignments.
+
+## Proxy-provider control plane (in progress; no real exit supply yet)
+
+`proxyProvider.js` now defines the vendor-neutral operational contract for
+exit inventory, region selection, health, enable/disable, capacity, exclusive
+leases, release, and rotation. `DeterministicProxyProvider` implements that
+contract in memory for repeatable local tests, including fail-closed capacity
+and rotation behavior. `proxyProviderRegistry.js` loads providers only when an
+explicit `PROXY_PROVIDER_CONFIG_PATH` is set; a missing/invalid/unknown config
+fails startup. The deterministic adapter additionally requires test mode or
+`ALLOW_DETERMINISTIC_PROXY_PROVIDER=true`, so it cannot silently masquerade as
+a production exit provider. It contains no proxy credentials, opens no sockets,
+and never changes a phone route.
+
+`GET /api/admin/proxy-providers` exposes the safe provider/exit inventory to
+roles with `proxy:view-pool`. Admins can change an exit's admission state with
+`PATCH /api/admin/proxy-providers/:providerId/exits/:exitId`; the operation is
+audited and explicitly returns `routingApplied: false` and
+`routingVerified: false`. Disabling an exit prevents new leases but deliberately
+does not pretend to terminate or reroute an existing lease.
+
+Roles with `proxy:assign` and a live grant for the target device can exercise
+the vendor-neutral lease state through:
+
+- `POST /api/admin/proxy-providers/:providerId/devices/:deviceId/lease`
+- `POST /api/admin/proxy-providers/:providerId/devices/:deviceId/rotate`
+- `DELETE /api/admin/proxy-providers/:providerId/devices/:deviceId/lease`
+
+These mutations recheck the current session, capability, and device grant around
+the asynchronous provider call and again through a provider commit callback.
+Operations are serialized per logical device so concurrent requests cannot
+orphan leases across two providers. They are audited and return the same explicit
+false routing flags. The device is represented to the provider by a stable
+SHA-256-derived lease ID rather than its logical ID. A real adapter must invoke
+the supplied authorization callback immediately before its irreversible provider
+mutation. The current in-process association is suitable only for the
+deterministic adapter; production lease authority must come from a durable
+real-provider adapter.
+
+A real provider adapter, durable provider lease authority, lease/rotation UI,
+and the independent infrastructure for regional exit servers/IP
+supply, provisioning, monitoring, metering, and abuse response are still
+required. The UI and documentation must not describe an inventory or lease as
+a working phone route; only device-originated egress verification can establish
+that result.
 
 ## Proxy tunnel routing (opt-in, `AUTO_ROUTE_PROXY_TUNNELS` — Phase B, part 2)
 
@@ -667,6 +733,10 @@ lets a later message's response arrive out of order.
 
 ## File transfer
 
+Device file push recognizes Safari's download confirmation sheet and taps its
+accessible Download button only after rechecking current device authorization.
+The exact iOS labels and Files delivery still require physical-iPhone acceptance.
+
 Each configured device has a separate server-side folder under `storage/devices/<deviceId>/`. `FILE_STORE_DIR` overrides the parent storage directory; media still uses its `devices/` namespace. Internal names such as `sessions`, `audit`, and `queue` cannot be device IDs, and startup rejects overlapping media and internal-state paths. Legacy media from an older installation must be relocated from `storage/<deviceId>/` to this new namespace before use; internal storage must never be migrated as media.
 
 Uploads are streamed through server-enforced capacity gates. Defaults are 10 GiB
@@ -678,6 +748,15 @@ disabled. Quota rejection returns JSON with HTTP 413, while a threatened disk
 reserve returns HTTP 507. Responses include the measured and configured byte
 counts. Partial staging files are removed and an existing file is preserved
 when its replacement fails.
+
+The upload boundary allow-lists the filename extension and declared MIME type,
+then inspects the completed hidden staging file before commit. JPEG, PNG, GIF,
+WebP, HEIF/HEIC, ISO-BMFF video/audio, QuickTime, WebM, MP3, WAV, and AAC must
+carry the expected leading container signature for their extension. Unknown,
+truncated, or mismatched content returns `MEDIA_CONTENT_REJECTED`; the staging
+file is removed, its quota reservation is released, and an existing file with
+that name is preserved. This is type validation, not a malware scanner or a
+full media decoder. Downloads remain attachments rather than inline content.
 
 Routes:
 
@@ -1049,6 +1128,64 @@ Not built: the actual hardware/routers/SIMs (Phases 1-3), and automatic or
 periodic checking. Checks are on demand; once a fail-closed check ages past the
 configured freshness window, the next Human action and every new/continuing AI
 step fail closed until verification passes again.
+
+## Staged PostgreSQL authority
+
+Durable-domain cutovers are explicit and independent. The first mounted slice is the site registry:
+
+```text
+DATABASE_URL=postgres://...
+SITE_REPOSITORY_BACKEND=postgres
+```
+
+Run `server/scripts/migrate-sites-to-postgres.js` against the intended database before enabling that flag.
+The default is `file`; an unknown backend or PostgreSQL mode without `DATABASE_URL` fails startup rather
+than silently falling back. When enabled, site administration and site-agent token authorization use the
+PostgreSQL repository, while the old file remains untouched as a rollback source. This wiring is automated-
+test covered, but enabling it against production data and observing/rolling it back are deployment steps,
+not claims made by the local suite. Other durable domains remain file-authoritative until they receive their
+own bounded selector and mounted-server proof.
+
+## Privacy deletion policy
+
+Public deletion requests, signed-in data export, reauthenticated self-service
+account locking, and administrator planning/processing are implemented. Actual
+cleanup is intentionally disabled unless `PRIVACY_DELETION_POLICY_JSON` contains
+a version-1 enabled policy with an explicit mode for every category:
+
+```json
+{"version":1,"enabled":true,"categories":{"access":"revoke","account":"anonymize","assignments":"anonymize_owned","tasks":"anonymize_owned","media":"retain","shared_records":"retain","audit":"retain"}}
+```
+
+The JSON belongs in protected deployment configuration, not source control.
+`media` must remain `retain` until stored media has demonstrable account
+ownership; selecting `delete_owned` currently fails closed. Shared operational
+records are retained rather than guessed to be exclusively owned. Choose these
+modes and any retention duration with the product/legal owner before enabling
+processing. Planning returns categories and counts only. Processing revokes
+access first, reauthorizes the administrator before each destructive category,
+persists category checkpoints, and resumes only unfinished work after a bounded
+failure or restart.
+
+The audit log is append-only, so the only accepted audit mode is `retain`.
+Existing actor fields are not rewritten. The completion event uses the same
+privacy tombstone as the anonymized account and other owned references.
+
+## Liveness and readiness
+
+`GET /healthz` is a process-only liveness probe and returns only `{"ok":true}`. `GET /readyz`
+is the deployment readiness probe. It returns ready immediately when no database-backed durable
+domain is selected; when PostgreSQL is authoritative, it performs a bounded database check and
+returns HTTP 503 if that dependency is unavailable. Readiness output is deliberately limited to a
+status and latency and never includes database exception text or connection details. External
+monitoring, alert delivery, dashboards, and SLO acceptance still require a deployed environment.
+
+Set `METRICS_BEARER_TOKEN` to a private random value to enable `GET /metrics`. Scrapers must send
+that value in `Authorization: Bearer <token>`. With no token configured the endpoint is hidden with
+HTTP 404; a wrong token receives 401. The Prometheus-compatible output includes process uptime and
+HTTP count/duration aggregates grouped only by a bounded method and status class. It deliberately
+does not label paths, queries, users, devices, payloads, or private content. The deployment example
+passes this optional environment variable through without putting a token in source control.
 
 ## Fleet UI
 

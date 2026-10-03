@@ -13,10 +13,18 @@ export function createFileSiteRepository(filePathOrStore, options = {}) {
   return assertSiteRepository({
     list() { return store.list(); },
     get(id) { return store.get(id); },
-    create(input) { return store.create(input); },
-    rotate(id) { return store.rotate(id); },
-    update(id, input) { return store.update(id, input); },
-    remove(id) { return store.remove(id); },
+    create(input, { authorize = null } = {}) {
+      return authorize ? Promise.resolve(authorize()).then(() => store.create(input)) : store.create(input);
+    },
+    rotate(id, { authorize = null } = {}) {
+      return authorize ? Promise.resolve(authorize()).then(() => store.rotate(id)) : store.rotate(id);
+    },
+    update(id, input, { authorize = null } = {}) {
+      return authorize ? Promise.resolve(authorize()).then(() => store.update(id, input)) : store.update(id, input);
+    },
+    remove(id, { authorize = null } = {}) {
+      return authorize ? Promise.resolve(authorize()).then(() => store.remove(id)) : store.remove(id);
+    },
     verifyToken(id, token) { return store.verifyToken(id, token); },
     markSeen(id, at) { return store.markSeen(id, at); },
   });

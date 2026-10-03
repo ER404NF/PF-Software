@@ -330,6 +330,57 @@ test("while the site is unreachable, an action fails cleanly and the phone shows
   assert.equal(list.devices.find(d => d.id === remoteId("mock-a")).siteOnline, false);
 });
 
+// P6 step 4 (docs/productionization/PHASE1_TEAM_ROLLOUT_HANDOUT.md): "Kill one
+// Mac mini's connection to the hub mid-session and confirm the other two
+// hosts and their VAs are completely unaffected." Every other test in this
+// file uses exactly one site; this is the only one that runs two real,
+// independent site agents at once and proves one going down doesn't touch
+// the other — matching the real fleet shape (1 Mac mini in Italy, 2 in
+// Romania, none talking to another, each dialing the hub directly).
+test("one site disconnecting mid-session leaves a second, independent site and its VA completely unaffected", async () => {
+  const second = siteStore.create({ name: "Cluj", timeZone: "Europe/Bucharest" });
+  const site1Remote = remoteId("mock-a");
+  const site2Remote = `${second.site.id}__mock-a`;
+
+  const agent1 = startAgent();
+  const agent2 = startAgent({ agentToken: second.token, siteId: second.site.id, map: siteDevices().map });
+  await until(() => devices.get(site1Remote)?.status === "idle", { label: "site 1 device ready" });
+  await until(() => devices.get(site2Remote)?.status === "idle", { label: "site 2 device ready" });
+  await until(() => siteLinkHub.isOnline(site.id), { label: "site 1 online" });
+  await until(() => siteLinkHub.isOnline(second.site.id), { label: "site 2 online" });
+
+  const client = await openClient();
+  client.send({ type: "select_device", deviceId: site2Remote });
+  await client.message(m => m.type === "frame" && m.deviceId === site2Remote, "control established on site 2's phone");
+
+  // Site 1's connection to the hub dies mid-session.
+  agent1.stop();
+  await until(() => !siteLinkHub.isOnline(site.id), { label: "site 1 offline" });
+
+  // Site 2 must be completely unaffected: still online, and the VA already
+  // controlling its phone can keep sending real input with no interruption.
+  // No stream was started on this connection, so a successful tap comes
+  // back as a follow-up "frame" (not "action_ack", which only applies with
+  // an active video stream — see index.js's afterAction()).
+  assert.equal(siteLinkHub.isOnline(second.site.id), true, "site 2 must still be online after site 1 dropped");
+  const framesBefore = client.messages.filter(m => m.type === "frame" && m.deviceId === site2Remote).length;
+  client.send({ type: "tap", x: 0.5, y: 0.5, requestId: 40 });
+  await client.until(
+    () => client.messages.filter(m => m.type === "frame" && m.deviceId === site2Remote).length > framesBefore,
+    "site 2's control keeps working uninterrupted",
+  );
+
+  // Site 1's own phone correctly shows offline, proving this isn't just "the
+  // hub ignored the disconnect" — site 1's state changed exactly as
+  // expected, while site 2's did not.
+  const list = await client.message(
+    m => m.type === "device_list" && m.devices.find(d => d.id === site1Remote)?.siteOnline === false,
+    "site 1's phone shows offline on the fleet list",
+  );
+  assert.equal(list.devices.find(d => d.id === site2Remote)?.siteOnline, true,
+    "site 2's phone must still show online on the same fleet list");
+});
+
 test("rotating the token cuts off the old agent at once and only the new token works", async () => {
   startAgent();
   await until(() => siteLinkHub.isOnline(site.id), { label: "site online" });
@@ -391,6 +442,35 @@ test("site administration API: create, list with live status, update, delete rem
   assert.equal((await adminApi("DELETE", "/api/admin/sites/rome-studio")).status, 404);
   const events = auditLog.listEvents().map(event => event.type);
   for (const type of ["site_created", "site_updated", "site_removed"]) assert.ok(events.includes(type), type);
+});
+
+test("committed site lifecycle operations remain successful when audit storage is unavailable", async () => {
+  const siteId = "audit-outage-site";
+  const originalAuditWrite = auditLog.logEvent;
+  try {
+    auditLog.logEvent = () => { throw new Error("injected site audit failure"); };
+
+    const created = await adminApi("POST", "/api/admin/sites", { name: "Audit Outage Site", timeZone: "Europe/Rome" });
+    assert.equal(created.status, 201);
+    assert.equal(created.body.site.id, siteId);
+    assert.match(created.body.token, /^pfs_/);
+
+    const updated = await adminApi("PATCH", `/api/admin/sites/${siteId}`, { name: "Audit Outage Updated" });
+    assert.equal(updated.status, 200);
+    assert.equal(updated.body.site.name, "Audit Outage Updated");
+
+    const rotated = await adminApi("POST", `/api/admin/sites/${siteId}/rotate-token`);
+    assert.equal(rotated.status, 200);
+    assert.match(rotated.body.token, /^pfs_/);
+
+    const removed = await adminApi("DELETE", `/api/admin/sites/${siteId}`);
+    assert.equal(removed.status, 200);
+    assert.deepEqual(removed.body, { ok: true });
+    assert.equal(await siteStore.get(siteId), null);
+  } finally {
+    auditLog.logEvent = originalAuditWrite;
+    if (await siteStore.get(siteId)) await siteStore.remove(siteId);
+  }
 });
 
 test("only an admin may manage sites", async () => {

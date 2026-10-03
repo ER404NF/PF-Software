@@ -7,6 +7,8 @@ const base = { HUB_URL: "https://phones.example.com", SITE_ID: "bucharest", SITE
 test("a complete, secure configuration is accepted and trimmed", () => {
   assert.deepEqual(readAgentConfig({ ...base, SITE_ID: " bucharest ", SITE_TOKEN: " pfs_abc " }),
     { hubUrl: "https://phones.example.com", siteId: "bucharest", token: "pfs_abc" });
+  assert.deepEqual(readAgentConfig({ ...base, HUB_URL: "https://phones.example.com/setup?invite=private#token" }),
+    { hubUrl: "https://phones.example.com", siteId: "bucharest", token: "pfs_abc" });
 });
 
 test("missing values are named so the operator knows what to copy from the Sites page", () => {
@@ -24,4 +26,5 @@ test("the site token never travels over plain http across the internet", () => {
 
 test("a hub address that is not a URL is rejected", () => {
   assert.throws(() => readAgentConfig({ ...base, HUB_URL: "phones.example.com" }), /must start with/);
+  assert.throws(() => readAgentConfig({ ...base, HUB_URL: "https://user:secret@phones.example.com" }), /username or password/);
 });

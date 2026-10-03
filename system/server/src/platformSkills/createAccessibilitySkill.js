@@ -1,5 +1,6 @@
 import { validateImageFrame } from "../observationPackage.js";
 import { MS8_READ_ONLY_ACTIONS } from "../actionPolicy.js";
+import { operationalErrorKind } from "../safeOperationalLog.js";
 import { findAccessibleElement, includesAny, normalizedCenter, normalizeUiText, observationTree, uiText } from "./accessibilityTree.js";
 
 const PASSIVE_ACTIONS = new Set(["observe", "capture", "capture_screenshot", "extract_visible"]);
@@ -122,10 +123,11 @@ export function createAccessibilitySkill({ name, platform, appVersion, appAliase
     },
 
     async recover(error, context) {
-      if (PASSIVE_ACTIONS.has(context?.decision?.action)) return { recovered: false, reason: error.message };
-      if (typeof context?.device?.pressHome !== "function") return { recovered: false, reason: error.message };
+      const reason = `skill recovery requested (${operationalErrorKind(error)})`;
+      if (PASSIVE_ACTIONS.has(context?.decision?.action)) return { recovered: false, reason };
+      if (typeof context?.device?.pressHome !== "function") return { recovered: false, reason };
       await context.device.pressHome();
-      return { recovered: true, destination: "springboard", reason: error.message };
+      return { recovered: true, destination: "springboard", reason };
     },
   };
   return skill;

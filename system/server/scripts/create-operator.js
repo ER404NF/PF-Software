@@ -3,13 +3,21 @@
 // a plaintext password into it).
 //
 // Usage:
-//   node server/scripts/create-operator.js <username> <password> [device1,device2,...] [--role=<role>] [--full-name="Name"] [--email=name@gmail.com] [--team=team-a] [--research-workspaces=client-a,client-b]
+//   node server/scripts/create-operator.js <username> <password> [device1,device2,...] [--role=<role>] [--full-name="Name"] [--email=name@gmail.com] [--team=team-a] [--research-workspaces=client-a,client-b] [--main-host]
 //
 // Omit the device list to grant every device to non-VA roles. Role defaults
 // to `va`; a VA with no list gets no devices and must receive explicit grants.
+//
+// --main-host (requires --role=host): marks this account as THE main host —
+// the one hub owner allowed to create/promote other host accounts (see
+// index.js's maxAssignableRoles). This is deliberately only reachable from
+// this local script, never from the running server's HTTP API — see
+// authStore.js's setMainHost for why. Bootstrapping a new hub's own host
+// account (e.g. the Romania Mac mini's owner) is just this same command run
+// again with a different username, without --main-host.
 
 import {
-  normalizeRole, OPERATOR_ROLES, operators, createOperatorAccount, updateOperatorAccount,
+  normalizeRole, OPERATOR_ROLES, operators, createOperatorAccount, updateOperatorAccount, setMainHost,
 } from "../src/authStore.js";
 import { validResearchId } from "../src/researchId.js";
 
@@ -27,8 +35,11 @@ let researchWorkspaces;
 let fullName;
 let email;
 let teamId;
+let mainHost = false;
 for (const arg of rest) {
-  if (arg.startsWith("--research-workspaces=")) {
+  if (arg === "--main-host") {
+    mainHost = true;
+  } else if (arg.startsWith("--research-workspaces=")) {
     const value = arg.slice("--research-workspaces=".length);
     researchWorkspaces = value ? value.split(",").map((id) => id.trim()) : [];
     // validResearchId (the same check researchAccess.js and authStore.js
@@ -65,6 +76,11 @@ for (const arg of rest) {
   }
 }
 
+if (mainHost && role !== OPERATOR_ROLES.HOST) {
+  console.error("--main-host requires --role=host");
+  process.exit(1);
+}
+
 const allowedDevices = deviceList ? deviceList.split(",").map((s) => s.trim()).filter(Boolean) : null;
 try {
   if (operators.has(username)) {
@@ -91,6 +107,10 @@ try {
       twoFactorRequired: true,
     });
     console.log(`Created operator "${username}".`);
+  }
+  if (mainHost) {
+    setMainHost(username, true);
+    console.log(`"${username}" is now the main host.`);
   }
 } catch (error) {
   console.error(error.message);

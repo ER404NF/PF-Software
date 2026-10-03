@@ -34,13 +34,16 @@ export class SupervisedProcessGroup extends EventEmitter {
   }
 
   // `bin`/`args` describe the OS process; `key` is this group's identity
-  // for the device (a UDID). Restarts reuse the same bin/args every time.
-  start(key, bin, args) {
+  // for the device (a UDID). Restarts reuse the same bin/args/env every
+  // time. `env` is optional extra environment merged over process.env (e.g.
+  // WDA's MJPEG tuning vars) — omitting it keeps the previous, unchanged
+  // behavior of simply inheriting the parent process's environment.
+  start(key, bin, args, env) {
     if (this.isRunning(key)) return;
     const entry = { child: null, log: [], restartCount: 0, restartTimer: null,
-      stableTimer: null, stopped: false, state: "starting", bin, args };
+      stableTimer: null, stopped: false, state: "starting", bin, args, env };
     this.entries.set(key, entry);
-    this._spawnNow(key, bin, args);
+    this._spawnNow(key, bin, args, env);
   }
 
   _appendLog(entry, line) {
@@ -48,12 +51,15 @@ export class SupervisedProcessGroup extends EventEmitter {
     if (entry.log.length > this.logRingSize) entry.log.shift();
   }
 
-  _spawnNow(key, bin, args) {
+  _spawnNow(key, bin, args, env) {
     const entry = this.entries.get(key);
     if (!entry || entry.stopped) return;
     let child;
     try {
-      child = this.spawn(bin, args, { stdio: ["ignore", "pipe", "pipe"] });
+      child = this.spawn(bin, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        ...(env ? { env: { ...process.env, ...env } } : {}),
+      });
     } catch (error) {
       this._appendLog(entry, `spawn error: ${error.message}`);
       this.emit("log", { key, stream: "stderr", line: `spawn error: ${error.message}` });
@@ -117,7 +123,7 @@ export class SupervisedProcessGroup extends EventEmitter {
     const delay = this.restartBackoffMs[entry.restartCount];
     entry.restartCount += 1;
     entry.state = "restarting";
-    entry.restartTimer = this.setTimeoutFn(() => this._spawnNow(key, entry.bin, entry.args), delay);
+    entry.restartTimer = this.setTimeoutFn(() => this._spawnNow(key, entry.bin, entry.args, entry.env), delay);
     entry.restartTimer.unref?.();
   }
 

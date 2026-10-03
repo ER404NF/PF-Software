@@ -18,6 +18,7 @@ process.env.RESEARCH_EVIDENCE_DIR = path.join(root, "evidence");
 process.env.SESSION_SECRET = "operator-management-test-secret";
 process.env.TWO_FACTOR_MASTER_KEY = "operator-management-test-two-factor-key-123456";
 process.env.ACCOUNT_NOTIFICATION_STORE_PATH = path.join(root, "account-notifications.json");
+process.env.DEVICE_CONFIG_PATH = path.resolve("server/fixtures/network-devices.config.json");
 process.env.AUTO_DISCOVER_IOS_DEVICES = "false";
 
 const auth = await import("../../src/authStore.js");
@@ -382,7 +383,7 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
       method: "PATCH",
       body: { allowedDevices: ["mock-1"] },
     });
-    assert.equal(granted.status, 200);
+    assert.equal(granted.status, 200, JSON.stringify(granted.body));
     const vaWs = await openSocket(address, noDeviceCookie);
     const selected = waitForMessage(vaWs,
       message => message.type === "frame" && message.deviceId === "mock-1");
@@ -410,7 +411,11 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
     // while the old device grant is still usable on an open socket.
     for (const account of [
       { username: "watch-owner", password: "watch-owner-password", role: "va", teamId: "team-a" },
-      { username: "watch-admin", password: "watch-admin-password", role: "admin", teamId: null },
+      // manager, not admin: an admin's own role-assignment ceiling (see
+      // index.js's maxAssignableRoles) tops out at manager — this fixture
+      // only needs MONITOR_DEVICE capability for the watch behavior below,
+      // which manager already has.
+      { username: "watch-admin", password: "watch-admin-password", role: "manager", teamId: "team-a" },
     ]) {
       const createdWatcherAccount = await request(baseUrl, "/api/admin/users", {
         cookie: adminCookie,
@@ -589,20 +594,21 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
     assert.equal(ownAdminCard.canReview, false);
     assert.match(ownAdminCard.actionReason, /currently using/);
 
-    const secondAdmin = await request(baseUrl, "/api/admin/users", {
-      cookie: adminCookie,
-      method: "POST",
-      body: {
-        username: "second-admin",
-        password: "second-admin-password",
-        fullName: "Second Admin",
-        email: "second.admin@gmail.com",
-        role: "admin",
-        allowedDevices: null,
-        allowedResearchWorkspaces: [],
-      },
+    // Created directly, not via POST /api/admin/users: an admin's own
+    // role-assignment ceiling (index.js's maxAssignableRoles) now tops out
+    // at manager, so admin-creates-admin is no longer something the HTTP
+    // route itself permits. This test is about the reject/last-active-admin
+    // behavior between two existing admins, not about that route.
+    const secondAdmin = auth.createOperatorAccount({
+      username: "second-admin",
+      password: "second-admin-password",
+      fullName: "Second Admin",
+      email: "second.admin@gmail.com",
+      role: "admin",
+      allowedDevices: null,
+      allowedResearchWorkspaces: [],
     });
-    assert.equal(secondAdmin.status, 201);
+    assert.equal(secondAdmin.username, "second-admin");
     const secondAdminRejected = await request(baseUrl, "/api/admin/users/second-admin/status", {
       cookie: adminCookie,
       method: "PATCH",

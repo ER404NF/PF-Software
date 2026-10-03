@@ -74,7 +74,7 @@ export async function createPostgresSiteRepository(pool, { defaultTimeZone = "Am
       });
     },
 
-    async create({ name, id = null, timeZone = null }) {
+    async create({ name, id = null, timeZone = null }, { authorize = null } = {}) {
       const displayName = typeof name === "string" ? name.trim() : "";
       if (displayName.length < 2 || displayName.length > 60) throw new SiteError("A site name must be 2 to 60 characters.");
       const siteId = id ?? slugify(displayName);
@@ -86,6 +86,7 @@ export async function createPostgresSiteRepository(pool, { defaultTimeZone = "Am
         const existing = await client.query("SELECT 1 FROM fleet.sites WHERE id = $1", [siteId]);
         if (existing.rowCount > 0) throw new SiteError(`A site with the id "${siteId}" already exists.`, "duplicate_site");
         const token = newToken();
+        await authorize?.();
         const result = await client.query(
           `INSERT INTO fleet.sites (id, organization_id, name, time_zone, token_hash)
            VALUES ($1, $2, $3, $4, $5)
@@ -96,11 +97,12 @@ export async function createPostgresSiteRepository(pool, { defaultTimeZone = "Am
       });
     },
 
-    async rotate(id) {
+    async rotate(id, { authorize = null } = {}) {
       return withOrg(async (client) => {
         const existing = await client.query("SELECT 1 FROM fleet.sites WHERE id = $1 AND organization_id = $2", [id, organizationId]);
         if (existing.rowCount === 0) throw new SiteError("Unknown site.", "unknown_site");
         const token = newToken();
+        await authorize?.();
         const result = await client.query(
           `UPDATE fleet.sites SET token_hash = $2, rotated_at = now() WHERE id = $1 RETURNING *`,
           [id, hashToken(token)],
@@ -109,7 +111,7 @@ export async function createPostgresSiteRepository(pool, { defaultTimeZone = "Am
       });
     },
 
-    async update(id, { name, timeZone }) {
+    async update(id, { name, timeZone }, { authorize = null } = {}) {
       return withOrg(async (client) => {
         const existing = await client.query("SELECT * FROM fleet.sites WHERE id = $1 AND organization_id = $2", [id, organizationId]);
         if (existing.rowCount === 0) throw new SiteError("Unknown site.", "unknown_site");
@@ -124,6 +126,7 @@ export async function createPostgresSiteRepository(pool, { defaultTimeZone = "Am
           if (!validTimeZone(timeZone)) throw new SiteError("That time zone is not recognised.");
           nextZone = timeZone;
         }
+        await authorize?.();
         const result = await client.query(
           "UPDATE fleet.sites SET name = $2, time_zone = $3 WHERE id = $1 RETURNING *",
           [id, nextName, nextZone],
@@ -132,8 +135,9 @@ export async function createPostgresSiteRepository(pool, { defaultTimeZone = "Am
       });
     },
 
-    async remove(id) {
+    async remove(id, { authorize = null } = {}) {
       return withOrg(async (client) => {
+        await authorize?.();
         const result = await client.query("DELETE FROM fleet.sites WHERE id = $1 AND organization_id = $2", [id, organizationId]);
         return result.rowCount > 0;
       });

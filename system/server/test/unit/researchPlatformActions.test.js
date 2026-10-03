@@ -91,6 +91,28 @@ test("once approved, the same action runs exactly once, is audited and mirrored,
   assert.equal(env.events.filter(event => event === "execute").length, 1);
 });
 
+test("an audit outage cannot replace a verified platform-action result", async () => {
+  const env = setup();
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...values) => errors.push(values.map(String).join(" "));
+  env.ctx.auditLog = { logEvent() {
+    const error = new Error("postgres://private:password@audit/platform-token");
+    error.code = "ECONNRESET";
+    throw error;
+  } };
+  try {
+    const result = await runResearchStep(env.ctx);
+    assert.equal(result.outcome, "VERIFIED");
+    assert.equal(env.mirrored.length, 1);
+    assert.equal(env.taskQueue.checkpoints.length, 1);
+  } finally {
+    console.error = originalError;
+  }
+  assert.deepEqual(errors, ["Research worker audit write failed: ECONNRESET"]);
+  assert.equal(errors.some(value => /private|password|token/.test(value)), false);
+});
+
 test("an approval for one wording never lets a different comment through", async () => {
   const env = setup({ action: "comment_generated", policy: "REQUIRE_APPROVAL", comment: { text: "Harbour boats are lovely", source: "generated" } });
   await runResearchStep(env.ctx);

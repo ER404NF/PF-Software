@@ -1,0 +1,28 @@
+{
+  "devices": [
+    {
+      "id": "mock-1",
+      "label": "Network test phone 1",
+      "type": "mock",
+      "hostLabel": "test-host",
+      "network": {
+        "egress": "cellular-sim",
+        "simIccid": "8901000000000000001",
+        "controlIface": "usb",
+        "failPolicy": "fail-open"
+      }
+    },
+    {
+      "id": "mock-2",
+      "label": "Network test phone 2",
+      "type": "mock",
+      "hostLabel": "test-host",
+      "network": {
+        "egress": "vlan-proxy",
+        "vlanId": "vlan-test-1",
+        "controlIface": "usb",
+        "failPolicy": "fail-open"
+      }
+    }
+  ]
+}

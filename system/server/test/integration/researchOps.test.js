@@ -23,6 +23,7 @@ Object.assign(process.env, {
   MODEL_SELECTION_STORE_PATH: path.join(root, "models.json"),
   ASSIGNMENT_STORE_PATH: path.join(root, "assignments.json"),
   SESSION_SECRET: "isolated-test-secret",
+  DEVICE_CONFIG_PATH: path.resolve("server/fixtures/network-devices.config.json"),
 });
 fs.writeFileSync(process.env.RESEARCH_CONFIG_PATH, JSON.stringify({ accounts: [
   { id: "account-a", workspaceId: "client-a", platform: "instagram", deviceId: "mock-1" },
@@ -149,6 +150,60 @@ test("an audit write failure after an approval decision does not report the comm
     assert.equal(approvalStore.get(pending.id).state, "APPROVED");
   } finally {
     auditLog.logEvent = originalLogEvent;
+  }
+});
+
+test("research denials and committed mutations keep their authoritative result during an audit outage", async () => {
+  const originalLogEvent = auditLog.logEvent;
+  const intervention = interventionQueue.open({
+    taskId: "task-audit-outage", accountId: "account-a", workspaceId: "client-a",
+    platform: "instagram", deviceId: "mock-1", reason: "audit outage fixture",
+  });
+  let templateId = null;
+  try {
+    auditLog.logEvent = () => { throw new Error("injected research audit failure"); };
+
+    assert.equal((await request("boss-b", "/api/research/account-a/runs")).status, 403,
+      "an audit outage must not turn an authorization denial into a server error");
+
+    const policy = await request("boss", "/api/research/account-a/policies/open_profile", "PUT", { policy: "REQUIRE_APPROVAL" });
+    assert.equal(policy.status, 200);
+    assert.equal(policy.body.policy.policy, "REQUIRE_APPROVAL");
+
+    const template = await request("boss", "/api/research/account-a/templates", "POST", {
+      text: "Audit outage fixture comment", tags: ["audit-outage"],
+    });
+    assert.equal(template.status, 201);
+    templateId = template.body.template.id;
+    assert.equal((await request("boss", `/api/research/account-a/templates/${templateId}`, "DELETE")).status, 200);
+    templateId = null;
+
+    const createdRun = await request("va", "/api/research/account-a/runs", "POST", {
+      platform: "instagram", overview: "audit outage run",
+      candidates: [{ canonical_url: "https://www.instagram.com/p/AUDIT-OUTAGE/" }],
+    });
+    assert.equal(createdRun.status, 200);
+    const candidate = createdRun.body.run.candidates[0];
+    const reviewed = await request("manager",
+      `/api/research/account-a/runs/${createdRun.body.run.id}/candidates/${candidate.id}`, "PATCH", { status: "confirmed" });
+    assert.equal(reviewed.status, 200);
+    assert.equal(reviewed.body.candidate.review_state, "confirmed");
+
+    const claimed = await request("manager", `/api/fleet/interventions/${intervention.id}/claim`, "POST");
+    assert.equal(claimed.status, 200);
+    assert.equal(claimed.body.intervention.state, "CLAIMED");
+    const resolved = await request("manager", `/api/fleet/interventions/${intervention.id}/resolve`, "POST", { resolution: "done" });
+    assert.equal(resolved.status, 200);
+    assert.equal(resolved.body.intervention.state, "RESOLVED");
+  } finally {
+    auditLog.logEvent = originalLogEvent;
+    if (templateId) templateLibrary.remove("client-a", templateId);
+    policyStore.set("account-a", "open_profile", "DISABLED", "test-cleanup");
+    const current = interventionQueue.list().find(item => item.id === intervention.id);
+    if (current && current.state !== "RESOLVED") {
+      if (current.state === "OPEN") interventionQueue.claim(current.id, "test-cleanup");
+      interventionQueue.resolve(current.id, { by: "test-cleanup", resolution: "cleanup" });
+    }
   }
 });
 

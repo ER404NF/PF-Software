@@ -2,6 +2,7 @@
 // separate authorization boundaries and must still be checked at the action.
 
 export const OPERATOR_ROLES = Object.freeze({
+  HOST: "host",
   ADMIN: "admin",
   MANAGER: "manager",
   VA: "va",
@@ -49,6 +50,11 @@ const lowerOperational = [
 ];
 
 export const ROLE_CAPABILITIES = Object.freeze({
+  // Host sits above admin in who-can-promote-whom (see index.js's
+  // maxAssignableRoles), but needs the exact same feature-capability surface
+  // as admin — the distinction between them is about role-assignment ceilings
+  // and multi-hub ownership, not which app features are reachable.
+  [OPERATOR_ROLES.HOST]: Object.freeze(Object.values(CAPABILITIES)),
   [OPERATOR_ROLES.ADMIN]: Object.freeze(Object.values(CAPABILITIES)),
   [OPERATOR_ROLES.MANAGER]: Object.freeze([
     ...lowerOperational,

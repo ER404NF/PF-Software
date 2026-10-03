@@ -1,3 +1,5 @@
+import { logOperationalFailure, operationalErrorKind } from "./safeOperationalLog.js";
+
 export function createSchedulerGuard({ taskQueue, expireAssignments, auditLog = null, logError = console.error } = {}) {
   if (!taskQueue?.tick || typeof expireAssignments !== "function") {
     throw new Error("scheduler guard requires task and assignment runners");
@@ -8,12 +10,12 @@ export function createSchedulerGuard({ taskQueue, expireAssignments, auditLog = 
     health.state = "degraded";
     health.lastErrorAt = at.toISOString();
     health.failedComponent = component;
-    logError(`Scheduled ${component} maintenance failed:`, error);
+    logOperationalFailure(`Scheduled ${component} maintenance failed`, error, logError);
     try {
       auditLog?.logEvent({ type: "scheduler_persistence_failed",
-        detail: { component, errorName: error?.name || "Error" } });
+        detail: { component, errorName: operationalErrorKind(error) } });
     } catch (auditError) {
-      logError("Scheduler failure audit could not be written:", auditError);
+      logOperationalFailure("Scheduler failure audit could not be written", auditError, logError);
     }
   }
 

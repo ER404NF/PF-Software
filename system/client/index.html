@@ -11,17 +11,7 @@
   <link rel="icon" href="icons/icon.svg" type="image/svg+xml" />
   <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
   <title>Phone Farm</title>
-  <script>
-    (() => {
-      try {
-        const savedTheme = localStorage.getItem("phone-farm-theme");
-        const systemTheme = window.matchMedia?.("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-        document.documentElement.dataset.theme = savedTheme === "dark" || savedTheme === "light" ? savedTheme : systemTheme;
-      } catch {
-        document.documentElement.dataset.theme = "light";
-      }
-    })();
-  </script>
+  <script src="theme-bootstrap.js"></script>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -33,7 +23,7 @@
     <label class="login-field">Password<input type="password" id="login-password" autocomplete="current-password" required /></label>
     <button type="submit">Sign in</button>
     <button type="button" id="logout-retry-button" class="secondary-auth-button" hidden>Retry session revocation</button>
-    <div class="auth-links"><button type="button" id="show-signup-button">Create account</button><button type="button" id="show-recovery-button">Recover access</button></div>
+    <div class="auth-links"><button type="button" id="show-signup-button">Create account</button><button type="button" id="show-recovery-button">Recover access</button><a href="/account-deletion.html">Request deletion</a></div>
     <p id="login-error" role="alert"></p>
   </form>
 
@@ -96,6 +86,7 @@
         <span id="whoami"></span>
         <button type="button" id="research-toggle" aria-controls="research-panel" aria-expanded="false">Research</button>
         <button type="button" id="review-toggle" aria-controls="review-panel" aria-expanded="false" hidden>Review</button>
+        <a href="/account-deletion.html">Privacy</a>
         <button type="button" id="logout-button">Sign out</button>
       </div>
     </header>
@@ -265,28 +256,41 @@
         <button type="button" id="admin-refresh-button">Refresh all</button>
       </header>
 
-      <section class="admin-panel" id="command-console-panel">
+      <nav id="operations-nav" aria-label="Operations sections">
+        <span>Jump to</span>
+        <a href="#command-console-panel" data-operations-target="command-console-panel">Commands</a>
+        <a href="#queue-panel" data-operations-target="queue-panel">Task queue</a>
+        <a href="#pending-panel" data-operations-target="pending-panel" hidden>Applications</a>
+        <a href="#users-panel" data-operations-target="users-panel" hidden>Users</a>
+        <a href="#sites-panel" data-operations-target="sites-panel" hidden>Sites</a>
+        <a href="#proxy-pool-panel" data-operations-target="proxy-pool-panel" hidden>Proxies</a>
+        <a href="#audit-panel" data-operations-target="audit-panel">Audit</a>
+      </nav>
+
+      <section class="admin-panel" id="command-console-panel" tabindex="-1" aria-labelledby="command-console-heading">
         <div class="admin-panel-heading">
-          <h3>Command Console</h3>
+          <h3 id="command-console-heading">Command Console</h3>
           <span>Uses the existing command parser and queue API.</span>
         </div>
         <form id="command-form">
+          <label class="visually-hidden" for="command-input">Command</label>
           <input id="command-input" type="text" placeholder="/queue list, /mode ai mock-1, /time 09:00-10:00 …" autocomplete="off" />
           <button type="submit">Run</button>
         </form>
         <pre id="command-output" aria-live="polite">No command run yet.</pre>
       </section>
 
-      <section class="admin-panel" id="queue-panel">
+      <section class="admin-panel" id="queue-panel" tabindex="-1" aria-labelledby="queue-heading">
         <div class="admin-panel-heading">
           <div>
-            <h3>Task Queue</h3>
+            <h3 id="queue-heading">Task Queue</h3>
             <span id="queue-state">Loading…</span>
           </div>
           <button type="button" id="queue-refresh-button">Refresh</button>
         </div>
         <div class="admin-table-wrap">
           <table class="admin-table">
+            <caption class="visually-hidden">Current task queue</caption>
             <thead>
               <tr>
                 <th>Task</th>
@@ -304,10 +308,22 @@
         <p id="queue-empty" class="admin-empty" hidden>No tasks are currently in the queue.</p>
       </section>
 
-      <section class="admin-panel" id="users-panel" hidden>
+      <section class="admin-panel" id="pending-panel" tabindex="-1" aria-labelledby="pending-heading" hidden>
         <div class="admin-panel-heading">
           <div>
-            <h3>Users and Access</h3>
+            <h3 id="pending-heading">Waiting for approval <span id="pending-count" class="pending-count"></span></h3>
+            <span>VAs who signed up and are waiting to be let onto the platform.</span>
+          </div>
+          <button type="button" id="pending-refresh-button">Refresh</button>
+        </div>
+        <div id="pending-list" class="users-list"></div>
+        <p id="pending-empty" class="admin-empty" hidden>No applications are waiting for review.</p>
+      </section>
+
+      <section class="admin-panel" id="users-panel" tabindex="-1" aria-labelledby="users-heading" hidden>
+        <div class="admin-panel-heading">
+          <div>
+            <h3 id="users-heading">Users and Access</h3>
             <span>Create accounts, assign roles and grants, or revoke access.</span>
           </div>
           <button type="button" id="users-refresh-button">Refresh</button>
@@ -338,10 +354,10 @@
         <p id="users-empty" class="admin-empty" hidden>No users configured.</p>
       </section>
 
-      <section class="admin-panel" id="sites-panel" hidden>
+      <section class="admin-panel" id="sites-panel" hidden tabindex="-1" aria-labelledby="sites-heading">
         <div class="admin-panel-heading">
           <div>
-            <h3>Sites</h3>
+            <h3 id="sites-heading">Sites</h3>
             <span>Other locations link their phones to this hub. Add a site, then run the Phone Farm site app there with the values shown once.</span>
           </div>
           <button type="button" id="sites-refresh-button">Refresh</button>
@@ -365,10 +381,10 @@
         <p id="sites-empty" class="admin-empty" hidden>No sites yet. Phones plugged into this machine appear under this-mac.</p>
       </section>
 
-      <section class="admin-panel" id="proxy-pool-panel" hidden>
+      <section class="admin-panel" id="proxy-pool-panel" tabindex="-1" aria-labelledby="proxy-pool-heading" hidden>
         <div class="admin-panel-heading">
           <div>
-            <h3>Proxy Pool</h3>
+            <h3 id="proxy-pool-heading">Proxy Pool</h3>
             <span>Add provider credentials once; assign them to phones from each fleet card.</span>
           </div>
           <button type="button" id="proxy-pool-refresh-button">Refresh</button>
@@ -394,18 +410,27 @@
         <p id="proxy-pool-message" role="status" aria-live="polite"></p>
         <div id="proxy-pool-list" class="users-list"></div>
         <p id="proxy-pool-empty" class="admin-empty" hidden>No proxies configured.</p>
+        <div class="admin-panel-heading proxy-provider-heading">
+          <div>
+            <h4>Provider exits</h4>
+            <span>Control-plane inventory only. An enabled exit is not proof that phone traffic uses it.</span>
+          </div>
+        </div>
+        <div id="proxy-provider-list" class="users-list"></div>
+        <p id="proxy-provider-empty" class="admin-empty" hidden>No proxy provider is configured.</p>
       </section>
 
-      <section class="admin-panel" id="audit-panel">
+      <section class="admin-panel" id="audit-panel" tabindex="-1" aria-labelledby="audit-heading">
         <div class="admin-panel-heading">
           <div>
-            <h3>Audit Log</h3>
+            <h3 id="audit-heading">Audit Log</h3>
             <span>Newest events first.</span>
           </div>
           <button type="button" id="audit-refresh-button">Refresh</button>
         </div>
         <div class="admin-table-wrap">
           <table class="admin-table">
+            <caption class="visually-hidden">Newest audit events</caption>
             <thead>
               <tr>
                 <th>Time</th>
@@ -450,6 +475,9 @@
   <script src="phoneStage.js"></script>
   <script src="research.js"></script>
   <script src="review.js"></script>
+  <script src="operationsController.js"></script>
+  <script src="peopleAssignmentsController.js"></script>
+  <script src="proxyPoolController.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

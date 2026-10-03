@@ -24,6 +24,7 @@ process.env.MEDIA_DEVICE_QUOTA_BYTES = "64";
 process.env.MEDIA_GLOBAL_QUOTA_BYTES = "128";
 process.env.MEDIA_MIN_FREE_BYTES = "0";
 process.env.STREAM_IDLE_CLOSE_MS = "150";
+process.env.DEVICE_CONFIG_PATH = path.resolve("server/fixtures/network-devices.config.json");
 
 const { server, wss, devices, deviceHealth, deviceLease, auditLog, streamHub, deviceMonitorConfig } = await import("../../src/index.js");
 const { operators, hashPassword } = await import("../../src/authStore.js");

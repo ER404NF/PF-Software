@@ -17,6 +17,7 @@
 // local ids.
 
 import { frameKind } from "./mjpegParser.js";
+import { operationalErrorKind } from "./safeOperationalLog.js";
 
 export const PROTOCOL_VERSION = 1;
 export const REMOTE_ID_SEPARATOR = "__";
@@ -27,6 +28,51 @@ export const RPC_METHODS = Object.freeze(["tap", "swipe", "drag", "longPress", "
 
 export const DEVICE_TYPES = Object.freeze(["mock", "wda", "discovered"]);
 export const MAX_ADVERTISED_DEVICES = 500;
+
+const SAFE_RPC_ERROR_CODE_RE = /^[A-Z][A-Z0-9_]{1,63}$/;
+const RPC_ERROR_MESSAGES = Object.freeze({
+  UNKNOWN_DEVICE: "Unknown phone at this site.",
+  UNSUPPORTED_METHOD: "That action is not supported.",
+  SITE_ACTION_FAILED: "The site could not perform the action.",
+});
+const DISCOVERY_MESSAGES = Object.freeze({
+  provisioning: "Automatic device setup is in progress at this site.",
+  user_action_required: "This phone needs a manual trust, Developer Mode, or WDA signing action at its site.",
+  provisioning_error: "Automatic device setup failed at this site. Review that host's local diagnostics.",
+  disconnected: "The phone is disconnected from its site.",
+});
+const STREAM_STATE_MESSAGES = Object.freeze({
+  connecting: "Remote video is connecting.",
+  live: null,
+  reconnecting: "Remote video is reconnecting.",
+  closed: "Remote video closed.",
+});
+
+function safeRpcErrorCode(value) {
+  return typeof value === "string" && SAFE_RPC_ERROR_CODE_RE.test(value)
+    ? value
+    : "SITE_ACTION_FAILED";
+}
+
+export function publicSiteRpcError(error) {
+  const code = safeRpcErrorCode(operationalErrorKind(error));
+  return { code, message: RPC_ERROR_MESSAGES[code] ?? RPC_ERROR_MESSAGES.SITE_ACTION_FAILED };
+}
+
+export function siteRpcErrorFromPayload(payload) {
+  const code = safeRpcErrorCode(payload?.code);
+  const error = new Error(RPC_ERROR_MESSAGES[code] ?? RPC_ERROR_MESSAGES.SITE_ACTION_FAILED);
+  error.code = code;
+  return error;
+}
+
+export function sanitizeSiteStreamState(payload) {
+  const requestedState = typeof payload?.state === "string" ? payload.state : "";
+  const state = Object.hasOwn(STREAM_STATE_MESSAGES, requestedState)
+    ? requestedState
+    : "reconnecting";
+  return { state, detail: STREAM_STATE_MESSAGES[state] };
+}
 
 export function remoteDeviceId(siteId, localId) {
   return `${siteId}${REMOTE_ID_SEPARATOR}${localId}`;
@@ -68,14 +114,15 @@ export function sanitizeAdvertisedDevices(list) {
     if (typeof entry.id !== "string" || !/^[a-zA-Z0-9_-]{1,80}$/.test(entry.id) || seen.has(entry.id)) continue;
     seen.add(entry.id);
     const text = (value, max) => (typeof value === "string" ? value.slice(0, max) : null);
+    const discoveryState = text(entry.discoveryState, 40);
     cleaned.push({
       id: entry.id,
       label: text(entry.label, 100) || entry.id,
       type: DEVICE_TYPES.includes(entry.type) ? entry.type : "wda",
       ready: entry.ready === true,
       supportsStream: entry.supportsStream === true,
-      discoveryState: text(entry.discoveryState, 40),
-      discoveryStateMessage: text(entry.discoveryStateMessage, 300),
+      discoveryState,
+      discoveryStateMessage: DISCOVERY_MESSAGES[discoveryState] ?? null,
     });
   }
   return cleaned;

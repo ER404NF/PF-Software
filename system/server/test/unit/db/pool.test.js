@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { resolvePoolConfig, DatabaseConfigError } from "../../../src/db/pool.js";
+import { createPool, resolvePoolConfig, DatabaseConfigError } from "../../../src/db/pool.js";
 
 test("resolvePoolConfig requires a connection string", () => {
   assert.throws(() => resolvePoolConfig({ connectionString: undefined }), DatabaseConfigError);
@@ -38,4 +38,21 @@ test("resolvePoolConfig requires opt-in to disable TLS verification, never defau
   assert.equal(verified.ssl, undefined);
   const explicit = resolvePoolConfig({ connectionString: "postgres://x", ssl: { rejectUnauthorized: false } });
   assert.deepEqual(explicit.ssl, { rejectUnauthorized: false });
+});
+
+test("pool error listener does not log connection strings or private exception text", async () => {
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...values) => errors.push(values.map(String).join(" "));
+  const pool = createPool({ connectionString: "postgres://private:password@database/phonefarm" });
+  try {
+    const error = new Error("postgres://private:password@database/phonefarm was rejected");
+    error.code = "ECONNRESET";
+    pool.emit("error", error);
+  } finally {
+    console.error = originalError;
+    await pool.end();
+  }
+  assert.deepEqual(errors, ["Unexpected PostgreSQL pool error on an idle client: ECONNRESET"]);
+  assert.equal(errors.some(value => /private|password|database/.test(value)), false);
 });

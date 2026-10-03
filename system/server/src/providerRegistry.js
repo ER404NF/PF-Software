@@ -20,6 +20,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import { AnthropicProvider } from "./anthropicProvider.js";
 import { OpenAiCompatibleProvider } from "./openAiCompatibleProvider.js";
+import { logOperationalFailure } from "./safeOperationalLog.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Env-overridable so tests can point at a disposable temp config instead of
@@ -33,6 +34,49 @@ const ADAPTER_KINDS = {
   anthropic: AnthropicProvider,
   "openai-compatible": OpenAiCompatibleProvider,
 };
+
+const PROVIDER_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const CREDENTIAL_ENV_RE = /^[A-Za-z_][A-Za-z0-9_]{0,127}$/;
+const MODEL_ID_RE = /^[^\u0000-\u001f\u007f]{1,256}$/;
+
+function safeProviderLabel(value) {
+  return typeof value === "string" && PROVIDER_NAME_RE.test(value)
+    ? value
+    : "invalid-provider";
+}
+
+function validateOptionalBaseUrl(value) {
+  if (value === undefined) return;
+  if (typeof value !== "string" || value.length < 1 || value.length > 2048) {
+    throw new TypeError("baseUrl must be a bounded HTTP(S) URL");
+  }
+  let parsed;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new TypeError("baseUrl must be a valid HTTP(S) URL");
+  }
+  if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
+    throw new TypeError("baseUrl must be a credential-free HTTP(S) URL");
+  }
+}
+
+function validateEntry(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    throw new TypeError("provider entry must be an object");
+  }
+  if (typeof entry.name !== "string" || !PROVIDER_NAME_RE.test(entry.name)) {
+    throw new TypeError("provider name must be a safe identifier");
+  }
+  if (typeof entry.model !== "string" || !MODEL_ID_RE.test(entry.model)) {
+    throw new TypeError("model must be a bounded printable identifier");
+  }
+  if (entry.credentialEnv !== undefined
+    && (typeof entry.credentialEnv !== "string" || !CREDENTIAL_ENV_RE.test(entry.credentialEnv))) {
+    throw new TypeError("credentialEnv must be an environment-variable identifier");
+  }
+  validateOptionalBaseUrl(entry.baseUrl);
+}
 
 function readConfig() {
   if (!fs.existsSync(configPath)) return { providers: [] };
@@ -55,9 +99,10 @@ function resolveCredential(name, credentialEnv) {
 }
 
 function buildProvider(entry) {
+  validateEntry(entry);
   const Adapter = ADAPTER_KINDS[entry.kind];
   if (!Adapter) {
-    throw new Error(`unknown provider kind "${entry.kind}" — expected one of ${Object.keys(ADAPTER_KINDS).join(", ")}`);
+    throw new TypeError(`unknown provider kind; expected one of ${Object.keys(ADAPTER_KINDS).join(", ")}`);
   }
   return new Adapter({
     name: entry.name,
@@ -68,19 +113,27 @@ function buildProvider(entry) {
 }
 
 function loadProviders() {
-  const raw = readConfig();
+  let raw;
+  try {
+    raw = readConfig();
+  } catch (error) {
+    logOperationalFailure("models.config.json: unable to read provider configuration", error, console.warn);
+    return { map: new Map(), defaultName: null };
+  }
   const map = new Map();
   let defaultName = null;
-  for (const entry of raw.providers || []) {
-    if (!entry || typeof entry.name !== "string" || !entry.name) {
-      console.warn("models.config.json: skipping a provider entry with no name");
-      continue;
-    }
-    if (map.has(entry.name)) {
-      console.warn(`models.config.json: duplicate provider name "${entry.name}" — keeping the first, ignoring the rest`);
-      continue;
-    }
+  if (!raw || typeof raw !== "object" || !Array.isArray(raw.providers)) {
+    console.warn("models.config.json: providers must be an array; no providers were loaded");
+    return { map, defaultName };
+  }
+  for (const entry of raw.providers) {
+    const providerLabel = safeProviderLabel(entry?.name);
     try {
+      validateEntry(entry);
+      if (map.has(entry.name)) {
+        console.warn(`models.config.json: duplicate provider name "${providerLabel}" — keeping the first, ignoring the rest`);
+        continue;
+      }
       map.set(entry.name, buildProvider(entry));
       // First entry wins as the fallback default unless a later one is
       // explicitly marked `"default": true` — mirrors devices.config.json's
@@ -88,7 +141,7 @@ function loadProviders() {
       // config to name a default explicitly.
       if (entry.default || !defaultName) defaultName = entry.name;
     } catch (err) {
-      console.warn(`models.config.json: failed to load provider "${entry.name}": ${err.message}`);
+      logOperationalFailure(`models.config.json: failed to load provider "${providerLabel}"`, err, console.warn);
     }
   }
   return { map, defaultName };

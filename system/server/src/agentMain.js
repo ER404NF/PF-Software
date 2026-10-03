@@ -28,12 +28,13 @@ export function readAgentConfig(env = process.env) {
   const hubUrl = String(env.HUB_URL).trim();
   if (!/^(https?|wss?):\/\//i.test(hubUrl)) throw new Error("HUB_URL must start with https:// (or http:// on a trusted local network).");
   // A site token must never cross the internet in clear text.
-  const url = new URL(hubUrl.replace(/^ws/i, "http"));
+  const url = new URL(hubUrl);
+  if (url.username || url.password) throw new Error("HUB_URL must not contain a username or password.");
   const isLoopback = ["localhost", "127.0.0.1", "::1", "[::1]"].includes(url.hostname);
-  if (url.protocol !== "https:" && !isLoopback && env.ALLOW_INSECURE_HUB !== "true") {
+  if (!["https:", "wss:"].includes(url.protocol) && !isLoopback && env.ALLOW_INSECURE_HUB !== "true") {
     throw new Error("HUB_URL must use https:// so the site token is encrypted in transit (set ALLOW_INSECURE_HUB=true only on a trusted private network).");
   }
-  return { hubUrl, siteId: String(env.SITE_ID).trim(), token: String(env.SITE_TOKEN).trim() };
+  return { hubUrl: url.origin, siteId: String(env.SITE_ID).trim(), token: String(env.SITE_TOKEN).trim() };
 }
 
 export function startAgent(env = process.env) {

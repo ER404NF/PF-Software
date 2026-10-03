@@ -157,6 +157,25 @@
     return bytes;
   }
 
+  function fitContain(intrinsicWidth, intrinsicHeight, maxWidth, maxHeight) {
+    if (![intrinsicWidth, intrinsicHeight, maxWidth, maxHeight].every(value => Number.isFinite(value) && value > 0)) return null;
+    const scale = Math.min(maxWidth / intrinsicWidth, maxHeight / intrinsicHeight);
+    return { width: intrinsicWidth * scale, height: intrinsicHeight * scale };
+  }
+
+  function pixelLimit(value) {
+    if (typeof value !== "string" || !value.endsWith("px")) return null;
+    const parsed = Number.parseFloat(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
+  }
+
+  function fullscreenCanvasHeight({ layoutBottom, frameTop, frameHeight, screenWrapHeight, paddingBottom = 0 }) {
+    const values = [layoutBottom, frameTop, frameHeight, screenWrapHeight, paddingBottom];
+    if (!values.every(Number.isFinite)) return null;
+    const height = layoutBottom - paddingBottom - frameTop - (frameHeight - screenWrapHeight);
+    return height > 0 ? height : null;
+  }
+
   // ---- the stage ------------------------------------------------------------
 
   class PhoneStage {
@@ -165,7 +184,7 @@
     // dotEl: the touch indicator; keyboardEl: the hidden text field that captures typing
     // send(message) -> requestId | null: sends an input to the phone (the app adds deviceId)
     constructor({
-      screenEl, frameEl = null, homeButtonEl = null, dotEl = null, keyboardEl = null,
+      screenEl, frameEl = null, layoutEl = null, homeButtonEl = null, dotEl = null, keyboardEl = null,
       send, onStatus = () => {},
       now = () => Date.now(),
       setTimeoutFn = scope.setTimeout.bind(scope),
@@ -173,9 +192,10 @@
       createCanvas = () => scope.document.createElement("canvas"),
       decode = browserDecode,
       coarsePointer = () => Boolean(scope.matchMedia?.("(pointer: coarse)")?.matches),
+      getComputedStyleFn = scope.getComputedStyle?.bind(scope) ?? null,
     }) {
       if (!screenEl || typeof send !== "function") throw new TypeError("PhoneStage needs a screen element and a send callback.");
-      Object.assign(this, { screenEl, frameEl, homeButtonEl, dotEl, keyboardEl, send, onStatus, now, setTimeoutFn, clearTimeoutFn, createCanvas, decode, coarsePointer });
+      Object.assign(this, { screenEl, frameEl, layoutEl, homeButtonEl, dotEl, keyboardEl, send, onStatus, now, setTimeoutFn, clearTimeoutFn, createCanvas, decode, coarsePointer, getComputedStyleFn });
       this.mode = "idle"; // idle | control | watch
       this.streamId = null;
       this.canvas = null;
@@ -195,6 +215,11 @@
       this.dotTimer = null;
       this.batcher = new TextBatcher({ send: message => this._sendInput(message), setTimeoutFn, clearTimeoutFn });
       this._bind();
+      scope.addEventListener?.("resize", () => this.fitCanvas());
+      if (layoutEl && typeof scope.ResizeObserver === "function") {
+        this.resizeObserver = new scope.ResizeObserver(() => this.fitCanvas());
+        this.resizeObserver.observe(layoutEl);
+      }
     }
 
     // ---- state -------------------------------------------------------------
@@ -301,6 +326,7 @@
         this.canvas.height = height;
       }
       this.canvas.getContext("2d").drawImage(image, 0, 0, width, height);
+      this.fitCanvas();
       image.close?.();
       this.frameEl?.classList?.add("has-picture");
       this.picture = true;
@@ -317,6 +343,36 @@
     displayRect() {
       const target = this.canvas || this.screenEl;
       return target.getBoundingClientRect();
+    }
+
+    fitCanvas() {
+      if (!this.canvas || !this.getComputedStyleFn) return null;
+      const style = this.getComputedStyleFn(this.canvas);
+      let maxHeight = pixelLimit(style.maxHeight);
+      if (this.layoutEl?.matches?.(":fullscreen") && this.frameEl && this.screenEl.parentElement) {
+        const layoutRect = this.layoutEl.getBoundingClientRect();
+        const frameRect = this.frameEl.getBoundingClientRect();
+        const screenWrapRect = this.screenEl.parentElement.getBoundingClientRect();
+        const layoutStyle = this.getComputedStyleFn(this.layoutEl);
+        const layoutLimit = fullscreenCanvasHeight({
+          layoutBottom: layoutRect.bottom,
+          frameTop: frameRect.top,
+          frameHeight: frameRect.height,
+          screenWrapHeight: screenWrapRect.height,
+          paddingBottom: pixelLimit(layoutStyle.paddingBottom) ?? 0,
+        });
+        if (layoutLimit) maxHeight = maxHeight ? Math.min(maxHeight, layoutLimit) : layoutLimit;
+      }
+      const fitted = fitContain(
+        this.canvas.width,
+        this.canvas.height,
+        pixelLimit(style.maxWidth),
+        maxHeight,
+      );
+      if (!fitted) return null;
+      this.canvas.style.width = `${fitted.width}px`;
+      this.canvas.style.height = `${fitted.height}px`;
+      return fitted;
     }
 
     // ---- input plumbing ----------------------------------------------------
@@ -543,7 +599,7 @@
     }
   }
 
-  PhoneStage.helpers = { pointInRect, classifyGesture, scrollDrag, wheelDragMessage, keyAction, TextBatcher };
+  PhoneStage.helpers = { pointInRect, classifyGesture, scrollDrag, wheelDragMessage, keyAction, TextBatcher, fitContain, fullscreenCanvasHeight };
   PhoneStage.constants = { TAP_TRAVEL_PX, LONG_PRESS_MS, HOLD_DRAG_MS, DOUBLE_TAP_MS };
   scope.PhoneStage = PhoneStage;
 })(typeof window === "undefined" ? globalThis : window);

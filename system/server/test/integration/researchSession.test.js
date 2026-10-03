@@ -126,7 +126,8 @@ test("an injected mid-session model failure is survived: the session resumes, fi
   await runner.waitForTask(task.id);
   assert.equal(queue.getTask(task.id).state, TASK_STATES.SUCCEEDED, "one outage does not sink the session");
   const report = runs[0].session;
-  assert.ok(report.failures.some(failure => /temporary model outage/.test(failure.error)), "the failure is on the record");
+  assert.ok(report.failures.some(failure => failure.error === "research planning failed (Error)"), "a safe failure is on the record");
+  assert.doesNotMatch(JSON.stringify(report), /temporary model outage/, "provider exception text is not persisted");
   assert.ok(report.recoveries.some(recovery => recovery.kind === "step_retry"), "and so is the recovery");
   assert.equal(report.candidates.kept, 4);
   assert.equal(new Set(runs[0].candidates.map(candidate => candidate.canonical_url)).size, 4, "no duplicates from the retry");

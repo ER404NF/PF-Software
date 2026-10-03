@@ -30,7 +30,7 @@ test("Redis foundation (real Redis)", { skip }, async (t) => {
     t.after(() => deadClient.disconnect());
     const result = await checkRedisHealth(deadClient, { timeoutMs: 500 });
     assert.equal(result.healthy, false);
-    assert.ok(result.error);
+    assert.ok(result.errorKind);
   });
 
   const orgA = crypto.randomUUID();

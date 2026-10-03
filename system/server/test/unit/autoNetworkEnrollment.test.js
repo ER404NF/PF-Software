@@ -90,13 +90,26 @@ test("a bridge inspection failure stays retryable and reports pending instead of
   const { enrollment } = makeEnrollment({
     attached: [{ id: "x", udid: UDID_A, label: "Phone A" }], members: [],
   });
-  enrollment.listBridgeMembers = async () => { throw new Error("ifconfig unavailable"); };
+  enrollment.listBridgeMembers = async () => { throw new Error("ifconfig unavailable at PRIVATE_HOST_PATH"); };
 
   await enrollment.tick();
 
   const status = enrollment.getStatus(discoveredDeviceId(UDID_A));
   assert.equal(status.state, "pending");
-  assert.match(status.note, /ifconfig unavailable/);
+  assert.equal(status.note, "Waiting to read the shared USB network (Error).");
+  assert.doesNotMatch(JSON.stringify(status), /PRIVATE_HOST_PATH|ifconfig unavailable/);
+});
+
+test("IP discovery failures retain a retryable state without exposing command details", async () => {
+  const { enrollment } = makeEnrollment({
+    attached: [{ id: "x", udid: UDID_A, label: "Phone A" }], members: ["en5"],
+  });
+  enrollment.discoverBridgeOwnIp = async () => { throw new Error("PRIVATE_BRIDGE_COMMAND_OUTPUT"); };
+  await enrollment.tick();
+  const status = enrollment.getStatus(discoveredDeviceId(UDID_A));
+  assert.equal(status.state, "discovering_ip");
+  assert.equal(status.note, "IP discovery failed (Error).");
+  assert.doesNotMatch(JSON.stringify(status), /PRIVATE_BRIDGE_COMMAND_OUTPUT/);
 });
 
 test("a manually configured UDID is never auto-enrolled", async () => {
@@ -270,6 +283,21 @@ test("without a proxy assigned yet, the device stops at ready and never calls st
   await enrollment.tick();
   assert.equal(startRoutingCalls.length, 0);
   assert.equal(enrollment.getStatus(discoveredDeviceId(UDID_A)).state, "ready");
+});
+
+test("automatic routing failures do not expose tunnel details in enrollment status", async () => {
+  const { enrollment, proxyPoolStorePath } = makeEnrollment({
+    startRouting: async () => { throw new Error("PRIVATE_TUNNEL_STDERR"); },
+  });
+  const logicalId = discoveredDeviceId(UDID_A);
+  const proxy = createProxy(proxyPoolStorePath, sampleProxyPayload(), MASTER_KEY);
+  assignProxyToDevice(proxyPoolStorePath, { deviceId: logicalId, proxyId: proxy.id });
+
+  await enrollment._maybeAutoRoute(logicalId, "192.168.2.10");
+  const status = enrollment.getStatus(logicalId);
+  assert.equal(status.state, "ready");
+  assert.equal(status.note, "Automatic routing failed to start (Error).");
+  assert.doesNotMatch(JSON.stringify(status), /PRIVATE_TUNNEL_STDERR/);
 });
 
 test("start()/stop() run an immediate tick, then on the interval, then nothing after stop", async () => {

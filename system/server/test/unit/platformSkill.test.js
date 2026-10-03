@@ -78,10 +78,22 @@ test("a failed recovery is reported once without rejecting the worker action", a
   const result = await executeSkillAction({ skill, decision, observation: {}, policyResult: allowed,
     observeAfter: async () => ({}), canExecute: () => true });
   assert.equal(result.outcome, "FAILED");
-  assert.equal(result.error, "device failed");
+  assert.equal(result.error, "skill action failed (Error)");
   assert.equal(result.recovery, null);
-  assert.equal(result.recoveryError, "recovery failed");
+  assert.equal(result.recoveryError, "skill recovery failed (Error)");
   assert.equal(recoveryCalls, 1);
+});
+
+test("skill and recovery exceptions are not returned to task persistence", async () => {
+  const skill = fakeSkill({
+    async execute() { throw new Error("PRIVATE_TYPED_TEXT"); },
+    async recover() { throw new Error("PRIVATE_RECOVERY_DETAIL"); },
+  });
+  const result = await executeSkillAction({ skill, decision, observation: {}, policyResult: allowed,
+    observeAfter: async () => ({}), canExecute: () => true });
+  assert.equal(result.error, "skill action failed (Error)");
+  assert.equal(result.recoveryError, "skill recovery failed (Error)");
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE_TYPED_TEXT|PRIVATE_RECOVERY_DETAIL/);
 });
 
 test("recovery cannot touch the device after the AI lease is revoked", async () => {

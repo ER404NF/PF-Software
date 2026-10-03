@@ -35,7 +35,8 @@ const PASSWORD_MIN_LENGTH = 12;
 const PASSWORD_MAX_LENGTH = 512;
 const FULL_NAME_PATTERN = /^[\p{L}\p{M}][\p{L}\p{M} .'’\-]{1,149}$/u;
 const TEAM_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,99}$/;
-const ACCOUNT_STATUSES = new Set(["pending", "approved", "rejected"]);
+const ACCOUNT_STATUSES = new Set(["pending", "approved", "rejected", "banned"]);
+const MAX_RECENT_LOGIN_IPS = 5;
 const roleSet = new Set(Object.values(OPERATOR_ROLES));
 
 function accountError(message, status = 400) {
@@ -107,6 +108,19 @@ function internalOperator(o) {
     accountStatus: ACCOUNT_STATUSES.has(o.accountStatus) ? o.accountStatus : "approved",
     securityFlagReason: typeof o.securityFlagReason === "string" ? o.securityFlagReason : null,
     securityFlaggedAt: typeof o.securityFlaggedAt === "string" ? o.securityFlaggedAt : null,
+    // Only ever set by server/scripts/create-operator.js's --main-host flag,
+    // never by any HTTP-reachable code path — see setMainHost below.
+    isMainHost: o.isMainHost === true,
+    bannedReason: typeof o.bannedReason === "string" ? o.bannedReason : null,
+    bannedBy: typeof o.bannedBy === "string" ? o.bannedBy : null,
+    bannedAt: typeof o.bannedAt === "string" ? o.bannedAt : null,
+    privacyDeletionState: ["requested", "completed"].includes(o.privacyDeletionState) ? o.privacyDeletionState : null,
+    privacyDeletionRequestedAt: typeof o.privacyDeletionRequestedAt === "string" ? o.privacyDeletionRequestedAt : null,
+    privacyDeletionRequestId: typeof o.privacyDeletionRequestId === "string" ? o.privacyDeletionRequestId : null,
+    // Best-effort recent-login-IP history, most recent first, used only to
+    // seed the IP blocklist (banStore.js) at the moment an account is
+    // banned. Never a complete audit trail — see recordOperatorLoginIp.
+    recentLoginIps: Array.isArray(o.recentLoginIps) ? o.recentLoginIps.filter(ip => typeof ip === "string") : [],
     twoFactorRequired: o.twoFactorRequired === true,
     twoFactorSecret: typeof o.twoFactorSecret === "string" ? o.twoFactorSecret : null,
     recoveryCodeDigests: Array.isArray(o.recoveryCodeDigests) ? [...o.recoveryCodeDigests] : [],
@@ -228,6 +242,7 @@ function validateAllowedDevices(value) {
 export function validateOperatorConfig(raw) {
   if (!raw || !Array.isArray(raw.operators)) throw new Error("operators config requires an operators array");
   const usernames = new Set();
+  let mainHostUsername = null;
   for (let index = 0; index < raw.operators.length; index += 1) {
     const operator = raw.operators[index];
     if (!operator || typeof operator !== "object" || Array.isArray(operator)) {
@@ -280,6 +295,37 @@ export function validateOperatorConfig(raw) {
         || operator.recoveryCodeDigests.some(value => typeof value !== "string" || !value))) {
       throw new Error(`operators.config.json: operator "${username}" has invalid recoveryCodeDigests`);
     }
+    if (Object.hasOwn(operator, "isMainHost")) {
+      if (typeof operator.isMainHost !== "boolean") {
+        throw new Error(`operators.config.json: operator "${username}" has an invalid isMainHost`);
+      }
+      if (operator.isMainHost && operator.role !== OPERATOR_ROLES.HOST) {
+        throw new Error(`operators.config.json: operator "${username}" is isMainHost but not role host`);
+      }
+      if (operator.isMainHost) {
+        if (mainHostUsername) {
+          throw new Error(`operators.config.json: more than one main host (${mainHostUsername}, ${username})`);
+        }
+        mainHostUsername = username;
+      }
+    }
+    if (Object.hasOwn(operator, "recentLoginIps")
+      && (!Array.isArray(operator.recentLoginIps) || operator.recentLoginIps.some(ip => typeof ip !== "string"))) {
+      throw new Error(`operators.config.json: operator "${username}" has invalid recentLoginIps`);
+    }
+    if (Object.hasOwn(operator, "privacyDeletionState") && !["requested", "completed"].includes(operator.privacyDeletionState)) {
+      throw new Error(`operators.config.json: operator "${username}" has an invalid privacyDeletionState`);
+    }
+    if (Object.hasOwn(operator, "privacyDeletionRequestedAt")
+      && (typeof operator.privacyDeletionRequestedAt !== "string"
+        || !Number.isFinite(Date.parse(operator.privacyDeletionRequestedAt)))) {
+      throw new Error(`operators.config.json: operator "${username}" has an invalid privacyDeletionRequestedAt`);
+    }
+    if (Object.hasOwn(operator, "privacyDeletionRequestId") && operator.privacyDeletionRequestId !== null
+      && (operator.privacyDeletionState !== "completed" || typeof operator.privacyDeletionRequestId !== "string"
+        || !/^[a-f0-9-]{36}$/.test(operator.privacyDeletionRequestId))) {
+      throw new Error(`operators.config.json: operator "${username}" has an invalid privacyDeletionRequestId`);
+    }
   }
   return raw;
 }
@@ -307,6 +353,17 @@ function publicOperatorAccount(operator) {
     ...(operator.securityFlagReason ? {
       securityFlagReason: operator.securityFlagReason,
       securityFlaggedAt: operator.securityFlaggedAt,
+    } : {}),
+    ...(operator.isMainHost ? { isMainHost: true } : {}),
+    ...(operator.accountStatus === "banned" ? {
+      bannedReason: operator.bannedReason,
+      bannedBy: operator.bannedBy,
+      bannedAt: operator.bannedAt,
+    } : {}),
+    ...(operator.privacyDeletionState ? {
+      privacyDeletionState: operator.privacyDeletionState,
+      privacyDeletionRequestedAt: operator.privacyDeletionRequestedAt,
+      ...(operator.privacyDeletionRequestId ? { privacyDeletionRequestId: operator.privacyDeletionRequestId } : {}),
     } : {}),
   };
 }
@@ -341,6 +398,7 @@ export function publicOperator(operator) {
     ...(operator.fullName ? { fullName: operator.fullName } : {}),
     ...(operator.teamId ? { teamId: operator.teamId } : {}),
     ...(operator.twoFactorRequired ? { twoFactorRequired: true, twoFactorEnabled: Boolean(operator.twoFactorSecret) } : {}),
+    ...(operator.isMainHost ? { isMainHost: true } : {}),
   };
 }
 
@@ -382,6 +440,16 @@ export function operatorByUsername(username) {
 export function listOperatorAccounts() {
   return [...operators.values()].map(publicOperatorAccount)
     .sort((a, b) => a.username.localeCompare(b.username));
+}
+
+// Server-private security context. Login history is deliberately kept out of
+// publicOperatorAccount() so account-management responses cannot disclose an
+// operator's recent network locations. The ban workflow reads only this
+// narrow copy through its repository boundary.
+export function getOperatorRecentLoginIps(username) {
+  if (typeof username !== "string") return [];
+  const operator = operators.get(username);
+  return Array.isArray(operator?.recentLoginIps) ? [...operator.recentLoginIps] : [];
 }
 
 export function createOperatorAccount(input) {
@@ -473,6 +541,15 @@ export function updateOperatorAccount(username, patch) {
     if (!hasAnother) throw accountError("cannot deactivate or demote the last active admin", 409);
   }
 
+  // isMainHost is never itself editable through this generic patch (see
+  // setMainHost, reachable only from the local create-operator.js CLI), but
+  // a role change reaching here could otherwise silently leave a "main
+  // host" flag on an account that is no longer role host. Require the CLI
+  // to deliberately transfer main-host status first instead.
+  if (current.isMainHost && Object.hasOwn(patch, "role") && normalizeRole(next.role) !== OPERATOR_ROLES.HOST) {
+    throw accountError("cannot change the main host's role away from host; transfer main-host status first", 409);
+  }
+
   const invalidatesSessions = Object.hasOwn(patch, "password")
     || (Object.hasOwn(patch, "active") && patch.active !== current.active);
   next.authVersion = invalidatesSessions ? (current.authVersion + 1) : current.authVersion;
@@ -534,14 +611,36 @@ export function prunePendingSignupAccounts({
   return { pendingCount, atCapacity: pendingCount >= maxPending, pruned: before - raw.operators.length };
 }
 
-export function setOperatorAccountStatus(username, status) {
+const BAN_REASON_MAX_LENGTH = 1000;
+
+function normalizedBanMetadata({ reason = null, bannedBy = null } = {}) {
+  if (reason != null && typeof reason !== "string") throw accountError("ban reason must be a string");
+  if (typeof reason === "string" && reason.length > BAN_REASON_MAX_LENGTH) {
+    throw accountError(`ban reason must be at most ${BAN_REASON_MAX_LENGTH} characters`);
+  }
+  if (bannedBy != null && (typeof bannedBy !== "string" || !bannedBy)) {
+    throw accountError("bannedBy must be a non-empty string");
+  }
+  return {
+    bannedReason: typeof reason === "string" && reason.trim() ? reason.trim() : null,
+    bannedBy: typeof bannedBy === "string" ? bannedBy : null,
+    bannedAt: new Date().toISOString(),
+  };
+}
+
+export function setOperatorAccountStatus(username, status, metadata = {}) {
   validateUsername(username);
-  if (!ACCOUNT_STATUSES.has(status) || status === "pending") throw accountError("status must be approved or rejected");
+  if (!ACCOUNT_STATUSES.has(status) || status === "pending") throw accountError("status must be approved, rejected, or banned");
+  // Validate all ban metadata before the status write. Previously the route
+  // wrote accountStatus=banned first and only then validated the reason in a
+  // second write, so an invalid reason returned 400 after partially banning
+  // the account.
+  const banMetadata = status === "banned" ? normalizedBanMetadata(metadata) : null;
   const raw = readConfig();
   const index = raw.operators.findIndex(operator => operator?.username === username);
   if (index < 0) throw accountError("operator not found", 404);
   const current = internalOperator(raw.operators[index]);
-  const removesActiveAdmin = status === "rejected"
+  const removesActiveAdmin = (status === "rejected" || status === "banned")
     && current.active !== false
     && (current.accountStatus ?? "approved") === "approved"
     && normalizeRole(current.role) === OPERATOR_ROLES.ADMIN;
@@ -550,14 +649,64 @@ export function setOperatorAccountStatus(username, status) {
       && operator?.active !== false
       && (operator?.accountStatus ?? "approved") === "approved"
       && normalizeRole(operator?.role) === OPERATOR_ROLES.ADMIN);
-    if (!hasAnother) throw accountError("cannot reject the last active admin", 409);
+    if (!hasAnother) throw accountError(`cannot ${status === "banned" ? "ban" : "reject"} the last active admin`, 409);
   }
   raw.operators[index] = {
     ...raw.operators[index],
     accountStatus: status,
     active: status === "approved",
     authVersion: current.authVersion + 1,
+    // Lifting a ban (moving away from "banned") clears the ban record along
+    // with it — a fresh ban later gets its own reason/timestamp rather than
+    // inheriting a stale one. A new ban's metadata is committed atomically
+    // with the status and authVersion change.
+    ...(status === "banned" ? banMetadata : { bannedReason: null, bannedBy: null, bannedAt: null }),
   };
+  writeConfig(raw);
+  replaceLiveOperators(raw);
+  return publicOperatorAccount(operators.get(username));
+}
+
+// Best-effort bookkeeping only — not a full audit trail (auditLog.js already
+// covers that). Its only purpose is giving a ban something real to seed the
+// IP blocklist (banStore.js) with. Silent on an unknown username, same
+// convention as flagAndDeactivateOperator below: a login that doesn't
+// resolve to a real operator has nothing to record and nothing to flag.
+export function recordOperatorLoginIp(username, ip) {
+  if (typeof username !== "string" || !username || typeof ip !== "string" || !ip) return;
+  const raw = readConfig();
+  const index = raw.operators.findIndex(operator => operator?.username === username);
+  if (index < 0) return;
+  const existing = Array.isArray(raw.operators[index].recentLoginIps) ? raw.operators[index].recentLoginIps : [];
+  raw.operators[index] = {
+    ...raw.operators[index],
+    recentLoginIps: [ip, ...existing.filter(entry => entry !== ip)].slice(0, MAX_RECENT_LOGIN_IPS),
+  };
+  writeConfig(raw);
+  replaceLiveOperators(raw);
+}
+
+// Grants or revokes main-host status: the one host (per hub network) allowed
+// to create/promote other host accounts (see index.js's maxAssignableRoles).
+// Deliberately exported for server/scripts/create-operator.js's --main-host
+// flag ONLY — never import this from index.js or any other HTTP-reachable
+// code path. updateOperatorAccount's allowedKeys intentionally has no
+// "isMainHost" entry so a PATCH request body can never reach it either way;
+// this function is the sole, CLI-only way to set or clear the flag.
+export function setMainHost(username, isMainHost) {
+  validateUsername(username);
+  if (typeof isMainHost !== "boolean") throw accountError("isMainHost must be a boolean");
+  const raw = readConfig();
+  const index = raw.operators.findIndex(operator => operator?.username === username);
+  if (index < 0) throw accountError("operator not found", 404);
+  if (isMainHost && normalizeRole(raw.operators[index].role) !== OPERATOR_ROLES.HOST) {
+    throw accountError("only a host account can be the main host");
+  }
+  if (isMainHost) {
+    const existing = raw.operators.find((operator, operatorIndex) => operatorIndex !== index && operator?.isMainHost === true);
+    if (existing) throw accountError(`main host already exists: ${existing.username}`, 409);
+  }
+  raw.operators[index] = { ...raw.operators[index], isMainHost };
   writeConfig(raw);
   replaceLiveOperators(raw);
   return publicOperatorAccount(operators.get(username));
@@ -661,6 +810,26 @@ export function createEmailRecoveryToken(identifier) {
   return { token, reused: false, operator: publicOperatorAccount(operators.get(current.username)) };
 }
 
+// Compensating action for a notification-outbox failure. Only the exact
+// plaintext token just generated by this process can clear its matching hash;
+// callers never identify an account directly, so this cannot revoke another
+// operator's recovery attempt by username guessing.
+export function discardEmailRecoveryToken(token) {
+  if (typeof token !== "string" || !token) return false;
+  const digest = crypto.createHash("sha256").update(token).digest("hex");
+  const raw = readConfig();
+  const index = raw.operators.findIndex(operator => operator?.recoveryTokenHash === digest);
+  if (index < 0) return false;
+  raw.operators[index] = {
+    ...raw.operators[index],
+    recoveryTokenHash: null,
+    recoveryTokenExpiresAt: null,
+  };
+  writeConfig(raw);
+  replaceLiveOperators(raw);
+  return true;
+}
+
 export function completeEmailRecovery(token, password, passwordConfirmation) {
   if (password !== passwordConfirmation) throw accountError("passwords do not match");
   validatePassword(password);
@@ -715,6 +884,113 @@ export function invalidateOperatorSessions(username) {
   writeConfig(raw);
   replaceLiveOperators(raw);
   return publicOperatorAccount(operators.get(username));
+}
+
+function deletionCandidate(username, password) {
+  validateUsername(username);
+  if (typeof password !== "string" || password.length > PASSWORD_MAX_LENGTH) {
+    throw accountError("current password is incorrect", 403);
+  }
+  const raw = readConfig();
+  const index = raw.operators.findIndex(operator => operator?.username === username);
+  if (index < 0) throw accountError("operator not found", 404);
+  const current = internalOperator(raw.operators[index]);
+  if (!verifyPassword(password, current.passwordHash)) throw accountError("current password is incorrect", 403);
+  if (current.isMainHost) {
+    throw accountError("transfer main-host responsibility before requesting account deletion", 409);
+  }
+  if (current.active !== false && current.accountStatus === "approved"
+    && current.role === OPERATOR_ROLES.ADMIN) {
+    const hasAnother = raw.operators.some((operator, operatorIndex) => operatorIndex !== index
+      && operator?.active !== false
+      && (operator?.accountStatus ?? "approved") === "approved"
+      && normalizeRole(operator?.role) === OPERATOR_ROLES.ADMIN);
+    if (!hasAnother) throw accountError("create or activate another admin before requesting account deletion", 409);
+  }
+  return { raw, index, current };
+}
+
+export function validateOperatorDeletionRequest(username, password) {
+  const { current } = deletionCandidate(username, password);
+  return publicOperatorAccount(current);
+}
+
+export function requestOperatorDeletion(username, password) {
+  const { raw, index, current } = deletionCandidate(username, password);
+  const requestedAt = new Date().toISOString();
+  raw.operators[index] = {
+    ...raw.operators[index],
+    active: false,
+    authVersion: current.authVersion + 1,
+    privacyDeletionState: "requested",
+    privacyDeletionRequestedAt: requestedAt,
+    twoFactorSecret: null,
+    recoveryCodeDigests: [],
+    recoveryTokenHash: null,
+    recoveryTokenExpiresAt: null,
+  };
+  writeConfig(raw);
+  replaceLiveOperators(raw);
+  return publicOperatorAccount(operators.get(username));
+}
+
+export function finalizeOperatorPrivacyDeletion(username, tombstone, requestId) {
+  validateUsername(username);
+  validateUsername(tombstone);
+  if (!/^deleted-[a-f0-9]{24}$/.test(tombstone) || typeof requestId !== "string"
+    || !/^[a-f0-9-]{36}$/.test(requestId)) {
+    throw accountError("privacy deletion identity is invalid", 400);
+  }
+  const raw = readConfig();
+  const index = raw.operators.findIndex(operator => operator?.username === username);
+  const tombstoneIndex = raw.operators.findIndex(operator => operator?.username === tombstone);
+  if (index < 0) {
+    if (tombstoneIndex >= 0) {
+      const existing = internalOperator(raw.operators[tombstoneIndex]);
+      if (existing.privacyDeletionState === "completed" && existing.privacyDeletionRequestId === requestId) {
+        return publicOperatorAccount(existing);
+      }
+    }
+    throw accountError("operator not found", 404);
+  }
+  if (tombstoneIndex >= 0 && tombstoneIndex !== index) {
+    throw accountError("privacy deletion tombstone unavailable", 409);
+  }
+  const current = internalOperator(raw.operators[index]);
+  if (current.privacyDeletionState !== "requested" || current.active !== false) {
+    throw accountError("operator is not locked for privacy deletion", 409);
+  }
+  raw.operators[index] = {
+    username: tombstone,
+    passwordHash: hashPassword(crypto.randomBytes(48).toString("base64url")),
+    role: raw.operators[index].role,
+    active: false,
+    authVersion: current.authVersion + 1,
+    allowedDevices: [],
+    allowedResearchWorkspaces: [],
+    accountStatus: "rejected",
+    privacyDeletionState: "completed",
+    privacyDeletionRequestedAt: current.privacyDeletionRequestedAt,
+    privacyDeletionRequestId: requestId,
+    fullName: null,
+    email: null,
+    teamId: null,
+    isMainHost: false,
+    twoFactorRequired: false,
+    twoFactorSecret: null,
+    recoveryCodeDigests: [],
+    recoveryTokenHash: null,
+    recoveryTokenExpiresAt: null,
+    recentLoginIps: [],
+    securityFlagReason: null,
+    securityFlaggedAt: null,
+    bannedReason: null,
+    bannedBy: null,
+    bannedAt: null,
+  };
+  writeConfig(raw);
+  replaceLiveOperators(raw);
+  return publicOperatorAccount(operators.get(tombstone));
 }
 
 export function canAccessDevice(operator, deviceId) {

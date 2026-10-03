@@ -7,7 +7,8 @@
 import { WebSocketServer } from "ws";
 import { RemoteDevice, SiteOfflineError } from "./remoteDevice.js";
 import {
-  PROTOCOL_VERSION, RPC_METHODS, remoteDeviceId, sanitizeAdvertisedDevices, unpackFrame,
+  PROTOCOL_VERSION, RPC_METHODS, remoteDeviceId, sanitizeAdvertisedDevices, sanitizeSiteStreamState,
+  siteRpcErrorFromPayload, unpackFrame,
 } from "./siteProtocol.js";
 
 const PING_INTERVAL_MS = 20_000;
@@ -22,6 +23,7 @@ export class SiteLinkHub {
     rpcTimeoutMs = 20_000,
     maxPayloadBytes = 8 * 1024 * 1024,
     pingIntervalMs = PING_INTERVAL_MS,
+    authorizationRecheckMs = 1_000,
   }) {
     this.siteStore = siteStore;
     this.devices = devices;
@@ -30,10 +32,16 @@ export class SiteLinkHub {
     this.unregisterRemoteDevice = unregisterRemoteDevice;
     this.onSiteEvent = onSiteEvent;
     this.rpcTimeoutMs = rpcTimeoutMs;
+    this.authorizationRecheckMs = authorizationRecheckMs;
     this.wss = new WebSocketServer({ noServer: true, maxPayload: maxPayloadBytes });
     this.connections = new Map(); // siteId -> { ws, site, connectedAt, alive }
     this.pending = new Map(); // rpc id -> { siteId, resolve, reject, timer }
     this.wanted = new Map(); // streamId -> { siteId, localId, onFrame, onState }
+    // An authorization lookup can be in flight while an administrator deletes a
+    // site or rotates its token. Bump this generation before closing the current
+    // socket so an upgrade authorized against the old durable state cannot be
+    // accepted afterward and repopulate the fleet.
+    this.authorizationGenerations = new Map();
     this.nextRpcId = 1;
     this.nextStreamId = 1;
     this.pingTimer = setInterval(() => this._ping(), pingIntervalMs);
@@ -42,28 +50,44 @@ export class SiteLinkHub {
 
   // ---- connection lifecycle ---------------------------------------------------
 
-  handleUpgrade(request, socket, head) {
+  async handleUpgrade(request, socket, head) {
     const siteId = String(request.headers["x-site-id"] ?? "");
+    const authorizationGeneration = this.authorizationGenerations.get(siteId) ?? 0;
     const authorization = String(request.headers.authorization ?? "");
     const token = authorization.startsWith("Bearer ") ? authorization.slice(7).trim() : "";
-    const site = this.siteStore.verifyToken(siteId, token);
-    if (!site) {
+    let site;
+    try {
+      site = await this.siteStore.verifyToken(siteId, token);
+    } catch {
+      socket.write("HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return false;
+    }
+    if (!site || (this.authorizationGenerations.get(siteId) ?? 0) !== authorizationGeneration) {
       socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
       socket.destroy();
       return false;
     }
-    this.wss.handleUpgrade(request, socket, head, ws => this._accept(ws, site));
+    this.wss.handleUpgrade(request, socket, head, ws => this._accept(ws, site, authorizationGeneration));
     return true;
   }
 
-  _accept(ws, site) {
+  _accept(ws, site, authorizationGeneration = this.authorizationGenerations.get(site.id) ?? 0) {
     this.connections.get(site.id)?.ws.close(4000, "Replaced by a newer connection");
-    const connection = { ws, site, connectedAt: new Date().toISOString(), alive: true };
+    const connection = {
+      ws, site, connectedAt: new Date().toISOString(), alive: true,
+      authorizationGeneration,
+      authorizationCheckedAt: Date.now(), authorizationCheck: null,
+    };
     this.connections.set(site.id, connection);
-    this.siteStore.markSeen(site.id, connection.connectedAt);
+    void Promise.resolve(this.siteStore.markSeen(site.id, connection.connectedAt)).catch(() => {});
     ws.on("pong", () => { connection.alive = true; });
     ws.on("error", () => ws.terminate());
-    ws.on("message", (data, isBinary) => this._onMessage(connection, data, isBinary));
+    ws.on("message", (data, isBinary) => {
+      void this._onMessage(connection, data, isBinary).catch(() => {
+        if (this.connections.get(connection.site.id) === connection) ws.close(1011, "Site authorization unavailable");
+      });
+    });
     ws.on("close", () => this._onClose(connection));
     this.onSiteEvent({ type: "site_connected", siteId: site.id, detail: { name: site.name } });
     // Operators already watching this site's phones (before a reconnect) get their video back.
@@ -85,7 +109,7 @@ export class SiteLinkHub {
     for (const device of this.devices.values()) {
       if (device instanceof RemoteDevice && device.siteId === site.id) device.applyReadiness(false);
     }
-    this.siteStore.markSeen(site.id);
+    void Promise.resolve(this.siteStore.markSeen(site.id)).catch(() => {});
     this.onSiteEvent({ type: "site_disconnected", siteId: site.id, detail: { name: site.name } });
     this.onDevicesChanged();
   }
@@ -110,10 +134,33 @@ export class SiteLinkHub {
 
   // ---- messages from the agent --------------------------------------------------
 
-  _onMessage(connection, data, isBinary) {
+  async _connectionAuthorized(connection) {
+    if (this.connections.get(connection.site.id) !== connection) return false;
+    if ((this.authorizationGenerations.get(connection.site.id) ?? 0) !== (connection.authorizationGeneration ?? 0)) return false;
+    if (Date.now() - connection.authorizationCheckedAt < this.authorizationRecheckMs) return true;
+    if (!connection.authorizationCheck) {
+      connection.authorizationCheck = Promise.resolve(this.siteStore.get(connection.site.id))
+        .then(site => {
+          connection.authorizationCheckedAt = Date.now();
+          return Boolean(site);
+        })
+        .finally(() => { connection.authorizationCheck = null; });
+    }
+    const authorized = await connection.authorizationCheck;
+    return authorized
+      && this.connections.get(connection.site.id) === connection
+      && (this.authorizationGenerations.get(connection.site.id) ?? 0) === (connection.authorizationGeneration ?? 0);
+  }
+
+  async _onMessage(connection, data, isBinary) {
     // A replaced connection, or a connection whose site was just deleted, may
     // still have an already-buffered message. It must never repopulate the fleet.
-    if (this.connections.get(connection.site.id) !== connection || !this.siteStore.get(connection.site.id)) return;
+    // PostgreSQL-backed repositories are asynchronous, so coalesce the check
+    // across a burst of video frames and keep a one-second authorization TTL.
+    // App-driven deletion/rotation still closes the socket synchronously.
+    if (!await this._connectionAuthorized(connection)
+      || this.connections.get(connection.site.id) !== connection
+      || (this.authorizationGenerations.get(connection.site.id) ?? 0) !== (connection.authorizationGeneration ?? 0)) return;
     if (isBinary) {
       const packet = unpackFrame(data);
       const want = packet && this.wanted.get(packet.streamId);
@@ -137,13 +184,14 @@ export class SiteLinkHub {
       this.pending.delete(message.id);
       if (message.ok === true) entry.resolve(message.value ?? null);
       else {
-        const error = new Error(typeof message.error?.message === "string" ? message.error.message.slice(0, 300) : "The site could not perform the action.");
-        if (typeof message.error?.code === "string") error.code = message.error.code;
-        entry.reject(error);
+        entry.reject(siteRpcErrorFromPayload(message.error));
       }
     } else if (message?.type === "stream_state") {
       const want = this.wanted.get(message.streamId);
-      if (want && want.siteId === connection.site.id) want.onState?.(String(message.state), message.detail ?? undefined);
+      if (want && want.siteId === connection.site.id) {
+        const state = sanitizeSiteStreamState(message);
+        want.onState?.(state.state, state.detail ?? undefined);
+      }
     }
   }
 
@@ -179,7 +227,7 @@ export class SiteLinkHub {
   call(siteId, localId, method, args = []) {
     const connection = this.connections.get(siteId);
     if (!connection || connection.ws.readyState !== 1) {
-      return Promise.reject(new SiteOfflineError(this.siteStore.get(siteId)?.name ?? siteId));
+      return Promise.reject(new SiteOfflineError(siteId));
     }
     if (!RPC_METHODS.includes(method)) return Promise.reject(new Error(`Unsupported remote method: ${method}`));
     const id = this.nextRpcId++;
@@ -223,8 +271,13 @@ export class SiteLinkHub {
 
   // ---- administration -----------------------------------------------------------
 
+  _invalidateAuthorization(siteId) {
+    this.authorizationGenerations.set(siteId, (this.authorizationGenerations.get(siteId) ?? 0) + 1);
+  }
+
   // Forget a site: drop its link and remove its phones from the fleet.
   removeSite(siteId) {
+    this._invalidateAuthorization(siteId);
     this.connections.get(siteId)?.ws.close(4002, "Site removed");
     for (const [id, device] of [...this.devices]) {
       if (device instanceof RemoteDevice && device.siteId === siteId) {
@@ -240,6 +293,7 @@ export class SiteLinkHub {
 
   // A rotated token must cut the old agent off at once.
   disconnect(siteId, reason = "Token rotated") {
+    this._invalidateAuthorization(siteId);
     this.connections.get(siteId)?.ws.close(4003, reason);
   }
 

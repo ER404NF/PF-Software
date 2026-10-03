@@ -3,6 +3,8 @@
 // platform reasoning. Accessibility data is preferred and a screenshot is
 // captured only when structured data is absent or fails.
 
+import { operationalErrorKind } from "./safeOperationalLog.js";
+
 const DEFAULT_MAX_UI_TREE_BYTES = 5 * 1024 * 1024;
 const DEFAULT_MAX_SCREENSHOT_BYTES = 20 * 1024 * 1024;
 const IMAGE_MIMES = new Set(["image/png", "image/jpeg", "image/webp"]);
@@ -13,7 +15,7 @@ function nonEmpty(value) {
 }
 
 function safeError(error) {
-  return error instanceof Error && error.message ? error.message.slice(0, 500) : "UI-tree capture failed";
+  return `UI-tree capture failed (${operationalErrorKind(error)})`;
 }
 
 export function validateImageFrame(frame, maxBytes = DEFAULT_MAX_SCREENSHOT_BYTES) {
@@ -60,10 +62,11 @@ export async function captureObservation(device, {
     screenshot: null,
   };
 
-  if (!canObserve()) throw new Error("Observation authorization was revoked");
+  if (!await canObserve()) throw new Error("Observation authorization was revoked");
   if (typeof device.getUiTree === "function") {
     try {
       const tree = await device.getUiTree();
+      if (!await canObserve()) throw new Error("Observation authorization was revoked");
       if (nonEmpty(tree)) {
         const bytes = Buffer.byteLength(typeof tree === "string" ? tree : JSON.stringify(tree));
         if (bytes <= maxUiTreeBytes) return { ...base, source: "ui_tree", ui_tree: tree };
@@ -78,7 +81,7 @@ export async function captureObservation(device, {
     base.ui_tree_error = "device adapter does not expose a UI tree";
   }
 
-  if (!canObserve()) throw new Error("Observation authorization was revoked");
+  if (!await canObserve()) throw new Error("Observation authorization was revoked");
   if (typeof device.render !== "function") throw new Error(`${base.ui_tree_error}; screenshot fallback is unavailable`);
   const screenshot = validateImageFrame(await device.render(), maxScreenshotBytes);
   return {

@@ -68,6 +68,35 @@ test("authenticate attaches user/session and calls next() on success", async () 
   assert.equal(req.identitySession, session);
 });
 
+test("authenticate does not log private session-touch failure details", async () => {
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...values) => errors.push(values.map(String).join(" "));
+  try {
+    const middleware = createAuthenticate({
+      identitySessionService: {
+        verifySession: async () => ({ id: "session-1", user_id: "user-1" }),
+        touchSession: async () => {
+          const error = new Error("postgres://private:password@database/session-1");
+          error.code = "ECONNRESET";
+          throw error;
+        },
+      },
+      userRepository: { getById: async () => ({ id: "user-1", status: "active" }) },
+    });
+    await middleware(
+      { headers: { authorization: "Bearer private-session-token" } },
+      fakeRes(),
+      () => {},
+    );
+    await new Promise(resolve => setImmediate(resolve));
+  } finally {
+    console.error = originalError;
+  }
+  assert.deepEqual(errors, ["Failed to record session activity: ECONNRESET"]);
+  assert.equal(errors.some(value => /private|password|session-1/.test(value)), false);
+});
+
 test("requireMembership 404s an unknown or inactive organization", async () => {
   const factory = createRequireMembership({
     pool: {}, withTransaction: async () => null,

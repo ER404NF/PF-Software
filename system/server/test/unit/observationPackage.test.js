@@ -23,7 +23,7 @@ for (const [name, getUiTree] of [
     const result = await captureObservation(device, { goal: "Observe", now });
     assert.equal(result.source, "screenshot");
     assert.equal(result.screenshot.mime, "image/png");
-    assert.match(result.ui_tree_error, name === "failed" ? /source unavailable/ : /UI tree|does not expose/);
+    assert.match(result.ui_tree_error, name === "failed" ? /UI-tree capture failed \(Error\)/ : /UI tree|does not expose/);
     assert.match(result.screenshot_ref, /^observation:wda-1:/);
   });
 }
@@ -45,4 +45,15 @@ test("validates required context and removes image bytes from text metadata", as
   const observation = { goal: "x", screenshot_ref: "ref", screenshot: { data: "secret-image-bytes" } };
   assert.deepEqual(observationForText(observation), { goal: "x", screenshot_ref: "ref" });
   assert.equal(observation.screenshot.data, "secret-image-bytes");
+});
+
+test("UI-tree exception details are not included in the model observation", async () => {
+  const result = await captureObservation({
+    id: "dev",
+    async getUiTree() { throw new Error("PRIVATE_UI_CONTENT at C:\\private\\device.log"); },
+    async render() { return { kind: "image", mime: "image/png", data: "YQ==" }; },
+  }, { goal: "Observe", now });
+
+  assert.equal(result.ui_tree_error, "UI-tree capture failed (Error)");
+  assert.doesNotMatch(JSON.stringify(result), /PRIVATE_UI_CONTENT|private\\device\.log/);
 });

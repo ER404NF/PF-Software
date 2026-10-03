@@ -145,9 +145,14 @@ test("a port that something is really listening on is reported busy", async () =
   const { port } = server.address();
   try {
     assert.equal(await isPortFree(port), false);
-    const next = await findFreePort(port);
+    const observations = new Map();
+    const next = await findFreePort(port, { isFree: async candidate => {
+      const free = await isPortFree(candidate);
+      observations.set(candidate, free);
+      return free;
+    } });
     assert.notEqual(next, port);
-    assert.equal(await isPortFree(next), true);
+    assert.equal(observations.get(next), true, "the selected port was free when the probe selected it");
   } finally {
     await new Promise(resolve => server.close(resolve));
   }

@@ -20,6 +20,7 @@ import {
   validatePersistedTask,
 } from "./taskSpec.js";
 import { createFileTaskQueueSnapshotRepository } from "./persistence/fileTaskQueueSnapshotRepository.js";
+import { logOperationalFailure, operationalErrorKind } from "./safeOperationalLog.js";
 
 const PRIORITY_ORDER = { urgent: 0, high: 1, normal: 2, low: 3 };
 const REPORTABLE_OUTCOMES = new Set([
@@ -43,6 +44,14 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, repository
   let paused = snapshot.paused;
   const humanHolds = snapshot.humanHolds;
   const listeners = { dispatched: [], completed: [] };
+
+  function recordAudit(event) {
+    try {
+      auditLog?.logEvent(event);
+    } catch (error) {
+      logOperationalFailure("Task queue audit write failed", error);
+    }
+  }
 
   function persist() {
     // A crash during a direct truncate/write can destroy the only durable
@@ -99,7 +108,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, repository
     // left in memory to dispatch on a later tick.
     repository.save([...tasks, task], paused, humanHolds);
     tasks.push(task);
-    auditLog?.logEvent({
+    recordAudit({
       operator: task.createdBy,
       type: "task_added",
       detail: { taskId: task.id, goal: task.goal, priority: task.priority },
@@ -120,7 +129,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, repository
         const draining = deviceLease.finishAiTask(deviceId);
         if (draining) void draining.then(() => tryDispatch(new Date())).catch(error => {
           deviceLease.markError(deviceId);
-          auditLog?.logEvent({ type: "task_drain_failed", deviceId, detail: { error: error.message } });
+          recordAudit({ type: "task_drain_failed", deviceId, detail: { errorKind: operationalErrorKind(error) } });
         });
       } else deviceLease.applyEvent(deviceId, "TASK_FINISHED");
     }
@@ -142,7 +151,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, repository
     repository.save(tasks.map(candidate => candidate === task ? nextTask : candidate), paused, humanHolds);
     Object.assign(task, nextTask);
     if (wasHoldingDevice && deviceId) releaseDevice(deviceId);
-    auditLog?.logEvent({ type: "task_cancelled", detail: { taskId } });
+    recordAudit({ type: "task_cancelled", detail: { taskId } });
     if (wasHoldingDevice) tryDispatch(new Date());
     return task;
   }
@@ -165,7 +174,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, repository
       throw error;
     }
     Object.assign(task, nextTask);
-    auditLog?.logEvent({ type: "task_paused", deviceId, detail: { taskId } });
+    recordAudit({ type: "task_paused", deviceId, detail: { taskId } });
     return task;
   }
 
@@ -182,7 +191,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, repository
       throw error;
     }
     Object.assign(task, nextTask);
-    auditLog?.logEvent({ type: "task_resumed", deviceId, detail: { taskId } });
+    recordAudit({ type: "task_resumed", deviceId, detail: { taskId } });
     // Starts a recovered worker; the runner coalesces an already active one.
     emit("dispatched", { task, deviceId });
     return task;
@@ -221,7 +230,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, repository
       deviceLease.markError?.(deviceId);
       throw error; // cancellation was not durable; require explicit recovery
     }
-    if (task) auditLog?.logEvent({ type: "task_cancelled", deviceId,
+    if (task) recordAudit({ type: "task_cancelled", deviceId,
       detail: { taskId: task.id, reason: reason === "network_policy" ? "network_policy" : "stop" } });
     tryDispatch(new Date());
     return task ?? null;
@@ -242,7 +251,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, repository
         at: new Date().toISOString(),
       };
       task.updatedAt = task.result.at;
-      auditLog?.logEvent({ type: "task_cancelled", deviceId, detail: { taskId: task.id, reason: "takeover" } });
+      recordAudit({ type: "task_cancelled", deviceId, detail: { taskId: task.id, reason: "takeover" } });
     }
     persist();
     await deviceLease.switchToHuman(deviceId);
@@ -275,7 +284,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, repository
         at: new Date().toISOString(),
       };
       task.updatedAt = task.result.at;
-      auditLog?.logEvent({ type: "task_cancelled", deviceId, detail: { taskId: task.id, reason: "emergency_stop" } });
+      recordAudit({ type: "task_cancelled", deviceId, detail: { taskId: task.id, reason: "emergency_stop" } });
     }
     persist();
     return task ?? null;
@@ -337,7 +346,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, repository
     const nextTask = { ...task, checkpoints: [...task.checkpoints, entry], updatedAt: entry.at };
     repository.save(tasks.map(candidate => candidate === task ? nextTask : candidate), paused, humanHolds);
     Object.assign(task, nextTask);
-    auditLog?.logEvent({
+    recordAudit({
       operator: task.createdBy,
       type: "task_checkpoint",
       deviceId: task.deviceSelector?.deviceId ?? null,
@@ -441,7 +450,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, repository
       }
       return null;
     }
-    auditLog?.logEvent({
+    recordAudit({
       operator: task.createdBy,
       type: "task_dispatched",
       deviceId,
@@ -505,7 +514,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, repository
       Object.assign(task, nextTask);
       if (wasHolding && deviceId) {
         releaseDevice(deviceId);
-        auditLog?.logEvent({ operator: task.createdBy, type: "task_window_closed", deviceId,
+        recordAudit({ operator: task.createdBy, type: "task_window_closed", deviceId,
           detail: { taskId: task.id, finalState: task.state } });
       }
     }
@@ -550,7 +559,7 @@ function createTaskQueue({ devices, deviceLease, auditLog, storePath, repository
     if (deviceId && task.state !== TASK_STATES.NEEDS_HUMAN) releaseDevice(deviceId);
 
     persist();
-    auditLog?.logEvent({
+    recordAudit({
       operator: task.createdBy,
       type: "task_result",
       deviceId,

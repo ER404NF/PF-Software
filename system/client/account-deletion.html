@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Request account deletion — Phone Farm</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <main id="login-shell">
+    <form id="deletion-request-form">
+      <div class="login-brand"><span class="brand-mark" aria-hidden="true">PF</span><div><strong>PHONE FARM</strong><span>Privacy request</span></div></div>
+      <h1>Request account deletion</h1>
+      <p class="login-intro">Enter the username or Gmail address used for your Phone Farm account. We will record the request and verify your identity before any personal data is removed.</p>
+      <label class="login-field">Username or Gmail address<input id="deletion-identifier" autocomplete="username" maxlength="320" required /></label>
+      <button type="submit">Submit deletion request</button>
+      <a class="secondary-auth-button" href="/">Back to sign in</a>
+      <p id="deletion-request-message" role="status" aria-live="polite"></p>
+    </form>
+    <form id="self-deletion-form" hidden>
+      <div class="login-brand"><span class="brand-mark" aria-hidden="true">PF</span><div><strong>PHONE FARM</strong><span>Signed-in privacy request</span></div></div>
+      <h1>Delete your account</h1>
+      <p class="login-intro">This immediately signs out every session and locks the account while the deletion request awaits the configured retention and cleanup process.</p>
+      <p>Signed in as <strong id="self-deletion-username"></strong>.</p>
+      <a class="secondary-auth-button" href="/api/me/data-export" download>Download available account data</a>
+      <label class="login-field">Current password<input id="self-deletion-password" type="password" autocomplete="current-password" maxlength="512" required /></label>
+      <label class="login-field">Type DELETE MY ACCOUNT<input id="self-deletion-confirmation" autocomplete="off" required /></label>
+      <button type="submit">Lock account and request deletion</button>
+      <a class="secondary-auth-button" href="/">Cancel</a>
+      <p id="self-deletion-message" role="alert" aria-live="assertive"></p>
+    </form>
+  </main>
+  <script type="module" src="/account-deletion.js"></script>
+</body>
+</html>

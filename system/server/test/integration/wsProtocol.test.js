@@ -18,6 +18,8 @@ let FAKE_WDA_PORT;
 let FAKE_WDA_URL;
 
 const TEST_PASSWORD = "test-password";
+const VALID_MP4_PREFIX = Buffer.from("0000ftypisom0000isommp42");
+const validMp4 = body => Buffer.concat([VALID_MP4_PREFIX, Buffer.from(body)]);
 
 // Isolate this run's session/audit files from the real storage/sessions and
 // storage/audit/events.log that `npm start` actually uses — without this,
@@ -33,6 +35,7 @@ process.env.AUDIT_LOG_PATH = path.join(tmpStorageRoot, "audit.log");
 process.env.QUEUE_STORE_PATH = path.join(tmpStorageRoot, "tasks.json");
 process.env.MODEL_SELECTION_STORE_PATH = path.join(tmpStorageRoot, "model-selections.json");
 process.env.ASSIGNMENT_STORE_PATH = path.join(tmpStorageRoot, "assignments.json");
+process.env.DEVICE_CONFIG_PATH = path.resolve("server/fixtures/network-devices.config.json");
 process.env.MEDIA_DEVICE_QUOTA_BYTES = "64";
 process.env.MEDIA_GLOBAL_QUOTA_BYTES = "128";
 process.env.MEDIA_MIN_FREE_BYTES = "0";
@@ -44,6 +47,16 @@ let relayUrl;
 let httpUrl;
 let fakeWdaChild;
 const openClients = [];
+
+async function waitForWdaHistory(predicate, timeoutMs = 3000) {
+  const startedAt = Date.now();
+  while (Date.now() - startedAt < timeoutMs) {
+    const body = await fetch(`${FAKE_WDA_URL}/debug/history`).then(response => response.json());
+    if (predicate(body.history)) return body.history;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error(`Timed out waiting for fake WDA history: ${predicate}`);
+}
 
 // Logs in over HTTP and returns the raw Set-Cookie value, trimmed to just
 // `name=value` — everything the WS handshake and later requests need, none
@@ -281,6 +294,31 @@ test("select_device, tap, swipe, type_text, and release_device work end-to-end",
   assert.equal(list.devices.find((d) => d.id === "mock-1").status, "idle");
 });
 
+test("WebSocket selection, applied input, and release remain usable when audit storage fails", async () => {
+  const client = await openClient();
+  await client.waitFor((message) => message.type === "device_list");
+  const originalAuditWrite = auditLog.logEvent;
+  try {
+    auditLog.logEvent = () => { throw new Error("injected WebSocket audit failure"); };
+    client.send({ type: "select_device", deviceId: "mock-1" });
+    await client.waitForNext((message) => message.type === "frame" && message.deviceId === "mock-1");
+
+    const requestId = 991;
+    client.send({ type: "tap", deviceId: "mock-1", x: 70 / 375, y: 120 / 667, requestId });
+    const applied = await client.waitForNext((message) => message.type === "frame" && /Instagram \(mock\)/.test(message.data));
+    assert.match(applied.data, /Instagram \(mock\)/);
+    assert.equal(client.received.some(message => message.type === "error" && message.requestId === requestId), false,
+      "an audit outage must not make an applied physical action look uncertain");
+
+    client.send({ type: "release_device", deviceId: "mock-1" });
+    const released = await client.waitForNext((message) => message.type === "device_list"
+      && message.devices.find(device => device.id === "mock-1")?.status === "idle");
+    assert.equal(released.devices.find(device => device.id === "mock-1").status, "idle");
+  } finally {
+    auditLog.logEvent = originalAuditWrite;
+  }
+});
+
 test("selecting an unknown device returns an error, not a frame", async () => {
   const client = await openClient();
   await client.waitFor((m) => m.type === "device_list");
@@ -313,6 +351,47 @@ test("a device already in use cannot be selected by a second connection", async 
   // waitForNext, same reasoning as the end-to-end test above.
   await a.waitForNext(
     (m) => m.type === "device_list" && m.devices.find((d) => d.id === "mock-2")?.status === "idle"
+  );
+});
+
+// P6 step 3 (docs/productionization/PHASE1_TEAM_ROLLOUT_HANDOUT.md): "two VAs
+// claiming the same device lease... confirm exactly one wins and the other
+// gets a clear, safe rejection." Unlike the sequential test above (A selects
+// and waits for confirmation before B ever tries), this fires both claims
+// with no ordering guarantee at all, to actually exercise claimDevice()'s
+// synchronous re-check-then-claim block rather than just its already-proven
+// "busy" rejection path.
+test("two VAs racing to claim the same idle device — exactly one wins, the other gets a clean rejection", async () => {
+  const racerUsername = "device-race-va";
+  operators.set(racerUsername, {
+    username: racerUsername, passwordHash: hashPassword(TEST_PASSWORD),
+    allowedDevices: ["mock-1"], role: "va",
+  });
+  const a = await openClient("test-va");
+  const b = await openClient(racerUsername, TEST_PASSWORD);
+  await a.waitFor((m) => m.type === "device_list");
+  await b.waitFor((m) => m.type === "device_list");
+
+  // No await between these two sends — both select_device messages are
+  // in flight before either connection's handler has run at all, so
+  // whichever one the event loop happens to service first is genuinely
+  // unpredictable, not just fast.
+  a.send({ type: "select_device", deviceId: "mock-1" });
+  b.send({ type: "select_device", deviceId: "mock-1" });
+
+  const [aResult, bResult] = await Promise.all([
+    a.waitFor((m) => (m.type === "frame" && m.deviceId === "mock-1") || (m.type === "error" && m.deviceId === "mock-1")),
+    b.waitFor((m) => (m.type === "frame" && m.deviceId === "mock-1") || (m.type === "error" && m.deviceId === "mock-1")),
+  ]);
+
+  const outcomes = [aResult.type, bResult.type].sort();
+  assert.deepEqual(outcomes, ["error", "frame"], "exactly one racer must win the claim and the other must be cleanly rejected");
+  const [winner, loserResult] = aResult.type === "frame" ? [a, bResult] : [b, aResult];
+  assert.ok(loserResult.message, "the losing racer must get a real, readable rejection message");
+
+  winner.send({ type: "release_device" });
+  await winner.waitForNext(
+    (m) => m.type === "device_list" && m.devices.find((d) => d.id === "mock-1")?.status === "idle"
   );
 });
 
@@ -383,7 +462,7 @@ test("concurrent messages on one connection are processed strictly in order", as
   // completed. Serialized, the pattern is strictly tap -> screenshot ->
   // tap -> screenshot.
   assert.deepEqual(
-    history.map((h) => h.type),
+    history.filter((h) => h.type !== "screenshot-response").map((h) => h.type),
     ["window-size", "tap", "screenshot", "window-size", "tap", "screenshot"]
   );
 
@@ -532,16 +611,14 @@ test("WDA live frames reject overlap and do not queue device input behind screen
 
   try {
     await fetch(`${FAKE_WDA_URL}/debug/reset`, { method: "POST" });
-    await fetch(`${FAKE_WDA_URL}/debug/delay`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ms: 250 }),
-    });
+    await fetch(`${FAKE_WDA_URL}/debug/hold-screenshots`, { method: "POST" });
 
     client.send({ type: "refresh_live_frame", deviceId: "test-wda", requestId: 101 });
+    await waitForWdaHistory(history => history.some(entry => entry.type === "screenshot"));
     client.send({ type: "refresh_live_frame", deviceId: "test-wda", requestId: 102 });
     const delayed = await client.waitForNext(message => message.type === "live_frame_delayed");
     assert.equal(delayed.requestId, 102);
+    await fetch(`${FAKE_WDA_URL}/debug/release-screenshots`, { method: "POST" });
     await client.waitForNext(message => message.type === "live_frame" && message.requestId === 101);
     let history = await fetch(`${FAKE_WDA_URL}/debug/history`).then(response => response.json());
     assert.equal(history.history.filter(entry => entry.type === "screenshot").length, 1,
@@ -554,65 +631,74 @@ test("WDA live frames reject overlap and do not queue device input behind screen
     assert.equal(history.history.filter(entry => entry.type === "screenshot").length, 1,
       "server cadence limiting must reject immediate follow-up screenshots");
 
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    await new Promise(resolve => setTimeout(resolve, throttled.retryAfterMs + 25));
     await fetch(`${FAKE_WDA_URL}/debug/reset`, { method: "POST" });
-    await fetch(`${FAKE_WDA_URL}/debug/delay`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ms: 250 }),
-    });
+    await fetch(`${FAKE_WDA_URL}/debug/hold-screenshots`, { method: "POST" });
     client.send({ type: "refresh_live_frame", deviceId: "test-wda", requestId: 103 });
+    await waitForWdaHistory(history => history.some(entry => entry.type === "screenshot"));
     client.send({ type: "tap", deviceId: "test-wda", x: 0.25, y: 0.25 });
-    await new Promise(resolve => setTimeout(resolve, 80));
-    history = await fetch(`${FAKE_WDA_URL}/debug/history`).then(response => response.json());
+    history = { history: await waitForWdaHistory(entries => entries.some(entry => entry.type === "tap")) };
     assert.ok(history.history.some(entry => entry.type === "screenshot"), "live screenshot should be in flight");
-    assert.ok(history.history.some(entry => entry.type === "window-size"),
+    assert.ok(history.history.some(entry => entry.type === "tap"),
       "tap must reach WDA while the live screenshot is still pending");
+    await fetch(`${FAKE_WDA_URL}/debug/release-screenshots`, { method: "POST" });
     await Promise.all([
       client.waitForNext(message => message.type === "live_frame" && message.requestId === 103, 3000),
       client.waitForNext(message => message.type === "frame" && message.deviceId === "test-wda", 3000),
     ]);
   } finally {
-    await fetch(`${FAKE_WDA_URL}/debug/delay`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ms: 0 }),
-    });
+    await fetch(`${FAKE_WDA_URL}/debug/release-screenshots`, { method: "POST" });
     client.send({ type: "release_device", deviceId: "test-wda" });
   }
 });
 
 test("a stale live-frame failure cannot damage a released and reclaimed WDA device", async () => {
-  const client = await openClient();
+  const deviceId = "test-wda-stale-live";
+  const username = "test-va-stale-live";
+  const staleDevice = new WdaDevice(deviceId, "Stale Live WDA", { port: FAKE_WDA_PORT, timeoutMs: 500 });
+  staleDevice.status = "idle";
+  devices.set(deviceId, staleDevice);
+  operators.set(username, {
+    username,
+    passwordHash: hashPassword(TEST_PASSWORD),
+    allowedDevices: [deviceId],
+    role: "admin",
+  });
+  const client = await openClient(username, TEST_PASSWORD);
   await client.waitFor(message => message.type === "device_list");
-  client.send({ type: "select_device", deviceId: "test-wda" });
-  await client.waitFor(message => message.type === "frame" && message.deviceId === "test-wda");
-  await new Promise(resolve => setTimeout(resolve, 1000));
+  client.send({ type: "select_device", deviceId });
+  await client.waitFor(message => message.type === "frame" && message.deviceId === deviceId);
 
   try {
     await fetch(`${FAKE_WDA_URL}/debug/reset`, { method: "POST" });
-    await fetch(`${FAKE_WDA_URL}/debug/hang`, { method: "POST" });
-    client.send({ type: "refresh_live_frame", deviceId: "test-wda", requestId: 201 });
-    while (true) {
-      const { history } = await fetch(`${FAKE_WDA_URL}/debug/history`).then(response => response.json());
-      if (history.some(entry => entry.type === "screenshot")) break;
-      await new Promise(resolve => setTimeout(resolve, 5));
-    }
+    await fetch(`${FAKE_WDA_URL}/debug/fail-next-screenshot`, { method: "POST" });
+    await fetch(`${FAKE_WDA_URL}/debug/hold-screenshots`, { method: "POST" });
+    client.send({ type: "refresh_live_frame", deviceId, requestId: 201 });
+    await waitForWdaHistory(history => history.filter(entry => entry.type === "screenshot").length === 1);
 
-    client.send({ type: "release_device", deviceId: "test-wda" });
+    client.send({ type: "release_device", deviceId });
     await client.waitForNext(message => message.type === "device_list"
-      && message.devices.find(device => device.id === "test-wda")?.status === "idle");
-    await fetch(`${FAKE_WDA_URL}/debug/unhang`, { method: "POST" });
-    client.send({ type: "select_device", deviceId: "test-wda" });
-    await client.waitForNext(message => message.type === "frame" && message.deviceId === "test-wda", 3000);
-    await new Promise(resolve => setTimeout(resolve, 600));
+      && message.devices.find(device => device.id === deviceId)?.status === "idle");
+    client.send({ type: "select_device", deviceId });
+    await waitForWdaHistory(history => history.filter(entry => entry.type === "screenshot").length === 2);
+    const priorFrameCount = client.received.filter(
+      message => message.type === "frame" && message.deviceId === deviceId,
+    ).length;
+    await fetch(`${FAKE_WDA_URL}/debug/release-screenshots`, { method: "POST" });
+    await client.waitUntil(() => client.received.filter(
+      message => message.type === "frame" && message.deviceId === deviceId,
+    ).length > priorFrameCount, 3000);
+    await waitForWdaHistory(history => history.filter(entry => entry.type === "screenshot-response").length === 2);
 
-    assert.equal(devices.get("test-wda").status, "in-use");
-    assert.equal(deviceHealth.get("test-wda")?.consecutiveFailures ?? 0, 0);
+    assert.equal(devices.get(deviceId).status, "in-use");
+    assert.equal(deviceHealth.get(deviceId)?.consecutiveFailures ?? 0, 0);
     assert.equal(client.received.some(message => message.type === "live_frame_error" && message.requestId === 201), false);
   } finally {
-    await fetch(`${FAKE_WDA_URL}/debug/unhang`, { method: "POST" });
-    client.send({ type: "release_device", deviceId: "test-wda" });
+    await fetch(`${FAKE_WDA_URL}/debug/release-screenshots`, { method: "POST" });
+    client.send({ type: "release_device", deviceId });
+    client.close();
+    devices.delete(deviceId);
+    operators.delete(username);
   }
 });
 
@@ -1440,7 +1526,7 @@ test("the audit command applies the same device filtering as the audit API", asy
 
 test("device authorization is rechecked after a long upload before commit", async () => {
   const cookie = await loginCookie("test-va-restricted", TEST_PASSWORD);
-  const filename = "revoked-during-upload.txt";
+  const filename = "revoked-during-upload.mp4";
   try {
     const result = await uploadWithPause({
       cookie,
@@ -1754,7 +1840,10 @@ for (const action of [{ type: "tap", x: 0.2, y: 0.2 }, { type: "swipe", directio
 
 async function uploadWithPause({ cookie, deviceId, filename, beforeFinish }) {
   const boundary = `phonefarm-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  const prefix = Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: text/plain\r\n\r\nfirst-`);
+  const prefix = Buffer.concat([
+    Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${filename}"\r\nContent-Type: video/mp4\r\n\r\n`),
+    validMp4("first-"),
+  ]);
   const suffix = Buffer.from(`second\r\n--${boundary}--\r\n`);
   const url = new URL(`/api/devices/${deviceId}/files`, httpUrl);
   return new Promise((resolve, reject) => {
@@ -1990,32 +2079,109 @@ test("rejected replacement upload preserves existing bytes and leaves no staging
   const endpoint = `${httpUrl}/api/devices/mock-1/files`;
   async function upload(body, extra = false) {
     const form = new FormData();
-    form.append("file", new Blob([body]), "original.txt");
-    if (extra) form.append("unexpected", new Blob(["extra"]), "extra.txt");
+    form.append("file", new Blob([validMp4(body)], { type: "video/mp4" }), "original.mp4");
+    if (extra) form.append("unexpected", new Blob(["extra"], { type: "video/mp4" }), "extra.mp4");
     const response = await fetch(endpoint, { method: "POST", headers: { Cookie: cookie }, body: form });
     await response.json();
     return response.status;
   }
   assert.equal(await upload("original bytes"), 200);
   assert.equal(await upload("rejected replacement", true), 400);
-  const download = await fetch(`${endpoint}/original.txt`, { headers: { Cookie: cookie } });
+  const download = await fetch(`${endpoint}/original.mp4`, { headers: { Cookie: cookie } });
   assert.equal(download.status, 200);
-  assert.equal(await download.text(), "original bytes");
-  assert.deepEqual(fs.readdirSync(path.join(process.env.FILE_STORE_DIR, "devices", "mock-1")), ["original.txt"]);
+  assert.deepEqual(Buffer.from(await download.arrayBuffer()), validMp4("original bytes"));
+  assert.deepEqual(fs.readdirSync(path.join(process.env.FILE_STORE_DIR, "devices", "mock-1")), ["original.mp4"]);
   assert.equal(await upload("valid replacement"), 200);
-  assert.equal(await (await fetch(`${endpoint}/original.txt`, { headers: { Cookie: cookie } })).text(), "valid replacement");
+  assert.deepEqual(
+    Buffer.from(await (await fetch(`${endpoint}/original.mp4`, { headers: { Cookie: cookie } })).arrayBuffer()),
+    validMp4("valid replacement"),
+  );
+});
+
+// Production-readiness audit §3: previously any file extension/content was
+// accepted (multer had no fileFilter at all). Proof required by the audit:
+// a disallowed type is cleanly rejected; an allowed type still succeeds —
+// the latter is already proven by the surrounding upload tests in this file.
+test("an upload with a disallowed file type is cleanly rejected before ever touching disk", async () => {
+  const cookie = await loginCookie("test-va", TEST_PASSWORD);
+  const endpoint = `${httpUrl}/api/devices/mock-1/files`;
+  const form = new FormData();
+  form.append("file", new Blob(["<script>alert(1)</script>"], { type: "text/html" }), "payload.html");
+  const response = await fetch(endpoint, { method: "POST", headers: { Cookie: cookie }, body: form });
+  assert.equal(response.status, 400);
+  const body = await response.json();
+  assert.equal(body.code, "MEDIA_TYPE_REJECTED");
+  assert.match(body.error, /not allowed/);
+  assert.equal(fs.existsSync(path.join(process.env.FILE_STORE_DIR, "devices", "mock-1", "payload.html")), false);
+});
+
+test("an upload whose declared MIME type doesn't match its extension is cleanly rejected", async () => {
+  const cookie = await loginCookie("test-va", TEST_PASSWORD);
+  const endpoint = `${httpUrl}/api/devices/mock-1/files`;
+  const form = new FormData();
+  form.append("file", new Blob(["not really a png"], { type: "text/html" }), "spoofed.png");
+  const response = await fetch(endpoint, { method: "POST", headers: { Cookie: cookie }, body: form });
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).code, "MEDIA_TYPE_REJECTED");
+});
+
+test("an upload with matching extension and declared MIME but hostile non-media bytes is rejected and cleaned up", async () => {
+  const cookie = await loginCookie("test-va", TEST_PASSWORD);
+  const endpoint = `${httpUrl}/api/devices/mock-1/files`;
+  const before = Buffer.from(await (await fetch(`${endpoint}/original.mp4`, { headers: { Cookie: cookie } })).arrayBuffer());
+  const form = new FormData();
+  form.append("file", new Blob(["<script>alert(1)</script>"], { type: "video/mp4" }), "original.mp4");
+  const response = await fetch(endpoint, { method: "POST", headers: { Cookie: cookie }, body: form });
+  assert.equal(response.status, 400);
+  const body = await response.json();
+  assert.equal(body.code, "MEDIA_CONTENT_REJECTED");
+  assert.match(body.error, /contents/);
+  const deviceDir = path.join(process.env.FILE_STORE_DIR, "devices", "mock-1");
+  const after = Buffer.from(await (await fetch(`${endpoint}/original.mp4`, { headers: { Cookie: cookie } })).arrayBuffer());
+  assert.deepEqual(after, before, "a rejected spoofed replacement must preserve the existing valid file");
+  assert.equal(fs.readdirSync(deviceDir).some(name => name.startsWith(".upload-")), false);
 });
 
 test("media quota rejects excess bytes and removes the partial staging file", async () => {
   const cookie = await loginCookie("test-va", TEST_PASSWORD);
   const endpoint = `${httpUrl}/api/devices/mock-2/files`;
   const form = new FormData();
-  form.append("file", new Blob(["x".repeat(65)]), "too-large.txt");
+  form.append("file", new Blob([Buffer.concat([VALID_MP4_PREFIX, Buffer.alloc(65 - VALID_MP4_PREFIX.length, 0x78)])],
+    { type: "video/mp4" }), "too-large.mp4");
   const response = await fetch(endpoint, { method: "POST", headers: { Cookie: cookie }, body: form });
   assert.equal(response.status, 413);
   assert.deepEqual(await response.json(), { error: "device media quota exceeded", code: "MEDIA_DEVICE_QUOTA",
     currentBytes: 65, maximumBytes: 64 });
   assert.deepEqual(fs.readdirSync(path.join(process.env.FILE_STORE_DIR, "devices", "mock-2")), []);
+});
+
+test("committed media operations remain successful when audit storage is unavailable", async () => {
+  const cookie = await loginCookie("test-va", TEST_PASSWORD);
+  const endpoint = `${httpUrl}/api/devices/mock-1/files`;
+  const filename = "original.mp4";
+  const bytes = validMp4("audit outage media");
+  const originalAuditWrite = auditLog.logEvent;
+  try {
+    auditLog.logEvent = () => { throw new Error("injected media audit failure"); };
+
+    const form = new FormData();
+    form.append("file", new Blob([bytes], { type: "video/mp4" }), filename);
+    const uploadResponse = await fetch(endpoint, { method: "POST", headers: { Cookie: cookie }, body: form });
+    assert.equal(uploadResponse.status, 200);
+    assert.deepEqual(await uploadResponse.json(), { ok: true, name: filename, size: bytes.length });
+
+    const downloadResponse = await fetch(`${endpoint}/${filename}`, { headers: { Cookie: cookie } });
+    assert.equal(downloadResponse.status, 200);
+    assert.deepEqual(Buffer.from(await downloadResponse.arrayBuffer()), bytes);
+
+    const deleteResponse = await fetch(`${endpoint}/${filename}`, { method: "DELETE", headers: { Cookie: cookie } });
+    assert.equal(deleteResponse.status, 200);
+    assert.deepEqual(await deleteResponse.json(), { ok: true });
+    assert.equal(fs.existsSync(path.join(process.env.FILE_STORE_DIR, "devices", "mock-1", filename)), false);
+  } finally {
+    auditLog.logEvent = originalAuditWrite;
+    fs.rmSync(path.join(process.env.FILE_STORE_DIR, "devices", "mock-1", filename), { force: true });
+  }
 });
 
 for (const failure of [false, true]) {
@@ -2091,7 +2257,10 @@ test("reserved media names cannot replace session records through uploads", asyn
   try {
     const cookie = await loginCookie("test-va", TEST_PASSWORD);
     const form = new FormData();
-    form.append("file", new Blob(["replacement"]), "protected.json");
+    // An allowed extension/MIME type, deliberately — this test is about the
+    // reserved-device-id storage protection, not the file-type allowlist;
+    // using a disallowed type here would make it pass for the wrong reason.
+    form.append("file", new Blob(["replacement"], { type: "video/mp4" }), "protected.mp4");
     const response = await fetch(`${httpUrl}/api/devices/sessions/files`, { method: "POST", headers: { Cookie: cookie }, body: form });
     assert.equal(response.status, 400);
     await response.json();

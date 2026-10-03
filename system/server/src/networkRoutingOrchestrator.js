@@ -2,6 +2,7 @@ import { proxyForDevice, decryptProxyPassword } from "./proxyPool.js";
 import { allocateTunIface, listAllInterfaces as defaultListAllInterfaces, discoverTunPeer as defaultDiscoverTunPeer } from "./tunManager.js";
 import { generatePfRuleset, parsePfCounters } from "./pfRuleGenerator.js";
 import { diagnosticError } from "./errorCatalog.js";
+import { operationalErrorKind } from "./safeOperationalLog.js";
 
 // Drives the automatable portion of the Automation Architecture guide's
 // §5 device state machine, for devices that already have a leased pool
@@ -113,6 +114,15 @@ export class NetworkRoutingOrchestrator {
     this.routes.set(deviceId, { ...current, diagnosticEvents });
   }
 
+  _recordFailure(deviceId, state, code, error) {
+    const detail = diagnosticError(code, {
+      technical: { errorKind: operationalErrorKind(error) },
+    });
+    this._setError(deviceId, state, detail.name);
+    this.routes.set(deviceId, { ...this.routes.get(deviceId), latestError: detail, protected: false });
+    return detail;
+  }
+
   // Full-replace regeneration for every device currently at PF_APPLYING or
   // ROUTED (guide §6: "PF rules should be generated from the full current
   // desired state ... rather than incrementally appending ad hoc lines").
@@ -162,7 +172,12 @@ export class NetworkRoutingOrchestrator {
   // `usbIp` must already be resolved (see the class-level comment).
   async startRouting(deviceId, options) {
     const inFlight = this.startPromises.get(deviceId);
-    if (inFlight) return inFlight;
+    if (inFlight) {
+      await options?.authorize?.();
+      const result = await inFlight;
+      await options?.authorize?.();
+      return result;
+    }
     const operation = (async () => {
       const stopping = this.stopPromises.get(deviceId);
       if (stopping) await stopping;
@@ -176,8 +191,10 @@ export class NetworkRoutingOrchestrator {
     }
   }
 
-  async _startRouting(deviceId, { usbIp }) {
+  async _startRouting(deviceId, { usbIp, authorize = null }) {
     if (typeof usbIp !== "string" || !usbIp) throw new Error("startRouting requires a known usbIp");
+
+    await authorize?.();
 
     const active = this.routes.get(deviceId);
     const wasRecovering = active?.state === ROUTING_STATES.ROUTE_LOST;
@@ -185,6 +202,8 @@ export class NetworkRoutingOrchestrator {
       if (active.usbIp === usbIp) return active;
       const error = new Error("routing is already active for this device; stop it before changing its USB IP");
       error.status = 409;
+      error.expose = true;
+      error.code = "ROUTING_ALREADY_ACTIVE";
       throw error;
     }
     if (active) this.tunManager.stop(deviceId);
@@ -200,6 +219,7 @@ export class NetworkRoutingOrchestrator {
     let pfLoaded = false;
     try {
       const existingIfaces = await this.listAllInterfaces();
+      await authorize?.();
       const previousTunIface = this.routes.get(deviceId)?.tunIface ?? null;
       const tunIface = allocateTunIface({
         existingIfaces, preferred: previousTunIface, rangeStart: this.tunPortRangeStart, rangeEnd: this.tunPortRangeEnd,
@@ -227,9 +247,11 @@ export class NetworkRoutingOrchestrator {
 
       this._setState(deviceId, ROUTING_STATES.PF_APPLYING, { usbIp, proxyId: proxyRecord.id, tunIface, tunPeer: peer.peerIp });
       this._recordEvent(deviceId, "PF_APPLY_STARTED");
+      await authorize?.();
       await this._applyPfRuleset(this._desiredPfDevices());
       pfLoaded = true;
       this._recordEvent(deviceId, "PF_APPLY_SUCCEEDED");
+      await authorize?.();
       await this.privilegedOps.clearState(usbIp);
 
       const routed = this._setState(deviceId, ROUTING_STATES.ROUTED, {
@@ -254,7 +276,10 @@ export class NetworkRoutingOrchestrator {
         }
       }
       this.tunManager.stop(deviceId);
-      this._setError(deviceId, state, reportedError.message);
+      const errorCode = state === ROUTING_STATES.PF_SYNTAX_ERROR ? "F201"
+        : state === ROUTING_STATES.PF_CLEANUP_ERROR ? "F202"
+          : "T202";
+      this._recordFailure(deviceId, state, errorCode, reportedError);
       this._recordEvent(deviceId, state === ROUTING_STATES.PF_SYNTAX_ERROR || pfLoaded
         ? "PF_APPLY_FAILED" : "TUNNEL_FAILED", { errorCode: state === ROUTING_STATES.PF_SYNTAX_ERROR ? "F201" : "T202" });
       try { await this._applyFailClosed(deviceId); } catch { /* the original setup error remains primary */ }
@@ -302,7 +327,7 @@ export class NetworkRoutingOrchestrator {
       await this._removeDeviceFromPf(deviceId);
       if (route.usbIp) await this.privilegedOps.clearState(route.usbIp);
     } catch (error) {
-      this._setError(deviceId, ROUTING_STATES.STOP_ERROR, error.message);
+      this._recordFailure(deviceId, ROUTING_STATES.STOP_ERROR, "F202", error);
       throw error;
     }
     this.routes.delete(deviceId);
@@ -378,7 +403,7 @@ export class NetworkRoutingOrchestrator {
     try {
       await this._applyFailClosed(deviceId);
     } catch (error) {
-      const pf = diagnosticError("F202", { why: error.message });
+      const pf = diagnosticError("F202", { technical: { errorKind: operationalErrorKind(error) } });
       this.routes.set(deviceId, { ...this.routes.get(deviceId), latestError: pf, internetBlocked: false });
       this.onStateChanged(deviceId, this.routes.get(deviceId));
       return;
@@ -426,11 +451,15 @@ export class NetworkRoutingOrchestrator {
         await this.startRouting(deviceId, { usbIp: current.usbIp });
       } catch (error) {
         const latest = this.routes.get(deviceId) ?? current;
+        const detail = diagnosticError("T202", {
+          technical: { errorKind: operationalErrorKind(error) },
+        });
         this.routes.set(deviceId, {
           ...latest,
           state: ROUTING_STATES.ROUTE_LOST,
           recoveryAttempts: attempts + 1,
-          lastError: error.message,
+          lastError: detail.name,
+          latestError: detail,
           protected: false,
         });
         try { await this._applyFailClosed(deviceId); } catch { /* remains explicitly unprotected */ }

@@ -27,6 +27,42 @@ test("start() builds the argv xcodebuild expects, as an array (never a shell str
   ]);
 });
 
+// Production-readiness audit §5: WDA's own MJPEG server was never tuned,
+// running its conservative defaults (full-resolution, high-quality frames at
+// a modest fixed rate) every session — the likely actual cause of "the
+// stream feels slow." These three env vars are WDA's own, documented knobs.
+test("start() passes WDA's MJPEG tuning env vars to the spawned xcodebuild process, with sensible defaults", () => {
+  const calls = [];
+  const spawn = (bin, args, options) => { calls.push({ bin, args, options }); return fakeChild(); };
+  const manager = new WdaProcessManager({ spawn, wdaRepoPath: "/repo" });
+  manager.start({ udid: "00008110-ABCDEF1234567890", derivedDataPath: "/tmp/derived/ios-abc" });
+  assert.equal(calls[0].options.env.MJPEG_SERVER_FRAMERATE, "20");
+  assert.equal(calls[0].options.env.MJPEG_SERVER_SCREENSHOT_QUALITY, "30");
+  assert.equal(calls[0].options.env.MJPEG_SCALING_FACTOR, "50");
+  // The spawned process must still inherit the rest of the parent's real
+  // environment (PATH, etc.) — these are additions, not a replacement.
+  assert.equal(calls[0].options.env.PATH, process.env.PATH);
+});
+
+test("start() lets each MJPEG tuning value be overridden via this app's own env vars, independently", () => {
+  const originalFramerate = process.env.WDA_MJPEG_SERVER_FRAMERATE;
+  const originalQuality = process.env.WDA_MJPEG_SERVER_SCREENSHOT_QUALITY;
+  process.env.WDA_MJPEG_SERVER_FRAMERATE = "15";
+  delete process.env.WDA_MJPEG_SERVER_SCREENSHOT_QUALITY;
+  try {
+    const calls = [];
+    const spawn = (bin, args, options) => { calls.push({ bin, args, options }); return fakeChild(); };
+    const manager = new WdaProcessManager({ spawn, wdaRepoPath: "/repo" });
+    manager.start({ udid: "00008110-ABCDEF1234567890", derivedDataPath: "/tmp/derived/ios-abc" });
+    assert.equal(calls[0].options.env.MJPEG_SERVER_FRAMERATE, "15");
+    assert.equal(calls[0].options.env.MJPEG_SERVER_SCREENSHOT_QUALITY, "30"); // default, since unset
+  } finally {
+    if (originalFramerate === undefined) delete process.env.WDA_MJPEG_SERVER_FRAMERATE;
+    else process.env.WDA_MJPEG_SERVER_FRAMERATE = originalFramerate;
+    if (originalQuality !== undefined) process.env.WDA_MJPEG_SERVER_SCREENSHOT_QUALITY = originalQuality;
+  }
+});
+
 test("start() refuses to run without WDA_REPO_PATH configured", () => {
   const manager = new WdaProcessManager({ spawn: () => fakeChild() });
   assert.throws(

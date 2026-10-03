@@ -17,8 +17,9 @@ process.env.SESSION_STORE_DIR = path.join(tmpStorageRoot, "sessions");
 process.env.AUDIT_LOG_PATH = path.join(tmpStorageRoot, "audit.log");
 process.env.QUEUE_STORE_PATH = path.join(tmpStorageRoot, "tasks.json");
 process.env.MODEL_SELECTION_STORE_PATH = path.join(tmpStorageRoot, "model-selection.json");
+process.env.DEVICE_CONFIG_PATH = path.resolve("server/fixtures/network-devices.config.json");
 
-const { server, wss, devices, deviceLease, taskQueue } = await import("../../src/index.js");
+const { server, wss, devices, deviceLease, taskQueue, auditLog } = await import("../../src/index.js");
 const { operators, hashPassword } = await import("../../src/authStore.js");
 const { researchAccounts, researchAccountDefinitions } = await import("../../src/researchAccess.js");
 const { providers } = await import("../../src/providerRegistry.js");
@@ -265,6 +266,26 @@ test("/mode ai, /pause, /resume, /stop, and /takeover drive a device through the
   const takeoverRes = await command(cookie, "/takeover mock-2");
   assert.equal(takeoverRes.status, 200);
   assert.equal(deviceLease.getMode("mock-2"), "HUMAN");
+});
+
+test("committed command-console mutations remain successful when audit storage fails", async () => {
+  const originalAuditWrite = auditLog.logEvent;
+  try {
+    auditLog.logEvent = () => { throw new Error("injected command audit failure"); };
+
+    const model = await command(cookie, "/model set queue-model device mock-1");
+    assert.equal(model.status, 200, "a durable model selection must not be reported as failed");
+
+    const switched = await command(cookie, "/mode ai mock-1");
+    assert.equal(switched.status, 200, "a committed controller-mode switch must not be reported as failed");
+    assert.equal(deviceLease.getMode("mock-1"), "AI_IDLE");
+
+    const takeover = await command(cookie, "/takeover mock-1");
+    assert.equal(takeover.status, 200, "a committed takeover must not be reported as failed");
+    assert.equal(deviceLease.getMode("mock-1"), "HUMAN");
+  } finally {
+    auditLog.logEvent = originalAuditWrite;
+  }
 });
 
 test("/mode ai is rejected if the device is already claimed (not idle)", async () => {

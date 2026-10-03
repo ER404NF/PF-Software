@@ -25,6 +25,7 @@ function serviceWith(operator = record()) {
       configureOperatorTwoFactor: noOp,
       createEmailRecoveryToken: noOp,
       createSignupAccount: noOp,
+      discardEmailRecoveryToken: noOp,
       prunePendingSignupAccounts: noOp,
       verifyOperatorSecondFactor: noOp,
     }),
@@ -48,6 +49,7 @@ test("file identity adapter is async-first and supports an injected registry", a
     configureOperatorTwoFactor(...args) { calls.push(["configure", ...args]); return { username: args[0] }; },
     verifyOperatorSecondFactor(...args) { calls.push(["verify", ...args]); return { method: "authenticator" }; },
     createEmailRecoveryToken(identifier) { calls.push(["recovery", identifier]); return { token: "token" }; },
+    discardEmailRecoveryToken(token) { calls.push(["discard-recovery", token]); return true; },
     completeEmailRecovery(...args) { calls.push(["complete", ...args]); return { username: "admin" }; },
   });
 
@@ -59,8 +61,9 @@ test("file identity adapter is async-first and supports an injected registry", a
   assert.deepEqual(await repository.configureTwoFactor("admin", "secret", ["digest"]), { username: "admin" });
   assert.deepEqual(await repository.verifySecondFactor("admin", "123456", "key"), { method: "authenticator" });
   assert.deepEqual(await repository.createEmailRecoveryToken("admin"), { token: "token" });
+  assert.equal(await repository.discardEmailRecoveryToken("token"), true);
   assert.deepEqual(await repository.completeEmailRecovery("token", "password", "password"), { username: "admin" });
-  assert.equal(calls.length, 6);
+  assert.equal(calls.length, 7);
 });
 
 test("identity service requires a password verifier", () => {
@@ -71,6 +74,7 @@ test("identity service requires a password verifier", () => {
     configureTwoFactor: async () => null,
     verifySecondFactor: async () => null,
     createEmailRecoveryToken: async () => null,
+    discardEmailRecoveryToken: async () => false,
     completeEmailRecovery: async () => null,
   } }), /requires verifyPassword/);
 });
@@ -84,6 +88,7 @@ test("identity service keeps authentication mutations asynchronous", async () =>
     configureTwoFactor: async username => { calls.push("configure"); return username; },
     verifySecondFactor: async username => { calls.push("verify"); return username; },
     createEmailRecoveryToken: async identifier => { calls.push("recovery"); return identifier; },
+    discardEmailRecoveryToken: async token => { calls.push("discard-recovery"); return token; },
     completeEmailRecovery: async token => { calls.push("complete"); return token; },
   };
   const service = createIdentityService({ repository, verifyPassword: () => false });
@@ -93,8 +98,9 @@ test("identity service keeps authentication mutations asynchronous", async () =>
   assert.equal(await service.configureTwoFactor("admin", "secret", []), "admin");
   assert.equal(await service.verifySecondFactor("admin", "123456", "key"), "admin");
   assert.equal(await service.createEmailRecoveryToken("admin"), "admin");
+  assert.equal(await service.discardEmailRecoveryToken("token"), "token");
   assert.equal(await service.completeEmailRecovery("token", "password", "password"), "token");
-  assert.deepEqual(calls, ["signup", "prune", "configure", "verify", "recovery", "complete"]);
+  assert.deepEqual(calls, ["signup", "prune", "configure", "verify", "recovery", "discard-recovery", "complete"]);
 });
 
 test("password authentication preserves valid pending and rejected identities", async () => {

@@ -13,6 +13,7 @@ process.env.RESEARCH_EVIDENCE_DIR = path.join(root, "evidence");
 process.env.RESEARCH_CONFIG_PATH = path.join(root, "research.config.json");
 process.env.OPERATORS_CONFIG_PATH = path.join(root, "operators.config.json");
 process.env.SESSION_SECRET = "isolated-test-secret";
+process.env.DEVICE_CONFIG_PATH = path.resolve("server/fixtures/network-devices.config.json");
 fs.writeFileSync(process.env.RESEARCH_CONFIG_PATH, JSON.stringify({ accounts: [
   { id: "account-a", workspaceId: "client-a", platform: "instagram" },
   { id: "account-b", workspaceId: "client-b", platform: "x" },

@@ -50,6 +50,10 @@ export function createIdentityService({ repository, verifyPassword }) {
       return repository.createEmailRecoveryToken(identifier);
     },
 
+    async discardEmailRecoveryToken(token) {
+      return repository.discardEmailRecoveryToken(token);
+    },
+
     async completeEmailRecovery(token, password, passwordConfirmation) {
       return repository.completeEmailRecovery(token, password, passwordConfirmation);
     },

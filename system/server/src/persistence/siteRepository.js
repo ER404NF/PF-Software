@@ -3,7 +3,9 @@
 // implementation stores site identity and credential material together in
 // one record; DATABASE_GAP_ANALYSIS.md's proposed `sites`/`site_credentials`
 // split is a later migration-design decision, not something this interface
-// slice changes.
+// slice changes. Mutation methods may receive an optional `{ authorize }`
+// callback and must invoke it immediately before their durable write, so an
+// authorization revoked during earlier asynchronous work cannot still commit.
 
 export const SITE_REPOSITORY_METHODS = Object.freeze([
   "list",

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { assertValidStructuredDecision, assertProviderContract, FIXTURE_OBSERVATION } from "../../src/modelProvider.js";
+import { assertValidStructuredDecision, assertProviderContract, FIXTURE_OBSERVATION, parseDecisionJson } from "../../src/modelProvider.js";
 
 const VALID = {
   screen_state: "instagram_reel",
@@ -79,4 +79,13 @@ test("assertProviderContract rejects a provider missing a name or observeAndPlan
 test("assertProviderContract rejects a provider that returns a malformed decision", async () => {
   const provider = { name: "fake", async observeAndPlan() { return { screen_state: "x" }; } };
   await assert.rejects(() => assertProviderContract(provider), /fake decision missing required string field/);
+});
+
+test("invalid model JSON errors never echo private response content", () => {
+  const privateOutput = "not-json private typed text and bearer-token";
+  assert.throws(
+    () => parseDecisionJson(privateOutput, "fixture-provider"),
+    error => error.message === "fixture-provider: response was not valid JSON"
+      && !error.message.includes(privateOutput),
+  );
 });

@@ -8,6 +8,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const clientDir = path.resolve(__dirname, "../../../client");
 const html = fs.readFileSync(path.join(clientDir, "index.html"), "utf8");
 const app = fs.readFileSync(path.join(clientDir, "app.js"), "utf8");
+const peopleAssignments = fs.readFileSync(path.join(clientDir, "peopleAssignmentsController.js"), "utf8");
 
 function htmlIds(source) {
   return new Set([...source.matchAll(/\bid=["']([^"']+)["']/g)].map((m) => m[1]));
@@ -28,11 +29,46 @@ test("navigation and privileged surfaces are hidden by default and capability-ga
   assert.match(app, /adminNavEl\.hidden = !currentOperator/);
   assert.match(app, /adminNavButtonEl\.hidden = !canManageOperations\(\)/);
   assert.match(app, /assignmentCreateFormEl\.hidden = !can\(UI_CAPABILITIES\.MANAGE_ASSIGNMENTS\)/);
-  assert.match(app, /const mayManage = can\(UI_CAPABILITIES\.MANAGE_ASSIGNMENTS\)/);
-  assert.match(app, /mayProgressOwnTask = assignment\.canProgress === true/);
-  assert.match(app, /nextStatuses\.filter\(value => mayManage \|\| value !== "cancelled"\)/);
+  assert.match(peopleAssignments, /const mayManage = can\(capabilities\.MANAGE_ASSIGNMENTS\)/);
+  assert.match(peopleAssignments, /mayProgressOwnTask = assignment\.canProgress === true/);
+  assert.match(peopleAssignments, /nextStatuses\.filter\(value => mayManage \|\| value !== "cancelled"\)/);
   assert.match(app, /if \(!canManageOperations\(\)\) return;[\s\S]*currentView = "admin"/);
   assert.match(app, /if \(!can\(UI_CAPABILITIES\.VIEW_ASSIGNMENTS\)\) return;[\s\S]*currentView = "assignments"/);
+});
+
+test("the command console input has an accessible name", () => {
+  assert.match(html, /<label class="visually-hidden" for="command-input">Command<\/label>/);
+});
+
+test("Operations has keyboard-reachable role-aware section navigation", () => {
+  assert.match(html, /<nav id="operations-nav" aria-label="Operations sections">/);
+  for (const target of ["command-console-panel", "queue-panel", "pending-panel", "users-panel", "sites-panel", "proxy-pool-panel", "audit-panel"]) {
+    assert.match(html, new RegExp(`data-operations-target="${target}"`));
+    assert.match(html, new RegExp(`id="${target}"[^>]*tabindex="-1"[^>]*aria-labelledby=`));
+  }
+  const controller = fs.readFileSync(path.join(clientDir, "operationsController.js"), "utf8");
+  assert.match(controller, /function sync\(allowed\)[\s\S]*panel\.hidden = !active/);
+  assert.match(controller, /function select\(panelId[\s\S]*historyRef\.replaceState[\s\S]*focus/);
+  assert.match(app, /operationsNavEl\.addEventListener\("click"[\s\S]*selectOperationsPanel/);
+  assert.match(controller, /activePanelId[\s\S]*aria-current/);
+});
+
+test("theme text tokens meet the documented AA contrast floor", () => {
+  const css = fs.readFileSync(path.join(clientDir, "style.css"), "utf8");
+  const luminance = hex => {
+    const channels = hex.match(/[0-9a-f]{2}/gi).map(value => Number.parseInt(value, 16) / 255)
+      .map(value => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+    return (0.2126 * channels[0]) + (0.7152 * channels[1]) + (0.0722 * channels[2]);
+  };
+  const contrast = (foreground, background) => {
+    const values = [luminance(foreground), luminance(background)].sort((a, b) => b - a);
+    return (values[0] + 0.05) / (values[1] + 0.05);
+  };
+  for (const [foreground, background] of [["666b72", "fcfcfd"], ["6f747b", "fcfcfd"], ["a7abb1", "202226"], ["858a91", "202226"]]) {
+    assert.ok(contrast(foreground, background) >= 4.5, `${foreground} on ${background} must meet 4.5:1`);
+  }
+  assert.match(css, /:root,[\s\S]*--muted:\s*#666b72;[\s\S]*--quiet:\s*#6f747b;/);
+  assert.match(css, /:root\[data-theme="dark"\][\s\S]*--muted:\s*#a7abb1;[\s\S]*--quiet:\s*#858a91;/);
 });
 
 test("fleet management and sensitive audit details use separate capabilities", () => {
@@ -87,10 +123,11 @@ test("live operator profiles replace cached capabilities and scrub privileged vi
   assert.match(app, /function applyLiveOperatorProfile\(profile\)[\s\S]*setOperatorProfile\(profile\)/);
   assert.match(app, /lastDevices = \[\][\s\S]*queueBodyEl\.replaceChildren\(\)[\s\S]*auditBodyEl\.replaceChildren\(\)[\s\S]*usersListEl\.replaceChildren\(\)/);
   for (const functionName of ["refreshPeople", "refreshAssignments", "runAdminCommand", "refreshQueueViewer", "refreshAuditViewer", "refreshUsers"]) {
-    const start = app.indexOf(`function ${functionName}`);
-    const nextFunction = app.indexOf("\nfunction ", start + 1);
-    const body = app.slice(start, nextFunction < 0 ? app.length : nextFunction);
-    assert.match(body, /profileRequestActive\(generation/, `${functionName} must reject responses from an older profile`);
+    const source = ["refreshPeople", "refreshAssignments"].includes(functionName) ? peopleAssignments : app;
+    const start = source.indexOf(`function ${functionName}`);
+    const nextFunction = source.indexOf("\n    function ", start + 1);
+    const body = source.slice(start, nextFunction < 0 ? source.length : nextFunction);
+    assert.match(body, /(?:profileRequestActive|requestActive)\(generation/, `${functionName} must reject responses from an older profile`);
   }
 });
 
@@ -124,12 +161,13 @@ test("role and error-handling audit controls are explicit and recoverable", () =
   assert.match(app, /server could not confirm session revocation/);
   assert.match(html, /id="logout-retry-button"/);
   assert.match(html, /id="detail-message" role="alert"/);
-  assert.match(app, /Cancel this assignment for \$\{assignment\.assignee\}/);
-  assert.match(app, /Save assignee/);
+  assert.match(peopleAssignments, /Cancel this assignment for \$\{assignment\.assignee\}/);
+  assert.match(peopleAssignments, /Save assignee/);
   assert.match(app, /Delete “\$\{name\}” from \$\{phone\}\? This cannot be undone\./);
   assert.match(app, /Sign out all sessions for \$\{user\.username\}/);
   assert.match(app, /Reset two-factor authentication for \$\{user\.username\}/);
-  assert.match(app, /Reject \$\{user\.username\}\?/);
+  assert.match(app, /Ban \$\{user\.username\}\?/);
+  assert.match(app, /Decline \$\{user\.username\}'s application\?/);
   assert.match(app, /No tasks are currently in the queue\./);
   assert.match(app, /markPresenceUnavailable\(\)/);
   assert.match(app, /function deviceComponentRows\(device\)/);
@@ -186,6 +224,18 @@ test("proxy tunnel routing controls are visible only through the server-issued r
   for (const action of ["network-enrollment/start", "network-enrollment/confirm", "discover-ip", "start-routing", "stop-routing"]) {
     assert.match(app, new RegExp(action.replace("/", "\\/")), `missing reference to ${action}`);
   }
+});
+
+test("proxy-provider inventory is capability-gated and never claims it changed phone routing", () => {
+  const controller = fs.readFileSync(path.join(clientDir, "proxyPoolController.js"), "utf8");
+  assert.match(html, /id="proxy-provider-list"/);
+  assert.match(html, /enabled exit is not proof that phone traffic uses it/);
+  assert.match(html, /<script src="proxyPoolController\.js"><\/script>\s*<script src="app\.js"><\/script>/);
+  assert.match(controller, /requestJson\("\/api\/admin\/proxy-providers"\)/);
+  assert.match(controller, /const mayManage = can\(capabilities\.MANAGE_PROXY\)/);
+  assert.match(controller, /\/api\/admin\/proxy-providers\/\$\{encodeURIComponent\(provider\.id\)\}\/exits/);
+  assert.match(controller, /Phone routing was not applied or verified/);
+  assert.match(controller, /active\(generation, capabilities\.VIEW_PROXY_POOL\)/);
 });
 
 test("every phone input carries a request ID and the current device", () => {

@@ -61,7 +61,7 @@ class FakeTunManager {
 
 function makeOrchestrator({ proxyPoolStorePath, testResult, inspectOutput,
   peerResult = { localIp: "10.0.0.2", peerIp: "10.0.0.1" }, interfaces = ["lo0", "en0"],
-  recoveryDelayMs, setTimeoutFn, clearTimeoutFn } = {}) {
+  listAllInterfaces = null, recoveryDelayMs, setTimeoutFn, clearTimeoutFn } = {}) {
   const tunManager = new FakeTunManager();
   const privilegedOps = new FakePrivilegedOps({ testResult, inspectOutput });
   const changes = [];
@@ -75,7 +75,7 @@ function makeOrchestrator({ proxyPoolStorePath, testResult, inspectOutput,
     // tunIface, a real `ifconfig -l` would show that interface from then
     // on — so allocateTunIface() must not hand the same name to a second
     // device.
-    listAllInterfaces: async () => [...interfaces, ...tunManager.activeIfaces],
+    listAllInterfaces: listAllInterfaces ?? (async () => [...interfaces, ...tunManager.activeIfaces]),
     discoverTunPeer: peerResult instanceof Error
       ? async () => { throw peerResult; }
       : async () => peerResult,
@@ -97,6 +97,30 @@ test("startRouting requires a known usbIp before doing anything else", async () 
   const { orchestrator, tunManager } = makeOrchestrator({ proxyPoolStorePath: tempStorePath() });
   await assert.rejects(() => orchestrator.startRouting("mock-1", {}), /requires a known usbIp/);
   assert.equal(tunManager.starts.length, 0);
+});
+
+test("authorization revoked during routing preparation prevents tunnel and PF mutations", async () => {
+  const storePath = tempStorePath();
+  const proxy = createProxy(storePath, samplePayload(), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxy.id });
+  let authorized = true;
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({
+    proxyPoolStorePath: storePath,
+    listAllInterfaces: async () => { authorized = false; return ["lo0", "en0"]; },
+  });
+
+  await assert.rejects(
+    () => orchestrator.startRouting("mock-1", {
+      usbIp: "192.168.2.10",
+      authorize: async () => {
+        if (!authorized) throw Object.assign(new Error("routing authorization revoked"), { status: 403 });
+      },
+    }),
+    /authorization revoked/,
+  );
+  assert.equal(tunManager.starts.length, 0);
+  assert.equal(privilegedOps.loadCalls.some(rules => /route-to/.test(rules)), false,
+    "authorization failure may add a fail-closed block but must never install a route");
 });
 
 test("startRouting happy path: proxy_leased -> tun_starting -> pf_applying -> routed, with decrypted (not encrypted) credentials passed to the tunnel", async () => {
@@ -184,7 +208,9 @@ test("a failure discovering/allocating the tun interface still lands in tun_erro
   await assert.rejects(() => orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" }), /ifconfig -l failed/);
   const route = orchestrator.getRoute("mock-1");
   assert.equal(route.state, ROUTING_STATES.TUN_ERROR);
-  assert.match(route.lastError, /ifconfig -l failed/);
+  assert.equal(route.lastError, "Proxy tunnel failed to start");
+  assert.equal(route.latestError.code, "T202");
+  assert.doesNotMatch(JSON.stringify(route), /ifconfig -l failed/);
   assert.equal(tunManager.starts.length, 0, "never got as far as starting a tunnel");
 });
 
@@ -288,7 +314,9 @@ test("a failed PF cleanup keeps teardown retryable instead of forgetting the sta
   await assert.rejects(() => orchestrator.stopRouting("mock-1"), /pfctl unavailable/);
   assert.equal(tunManager.isRunning("mock-1"), false);
   assert.equal(orchestrator.getRoute("mock-1").state, ROUTING_STATES.STOP_ERROR);
-  assert.match(orchestrator.getRoute("mock-1").lastError, /pfctl unavailable/);
+  assert.equal(orchestrator.getRoute("mock-1").lastError, "PF rules could not be loaded");
+  assert.equal(orchestrator.getRoute("mock-1").latestError.code, "F202");
+  assert.doesNotMatch(JSON.stringify(orchestrator.getRoute("mock-1")), /pfctl unavailable/);
 
   privilegedOps.clearAnchor = async () => {
     privilegedOps.clearAnchorCalls += 1;

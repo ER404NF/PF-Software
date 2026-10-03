@@ -9,6 +9,7 @@
 // Nothing durable belongs behind this client.
 
 import Redis from "ioredis";
+import { logOperationalFailure } from "../safeOperationalLog.js";
 
 export class RedisConfigError extends Error {
   constructor(message) {
@@ -69,7 +70,7 @@ export function createRedisClient(options = {}) {
   // the process — ioredis emits 'error' for any socket-level failure, and
   // Node terminates on an unhandled 'error' event with no listener attached.
   client.on("error", (error) => {
-    console.error("Unexpected Redis client error:", error.message);
+    logOperationalFailure("Unexpected Redis client error", error);
   });
   return client;
 }

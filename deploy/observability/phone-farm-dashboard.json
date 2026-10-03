@@ -1,0 +1,92 @@
+{
+  "annotations": { "list": [] },
+  "editable": false,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "id": 1,
+      "title": "Hub scrape status",
+      "type": "stat",
+      "targets": [{ "expr": "up{job=\"phone-farm\"}", "legendFormat": "hub" }],
+      "fieldConfig": { "defaults": { "mappings": [{ "type": "value", "options": { "0": { "text": "DOWN" }, "1": { "text": "UP" } } }] }, "overrides": [] },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "title": "Request rate",
+      "type": "timeseries",
+      "targets": [{ "expr": "phone_farm:http_requests:rate5m", "legendFormat": "requests/s" }],
+      "gridPos": { "h": 8, "w": 9, "x": 6, "y": 0 }
+    },
+    {
+      "id": 3,
+      "title": "Server error ratio",
+      "type": "timeseries",
+      "targets": [{ "expr": "phone_farm:http_server_errors:ratio5m", "legendFormat": "5xx ratio" }],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0 }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 9, "x": 15, "y": 0 }
+    },
+    {
+      "id": 4,
+      "title": "Average response duration",
+      "type": "timeseries",
+      "targets": [{ "expr": "phone_farm:http_request_duration:average5m", "legendFormat": "seconds" }],
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0 }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 }
+    },
+    {
+      "id": 5,
+      "title": "Process uptime",
+      "type": "timeseries",
+      "targets": [{ "expr": "phone_farm_process_uptime_seconds", "legendFormat": "uptime" }],
+      "fieldConfig": { "defaults": { "unit": "s", "min": 0 }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 }
+    },
+    {
+      "id": 6,
+      "title": "Device control state",
+      "type": "timeseries",
+      "targets": [{ "expr": "phone_farm_devices", "legendFormat": "{{state}}" }],
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 }
+    },
+    {
+      "id": 7,
+      "title": "Queue state",
+      "type": "timeseries",
+      "targets": [{ "expr": "phone_farm_queue_tasks", "legendFormat": "{{state}}" }],
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 }
+    },
+    {
+      "id": 8,
+      "title": "Routing evidence",
+      "type": "timeseries",
+      "targets": [
+        { "expr": "phone_farm_routed_devices", "legendFormat": "routed" },
+        { "expr": "phone_farm_protected_devices", "legendFormat": "protected" }
+      ],
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 }
+    },
+    {
+      "id": 9,
+      "title": "Open interventions",
+      "type": "timeseries",
+      "targets": [{ "expr": "phone_farm_open_interventions", "legendFormat": "{{category}}" }],
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 }
+    },
+    {
+      "id": 10,
+      "title": "AI task outcomes",
+      "type": "timeseries",
+      "targets": [{ "expr": "phone_farm_ai_tasks", "legendFormat": "{{outcome}}" }],
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["phone-farm", "operations"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "title": "Phone Farm operations",
+  "uid": "phone-farm-operations",
+  "version": 1
+}

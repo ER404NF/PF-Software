@@ -14,14 +14,15 @@ let root;
 beforeEach(() => { root = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-research-runner-")); deviceLease.reset(); });
 afterEach(() => fs.rmSync(root, { recursive: true, force: true }));
 
-function setup({ operatorForUsername = () => ({ username: "admin", role: "admin", allowedDevices: null }), sleep = async () => {}, provider = null, skill = createInstagramSkill({ appVersion: "fixture-1" }) } = {}) {
+function setup({ operatorForUsername = () => ({ username: "admin", role: "admin", allowedDevices: null }), sleep = async () => {}, provider = null,
+  skill = createInstagramSkill({ appVersion: "fixture-1" }), auditLog = null } = {}) {
   const device = new MockDevice("mock-1", "Mock");
   const devices = new Map([[device.id, device]]);
   const queue = createTaskQueue({ devices, deviceLease, storePath: path.join(root, "tasks.json") });
   const workspaceMap = new Map([["account-a", "client-a"]]);
   const policies = new Map([["account-a", { open_feed: "ALLOW_AUTONOMOUS", observe: "ALLOW_AUTONOMOUS" }]]);
   const runs = [];
-  const runner = createResearchTaskRunner({ taskQueue: queue, devices, deviceLease,
+  const runner = createResearchTaskRunner({ taskQueue: queue, devices, deviceLease, auditLog,
     accountWorkspaces: workspaceMap, accountPolicies: policies,
     providerForTask: () => provider, skillForPlatform: () => skill,
     operatorForUsername,
@@ -118,6 +119,40 @@ test("a verified candidate is written to the task's durable research run", async
   assert.equal(runs[0].outcome, TASK_STATES.SUCCEEDED);
   assert.equal(queue.getTask(task.id).checkpoints.some((entry) => entry.data?.recordType === "content_candidate"), true);
   assert.equal(queue.getTask(task.id).checkpoints.some((entry) => entry.data?.recordType === "research_run_completed"), true);
+});
+
+test("a runner audit outage cannot strand a verified research run", async () => {
+  let call = 0;
+  const provider = { async observeAndPlan() {
+    call += 1;
+    return call === 1
+      ? { screen_state: "feed", goal_progress: "candidate_found", action: "observe", target: null,
+        reason: "useful post", confidence: 0.99,
+        candidate: { platform_content_id: "post-1", canonical_url: "https://example.com/post-1" } }
+      : { screen_state: "feed", goal_progress: "complete", action: "observe", target: null,
+        reason: "done", confidence: 0.99 };
+  } };
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...values) => errors.push(values.map(String).join(" "));
+  try {
+    const auditLog = { logEvent() {
+      const error = new Error("postgres://private:password@audit/run-token");
+      error.code = "ECONNRESET";
+      throw error;
+    } };
+    const { queue, runner, runs } = setup({ provider, auditLog });
+    const task = queue.addTask({ kind: "research", goal: "Collect despite audit outage", createdBy: "admin",
+      accountSelector: { platform: "instagram", accountId: "account-a" }, allowedActions: ["observe"] });
+    await runner.waitForTask(task.id);
+    assert.equal(queue.getTask(task.id).state, TASK_STATES.SUCCEEDED);
+    assert.equal(runs[0].candidates.length, 1);
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(errors.length >= 2, true);
+  assert.equal(errors.every(value => value === "Research runner audit write failed: ECONNRESET"), true);
+  assert.equal(errors.some(value => /private|password|token/.test(value)), false);
 });
 
 test("the next decision uses a provider selected while the task is running", async () => {

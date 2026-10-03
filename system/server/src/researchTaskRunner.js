@@ -5,6 +5,7 @@ import { createRun, appendCandidate, finalizeRun, getRun, locateCandidate, recor
 import { SessionBudget, buildSessionReport, scoreCandidate, DEFAULT_SCORING_PROFILE, SESSION_OUTCOMES } from "./researchSession.js";
 import { saveResearchEvidence } from "./researchEvidenceStore.js";
 import { observationFingerprint } from "./optimization/stateCache.js";
+import { logOperationalFailure, operationalErrorKind } from "./safeOperationalLog.js";
 
 const COMPLETE_PROGRESS = new Set(["complete", "completed", "done", "goal complete", "goal completed"]);
 
@@ -61,6 +62,14 @@ export function createResearchTaskRunner({
   const budgets = new Map(); // taskId -> SessionBudget, for the live monitor and reports
   let started = false;
 
+  function recordAudit(event) {
+    try {
+      auditLog?.logEvent(event);
+    } catch (error) {
+      logOperationalFailure("Research runner audit write failed", error);
+    }
+  }
+
   async function failIfRunning(task, detail) {
     if (taskQueue.getTask(task.id)?.state === TASK_STATES.RUNNING) {
       await taskQueue.reportResult(task.id, TASK_STATES.FAILED_FINAL, { detail });
@@ -112,7 +121,7 @@ export function createResearchTaskRunner({
       if (!run?.id) throw new Error("research run could not be created");
       runId = run.id;
       taskQueue.checkpoint(task.id, { researchRunId: runId, recordType: "research_run_started" });
-      auditLog?.logEvent({ operator: task.createdBy, type: "research_run_started", deviceId,
+      recordAudit({ operator: task.createdBy, type: "research_run_started", deviceId,
         detail: { taskId: task.id, accountId, workspaceId, runId } });
       return runId;
     }
@@ -127,7 +136,7 @@ export function createResearchTaskRunner({
         : (current.checkpoints?.length ?? 0) > 0 || budget.state.steps > 0 ? TASK_STATES.PARTIAL : TASK_STATES.FAILED_FINAL;
       finalizeRunRecord(workspaceId, accountId, stoppedRunId, { overview: `Session stopped: ${verdict.reason}`, outcome: finalOutcome, session: report });
       taskQueue.checkpoint(task.id, { researchRunId: stoppedRunId, recordType: "research_run_completed" });
-      auditLog?.logEvent({ operator: task.createdBy, type: "research_session_stopped", deviceId,
+      recordAudit({ operator: task.createdBy, type: "research_session_stopped", deviceId,
         detail: { taskId: task.id, accountId, workspaceId, runId: stoppedRunId, outcome: finalOutcome, reason: verdict.reason,
           steps: budget.state.steps, costUsd: report.cost.totalUsd } });
       if (taskQueue.getTask(task.id)?.state === TASK_STATES.RUNNING) {
@@ -207,9 +216,9 @@ export function createResearchTaskRunner({
             if (saved?.ref) evidence.push(saved.ref);
           }
         } catch (error) {
-          auditLog?.logEvent({ operator: task.createdBy, type: "research_evidence_failed", deviceId,
+          recordAudit({ operator: task.createdBy, type: "research_evidence_failed", deviceId,
             detail: { taskId: task.id, accountId, workspaceId, runId: candidateRunId,
-              error: error?.message || String(error) } });
+              errorKind: operationalErrorKind(error) } });
         }
         const afterCapture = taskQueue.getTask(task.id);
         if (afterCapture?.state !== TASK_STATES.RUNNING || deviceLease.getAiToken(deviceId) !== stepToken || !canAccessAccount()) {
@@ -234,7 +243,7 @@ export function createResearchTaskRunner({
         if (!recorded?.id) throw new Error("verified candidate could not be recorded");
         taskQueue.checkpoint(task.id, { researchRunId: candidateRunId, candidateId: recorded.id,
           recordType: "content_candidate" });
-        auditLog?.logEvent({ operator: task.createdBy, type: "research_candidate_recorded", deviceId,
+        recordAudit({ operator: task.createdBy, type: "research_candidate_recorded", deviceId,
           detail: { taskId: task.id, accountId, workspaceId, runId: candidateRunId, candidateId: recorded.id } });
       }
       const progress = String(result.decision?.goal_progress ?? "").trim().toLowerCase();
@@ -260,7 +269,9 @@ export function createResearchTaskRunner({
   async function runTask(payload) {
     try { return await runTaskBody(payload); }
     catch (error) {
-      await failIfRunning(payload.task, error?.message || String(error));
+      const detail = `research task failed (${operationalErrorKind(error)})`;
+      logOperationalFailure("Research task failed", error);
+      await failIfRunning(payload.task, detail);
       throw error;
     } finally {
       const task = taskQueue.getTask(payload.task.id);
@@ -281,8 +292,9 @@ export function createResearchTaskRunner({
     if (active.has(payload.task.id)) return active.get(payload.task.id);
     const promise = runTask(payload)
       .catch(async (error) => {
-        await failIfRunning(payload.task, error?.message || String(error));
-        return { outcome: TASK_STATES.FAILED_FINAL, error: error?.message || String(error) };
+        const detail = `research task failed (${operationalErrorKind(error)})`;
+        await failIfRunning(payload.task, detail);
+        return { outcome: TASK_STATES.FAILED_FINAL, error: detail };
       })
       .finally(() => {
         active.delete(payload.task.id);

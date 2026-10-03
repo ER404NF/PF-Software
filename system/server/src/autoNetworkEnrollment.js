@@ -3,6 +3,7 @@ import { listBridgeMembers as defaultListBridgeMembers, discoverBridgeOwnIp as d
 import { captureDeviceTraffic as defaultCaptureDeviceTraffic, discoverDeviceIp } from "./usbIpDiscovery.js";
 import { clearUsbNetworkRecord, getUsbNetworkRecord, setUsbIface, setUsbIp, loadUsbNetworkRecords } from "./usbNetworkStore.js";
 import { proxyForDevice } from "./proxyPool.js";
+import { operationalErrorKind } from "./safeOperationalLog.js";
 
 const DEFAULT_POLL_INTERVAL_MS = 5000;
 const IP_DISCOVERY_COOLDOWN_MS = 15_000;
@@ -107,7 +108,8 @@ export class AutoNetworkEnrollment {
     try {
       members = await this.listBridgeMembers({ bridgeIface: this.bridgeIface });
     } catch (error) {
-      for (const device of candidateDevices) this._setStatus(discoveredDeviceId(device.udid), "pending", `Waiting to read ${this.bridgeIface}: ${error.message}`);
+      const note = `Waiting to read the shared USB network (${operationalErrorKind(error)}).`;
+      for (const device of candidateDevices) this._setStatus(discoveredDeviceId(device.udid), "pending", note);
       return;
     }
     // Persisted enX/IP values are hints, never proof. On the first sighting
@@ -140,7 +142,7 @@ export class AutoNetworkEnrollment {
         this.validatedMappings.add(logicalId);
         this._setStatus(logicalId, "discovering_ip", null);
       } catch (error) {
-        this._setStatus(logicalId, "pending", `Could not record network enrollment: ${error.message}`);
+        this._setStatus(logicalId, "pending", `Could not record network enrollment (${operationalErrorKind(error)}).`);
       }
     } else {
       for (const device of pendingDevices) {
@@ -183,7 +185,7 @@ export class AutoNetworkEnrollment {
         this.ipAttempts.delete(logicalId);
         await this._maybeAutoRoute(logicalId, result.ip);
       } catch (error) {
-        this._setStatus(logicalId, "discovering_ip", `IP discovery failed: ${error.message}`);
+        this._setStatus(logicalId, "discovering_ip", `IP discovery failed (${operationalErrorKind(error)}).`);
       }
     }
   }
@@ -202,7 +204,7 @@ export class AutoNetworkEnrollment {
       await this.startRouting(deviceId, { usbIp });
       this._setStatus(deviceId, "routing", null);
     } catch (error) {
-      this._setStatus(deviceId, "ready", `Automatic routing failed to start: ${error.message}`);
+      this._setStatus(deviceId, "ready", `Automatic routing failed to start (${operationalErrorKind(error)}).`);
     }
   }
 }

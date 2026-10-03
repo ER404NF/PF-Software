@@ -15,6 +15,7 @@ services:
     environment:
       PUBLIC_BASE_URL: https://${PUBLIC_HOSTNAME:?set PUBLIC_HOSTNAME in .env}
       SESSION_SECRET: ${SESSION_SECRET:?set SESSION_SECRET in .env (at least 32 random characters)}
+      METRICS_BEARER_TOKEN: ${METRICS_BEARER_TOKEN:-}
       PHONE_FARM_TIMEZONE: ${PHONE_FARM_TIMEZONE:-America/Los_Angeles}
       SMTP_HOST: ${SMTP_HOST:-}
       SMTP_PORT: ${SMTP_PORT:-}
@@ -40,7 +41,41 @@ services:
       - caddy-data:/data
       - caddy-config:/config
 
+  prometheus:
+    image: prom/prometheus:v3.5.5
+    profiles: ["monitoring"]
+    restart: unless-stopped
+    depends_on:
+      - hub
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+    configs:
+      - source: prometheus_config
+        target: /etc/prometheus/prometheus.yml
+      - source: phone_farm_alerts
+        target: /etc/prometheus/phone-farm-alerts.yml
+    secrets:
+      - source: metrics_token
+        target: metrics_token
+    volumes:
+      - prometheus-data:/prometheus
+    expose:
+      - "9090"
+
 volumes:
   hub-data:
   caddy-data:
   caddy-config:
+  prometheus-data:
+
+configs:
+  prometheus_config:
+    file: ../observability/prometheus.yml
+  phone_farm_alerts:
+    file: ../observability/phone-farm-alerts.yml
+
+secrets:
+  metrics_token:
+    environment: METRICS_BEARER_TOKEN

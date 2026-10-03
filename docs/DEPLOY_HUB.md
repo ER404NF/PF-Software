@@ -34,6 +34,39 @@ docker compose up -d --build
 Caddy (in the same compose file) gets and renews the HTTPS certificate by itself. Open
 `https://<your hostname>/healthz` — it should answer `{"ok":true}`.
 
+Use `https://<your hostname>/readyz` for load-balancer or deployment readiness. File-backed
+deployments report the database as `not_required`. When a PostgreSQL-backed durable domain is
+authoritative, readiness performs a bounded database probe and returns HTTP 503 while it is
+unavailable. The public response never includes a database URL, hostname, credential, or exception
+message. This endpoint makes external monitoring possible; it does not mean an outside uptime check
+or alert has already been deployed.
+
+Set `METRICS_BEARER_TOKEN` in `deploy/hub/.env` to enable the Prometheus-compatible
+`GET /metrics` endpoint, then configure the scraper to send `Authorization: Bearer <token>`.
+When the variable is empty the route returns 404; an invalid token returns 401. Metrics use only
+bounded HTTP method and status-class labels—never paths, query strings, users, device IDs, payloads,
+tokens, or screenshots. Enabling this endpoint does not itself deploy a collector, dashboard, alert,
+or SLO.
+
+For a private in-network collector, set `METRICS_BEARER_TOKEN` and enable the
+optional monitoring profile:
+
+```bash
+docker compose --profile monitoring up -d --build
+```
+
+This starts pinned Prometheus LTS `3.5.5`, stores 15 days of metrics, and loads
+the bounded rules in `deploy/observability/phone-farm-alerts.yml`. Import
+`deploy/observability/phone-farm-dashboard.json` into the approved private
+Grafana instance to view scrape status, request rate, server-error ratio,
+average response duration, and process uptime. The dashboard contains no
+user, device, route, payload, or credential labels. Prometheus is
+not published on a host port. Connect it to an approved dashboard and alert
+receiver through the deployment network; do not expose it directly to the
+internet. Follow [`docs/INCIDENT_RESPONSE.md`](INCIDENT_RESPONSE.md). Until a
+test alert is delivered and an incident exercise is recorded, this remains
+configuration readiness rather than operational acceptance.
+
 Create the first admin (run once; it writes to the persistent volume):
 
 ```bash
@@ -43,11 +76,11 @@ docker compose exec hub node server/scripts/create-operator.js admin '<a long pa
 Everything that must survive upgrades (accounts, sessions, audit, queue, sites) lives in
 the `hub-data` volume. Back that volume up. To upgrade: `git pull && docker compose up -d --build`.
 
-**Status:** the hub was verified to boot in exactly this configuration (public HTTPS
-address, real session secret, empty device list) and to answer `/healthz`; that is part of
-the automated tests. The Dockerfile and compose file themselves were **not built or run**
-during development because Docker was not available — expect to fix a typo or two on the
-first `docker compose up`.
+**Status:** the hub was verified by automated process tests to boot with the expected
+environment (including an empty device list) and answer `/healthz`. The public HTTPS
+deployment, Compose monitoring profile, and external alert path were not run on this
+Windows host because Docker is unavailable. The Dockerfile and compose file themselves
+must still be validated with `docker compose config` and a controlled deployment.
 
 ## 2. Add a site
 

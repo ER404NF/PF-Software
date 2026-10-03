@@ -7,7 +7,11 @@ test("scheduler guard catches component failures and exposes degraded health", (
   const errors = [];
   let assignmentsRan = 0;
   const guard = createSchedulerGuard({
-    taskQueue: { tick() { throw new Error("injected queue failure"); } },
+    taskQueue: { tick() {
+      const error = new Error("postgres://private:password@database/scheduler-token");
+      error.code = "ECONNRESET";
+      throw error;
+    } },
     expireAssignments() { assignmentsRan += 1; },
     auditLog: { logEvent(event) { events.push(event); } },
     logError(...args) { errors.push(args); },
@@ -23,7 +27,28 @@ test("scheduler guard catches component failures and exposes degraded health", (
   });
   assert.equal(events[0].type, "scheduler_persistence_failed");
   assert.equal(events[0].detail.component, "task_queue");
-  assert.equal(errors.length, 1);
+  assert.deepEqual(errors, [["Scheduled task_queue maintenance failed:", "ECONNRESET"]]);
+  assert.equal(JSON.stringify(errors).includes("private"), false);
+});
+
+test("scheduler audit failures are isolated and do not log private exception text", () => {
+  const errors = [];
+  const guard = createSchedulerGuard({
+    taskQueue: { tick() { throw new Error("queue unavailable"); } },
+    expireAssignments() {},
+    auditLog: { logEvent() {
+      const error = new Error("postgres://private:password@audit/scheduler-token");
+      error.code = "ECONNRESET";
+      throw error;
+    } },
+    logError(...args) { errors.push(args); },
+  });
+  assert.equal(guard.run(new Date("2026-09-15T10:00:00.000Z")), false);
+  assert.deepEqual(errors, [
+    ["Scheduled task_queue maintenance failed:", "Error"],
+    ["Scheduler failure audit could not be written:", "ECONNRESET"],
+  ]);
+  assert.equal(JSON.stringify(errors).includes("private"), false);
 });
 
 test("scheduler guard recovers health after a later successful tick", () => {

@@ -94,6 +94,37 @@ test("a refresh() failure is reported via onRefreshError and keeps the last-know
   assert.deepEqual(errors, ["backend unreachable"]);
 });
 
+test("default cache failure logging excludes private backend exception text", async () => {
+  const errors = [];
+  const originalError = console.error;
+  console.error = (...values) => errors.push(values.map(String).join(" "));
+  try {
+    let refreshFails = false;
+    const privateFailure = () => {
+      const error = new Error("redis://private:password@cache/token");
+      error.code = "ECONNRESET";
+      return error;
+    };
+    const cache = await createSyncCache({
+      load: async () => {
+        if (refreshFails) throw privateFailure();
+        return {};
+      },
+      persist: async () => { throw privateFailure(); },
+    });
+    await cache.set("private-user", "private-value");
+    refreshFails = true;
+    await cache.refresh();
+  } finally {
+    console.error = originalError;
+  }
+  assert.deepEqual(errors, [
+    "SyncCache: durable write failed: ECONNRESET",
+    "SyncCache: periodic refresh failed: ECONNRESET",
+  ]);
+  assert.equal(errors.some(value => /private|password|token|user|value/.test(value)), false);
+});
+
 test("stop() cancels a periodic refresh timer", async () => {
   const cache = await createSyncCache({ load: async () => ({}), persist: async () => {}, refreshIntervalMs: 50 });
   cache.stop();

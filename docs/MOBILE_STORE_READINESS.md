@@ -1,6 +1,6 @@
 # Mobile store readiness
 
-Last reviewed: 2026-09-21
+Last reviewed: 2026-10-02
 
 This document covers the Phone Farm operator client for iPhone/iPad and Android.
 It does not cover the macOS host installer that runs WebDriverAgent or the site
@@ -21,9 +21,15 @@ The repository currently contains only:
 
 There is no reproducible mobile dependency manifest and lockfile, Android
 project, iOS project, signed AAB, signed iOS archive, privacy manifest, store
-metadata, or physical-device store build result. The main web client also lets
-a user create an account, but it does not currently provide self-service
-account deletion. That is a store blocker on both platforms.
+metadata, or physical-device store build result. The web product now provides a
+public deletion-request entry point, authenticated data export, reauthenticated
+self-service account locking with immediate session revocation, and a durable
+administrator processor for policy-driven anonymization and cleanup. The
+processor deliberately remains disabled until every retention/cleanup category
+has an explicit owner-approved policy; ambiguous shared evidence is retained and
+owned-media deletion is unavailable until ownership can be proved. The native
+mobile scaffold still has no in-app deletion UI, and the retention decision and
+end-to-end deployed deletion proof remain store blockers.
 
 The PWA remains the fastest route for real-device testing. Store distribution
 is a separate release track and is not required to test Phone Farm from Safari
@@ -84,13 +90,12 @@ Official distribution references:
 
    - [Apple App Review Guidelines, including minimum functionality](https://developer.apple.com/app-store/review/guidelines/)
 
-4. **Add complete account deletion.** Phone Farm exposes in-app account
-   creation, so the app needs an easy-to-find in-app action that initiates
-   deletion of the account and associated personal data. Google also requires
-   a public web URL where a user can request deletion. Define which security or
-   audit records must be retained, the lawful retention period, and how the
-   username and email are removed or irreversibly de-identified. Account
-   suspension is not deletion.
+4. **Finish and deploy account deletion.** The web backend now has public
+   request, export, immediate revocation, durable processing, anonymization, and
+   exact-completion boundaries. Add an easy-to-find native in-app action, adopt
+   an owner-approved retention policy, map media to demonstrable ownership,
+   deploy the public web URL, and verify the complete workflow against the
+   deployed service. Account locking alone is not deletion.
 
    - [Apple account deletion requirements](https://developer.apple.com/support/offering-account-deletion-in-your-app)
    - [Google Play account deletion requirements](https://support.google.com/googleplay/android-developer/answer/13327111?hl=en)
@@ -259,10 +264,12 @@ The mobile release is submission-ready only when all of these are true:
 
 ## Next coding milestone
 
-The next locally eligible milestone is **account deletion plus the public privacy,
-support and deletion routes**. Before implementing permanent deletion, the owner
-must define which audit records are legally or contractually retained and for how
-long. After that decision, implement deletion with re-authentication, revoke all
-sessions immediately, remove or de-identify personal fields, release device and
-assignment ownership, and test that deleted accounts cannot recover or sign in.
+The backend deletion engine and public request route now exist. The next mobile
+milestone depends on the owner choosing distribution, publisher identity,
+bundle/package ownership, and retention rules. After those decisions, create the
+pinned native projects, add the native deletion entry point, bind media to
+demonstrable account ownership, configure the policy outside source control, and
+verify deletion/export end to end in the deployed environment. Session
+revocation, retries, restart recovery, isolation, and exact completion already
+have local automated coverage; that evidence is not store acceptance.
 

@@ -3,6 +3,7 @@ import {
   configureOperatorTwoFactor,
   createEmailRecoveryToken,
   createSignupAccount,
+  discardEmailRecoveryToken,
   operators,
   prunePendingSignupAccounts,
   verifyOperatorSecondFactor,
@@ -18,6 +19,7 @@ export function createFileOperatorIdentityRepository(legacyStore = {
   configureOperatorTwoFactor,
   createEmailRecoveryToken,
   createSignupAccount,
+  discardEmailRecoveryToken,
   prunePendingSignupAccounts,
   verifyOperatorSecondFactor,
 }) {
@@ -40,6 +42,9 @@ export function createFileOperatorIdentityRepository(legacyStore = {
     },
     async createEmailRecoveryToken(identifier) {
       return legacyStore.createEmailRecoveryToken(identifier);
+    },
+    async discardEmailRecoveryToken(token) {
+      return legacyStore.discardEmailRecoveryToken(token);
     },
     async completeEmailRecovery(token, password, passwordConfirmation) {
       return legacyStore.completeEmailRecovery(token, password, passwordConfirmation);

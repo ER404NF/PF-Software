@@ -33,7 +33,7 @@ process.env.AUTO_DISCOVER_IOS_DEVICES = "false";
 
 const auth = await import("../../src/authStore.js");
 const { totpCode } = await import("../../src/twoFactor.js");
-const { server, isLoopbackAddress } = await import("../../src/index.js");
+const { server, isLoopbackAddress, auditLog } = await import("../../src/index.js");
 
 async function request(baseUrl, url, { cookie, method = "GET", body } = {}) {
   const response = await fetch(`${baseUrl}${url}`, {
@@ -103,10 +103,17 @@ test("bootstrap creates the first admin, then locks out; self-escalation attempt
   try {
     assert.equal(auth.listOperatorAccounts().some(u => u.role === "admin"), false);
 
-    const created = await request(baseUrl, "/api/setup/create-admin", {
-      method: "POST",
-      body: { username: "host-admin", password: "host-admin-password-123" },
-    });
+    const originalAuditWrite = auditLog.logEvent;
+    auditLog.logEvent = () => { throw new Error("injected bootstrap audit failure"); };
+    let created;
+    try {
+      created = await request(baseUrl, "/api/setup/create-admin", {
+        method: "POST",
+        body: { username: "host-admin", password: "host-admin-password-123" },
+      });
+    } finally {
+      auditLog.logEvent = originalAuditWrite;
+    }
     assert.equal(created.status, 201, JSON.stringify(created.body));
     assert.equal(created.body.operator.role, "admin");
 

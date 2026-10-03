@@ -10,6 +10,7 @@ export const OPERATOR_IDENTITY_REPOSITORY_METHODS = Object.freeze([
   "configureTwoFactor",
   "verifySecondFactor",
   "createEmailRecoveryToken",
+  "discardEmailRecoveryToken",
   "completeEmailRecovery",
 ]);
 

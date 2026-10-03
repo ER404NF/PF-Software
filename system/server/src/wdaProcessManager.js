@@ -8,6 +8,29 @@ import { SupervisedProcessGroup } from "./processSupervisor.js";
 const TEAM_ID_PATTERN = /^[A-Z0-9]{10}$/;
 const BUNDLE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.-]{0,199}$/;
 
+// WebDriverAgent's own MJPEG server reads these from its process environment
+// (WebDriverAgentLib/Utilities/FBConfiguration.m) — none were ever set here
+// before, so every session ran WDA's conservative, un-tuned defaults
+// (full-resolution, high-quality frames at a modest fixed rate). This is the
+// production-readiness audit's §5 fix: cheap, no new architecture, and the
+// most likely actual cause of "the stream feels slow" (the app's own
+// streaming pipeline — mjpegParser.js/streamHub.js — was never the
+// bottleneck). Each is independently overridable per deployment without a
+// code change; defaults are conservative starting points, not tuned/proven
+// against a real phone yet — see PRODUCTION_READINESS_AUDIT.md §5 step 2.
+const DEFAULT_MJPEG_SERVER_FRAMERATE = "20";
+const DEFAULT_MJPEG_SERVER_SCREENSHOT_QUALITY = "30";
+const DEFAULT_MJPEG_SCALING_FACTOR = "50";
+
+function mjpegTuningEnv() {
+  return {
+    MJPEG_SERVER_FRAMERATE: process.env.WDA_MJPEG_SERVER_FRAMERATE || DEFAULT_MJPEG_SERVER_FRAMERATE,
+    MJPEG_SERVER_SCREENSHOT_QUALITY:
+      process.env.WDA_MJPEG_SERVER_SCREENSHOT_QUALITY || DEFAULT_MJPEG_SERVER_SCREENSHOT_QUALITY,
+    MJPEG_SCALING_FACTOR: process.env.WDA_MJPEG_SCALING_FACTOR || DEFAULT_MJPEG_SCALING_FACTOR,
+  };
+}
+
 export class WdaProcessManager {
   // `developmentTeam` (an Apple Developer Team ID) is only supplied for a
   // WebDriverAgent checkout that ships unsigned — Phone Farm's bundled copy.
@@ -64,6 +87,6 @@ export class WdaProcessManager {
         `PRODUCT_BUNDLE_IDENTIFIER=${this.bundleId}`,
       );
     }
-    this.group.start(udid, this.xcodebuildBin, args);
+    this.group.start(udid, this.xcodebuildBin, args, mjpegTuningEnv());
   }
 }

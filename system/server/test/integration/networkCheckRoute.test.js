@@ -21,7 +21,7 @@ const TEST_PASSWORD = "test-password";
 
 const tmpStorageRoot = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-networkcheck-"));
 const isolatedDeviceConfigPath = path.join(tmpStorageRoot, "devices.config.json");
-fs.copyFileSync(path.join(__dirname, "../../../devices.config.json"), isolatedDeviceConfigPath);
+fs.copyFileSync(path.join(__dirname, "../../fixtures/network-devices.config.json"), isolatedDeviceConfigPath);
 const isolatedDeviceConfig = JSON.parse(fs.readFileSync(isolatedDeviceConfigPath, "utf8"));
 isolatedDeviceConfig.devices.find(device => device.id === "mock-1").network.failPolicy = "fail-closed";
 fs.writeFileSync(isolatedDeviceConfigPath, `${JSON.stringify(isolatedDeviceConfig, null, 2)}\n`);
@@ -32,7 +32,7 @@ process.env.QUEUE_STORE_PATH = path.join(tmpStorageRoot, "tasks.json");
 process.env.ALLOW_NETWORK_CHECK_URL_OVERRIDE = "true";
 process.env.NODE_ENV = "test";
 
-const { server, wss, deviceLease, taskQueue } = await import("../../src/index.js");
+const { server, wss, deviceLease, taskQueue, auditLog } = await import("../../src/index.js");
 const { operators, hashPassword } = await import("../../src/authStore.js");
 
 let httpUrl;
@@ -223,6 +223,29 @@ test("a successful check updates the device summary and is audited with the assi
   assert.ok(checkEvent, "expected a network_check audit event");
   assert.equal(checkEvent.detail.networkEgress, "cellular-sim");
   assert.equal(checkEvent.detail.observedIp, "198.51.100.77");
+});
+
+test("a completed network check remains successful when audit storage is unavailable", async () => {
+  await fetch(`${CHECK_URL.replace("/ip", "/debug/set-ip")}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ip: "198.51.100.77" }),
+  });
+  const originalAuditWrite = auditLog.logEvent;
+  try {
+    auditLog.logEvent = () => { throw new Error("injected network-check audit failure"); };
+    const response = await fetch(`${httpUrl}/api/devices/mock-1/network-check`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Cookie: cookie },
+      body: JSON.stringify({ checkUrl: CHECK_URL }),
+    });
+    assert.equal(response.status, 200);
+    const { network } = await response.json();
+    assert.equal(network.networkObservedIp, "198.51.100.77");
+    assert.equal(network.networkVerified, true);
+  } finally {
+    auditLog.logEvent = originalAuditWrite;
+  }
 });
 
 test("device_list over WebSocket carries the same network fields as the HTTP route", async () => {

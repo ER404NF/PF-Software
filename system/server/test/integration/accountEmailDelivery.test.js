@@ -37,7 +37,10 @@ const sentMail = [];
 let nextShouldFail = false;
 mock.method(nodemailer, "createTransport", () => ({
   sendMail: async (options) => {
-    if (nextShouldFail) { nextShouldFail = false; throw new Error("injected SMTP failure"); }
+    if (nextShouldFail) {
+      nextShouldFail = false;
+      throw new Error("SMTP auth failed for smtp://outbox@example.com:sensitive-password@smtp.example.com");
+    }
     sentMail.push(options);
   },
 }));
@@ -47,8 +50,13 @@ auth.createOperatorAccount({
   username: "admin-test", password: "admin-password-123", role: "admin",
   allowedDevices: null, allowedResearchWorkspaces: [], twoFactorRequired: false,
 });
+auth.createOperatorAccount({
+  username: "recovery-target", password: "recovery-target-password-123", role: "va",
+  fullName: "Recovery Target", email: "recovery.target@gmail.com",
+  allowedDevices: [], allowedResearchWorkspaces: [], twoFactorRequired: false,
+});
 
-const { server } = await import("../../src/index.js");
+const { server, accountNotificationStore, auditLog } = await import("../../src/index.js");
 
 async function request(baseUrl, url, { cookie, method = "GET", body } = {}) {
   const response = await fetch(`${baseUrl}${url}`, {
@@ -65,7 +73,7 @@ async function login(baseUrl, username, password) {
   return response.headers.get("set-cookie").split(";")[0];
 }
 
-test("approving a pending signup actually sends the acceptance email via SMTP", async () => {
+test("signup/review notifications send when available and post-commit failures never misreport account state", async () => {
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   const address = server.address();
   const baseUrl = `http://127.0.0.1:${address.port}`;
@@ -84,16 +92,24 @@ test("approving a pending signup actually sends the acceptance email via SMTP", 
     });
     assert.equal(signup.status, 201);
 
+    // Signup itself now fires a "received" email before any admin action —
+    // confirm it landed before asserting on the approval's own email.
+    assert.equal(sentMail.length, 1);
+    assert.equal(sentMail[0].to, "realdelivery@gmail.com");
+    assert.match(sentMail[0].subject, /received/i);
+    assert.match(sentMail[0].text, /Real Delivery/);
+
     const approved = await request(baseUrl, "/api/admin/users/real-delivery/status", {
       cookie: adminCookie, method: "PATCH", body: { status: "approved" },
     });
     assert.equal(approved.status, 200);
     assert.equal(approved.body.notification.deliveryState, "sent");
-    assert.equal(sentMail.length, 1);
-    assert.equal(sentMail[0].to, "realdelivery@gmail.com");
-    assert.equal(sentMail[0].from, "noreply@example.com");
-    assert.match(sentMail[0].subject, /accepted/i);
-    assert.match(sentMail[0].text, /Real Delivery/);
+    assert.equal(sentMail.length, 2);
+    const acceptedMail = sentMail.find(mail => /accepted/i.test(mail.subject));
+    assert.ok(acceptedMail, "expected an acceptance email to have been sent");
+    assert.equal(acceptedMail.to, "realdelivery@gmail.com");
+    assert.equal(acceptedMail.from, "noreply@example.com");
+    assert.match(acceptedMail.text, /Real Delivery/);
 
     // A send failure must not break the approval itself — the account is
     // already approved either way; only the notification outcome differs.
@@ -109,12 +125,162 @@ test("approving a pending signup actually sends the acceptance email via SMTP", 
     });
     assert.equal(secondSignup.status, 201);
     nextShouldFail = true;
-    const rejected = await request(baseUrl, "/api/admin/users/flaky-delivery/status", {
-      cookie: adminCookie, method: "PATCH", body: { status: "rejected" },
-    });
+    const originalConsoleError = console.error;
+    const deliveryErrors = [];
+    console.error = (...values) => { deliveryErrors.push(values.map(String).join(" ")); };
+    let rejected;
+    try {
+      rejected = await request(baseUrl, "/api/admin/users/flaky-delivery/status", {
+        cookie: adminCookie, method: "PATCH", body: { status: "rejected" },
+      });
+    } finally {
+      console.error = originalConsoleError;
+    }
     assert.equal(rejected.status, 200);
     assert.equal(rejected.body.operator.accountStatus, "rejected");
     assert.equal(rejected.body.notification.deliveryState, "failed");
+    assert.ok(deliveryErrors.some(message => message.includes("Account notification email send failed")));
+    assert.equal(deliveryErrors.some(message => /sensitive-password|outbox@example\.com|smtp\.example\.com/.test(message)), false,
+      "SMTP credentials and endpoints must not be copied from transport errors into logs");
+
+    const failureStateSignup = await request(baseUrl, "/api/signup", {
+      method: "POST",
+      body: {
+        fullName: "Failure State",
+        email: "failure.state@gmail.com",
+        username: "failure-state",
+        password: "failure-state-password-123",
+        passwordConfirmation: "failure-state-password-123",
+      },
+    });
+    assert.equal(failureStateSignup.status, 201);
+    const originalMarkFailed = accountNotificationStore.markFailed;
+    accountNotificationStore.markFailed = () => {
+      throw new Error("failed to write C:/sensitive/outbox/account-notifications.json");
+    };
+    nextShouldFail = true;
+    try {
+      const committedWithUnrecordedDeliveryFailure = await request(baseUrl, "/api/admin/users/failure-state/status", {
+        cookie: adminCookie, method: "PATCH", body: { status: "rejected" },
+      });
+      assert.equal(committedWithUnrecordedDeliveryFailure.status, 200);
+      assert.equal(committedWithUnrecordedDeliveryFailure.body.operator.accountStatus, "rejected");
+      assert.equal(committedWithUnrecordedDeliveryFailure.body.notification.deliveryState, "pending_reconciliation");
+    } finally {
+      accountNotificationStore.markFailed = originalMarkFailed;
+    }
+
+    // Account creation is the authoritative commit. A later outbox write
+    // failure must not turn that completed mutation into a misleading 500
+    // that invites a duplicate retry.
+    const originalQueue = accountNotificationStore.queue;
+    accountNotificationStore.queue = () => { throw new Error("injected outbox disk failure"); };
+    try {
+      const committedWithoutOutbox = await request(baseUrl, "/api/signup", {
+        method: "POST",
+        body: {
+          fullName: "Outbox Failure",
+          email: "outbox.failure@gmail.com",
+          username: "outbox-failure",
+          password: "outbox-failure-password-123",
+          passwordConfirmation: "outbox-failure-password-123",
+        },
+      });
+      assert.equal(committedWithoutOutbox.status, 201);
+      assert.equal(committedWithoutOutbox.body.operator.username, "outbox-failure");
+      assert.equal(auth.listOperatorAccounts().some(account => account.username === "outbox-failure"), true);
+    } finally {
+      accountNotificationStore.queue = originalQueue;
+    }
+
+    const originalAuditWrite = auditLog.logEvent;
+    auditLog.logEvent = () => { throw new Error("injected audit disk failure"); };
+    try {
+      const committedWithoutAudit = await request(baseUrl, "/api/signup", {
+        method: "POST",
+        body: {
+          fullName: "Audit Failure",
+          email: "audit.failure@gmail.com",
+          username: "audit-failure",
+          password: "audit-failure-password-123",
+          passwordConfirmation: "audit-failure-password-123",
+        },
+      });
+      assert.equal(committedWithoutAudit.status, 201);
+      assert.equal(auth.listOperatorAccounts().some(account => account.username === "audit-failure"), true);
+    } finally {
+      auditLog.logEvent = originalAuditWrite;
+    }
+
+    auditLog.logEvent = () => { throw new Error("injected login audit failure"); };
+    try {
+      const loginWithDegradedAudit = await request(baseUrl, "/api/login", {
+        method: "POST",
+        body: { username: "admin-test", password: "admin-password-123" },
+      });
+      assert.equal(loginWithDegradedAudit.status, 200,
+        "best-effort login audit failure must not produce an ambiguous failed login");
+    } finally {
+      auditLog.logEvent = originalAuditWrite;
+    }
+
+    const originalWriteFileSync = fs.writeFileSync;
+    fs.writeFileSync = (targetPath, ...args) => {
+      if (String(targetPath).includes(".operators.json.") && String(targetPath).endsWith(".tmp")) {
+        throw new Error("injected login-IP persistence failure");
+      }
+      return originalWriteFileSync(targetPath, ...args);
+    };
+    try {
+      const loginWithDegradedIpHistory = await request(baseUrl, "/api/login", {
+        method: "POST",
+        body: { username: "admin-test", password: "admin-password-123" },
+      });
+      assert.equal(loginWithDegradedIpHistory.status, 200,
+        "best-effort login-IP persistence must not produce an ambiguous failed login");
+    } finally {
+      fs.writeFileSync = originalWriteFileSync;
+    }
+
+    const sentBeforeRecovery = sentMail.length;
+    accountNotificationStore.queue = () => { throw new Error("injected recovery outbox failure"); };
+    try {
+      const failedOutboxRequest = await request(baseUrl, "/api/recovery/request", {
+        method: "POST", body: { identifier: "recovery-target" },
+      });
+      assert.equal(failedOutboxRequest.status, 200,
+        "recovery remains enumeration-safe when its outbox is temporarily unavailable");
+    } finally {
+      accountNotificationStore.queue = originalQueue;
+    }
+    const retriedRecovery = await request(baseUrl, "/api/recovery/request", {
+      method: "POST", body: { identifier: "recovery-target" },
+    });
+    assert.equal(retriedRecovery.status, 200);
+    assert.equal(sentMail.length, sentBeforeRecovery + 1,
+      "a failed outbox write must roll back that exact token so a retry can deliver a fresh one");
+
+    const recoveryMail = sentMail.at(-1);
+    const recoveryToken = recoveryMail.text.match(/: ([A-Za-z0-9_-]+)$/)?.[1];
+    assert.ok(recoveryToken, "the delivered recovery message must contain its one-time token");
+    const oldRecoverySession = await login(baseUrl, "recovery-target", "recovery-target-password-123");
+    auditLog.logEvent = () => { throw new Error("injected recovery-completion audit failure"); };
+    try {
+      const completedWithDegradedAudit = await request(baseUrl, "/api/recovery/complete", {
+        method: "POST",
+        body: {
+          token: recoveryToken,
+          password: "recovery-target-new-password-123",
+          passwordConfirmation: "recovery-target-new-password-123",
+        },
+      });
+      assert.equal(completedWithDegradedAudit.status, 200,
+        "a completed password reset must not be reported as failed because its audit sink is down");
+    } finally {
+      auditLog.logEvent = originalAuditWrite;
+    }
+    const staleSession = await request(baseUrl, "/api/me", { cookie: oldRecoverySession });
+    assert.equal(staleSession.status, 401, "password recovery must revoke existing sessions even if audit fails");
   } finally {
     server.close();
   }

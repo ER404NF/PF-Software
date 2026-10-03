@@ -1,6 +1,804 @@
-# Roadmap Status Report — updated 2026-09-26
+# Roadmap Status Report — updated 2026-10-03
 
-## 2026-09-26 (latest) — P3 complete for all 9 available domains; 2 more real bugs found
+## 2026-10-03 (latest, part 25) — proxy-pool server and client boundaries
+
+The manual proxy-pool HTTP family now lives in
+`server/src/routes/proxyPoolRoutes.js`. `index.js` remains the composition root
+and injects the existing repository, encryption/decryption boundary, cache
+refresh/getter, device-network map, device scope checks, current-operator
+reauthorizer, tester, serializers, audit helper, broadcaster, and configuration
+mutation. The module creates no repository, cache, lease map, or alternate
+state owner. The exact `VIEW_PROXY_POOL`, `MANAGE_PROXY`, and `ASSIGN_PROXY`
+middleware boundaries and existing public response formats remain in place.
+
+Both successful and failed saved-proxy tests reauthorize after the awaited
+network operation and before health persistence. Revocation therefore returns
+no successful test data and cannot mutate health. Expected validation and
+lease errors retain their HTTP status; unexpected repository or tester errors
+reach Express error middleware. Public responses and audit metadata continue
+to exclude proxy host, port, username, password, ciphertext, and encryption
+material. Focused route-contract tests cover all seven routes, exact middleware,
+missing encryption, device scope, malformed assignment IDs, exclusive leases,
+assigned-proxy deletion, both revocation paths, unknown failures, and response
+redaction. Those unit tests passed **8/8** and the existing proxy integration
+suite passed **18/18**.
+
+The browser's proxy pool/provider owner now lives in
+`client/proxyPoolController.js`, loaded before `app.js`. It exclusively owns
+the current pool and loaded flag and exposes only `refresh()`, `clear()`,
+`isLoaded()`, and `getPool()` plus test-facing operations. Every asynchronous
+read and mutation captures the profile generation and suppresses success and
+failure output after session, role, or capability changes. Sign-out and live
+role changes clear the pool, provider inventory, messages, form, and password.
+All untrusted values use `textContent`; buttons are restored on every outcome;
+pool/provider failures remain independent; and pool changes still rebuild the
+fleet proxy pickers. The device assignment picker also suppresses stale results
+after loss of `ASSIGN_PROXY`.
+
+Focused client/controller and boundary coverage passed **54/54**. The rendered
+Electron role acceptance initially exposed a timing race in its own Tab-focus
+sampling: Chromium could still report `BODY` before focus traversal committed.
+The harness now waits for that browser task; the rendered acceptance test
+passed **three consecutive focused runs** and again in the complete desktop
+suite. This is local rendered evidence, not screen-reader or physical-device
+acceptance.
+
+Final evidence: complete system suite **209 files, 1,578 tests, 1,546 passed,
+0 failed, 32 skipped**; the 32 PostgreSQL/Redis cases remain unexecuted.
+Desktop suite: **160/160 passed**. Both production dependency audits reported
+**0 vulnerabilities**. All **174/174** changed or untracked JavaScript files
+passed `node --check`; `git diff --check` passed; and the refined
+high-confidence credential scan found **0 matches across 203 changed paths**
+(one `sk-assignment` documentation substring was inspected and rejected as a
+token-pattern false positive).
+
+The worktree is **203 paths: 108 tracked modifications, 95 untracked files,
+0 staged**. `HEAD` and local `origin/main` remain equal at
+`8073f8a89e44f9c567114f470e7e24005c6c8a99`; nothing was committed or pushed.
+`server/src/index.js` is 4,511 lines and `client/app.js` is 4,068 lines.
+Bounded route/controller maintainability is now **8/10 local**: the two files
+remain substantial composition surfaces, but the proxy feature has one server
+route boundary and one client state owner with direct contract coverage. No
+physical Mac/iPhone, device routing, provider infrastructure, deployment,
+database, restore-drill, alert-delivery, AI-live, or store score changes follow
+from this local extraction.
+
+## 2026-10-03 (latest, part 24) — accurate rendered roles and bounded assignment/people extraction
+
+Rendered acceptance no longer invents account roles. The Electron matrix now
+covers each authoritative role exactly once: `host`, `admin`, `manager`, `va`,
+`content_creator`, and `editor`. It derives panel and input expectations from
+the server capability table. Human versus AI control is a separate device-state
+scenario: a real Manager account opens an AI-controlled synthetic phone
+read-only and cannot acquire human input. Keyboard focus, desktop/narrow
+overflow, full-screen handling, dark mode, reduced motion, and human-mode input
+checks remain. This is rendered local evidence, not screen-reader or physical
+device acceptance.
+
+The assignment access helpers and `/api/assignments` route family now live in
+`server/src/routes/assignmentRoutes.js`. `index.js` remains the composition root
+and injects the existing repository, capability middleware, device/account
+scope checks, management hierarchy, recurrence/status rules, audit helper,
+broadcast functions, and expiry owner. The module creates no cache. Focused
+contract tests cover route registration, exact capability middleware, scope
+filtering, bounded worker progress, validation errors, and propagation of
+unknown persistence failures.
+
+People and Assignments rendering and interaction now live in
+`client/peopleAssignmentsController.js`. The controller receives DOM nodes,
+HTTP access, profile-generation and capability accessors, current profile and
+device getters, formatting, and message handling from `app.js`; server responses
+remain authoritative. Focused tests cover stale response suppression after role
+changes, unavailable data, live device-grant changes, and assignment mutation
+failure/retry cleanup. Rendering continues to assign untrusted values through
+`textContent`.
+
+Final local evidence for this milestone: focused assignment routes **4/4**;
+focused client/controller boundaries **50/50**; rendered desktop acceptance and
+the complete desktop suite **160/160**; complete system suite **207 files,
+1,562 tests, 1,530 passed, 0 failed, 32 skipped**. The 32 PostgreSQL/Redis tests
+remain unexecuted. Both production dependency audits found **0 vulnerabilities**.
+All **170/170** changed or untracked JavaScript files passed `node --check`;
+the refined credential scan found **0 high-confidence matches across 199
+paths**; and `git diff --check` passed. The final worktree is **199 paths: 108
+tracked modifications, 91 untracked files, 0 staged**. `HEAD` and local
+`origin/main` remain equal at
+`8073f8a89e44f9c567114f470e7e24005c6c8a99`; nothing was committed or pushed.
+`index.js` is 4,658 lines and `app.js` is 4,295 lines.
+
+Brutal re-score: rendered role/accessibility coverage remains **7.5/10 local**
+because no screen reader or assistive-technology session ran; route/code
+maintainability improves from **7/10 to 7.5/10**, not 8, because `index.js`
+and `app.js` remain large composition surfaces. No physical, provider,
+deployment, backup-drill, AI-live, or store score changes from these local
+tests.
+
+## 2026-10-02 (latest, part 23) — privacy tombstone correctness and pre-enumeration authorization
+
+The completed privacy processor previously reported anonymization while retaining
+the original username in both the inactive account record and completed privacy
+request. Assignments and tasks independently recalculated a username-derived
+tombstone, the documented `anonymize_actor` audit mode did not rewrite append-only
+events, and administrator authorization was first refreshed only after the
+planning pass had enumerated private account data.
+
+One request-scoped HMAC tombstone is now resolved, collision-checked, and durably
+stored when processing is claimed. That exact value is injected into account,
+assignment, task, audit-completion, and request operations. The file account
+authority atomically renames the inactive account and rejects a conflicting
+tombstone even if a preflight check races. It records only the deletion request
+ID needed for retry identity; the completed request removes both `accountUsername`
+and `lookupDigest` while remaining queryable by request ID. A retry recognizes
+the already-renamed account by request ID and tombstone, so a restart after
+account anonymization does not create a new identity or rerun a completed
+category.
+
+The audit log remains append-only. The unimplemented `anonymize_actor` policy
+mode was removed; `retain` is now the only accepted audit mode. Existing shared
+audit evidence is not rewritten or deleted, and the new completion event uses
+the same tombstone. Unsupported modes fail policy validation before planning or
+mutation. Administrator authority is checked before any planning read, after the
+awaited planning pass before results can be returned, before the durable claim,
+before every destructive category, and again at the file repository commit for
+the account rename. Collision responses and failure codes are bounded and never
+contain the original username.
+
+Regression evidence directly covers removal of the original username from the
+account configuration and completed request, one tombstone across assignments
+and tasks, idempotent second execution, preflight and authoritative file-store
+collision rejection, restart recovery between account anonymization and request
+completion, revoked planning authorization, unsupported audit modes, and file
+repository commit authorization. There is no PostgreSQL operator-account adapter
+in the current architecture, so no PostgreSQL parity claim is made for this
+file-authoritative account lifecycle.
+
+Focused privacy/account verification passed **47/47**. The complete system suite
+passed **205 files, 1,555 tests, 1,523 passed, 0 failed, 32 skipped**; all skips
+still require external PostgreSQL or Redis and are not passes. Desktop passed
+**160/160**. Both production dependency audits reported **0 vulnerabilities**.
+All **166/166** changed or untracked JavaScript files passed `node --check`; the
+refined credential scan found **0 high-confidence matches across 195 paths**;
+and `git diff --check` passed.
+
+The worktree remains **195 paths: 108 tracked modifications, 87 untracked files,
+0 staged**. `HEAD` and local `origin/main` remain equal at
+`8073f8a89e44f9c567114f470e7e24005c6c8a99`. Nothing was committed or pushed.
+Privacy lifecycle remains **7/10 local**, now for external reasons rather than
+the corrected identifier leak: owner-approved retention periods, demonstrable
+media ownership/cleanup, deployed execution, and legal acceptance remain open.
+Physical Mac/iPhone, production deployment, real proxy egress, AI-live, database,
+restore-drill, alert-delivery, and store scores are unchanged.
+
+## 2026-10-02 (latest, part 22) — sub-7 local hardening loop
+
+The expanded working-tree inventory was exactly **179 files** before this milestone (107 tracked modifications
+and 72 untracked). Four bounded untracked artifacts were added below (the PostgreSQL backup module, its CLI and
+test, plus the observability dashboard), so the current inventory is **183 files**: 107 tracked modifications,
+76 untracked files, and 0 staged. Classification is 74 source files, 85 tests/fixtures, 15 documentation files,
+and 9 configuration/packaging files. With the current
+nine-group commit map and clean gates, local change reviewability is **7/10**; it cannot rise further without
+owner review, commits, and a verified remote revision.
+
+Device file push now models Safari's download-confirmation sheet instead of treating it as an unknown state and
+retrying until timeout. It locates a real Download button, reauthorizes immediately before the tap, and verifies
+that the next observation is downloading or complete. Focused file-push coverage passed **39/39**. This supports
+**7/10 local code readiness**, while physical Safari/Files delivery remains unverified.
+
+Proxy-provider leases gained an authoritative `getLease()` contract. Route-local cache loss can no longer allow
+the same logical device to acquire a second lease from another provider; lease, rotate, and release operations
+recover ownership from provider state after restart. Focused provider coverage passed **41/41**. The provider
+control plane is now **7/10 locally**, but this is not a live proxy network or routing proof.
+
+Observability now includes reusable request-rate, server-error-ratio, and average-duration recording rules plus
+an importable, bounded operations dashboard covering scrape status, traffic, errors, latency, and uptime. Focused
+health/metrics/deployment coverage passed **12/12**. This supports **7/10 local configuration readiness** only;
+collector deployment, receiver delivery, external checks, and an incident exercise remain external gates.
+
+Backup and restore now refuse source or encrypted-object path swaps through descriptor-based no-follow checks.
+The new PostgreSQL slice runs `pg_dump` into private staging, encrypts it before publication, keeps credentials in
+environment variables, requires an exact disposable-restore confirmation, runs `pg_restore`, and always removes
+plaintext staging data. Focused backup coverage passed **11/11**. This raises local backup readiness to **6.5/10**,
+not 7: real PostgreSQL restore evidence, database/file reconciliation, approved RPO/RTO/retention, off-host
+storage, and a timed production-shaped drill remain absent.
+
+Rendered browser inspection confirmed that Operations previously showed every authorized panel in one long page.
+It now exposes one role-allowed section at a time, preserves hash deep links, marks one navigation link current,
+and moves keyboard focus to the selected panel. Focused client coverage passed **78/78** and direct browser
+inspection observed one visible panel after selecting Users. Information architecture is now **7/10 locally**.
+
+The latest complete suite passed **1,502/1,534**, with **0 failures** and **32 external PostgreSQL/Redis skips**,
+across **201 files**. Nothing was committed or pushed. Remaining sub-7 categories require an owner/legal decision,
+deployment or database services, Git authorization, credentials/purchases, physical Mac/iPhone infrastructure,
+owned regional proxy nodes, supervised live AI, or signed store delivery; none is converted into a local claim.
+
+## 2026-10-02 (latest, part 21) — safe default fleet, deployable monitoring, and current Windows installer
+
+The tracked `system/devices.config.json` is now an empty production-safe fleet. Simulation remains available
+only through `npm run demo` and explicit test fixtures. The network-route integration fixture moved under
+`server/fixtures`, and every integration test that requires `mock-1`/`mock-2` now sets `DEVICE_CONFIG_PATH`
+explicitly. The first complete run correctly exposed one missed implicit dependency in `routingRoutes.test.js`;
+after migrating all affected tests, the focused set passed **84/84**, `wsProtocol` passed **74/74**, and the
+final complete suite passed.
+
+The deployment package now includes an optional Compose `monitoring` profile with pinned Prometheus LTS 3.5.5,
+private bearer-token scraping, 15-day local retention, and bounded availability, server-error-ratio, and restart
+rules. The incident runbook prohibits private payloads and defines triage, rollback, and closeout evidence. YAML
+parsing and **11/11** focused health/metrics/deployment checks pass. Docker is not installed on this Windows host,
+so `docker compose config`, collector startup, dashboard wiring, external health checks, receiver delivery, and a
+timed incident exercise remain deployment gates. This supports raising observability from **4/10 to 5/10 local
+configuration readiness**, not operational acceptance.
+
+Desktop **0.2.2** tests passed **159/159**. A fresh Windows NSIS build completed and produced the ignored local
+artifact `desktop/dist/Phone-Farm-Windows.exe` (116,908,383 bytes; SHA-256
+`157C57DEED337E0B649D4308CBC728E1B5EE49D9445A74527E450068AF58B32A`). The unpacked application passed the
+packaged-runtime verifier, including bundled WDA and real server boot. The installer is unsigned and was neither
+committed nor published; no macOS package can be built or notarized on this Windows host.
+
+Final local verification: system **1,491/1,523 passed**, **0 failed**, **32 PostgreSQL/Redis skips**, across **200
+files**; desktop **159/159**; both production audits **0 vulnerabilities**; **152/152** changed/untracked JavaScript
+files passed `node --check`; refined credential scan **0 matches**; runtime/build artifact candidates in Git **0**;
+and `git diff --check` passed. The tree contains **179 paths**: 107 tracked modifications, 72 untracked, and 0
+staged. The tracked diff is **5,605 insertions and 1,170 deletions across 107 files**. Nothing was committed or
+pushed.
+
+External/non-physical gates remain: Docker or disposable PostgreSQL/Redis for the 32 tests, an owner-approved
+privacy retention/deletion policy, deployment credentials and alert receiver, real proxy/provider infrastructure,
+AI provider/account configuration, signing/notarization identities, Git commit/push authorization, and mobile
+store accounts. Physical Mac/iPhone, routing/leak, file-delivery, and assistive-technology acceptance also remain
+open and must not be inferred from these local results.
+
+## 2026-10-02 (latest, part 20) — deterministic WDA tests, privacy intake/export, and encrypted file restore
+
+The two timing-sensitive WDA live-frame tests no longer depend on arbitrary sleeps or a response delay that put
+two sequential WDA calls exactly on the command timeout boundary. The fake WDA fixture can now hold and release
+screenshot responses independently of input, records screenshot completion, and binds a one-shot failure to the
+request that consumed it. The integration tests wait for observed WDA state transitions and use isolated limiter
+keys. The target pair passed **25/25**, the complete `wsProtocol` file passed **74/74** three consecutive times,
+and the repaired pair remained green in every later complete suite.
+
+The first privacy-lifecycle implementation adds a public, rate-limited deletion-request page that returns the
+same response for known and unknown accounts and stores an HMAC lookup digest instead of an unknown raw
+identifier. A signed-in operator must re-enter the current password and type `DELETE MY ACCOUNT`. The account
+lock, auth-version increment, recovery-token removal, TOTP/recovery-code removal, and durable request happen
+before best-effort audit/notification work. The repository commit callback now rechecks the authoritative stored
+session rather than the request's cached principal, so a concurrent logout cannot complete a stale deletion
+mutation. Main-host and last-active-admin invariants fail closed.
+
+The public request store is now bounded to 8 MiB and 10,000 requests, validates every durable lifecycle record,
+and validates/reads through one descriptor. Oversized, symbolic-link, swapped, or malformed state fails closed
+instead of being loaded into memory or used for account decisions. Gmail identifiers are canonicalized before
+digesting; a later verified username request upgrades the matching active public request instead of duplicating
+it, and bad credentials create no verified request.
+
+Signed-in users can download a bounded JSON export of their explicit account profile, assignments where they are
+the assignee, tasks they created, audit-event metadata, and deletion-request status. The route reauthorizes after
+collecting data and before returning bytes, uses `no-store`, reports category truncation, and excludes password,
+MFA/recovery material, raw lookup digests, audit detail, task execution evidence, and other users' records. The
+export explicitly reports that shared media/research evidence lacks per-account ownership metadata and is not yet
+included. This is not completed deletion: owner-approved retention, de-identification, media/evidence ownership,
+verified cleanup, retry processing, and auditable completion remain open.
+
+The first disaster-recovery code slice adds streaming AES-256-GCM backups for the file store and atomic restore
+to a new directory. Opaque encrypted objects are verified against manifest size and SHA-256, tampering and unsafe
+paths fail closed, existing destinations are never overwritten, and the encrypted manifest records only the
+names of deployment secrets that must be rebound. The key and secret values are never stored or printed. The
+runbook requires the hub to be quiesced and correctly labels this as a local file-storage slice, not PostgreSQL
+PITR or a production restore drill. Owner-approved RPO/RTO/retention, off-host scheduling, database/file
+reconciliation, monitoring, and a timed production-shaped restore remain external gates.
+
+A bounded-resource review additionally found that restore loaded `manifest.enc` without a size ceiling and that
+backup accepted unbounded file and secret-name inventories. The file-backup authority now caps manifests at
+64 MiB, file inventories at 100,000, required-secret names at 128, and relative paths at 1,024 characters. It
+validates and reads the manifest through the same descriptor, rejects manifest symlinks/path swaps, and creates
+no restore target on these failures.
+
+The same bounded-state review found that the device file-push one-time-link store read an unbounded JSON file
+and accepted malformed persisted records. It now caps the store at 1 MiB and 10,000 active links, bounds device,
+filename, issuer, and TTL inputs, validates every persisted record, and validates/reads through one descriptor.
+Oversized, symbolic-link, swapped, or malformed state fails closed before token matching. This hardens the local
+delivery control plane only; a real Safari/Files delivery on an assigned iPhone is still unverified.
+
+Focused privacy verification passed **20/20**. Focused backup/CLI verification passed **7/7**. Focused device
+file-push verification passed **27/27**. The final complete system suite passed **1,488/1,520**, with **0 failures**
+and **32 external PostgreSQL/Redis skips**, across **199
+files**. Desktop passed **159/159**. System and desktop production audits each reported **0 vulnerabilities**.
+All **147/147** changed or untracked JavaScript files passed `node --check`; `git diff --check` passed; the refined
+credential scan checked all **169** changed paths with **0 high-confidence matches**; and no runtime/build/storage
+artifact was found.
+
+The stable tree contains **169 paths**: 102 tracked modifications, 67 untracked files, and 0 staged. Classification
+is 72 source files, 78 tests/fixtures, 14 documentation files, and 5 configuration/packaging files. The tracked
+diff is **5,499 insertions and 1,147 deletions across 102 files**. `HEAD` and the local `origin/main` reference
+remain equal at `8073f8a89e44f9c567114f470e7e24005c6c8a99`. Nothing was committed or pushed.
+
+Evidence supports raising privacy lifecycle from **3/10 to 5/10 local code** and backup/disaster recovery from
+**1/10 to 3/10 local code**. Neither reaches 8 because cleanup policy/execution and a real reconciled restore are
+unproven. Local change reviewability remains **7/10**: the inventory and gates are current, but 169 uncommitted
+paths still require owner-reviewed commits and a verified remote SHA.
+
+### Updated logical commit plan (not executed)
+
+1. Client live-screen/theme/Operations accessibility and focused UI tests.
+2. Account/auth/CSP/rate-limit/ban/notification hardening and tests.
+3. Privacy request, account-lock, data-export UI/routes/stores, and focused tests.
+4. Media signature validation and guarded device file-push implementation/tests.
+5. Proxy-provider contract, registry, routes, UI, and tests.
+6. Sites/PostgreSQL authority slice, authorization generations, migrations/tests, and rollback docs.
+7. WDA/process supervision, deterministic live-frame tests, and desktop/Mac acceptance material.
+8. Encrypted file backup/restore library, CLI, tests, package scripts, and runbook.
+9. Productionization documents, reports, deployment metadata, and ignore rules.
+
+`system/server/src/index.js` spans several domains and must be staged by hunk into the matching groups. No commit
+or push is authorized. This local evidence does not prove physical Mac/iPhone behavior, PostgreSQL/Redis,
+production deployment, phone-originated proxy routing, monitoring/alerts, deletion cleanup, supervised AI,
+signed native builds, or store acceptance.
+
+## 2026-09-30 (latest, part 19) — committed-result isolation and bounded operational data
+
+A P0 fault-injection pass found that audit-storage errors could still replace authoritative results
+across assignments, WebSocket input, command mutations, proxy/provider leases, media operations,
+Sites lifecycle operations, research controls, and network verification. Those call sites now use one
+best-effort audit boundary: durable mutations and explicit authorization denials retain their real HTTP
+or WebSocket outcome, while the operational log records only a generic audit-write failure. A stale
+WebSocket peer was also able to throw during a presence/fleet broadcast after account creation had
+committed; broadcasts are now isolated per peer and an unusable peer is terminated without changing
+the mutation response.
+
+Operational error logging now retains only a bounded error kind. SMTP exception text, recipients,
+subjects, tokens, database paths, and transport URLs are not copied into application logs. If both an
+email send and its failure-state persistence fail, the account mutation remains successful and reports
+`pending_reconciliation` rather than a misleading 500.
+
+The first locally deployable observability slice separates `GET /healthz` liveness from `GET /readyz`
+readiness. File-backed mode reports PostgreSQL as `not_required`; a PostgreSQL-authoritative process
+runs the existing bounded database probe and returns 503 while unavailable. The unauthenticated
+response contains only status and latency, never exception or connection text. Focused audit-outage,
+WebSocket, Sites, research, media, network, notification, safe-log, health-route, and deployment checks
+are green. A separately authenticated `/metrics` route now publishes process uptime and bounded HTTP
+count/duration aggregates without path, query, user, device, payload, or content labels. It remains
+hidden when `METRICS_BEARER_TOKEN` is not configured, and the container deployment passes the optional
+secret only through environment configuration. An explicitly configured metrics token must be a bounded
+token-safe value (32–512 characters), so a weak or malformed token fails startup rather than silently
+weakening the endpoint. Raw session-touch, database, Redis, transaction rollback,
+and synchronous-cache error text is no longer copied into logs. Task-queue and research-worker audit failures
+are also isolated after authoritative persistence or device-action results; they can no longer replace a
+committed result or strand a verified run.
+
+The follow-on information-safety pass now validates model-provider configuration before constructing an
+adapter. Malformed JSON and malformed provider collections fail closed without aborting server startup;
+unsafe names, environment-variable references, models, and credential-bearing/non-HTTP URLs are rejected
+without being echoed into logs. Routing state and HTTP responses retain catalog error codes and public messages
+instead of host command stderr, paths, or provider details. Database and Redis health results retain only a
+bounded error kind. Model, UI-tree capture, platform-skill, recovery, and file-push exceptions are sanitized
+before they can enter model observations, task/session history, audit records, or browser responses; original
+exceptions remain private to in-process recovery and rejection paths.
+Automatic network-enrollment status follows the same rule: bridge inspection, IP discovery, and automatic
+routing failures publish a retryable state plus bounded error kind, not host command output.
+The remote-site boundary now follows the same contract: site-agent RPC failures carry only a bounded code
+and public message, while discovery status text is authored by the hub instead of accepted from the remote
+agent. WDA MJPEG reconnect and stall notices likewise use fixed public diagnostics rather than socket,
+hostname, or transport exception text.
+Direct Site-agent startup now rejects credential-bearing hub URLs, reduces accepted addresses to their
+origin, and logs only bounded transport/handler error kinds. Paths, queries, fragments, embedded passwords,
+and raw remote exception text therefore cannot enter the agent URL or its operational log.
+
+Complete server verification after these changes: **192 files, 1,496 tests, 1,464 passed, 0 failed,
+32 skipped**. The skipped tests still require external PostgreSQL or Redis and are not passes.
+Desktop verification remains **159/159 passed**. System and desktop production audits each report
+**0 vulnerabilities**. The current tree contains **153 paths**: 101 tracked modifications and 52 untracked
+files, with 0 staged; all **133/133** changed or untracked JavaScript files pass `node --check`, the refined
+high-confidence credential scan reports **0 matches across 153 paths**, and `git diff --check` passes.
+`HEAD` still equals `origin/main` at `8073f8a89e44f9c567114f470e7e24005c6c8a99`; none of this work was
+committed or pushed.
+
+This is local implementation evidence only. No external monitor or alert is deployed, no database
+outage was exercised against a controlled deployment, and no Mac/iPhone, proxy egress, backup restore,
+privacy deletion, AI provider, or store acceptance gate is raised by this work.
+
+## 2026-09-29 (latest, part 11) — private identity data and post-commit failure boundaries
+
+A P0 review of the account and recovery flows reproduced two classes of defects that the prior green suite did
+not cover. First, the administrative user-list shape serialized each operator's recent login IP history even
+though the browser never uses it. Second, several identity mutations committed successfully and then returned
+HTTP 500, skipped immediate live-session cleanup, or could escape an asynchronous callback when a later audit or
+notification write failed.
+
+Recent login IPs now remain inside a narrow server-private repository method used only to seed the
+defense-in-depth signup blocklist after a ban. The public account shape never contains them. The obsolete second
+ban-metadata writer was removed; account status and ban metadata still commit atomically through the single
+account repository boundary.
+
+Signup, first-admin bootstrap, login bookkeeping, account creation/update, explicit session revocation, 2FA
+reset, recovery completion, and logout now treat post-commit audit/outbox failures accurately. Security effects
+run first: committed password recovery and account-security changes revoke live sessions before best-effort
+auditing. A failed recovery outbox write rolls back only the exact newly generated token hash, so a later retry
+can deliver a fresh token without weakening the existing-token reuse protection or exposing account existence.
+Live authorization reconciliation suspends affected sockets before asynchronous refresh and stays fail-closed if
+that refresh fails.
+
+The fault-injection tests first reproduced login-IP disclosure, misleading 500 responses, a stranded recovery
+token, skipped recovery revocation, and an unguarded logout callback. Focused repair sets passed **32/32**,
+**8/8**, and **5/5**. Complete server result: **182 files, 1,446 tests, 1,414 passed, 0 failed, 32 skipped**;
+the skips still require external PostgreSQL or Redis and are not passes. Desktop: **159/159**. System and desktop
+production audits: **0 vulnerabilities**. Syntax: **74/74** changed or untracked JavaScript files. `git diff
+--check`: passed. The refined high-confidence credential scan checked **91 paths with 0 matches**.
+
+The tree now contains **91 paths**: 54 tracked modifications and 37 untracked files, with nothing staged.
+Classification: 34 server source/script files, 5 client files, 37 tests, 12 documentation files, 2 package files,
+and 1 repository configuration file. No runtime/build/storage artifact was found. `HEAD` still equals
+`origin/main` at `8073f8a89e44f9c567114f470e7e24005c6c8a99`; no commit or push occurred.
+
+Evidence supports raising **information and secret safety to 8/10 locally**: password/MFA/recovery material was
+already excluded or encrypted, and recent network-location history is now server-private with a regression test.
+Reliability/error recovery remains **8.5/10 local**, now with explicit cross-store and audit-outage coverage.
+These results do not raise physical Mac/iPhone, live database/backup, deployed observability, privacy deletion,
+provider egress, AI live-operation, or store-delivery scores.
+
+## 2026-09-28 (latest, part 10) — first reversible PostgreSQL authority slice: sites
+
+The migration adapters existed, but the running server always constructed the file site repository. The
+site admin routes and `SiteLinkHub` also assumed synchronous repository calls, so merely swapping in the
+existing asynchronous PostgreSQL adapter would have returned promises as data and broken site-agent
+authorization.
+
+Added an explicit `SITE_REPOSITORY_BACKEND=file|postgres` selector. File remains the default;
+`postgres` requires `DATABASE_URL`, unknown values fail startup, the pool is shared with the optional cloud
+identity API, and shutdown closes it. Site routes now await durable writes. Site-agent upgrade and live-link
+authorization await the same repository and fail closed on a database error. Live messages use a coalesced
+one-second authorization recheck so a video stream cannot turn FPS into PostgreSQL QPS; app-driven token
+rotation/deletion still disconnects immediately. The old file remains untouched as the rollback source.
+
+Focused result: **20/20 passed** for backend configuration, async authorization coalescing/failure, and the
+existing full site-link integration. The mounted-server PostgreSQL test is present but skipped locally because
+`TEST_DATABASE_URL` is not configured. Full system suite: **178 files, 1408 tests, 1376 passed, 0 failed,
+32 skipped**. Desktop suite: **159/159 passed**. Both production audits: **0 vulnerabilities**. This proves
+the reversible wiring and file-default behavior locally; migration/activation/observation against the real
+deployment database remains a deployment gate, and the other eight durable domains remain file-authoritative.
+
+## 2026-09-28 (part 9) — worktree inventory and physical acceptance handoff tightened
+
+The scorecard baseline had 51 dirty paths. After the requested live-screen fix and the bounded follow-on work,
+the current inventory is **61 paths: 36 modified and 25 untracked**. Classification: 11 documentation, 5 web
+client, 2 maintained package manifests/lockfiles, 2 server scripts, 13 server source, 27 tests, and 1 repository
+ignore file. No runtime storage, temp files, packaged installers, dependency trees, private keys, or known
+credential signatures were found. The generated-but-maintained `system/package-lock.json` is the only generated
+commit candidate. Runtime `.env` files and `.claude/settings.local.json` were not ignored; `.gitignore` now
+excludes them while keeping `.env.example` trackable. Storage/tmp/dist/runtime build exclusions were rechecked.
+
+`docs/MAC_INSTALLER_ACCEPTANCE.md` now provides the ordered real-Mac/two-iPhone run requested by the scorecard:
+clean install and preflight, WDA/iproxy, contain-fit geometry and coordinate mapping, portrait/landscape, FPS and
+latency evidence, hidden/release/signout live-poll cleanup, real Safari/Files push, two independent proxy routes,
+device-originated egress, DNS/WebRTC/IPv6 checks, tunnel/iproxy/WDA fault isolation, unplug/reconnect, restart,
+30-minute soak, rollback, and one evidence row per step. It does not mark any hardware, routing, signing, or
+notarization result as passed.
+
+## 2026-09-27 (latest, part 8) — low-resolution live screens now scale without distortion or cropping
+
+Reproduced the scorecard's full-screen defect in the real demo at a 1536x864 browser viewport: the
+fake-WDA stream's 90x160 canvas remained exactly 90x160 while its full-screen panel occupied the whole
+viewport. The canvas had only CSS maximums, so nothing requested an upscale.
+
+`phoneStage.js` now contain-fits each decoded frame from its intrinsic dimensions into the current CSS
+width/height ceilings. It refits on a rotated frame, browser resize, full-screen change, and phone-panel
+resize. Full-screen height uses the actual toolbar, bezel, wrapper, and panel padding measurements rather
+than a fixed viewport subtraction, so toolbar wrapping or browser zoom cannot silently crop the bottom of
+the phone. Input still normalizes against the canvas's displayed rectangle; no letterboxed control box was
+introduced.
+
+Focused regression: **57/57 passed**, covering portrait and landscape contain-fit, rotation, tap/drag/wheel/
+keyboard/Home behavior, and the displayed-rectangle mapping boundary. Real-browser recheck at 1536x864:
+the 90x160 portrait stream rendered at **391.73x696.40**, retained its 0.5625 aspect ratio, exactly matched
+its wrapper, and left the toolbar and Home control visible. A click at approximately 75% x / 25% y reached
+fake WDA at 281.32 / 167.04 on its 375x667 coordinate space; drag, wheel, text, and Home also reached the
+fixture. Full server suite: **175 files, 1401 tests, 1370 passed, 0 failed, 31 skipped**. This is browser/demo
+validation, not physical Mac/iPhone latency, rotation, or monitor acceptance.
+
+## 2026-09-27 (latest, part 7) — P4 built: device file push via Safari/Files
+
+Owner confirmed the decision recorded in `docs/productionization/P4_DEVICE_PUSH_BUILD.md`: build the
+researched device-push mechanism now rather than leave it as research. Built per that handout's architecture
+requirement (a real platform skill, not ad-hoc taps):
+
+- `filePushLinkStore.js` — short-lived (10 min), single-use, hashed tokens bound to one `(deviceId,
+  filename)` pair, this project's existing token conventions.
+- `platformSkills/filePushSkill.js` — same `detectState`/`availableActions`/`execute`/`verify`/`recover`
+  contract every other skill uses; deliberately driven by its own small orchestrator
+  (`filePushOrchestrator.js`) rather than the shared `executeSkillAction()` engine, since that engine is wired
+  to the social-research action catalog and "push a file to this phone" isn't part of it (documented in the
+  skill's own header).
+- Three new, additive routes in `index.js`: issue a one-time link, consume it (the phone's own Safari hits
+  this, never given a real operator session), and a blocking trigger route that drives the whole thing and
+  returns a specific per-file outcome (SUCCESS/FAILED/NEEDS_HUMAN/TIMED_OUT/BLOCKED) — gated on the device
+  already being in `HUMAN` controller mode, re-checked on every poll, not just once.
+- Found and fixed two real bugs during testing (not just happy-path tests passing): the orchestrator's very
+  first observation call had no authorization check at all (an uncaught exception instead of a clean
+  `BLOCKED`), and a second, subtler version of the same gap — `captureObservation()` re-checks authorization
+  itself on every call, so a `canExecute` that changes its answer *between* calls could still throw
+  uncaught from deeper inside the loop. Fixed by having every observation call recognize that specific error
+  and convert it to `BLOCKED`, rather than relying only on a pre-emptive check that could race against the
+  shared helper's own internal re-check.
+- 23 new unit tests (link store, skill, orchestrator fixtures) + 1 new integration test (full route chain:
+  issuance auth boundary, consume-once-then-404-on-replay, malformed/unknown token rejection, the trigger
+  route's own auth boundary, and end-to-end wiring against the real `MockDevice` — which has no Safari icon to
+  find, so the one honest thing that test proves is that the whole chain runs cleanly to a specific outcome,
+  never a crash or a silent no-op).
+- Full suite after: **175 files, 1398 tests, 1367 passed, 0 failed, 31 skipped.** `npm audit --omit=dev`:
+  still 0 vulnerabilities.
+
+**Not claimed working, honestly:** per the build handout's own explicit instruction, this is marked **PASS
+WITH KNOWN LIMITATIONS — unverified on real hardware.** The skill's UI-text patterns (which label identifies
+Safari's address bar, a download-in-progress vs. download-complete banner, an error page) are a best-effort
+guess at real iOS accessibility labels that genuinely vary by iOS version — nothing about that can be proven
+without an actual iPhone. See `docs/productionization/P4_DEVICE_PUSH_BUILD.md`'s completed report template for
+the full detail, and `PRODUCTION_READINESS_AUDIT.md` §4/§6 for the updated rating.
+
+## 2026-09-27 (part 6) — real bug found and fixed: the proxy pool was completely broken in the demo
+
+The owner reported "I added everything correctly but was not able to see any proxies." Reproduced directly
+rather than guessed at: ran `npm run demo`, signed in as the demo admin (confirmed real `proxy:manage` /
+`proxy:view-pool` capabilities), and submitted a real `POST /api/admin/proxies` exactly as the client does.
+
+**Root cause, confirmed:** `POST /api/admin/proxies` requires `TWO_FACTOR_MASTER_KEY` (or
+`PROXY_CREDENTIAL_ENCRYPTION_KEY`) to be set, to encrypt the stored proxy password — `server/scripts/demo.js`
+never set either one, so every add silently 503'd with `"the proxy pool is unavailable until
+TWO_FACTOR_MASTER_KEY... is configured"`. The packaged desktop app was never affected — `desktop/main.js`'s
+`hostSecrets()` already generates a real one for every real install — so this was invisible anywhere except
+the one place a person can currently try the app before a real deployment exists. The same missing key would
+also have blocked the deeper OS-level tunnel-routing feature (`networkRoutingOrchestrator.js` decrypts the
+same stored password using the same key) for the identical reason, had a real Mac gotten that far.
+
+**Fixed:** `demo.js` now generates a real `TWO_FACTOR_MASTER_KEY` at startup, same as the real desktop app
+already does. Re-ran the exact repro end to end after the fix — add (`201`), list (shows it), the real
+rendered UI panel (proxy card with Test/Delete buttons), delete (`200`) — all confirmed live in a real
+browser, not just via the API. Added `server/test/unit/demoScript.test.js` so this can't silently regress.
+Full server suite after the fix: **175 files, 1398 tests, 1367 passed, 0 failed, 31 skipped** (skips are the
+same real-database/Redis-only tests as every prior pass).
+
+**Still unverified, honestly:** this fixes the proxy *pool* (adding/seeing/testing/assigning credentials) —
+confirmed working now, in software. The actual OS-level traffic routing through a proxy
+(`AUTO_ROUTE_PROXY_TUNNELS`, macOS-only, needs `sudo`/PF/tun2proxy) has never been run on a real Mac and
+remains exactly as unverified as everything else in this project that depends on real hardware — this fix
+does not change that.
+
+## 2026-09-27 (part 5) — P2b actually done: a false positive caught and corrected along the way
+
+Part 4's entry (below) reported P2b done after real Brevo credentials produced a `"deliveryState":"sent"`
+with no transport error. **That was premature and has been corrected — it is left in place below rather than
+rewritten, because the correction itself is the useful record.** The owner checked their inbox and Brevo's
+Activity Log and found nothing had arrived: every send showed both "Sent" *and* "Error." Brevo's own error
+detail: the sender address used (`bb46b8001@smtp-brevo.com`, an SMTP login identifier, not a real mailbox)
+was never a verified sender, so Brevo accepted the SMTP transaction and then rejected the message at a later
+stage — a failure mode that never surfaces as a `mailSender`/nodemailer error, which is exactly why the
+code-level "sent" signal alone was not sufficient proof.
+
+**Real lesson, worth keeping:** a mail-relay accepting a message is not the same claim as the message being
+delivered — this handout's own "never fabricate a real-delivery claim" rule means checking the *provider's*
+delivery status (or, better, the actual recipient inbox), not just the absence of a local transport error.
+
+**Fixed and re-proven:** the owner added and verified a real address they control
+(`404.design00@gmail.com`) as a single sender in Brevo. Re-ran the identical proof with that as
+`COMPANY_FROM_EMAIL`, sending to a recipient the owner specified (`yfy264417@gmail.com`) — all four emails
+(invite, password-reset, received, accepted) sent with no transport error, **and the owner independently
+confirmed they actually arrived** this time. That is the first point where "sent" and "delivered" are both
+true, confirmed by the person who can see the inbox.
+
+`PHASE1_TEAM_ROLLOUT_HANDOUT.md`'s P2b section has the full three-attempt account. Going forward,
+`COMPANY_FROM_EMAIL` must be `404.design00@gmail.com` (or a properly domain-authenticated sender if one gets
+set up later) — never the raw SMTP login again.
+
+## 2026-09-27 (part 4) — P2b done: real Brevo credentials wired, real delivery proved
+
+The owner provided real Brevo SMTP credentials in chat. Set as process environment only (never written to a
+file in this repo) and used to boot the actual server for real, driving the real HTTP routes — not a
+service-layer shortcut — for all four notification kinds this app sends: the M04 cloud API's invite and
+password-reset-request routes, and the legacy file-backed system's self-service-signup ("received") and
+admin-acceptance ("accepted") routes.
+
+**First attempt failed for real**, honestly reported rather than glossed over: Brevo rejected every send with
+`535 5.7.1 Unauthorized IP address` — a real Brevo account-level IP-authorization control, not a code defect.
+The owner authorized the IP in Brevo's dashboard. **Second attempt: all four sends succeeded** — confirmed by
+the complete absence of any transport error (the failed run had logged one per send) and by the "accepted"
+email's own API response explicitly flipping from `"deliveryState":"failed"` to `"deliveryState":"sent"` for
+the identical call.
+
+This closes out P2b (`PHASE1_TEAM_ROLLOUT_HANDOUT.md` §4) in full — see that document's P2b section for the
+complete step-by-step report. One thing carried forward for whoever sets up the real deployment (P5): the
+same four env vars need setting there too, and that host's own IP will need separate authorization in
+Brevo's dashboard — authorizing this dev machine's IP does not cover it.
+
+## 2026-09-27 (part 3) — Independent re-verification confirmed; one polish item added
+
+A second, independent pass re-checked every claim from part 2's audit fixes — read the actual diffs (not
+just the report text), re-ran the full suite itself, re-opened the real demo in a real browser and read the
+actual HTTP response headers, re-ran `npm audit` on both new dependencies. **Every claimed fix was confirmed
+genuinely fixed**, several ratings raised as a result (auth 8→9, uploads 6→8, headers 4→9, rate limiting
+5→8, durability 8→9). One residual, explicitly-optional polish item was named for §7: a CSP
+violation-reporting endpoint, since a `report-uri` was declared but nothing was listening on it yet.
+
+Added it: `index.js`'s CSP now includes `report-uri: /api/csp-report`, and that route logs incoming
+violation reports through the existing audit log (`type: "csp_violation"`) rather than requiring a manual
+browser console check to notice a future accidental policy mismatch. Two new tests
+(`cspReporting.test.js`): the header carries the directive and a real report is accepted and logged; a
+malformed report body still gets a clean, non-500 response.
+
+Nothing else changed — §9 (email) and §12 (deployment) remain owner-gated exactly as before, §4 (device
+push) remains researched-not-built pending owner confirmation, §16 (real hardware) remains unreachable from
+this environment.
+
+## 2026-09-27 (part 2) — Production readiness audit: 5 of 8 priority items fixed, 1 researched
+
+Worked through `docs/productionization/PRODUCTION_READINESS_AUDIT.md`'s priority-ordered action list.
+
+**§5 — WDA MJPEG tuning (`wdaProcessManager.js`, `processSupervisor.js`):** WDA's own MJPEG server was never
+configured — every session ran full-resolution, high-quality frames at WDA's conservative fixed rate, the
+likely actual cause of "the stream feels slow" rather than this app's own streaming pipeline (already good).
+Now sets `MJPEG_SERVER_FRAMERATE=20`, `MJPEG_SERVER_SCREENSHOT_QUALITY=30`, `MJPEG_SCALING_FACTOR=50` by
+default, each overridable per deployment via `WDA_MJPEG_*` env vars.
+`processSupervisor.js`'s `start()`/`_spawnNow()` gained an optional `env` parameter (merged over
+`process.env`, reused across restarts) to carry this through — a small, generically useful addition, not
+WDA-specific.
+
+**§7 — security headers moved into the app itself (`index.js`, new `helmet` dependency):** previously these
+headers (HSTS, nosniff, referrer-policy) existed only in `deploy/hub/Caddyfile`, which Railway (the leading
+hosting candidate) would never run, since Railway terminates TLS itself. Added `helmet()` with a deliberately
+custom CSP (not defaults) — `img-src` allows `blob:` for `phoneStage.js`'s frame-rendering pipeline,
+`connect-src 'self'` covers the app's own same-origin WebSocket. The one inline `<script>` in `index.html`
+(theme bootstrap) moved to an external file (`theme-bootstrap.js`) since a strict `script-src 'self'` blocks
+inline scripts. Verified for real: `curl -I` against the actual running demo server shows every header now
+present, and a real SVG phone frame was confirmed decoding correctly through the `blob:` URL pipeline under
+the new policy (exact icon colors read back from the rendered canvas).
+
+**§3 — upload file-type allowlist (`fileStore.js`, `index.js`):** multer previously had no `fileFilter` at
+all — any extension, any declared MIME type was accepted and stored as-is. Added
+`rejectedMediaUploadReason()`: an allowlist of the video/image/audio extensions this app's actual use case
+needs, checked against both the extension and the declared MIME type (rejecting a mismatch as a spoofed-type
+signal). Four pre-existing tests that happened to upload `.txt`/`.json` fixtures for unrelated reasons
+(replacement-safety, quota enforcement, reserved-device-id protection) were updated to use an allowed
+type — each was about something else and would otherwise have started passing for the wrong reason.
+
+**§8 — general API rate limiting (`index.js`, new `express-rate-limit` dependency):** ordinary API routes
+had no general limiter (only login/2FA/signup/recovery did). Added one scoped to `/api`, keyed by operator
+username when signed in (falling back to IP only when unauthenticated) — deliberately not IP-keyed for
+authenticated traffic, since this fleet's VAs can share one office/NAT IP per hub and an IP-keyed limit would
+risk one session collaterally throttling every coworker on it. Limit/window are env-configurable
+(`API_RATE_LIMIT_MAX`/`_WINDOW_MS`) so a dedicated test could prove the real 429 behavior deterministically
+without touching the generous production default (300/minute), which the full suite confirms doesn't
+interfere with any existing test's normal traffic.
+
+**§1 — CSRF protection (`index.js`), with a deliberate design change from the audit's own suggestion:** the
+audit named a token (double-submit cookie) as the example fix. Implemented Origin/Referer verification
+instead — OWASP's own recognized alternative — because a token would have required retrofitting roughly 20
+existing test files' hand-rolled `fetch()` helpers to carry it, for no actual gain in this app's threat model
+(CSRF is fundamentally a browser-only attack; a browser cannot be made to omit or spoof its `Origin` header
+on a cross-origin state-changing request, so checking it is just as real a defense, with zero client-side
+plumbing and zero test-suite disruption). Proven with a real forged-cross-origin-POST test using an actual
+session cookie.
+
+**§4 — device-file-push mechanism: researched, not built,** per the audit's own explicit instruction. Full
+findings in [docs/productionization/P4_DEVICE_PUSH_RESEARCH.md](productionization/P4_DEVICE_PUSH_RESEARCH.md):
+direct Photos-library push is confirmed infeasible without a jailbreak (AFC2, the mechanism that would allow
+it, doesn't exist on a stock device); the `com.apple.mobile.house_arrest` AFC service is real, current, and
+what Appium's own real-device `push_file` command uses, but only reaches an app's own sandbox for apps that
+opt in via `UIFileSharingEnabled` — it can't target arbitrary apps like Photos or Instagram. Recommended path:
+automate an existing in-app import flow with the tap/swipe primitives already built (the same thing a human
+VA does by hand today) — flagged for the owner to confirm before any code is written.
+
+**Left untouched, all owner/hardware-gated exactly as the audit says:** §9 (email — needs the real Brevo
+credential), §12 (deployment — needs the hosting decision), §16 (real-hardware re-verification — no real Mac
+mini/iPhone reachable from this environment).
+
+Full local server suite after all of the above: **169 files, 1,608 tests, 1,608 passed, 0 failed, 0 skipped**
+(real PostgreSQL 16 + real Redis-compatible server).
+
+## 2026-09-27 — Phase 1 handout: P2b's code confirmed already done; P6 bug hunt complete
+
+Worked through `docs/productionization/PHASE1_TEAM_ROLLOUT_HANDOUT.md` starting from §7's first action.
+
+**Baseline confirmed matching the handout's own expectation:** server suite 165 files/1,328 tests/1,298
+passed/0 failed/30 skipped without a local database (exactly as documented); desktop suite 159/159.
+
+**P2b — investigated, not redone:** the handout's steps 3 ("wire `emailActionService.js` into real routes")
+and 4 ("wire the invite email for both flows") turned out to already be done, confirmed by reading the
+actual mount code rather than assuming — `createCloudApi.js`'s routes already call `emailActionService`,
+`index.js`'s real `CLOUD_API_ENABLED` mount already passes the real `mailSender`, and the file-based
+self-service flow's own emails (this session's earlier work) already share the same `mailSender.js`. What's
+left of P2b is exactly the owner-gated part: a real Brevo credential and a real delivery proof, neither of
+which this environment can supply.
+
+**P5 — genuinely blocked**, hosting provider still undecided; no deployment-specific work started, per the
+handout's own explicit instruction not to.
+
+**P6 — the bug-hunting pass, done in full for every item not requiring a real deployment.** One real bug
+found: `authStore.js`'s `recordAccountBan()` had no length cap on the `reason` field, unlike every other
+free-text field in that file — fixed with a 1000-character cap. Otherwise, every item proved already-correct
+behavior for real rather than finding new bugs:
+- Extended `cloudApiFuzz.test.js` to two routes it had missed, and wrote a new
+  `adminUsersFuzz.test.js` (22 sub-tests) giving the legacy `/api/admin/users*` routes their first
+  hostile-input pass ever — including this session's own new `banned` status, `reason` field, and
+  role-ceiling logic.
+- New `postgresConnectionLoss.test.js`: severed a running server's real Postgres connections mid-request
+  (via `pg_terminate_backend` from a separate admin connection, not by stopping the shared database service)
+  and confirmed every request still gets a clean response, no crash, and the exact route recovers moments
+  later.
+- New genuine-concurrency tests (not the sequential "A then B" kind already in the suite): two WebSocket
+  connections racing to claim the same device with no `await` between the sends
+  (`wsProtocol.test.js`), and two database calls racing to accept the same invitation
+  (`invitation.test.js`) — both confirmed exactly one winner, run repeatedly to rule out flakiness.
+- New two-independent-sites test (`siteLink.test.js`) — the only test in that file running two real site
+  agents at once, matching the actual fleet shape (Italy + 2 in Romania) — confirmed one disconnecting
+  mid-session leaves the other's already-open control session completely unaffected.
+
+Full write-up: [docs/productionization/P6_BUG_HUNT.md](productionization/P6_BUG_HUNT.md).
+
+Full local server suite after this pass: **167 files, 1,597 tests, 1,597 passed, 0 failed, 0 skipped**
+(real PostgreSQL 16 + real Redis-compatible server — every test able to run against a real database did).
+
+**Two things only the owner can unblock, surfaced per the handout's own §5:** the hub hosting provider
+(Railway vs. something else — nothing signed up for yet), and the real Brevo SMTP credential (the one
+pasted earlier this session never reached a usable state).
+
+## 2026-09-26 — VA self-service onboarding, a host role tier, and a separate Ban mechanism
+
+Built the requested VA sign-up/approval workflow end to end, then extended it twice more based on follow-up
+direction: separate Reject/Ban/Kick actions (not one relabeled button), and a `host` role above `admin` for
+running multiple hubs (each hub = one Mac mini + its phones, e.g. 1 mac mini + 2 phones in Italy, 2 mac
+minis + phones in Romania).
+
+**Onboarding email + Waiting for approval tab:**
+- `accountNotificationStore.js` gained a `"received"` notification kind, sent the moment `/api/signup`
+  creates a pending account ("your application was received, an admin will review it").
+- A new **Waiting for approval** panel in Operations (`system/client/index.html`/`app.js`), visible to
+  anyone with `MANAGE_USERS` or `MANAGE_TEAM_MEMBERS`, lists only `accountStatus === "pending"` applicants
+  with Accept/Decline/Ban buttons, reusing the existing `PATCH /api/admin/users/:username/status` route.
+
+**Reject vs Kick vs Ban — three distinct actions, not one relabeled button:**
+- **Reject** — onboarding-only. Declines a still-pending application (`accountStatus: "rejected"`).
+- **Kick** — already existed (`buildUserActionsMenu`'s "⋮" menu): deactivates an approved operator
+  (`active: false`) for an ordinary firing/offboarding; reversible by reactivating.
+- **Ban** — new, separate, for security incidents ("someone steals information or models from us"),
+  available both during onboarding and after approval. Sets a new `accountStatus: "banned"` (distinct from
+  `"rejected"`), ends all sessions, records who/why/when (`authStore.js`'s `recordAccountBan`), and
+  blocklists the account's most-recently-seen login IP addresses (`banStore.js`) against **new signups**
+  (not logins — see limits below). Lifting a ban is restricted to `host`-role operators only.
+
+**A `host` role above `admin`, for multi-hub ownership:**
+- `roleCapabilities.js` gained `OPERATOR_ROLES.HOST`, with the same full capability set as admin — the
+  distinction from admin is about *who can promote whom*, not which features are reachable.
+- `index.js`'s new `maxAssignableRoles()`: admin can create/promote up to `manager`; host can create/promote
+  up to `admin`; only the **main host** (`isMainHost` flag) can create/promote to `host` itself. `admin`
+  can no longer manage or even see a `host` account (`canManagePerson` updated); a `host` can manage
+  everyone, including admins.
+- `isMainHost` is set **only** via `server/scripts/create-operator.js --main-host` (requires
+  `--role=host`) — never through any HTTP route. `createOperatorAccount`'s input has no such field at all,
+  and `updateOperatorAccount`'s allowlist deliberately omits it, so a request body can never reach it even
+  if someone tried to smuggle it in (verified by a dedicated test).
+
+**Documented limits, not overclaimed:**
+- A ban is **not** an unbreakable network perimeter. It only knows the handful of IP addresses this specific
+  account was last seen logging in from (`recentLoginIps`, capped at 5) — a new IP (different network, VPN,
+  mobile data, a new device) isn't stopped by it. There is no device/browser fingerprinting in this codebase
+  to layer on top yet.
+- The blocklist is checked at `/api/signup` only, deliberately **not** at `/api/login`: this team can share
+  one office/NAT IP per hub, and gating login on IP would risk locking out every legitimate coworker on that
+  same network the moment one person is banned, for no real extra security (the banned account is already
+  fully blocked via `accountStatus === "banned"` regardless of IP).
+
+Tests: `server/test/unit/authStore.test.js` (isMainHost/recentLoginIps config validation, six-role
+capability check), `server/test/integration/hostRoleAndBans.test.js` (new — role-ceiling enforcement,
+canManagePerson host/admin boundary, isMainHost never settable via HTTP, full ban→blocklist→lift-ban flow,
+self-ban refused, ban/lift-ban never require an email unlike approve/reject),
+`server/test/unit/clientRoleUi.test.js` and `server/test/integration/accountEmailDelivery.test.js` updated
+for the new wording/email-count. Two pre-existing tests in `operatorManagement.test.js` fixed: they created
+a second admin account via the now-restricted `POST /api/admin/users` route as pure test setup, unrelated to
+what those tests actually check — switched to a role within the creator's ceiling, or to a direct
+`authStore.js` import, as appropriate.
+
+Full local server suite: **165 files, 1,559 tests, 1,559 passed, 0 failed, 0 skipped** (real PostgreSQL 16 +
+real Redis-compatible server). Manually verified in the browser via `npm run demo`: signup → Waiting for
+approval tab → Accept/Ban both exercised for real over HTTP, role dropdown correctly hides "Host" from a
+non-main-host admin, banned account correctly blocked from login and shows no Lift-ban button to an admin.
+
+## 2026-09-26 — P3 complete for all 9 available domains; 2 more real bugs found
 
 Extended P3 (started with sites — see the entry below) to every remaining domain that has a Postgres
 adapter: assignments, platform accounts/policies, task queue/runs/checkpoints, approvals, interventions,
@@ -855,6 +1653,92 @@ Not a bug and untouched: the earlier `/time` timezone failures are fixed; the re
 The pipeline got as far as producing `Phone-Farm-0.1.0-arm64-UNSIGNED.pkg` (electron-builder, pkgbuild and productbuild all succeeded) before
 failing in the post-build verification, so the macOS install-to-`/Applications` step and the artifact upload have still never run. The same
 caveat applies to the Windows installer build. **After this fix, re-run both workflows and review whatever the later stages show.**
+
+---
+
+# 2026-10-02 (latest, part 21) — privacy completion engine, coordinated backup sets, bounded operations metrics, and rendered role checks
+
+The policy-driven privacy lifecycle now continues from `account_locked` through
+durable, idempotent `processing`, `retryable_failed`, and `completed` states.
+Access is revoked before cleanup, every destructive category reauthorizes the
+initiating administrator, progress is checkpointed by category, restart recovery
+releases interrupted claims, and concurrent workers have one winner. Planning
+returns bounded counts only. Account-owned assignment and task references are
+pseudonymized; the account record is stripped of credentials, recovery, 2FA,
+security, contact, grant, and session data. Shared records are retained. Media
+deletion remains disabled until media has demonstrable account ownership, and
+the whole processor fails closed unless an explicit versioned policy selects a
+mode for every category. No legal retention duration was invented.
+
+Backup tooling now creates one UUID backup-set manifest that binds the encrypted
+file snapshot and encrypted PostgreSQL dump by streaming SHA-256 hashes,
+versions, timestamps, membership counts, and required secret *names*. It never
+stores secret values. Publication is an atomic rename after both components and
+their reconciliation pass; failed staging is removed. Verification rejects
+tampering, mixed components, unexpected members, symbolic links, unsafe or
+existing destinations, and incomplete sets. Restore requires an exact
+confirmation, a new filesystem target, and an explicitly disposable database.
+This is a locally tested workflow, not evidence of crash consistency, PITR,
+off-host durability, an achieved RPO/RTO, or a completed recovery drill.
+
+The protected metrics surface now exports only fixed-vocabulary aggregates for
+device connectivity/controllability, queue state, open intervention category,
+routed/protected device totals, and AI outcomes. Tests enumerate the permitted
+labels and exclude usernames, device IDs, accounts, URLs, paths, tokens,
+screenshots, proxy material, and arbitrary errors. Alerts and dashboard panels
+were added only for states with runbook responses. Alert delivery remains a
+deployment gate.
+
+A real Electron BrowserWindow harness now checks each real operator role exactly
+once: Host, Admin, Manager, VA, Content Creator, and Editor. It checks role and
+capability-derived panel visibility, human-mode input ownership, and a separate
+manager viewing an AI-controlled device read-only, plus keyboard focus, desktop and
+narrow overflow, live-screen geometry, full-screen entry/exit handling,
+read-only input ownership, dark-state rendering, and reduced motion. The test
+uses synthetic accounts/devices only. It does not prove screen-reader behavior
+or physical-device acceptance. The harness also disables repository-side cache
+pollution by running Chromium inside disposable user data and working folders.
+
+Two bounded composition extractions were completed: `/api/me` and `/api/logout`
+now live in `routes/sessionAccountRoutes.js`, while Operations panel navigation
+and focus behavior live in `client/operationsController.js`. Existing stores,
+services, capability checks, revocation ordering, and composition remain the
+authoritative owners; neither module adds a cache.
+
+Final local evidence for this slice:
+
+- focused privacy/backup regression set: **14/14 passed** after the final
+  authorization and streaming-hash review;
+- focused rendered Electron role acceptance: **1/1 passed**, with no repository
+  cache directory left afterward;
+- complete system suite: **205 files, 1,551 tests, 1,519 passed, 0 failed,
+  32 skipped**; the skips require external PostgreSQL/Redis and are not passes;
+- complete desktop suite: **160/160 passed**;
+- system and desktop production audits: **0 vulnerabilities** each;
+- syntax: **166/166** changed or untracked JavaScript files passed `node --check`;
+- refined credential scan: **195 paths, 0 high-confidence matches**;
+- `git diff --check`: **passed**.
+
+The final worktree inventory is **195 paths**: **108 tracked modifications, 87
+untracked files, 0 staged**. Classification is 73 server source/script/fixture
+files, 86 server tests, 8 web-client files, 1 desktop source file, 2 desktop
+tests, 15 documentation files, 5 deployment/observability files, 4 system
+package/configuration/documentation files, and 1 repository configuration file.
+The tracked diff is **5,992 insertions and 1,203 deletions across 108 files**.
+`HEAD` and local `origin/main` remain equal at
+`8073f8a89e44f9c567114f470e7e24005c6c8a99`; nothing is staged, committed, or
+pushed.
+
+Brutal self-evaluation: privacy lifecycle is **7/10 local** (complete engine and
+revocation semantics, but owner retention rules and owned-media cleanup remain),
+backup/disaster recovery is **6.5/10 local** (coordinated encrypted sets, but no
+off-host automation or measured restore drill), observability is **6/10 local**
+(safe metrics/dashboard/rules/runbook, but no deployed collector, alert delivery,
+or incident exercise), rendered accessibility is **7.5/10 local** (six roles in
+Electron, but no assistive-technology acceptance), and route maintainability is
+**7.5/10** after the two bounded extractions. Physical Mac/iPhone, real routing,
+live provider, live AI, deployment, external database, recovery-drill, and store
+scores are unchanged.
 
 ---
 
@@ -2306,3 +3190,278 @@ What's actually left, in rough priority order:
 
 The first git commit is still pending because project rules require explicit
 user approval before committing.
+# 2026-09-28 (latest, part 11) — uploads reject spoofed media before commit
+
+The upload route previously trusted the client-controlled filename extension and
+MIME type. A payload such as HTML renamed to `.mp4` could therefore pass the
+allow-list and become durable media. Uploads now remain in their hidden staging
+file until a bounded header read confirms a supported media signature consistent
+with the requested extension. A mismatch returns the stable
+`MEDIA_CONTENT_REJECTED` error, releases the reserved quota, removes the staging
+file, and leaves an existing same-name file untouched.
+
+The detector covers JPEG, PNG, GIF, WebP, WebM, ISO-BMFF MP4/MOV/M4A/HEIF,
+MP3, WAV, and AAC signatures. This is content-type validation, not an antivirus
+scanner or full decoder; malware scanning and object-storage quarantine remain a
+deployment/product decision.
+
+Focused regression: **86/86 passed**, including spoof rejection, cleanup, quota
+release, and preservation of a prior file. Full system suite: **178 files, 1,411
+tests, 1,379 passed, 0 failed, 32 skipped** (external PostgreSQL/Redis services
+were not configured, so those explicitly gated tests remained skipped).
+
+---
+
+# 2026-09-28 (latest, part 12) — proxy-provider operational contract and deterministic adapter
+
+`proxyProvider.js` was only a health/rotation placeholder and could not express
+the provider control-plane behavior named in the production handoff. It now
+defines exit inventory, regions, enable/disable, normalized health, capacity,
+exclusive leases, release, and atomic rotation. A deterministic in-memory
+adapter exercises those semantics without credentials or network side effects;
+disabled, unhealthy, full, unknown, and no-alternate cases fail closed.
+
+This is a control-contract milestone, not an exit network. The adapter is not
+registered automatically and does not open a socket, start a tunnel, or change
+phone egress. Configuration/registry wiring, durable or provider-owned lease
+state, audited admin controls, real regional nodes/IP supply, monitoring,
+metering, abuse operations, and device-originated leak verification remain.
+
+Focused regression: **8/8 passed**. Full system suite: **178 files, 1,416 tests,
+1,384 passed, 0 failed, 32 skipped** (external PostgreSQL/Redis services were not
+configured).
+
+---
+
+# 2026-09-28 (latest, part 13) — configured proxy-provider admin control plane
+
+The operational provider contract now has an explicit configuration loader and
+audited HTTP/admin surfaces. No configuration remains a valid disabled state;
+an explicit missing, oversized, malformed, duplicate, or unknown provider
+configuration fails startup. The deterministic adapter is accepted only in test
+mode or with an explicit local-development gate.
+
+Authorized operators can inspect safe exit inventory and capacity. Admins can
+enable or disable exit admission. Device-authorized proxy assigners can lease,
+rotate, and release a provider exit; their live session, capability, and device
+grant are rechecked around the asynchronous provider operation. Provider-facing
+lease IDs are stable hashes instead of raw logical device IDs. All mutations are
+audited and every response explicitly says routing was neither applied nor
+verified. The Operations UI displays health, region, capacity, and lease counts,
+scrubs them on demotion, and repeats the same routing disclaimer.
+
+This remains a locally tested control plane. The deterministic lease association
+is in-process, and no real provider adapter, regional exit infrastructure,
+durable provider lease authority, metering, or abuse operation has been selected
+or proven. Physical phone egress and leak verification remain mandatory.
+
+Focused regressions: registry/API **24/24**, provider UI **55/55**, lease/rotate/
+release **25/25**, and command accessible-name **19/19** passed. Final full
+system suite: **179 files, 1,424 tests, 1,392 passed, 0 failed, 32 skipped**
+(external PostgreSQL/Redis services were not configured).
+
+---
+
+# 2026-09-28 (latest, part 14) — reviewability pass fixed four security races
+
+The complete 67-path working tree was re-inventoried before review: 17 server
+source files, 5 client files, 30 tests, 12 documentation files, 2 maintained
+package files, and 1 repository configuration file. No runtime/build artifact or
+high-confidence secret signature was found in that set; ignored local storage,
+temporary files, dependencies, installers, and operator data remain excluded.
+
+Reviewing the new authorization and provider paths found four reproducible gaps:
+
+- file push captured the request-time operator object, so a device-grant
+  revocation during an awaited observation could still be followed by input;
+- provider exit enable/disable did not reauthorize at the provider commit point;
+- concurrent lease requests against two providers could both observe no current
+  lease and leave one provider lease orphaned;
+- ban status was persisted before ban-reason validation, so an invalid reason
+  returned 400 after partially banning the account.
+
+File push now accepts asynchronous authorization, re-resolves live identity
+after observation, and checks before every tap, text entry, and Home recovery.
+Provider mutations receive a commit-time authorization callback and all
+lease/rotate/release operations serialize per logical device. Ban metadata and
+status validate and persist in one account-store write. The CSP reporting route
+was also hardened during the same review: unauthenticated writes are rate-limited
+and only bounded, query-stripped diagnostic fields are logged; script samples are
+discarded.
+
+Focused verification: **60/60 passed** across route-level revocation, provider
+concurrency/reauthorization, atomic ban failure, CSP privacy/rate limiting, and
+the affected unit boundaries. Final full system suite: **179 files, 1,429 tests,
+1,397 passed, 0 failed, 32 skipped** (external PostgreSQL/Redis services were not
+configured). Desktop suite: **159/159 passed**. Both production dependency
+audits: **0 vulnerabilities**. `node --check` passed on all **53** changed or
+untracked JavaScript files and `git diff --check` passed. None of these checks is
+physical-device, live-routing, provider, deployment, or delivery evidence.
+
+---
+
+# 2026-09-28 (latest, part 15) — route boundaries, site revocation races, and review-ready local evidence
+
+Five bounded route families were extracted from `server/src/index.js` without
+changing their durable owners: proxy-provider administration now lives in
+`routes/proxyProviderRoutes.js`, site administration in `routes/siteRoutes.js`,
+guarded device file-push delivery in `routes/filePushRoutes.js`, network
+verification in `routes/networkCheckRoutes.js`, and media CRUD/upload in
+`routes/mediaRoutes.js`. `index.js` remains the composition root and is now
+4,392 lines (down from approximately
+4,786 at the start of this slice). The
+provider route preserves per-device serialization, commit-time authorization,
+auditing, safe logical lease identifiers, and explicit `routingApplied: false` /
+`routingVerified: false` responses.
+
+The extraction review found two site-link races. First, moving the shared hub
+origin helper into the Sites module broke file-push link issuance with a
+`ReferenceError`; the helper is now owned once by composition and injected into
+Sites. Second, a WebSocket upgrade or buffered device message authorized before
+site deletion/token rotation could complete afterward and repopulate the fleet.
+`SiteLinkHub` now assigns a per-site authorization generation to every accepted
+connection, invalidates it synchronously on deletion/rotation, and rechecks it
+after asynchronous authorization before consuming any message. Deterministic
+tests cover stale upgrades and buffered device advertisements.
+
+Operations accessibility also received a bounded improvement: role-aware
+section navigation, focusable labelled panels, a real command-input label,
+table captions, 44-pixel navigation targets, reduced-motion-aware scrolling,
+and corrected light/dark muted text contrast. Automated accessibility boundary
+tests pass. A rendered screen-reader/per-role audit is still required; the
+Windows Electron probe was stopped after it triggered the reported native
+memory-address dialog, and no physical or rendered acceptance is claimed.
+
+Focused evidence:
+
+- accessibility/security boundary set: **48/48 passed**;
+- proxy-provider route/control set: **28/28 passed**;
+- extracted file-push route/skill set: **31/31 passed**;
+- extracted network-check boundary: **51/51 passed**;
+- extracted media CRUD/upload boundary: **87/87 passed**;
+- file-push plus site authorization race set: **6/6 passed**;
+- complete `siteLink.test.js`: **14/14 passed on three consecutive runs**;
+- complete server suite: **179 files, 1,435 tests, 1,403 passed, 0 failed, 32 skipped**;
+- desktop suite: **159/159 passed**;
+- both production dependency audits: **0 vulnerabilities**;
+- `node --check`: **58/58 changed or untracked JavaScript files passed**;
+- `git diff --check`: **passed**.
+
+The current inventory is **75 paths**: 25 server source/script files, 5 client
+files, 30 tests, 12 documentation files, 2 package files, and 1 repository
+configuration file. Of these, 42 are tracked modifications and 33 are untracked
+source/test/documentation files; nothing is staged. The changed-path review
+found no runtime/build/storage artifact and no high-confidence credential
+signature. This is locally reviewable evidence, not a commit, pushed SHA,
+release, deployment, Mac build, iPhone acceptance, or security certification.
+
+Recommended commit boundaries once the owner explicitly authorizes Git work:
+
+1. live-screen/client shell, theme, Operations navigation, and accessibility tests;
+2. account/authentication, CSP/rate-limit, ban atomicity, and notification hardening;
+3. media validation and the guarded Safari/Files push path;
+4. proxy-provider contract, registry, serialized route controls, UI, and tests;
+5. Sites/PostgreSQL authority slice, site-link generation guards, and tests;
+6. WDA/process-supervision/desktop handoff behavior and acceptance documentation;
+7. productionization reports, roadmap material, package metadata, and ignore rules.
+
+`server/src/index.js` must be hunk-split across the relevant groups rather than
+assigned wholesale to one commit. No commit or push was performed.
+
+---
+
+# 2026-09-29 (latest, part 16) — commit-point authorization and host authority invariants
+
+A second complete-diff security pass concentrated on asynchronous authorization
+boundaries and authoritative state owners. The review reproduced five related
+classes of failure before changing code:
+
+- Sites create, update, token rotation, and removal could pass route
+  authorization, wait for an asynchronous repository operation, and still
+  commit after the operator session was revoked.
+- Account administration mutations used request-time authority. Session
+  invalidation and two-factor reset also allowed an admin to act on a host even
+  though host accounts are outside the admin management boundary.
+- Automatic routing and network enrollment could continue after asynchronous
+  interface discovery even if routing authority was withdrawn in the meantime.
+- Configuration accepted more than one `isMainHost` account, allowing the
+  unique top-level host authority to become ambiguous.
+- Async Sites/proxy inventory and proxy-test responses could return privileged
+  or health-mutating results after the caller lost access.
+
+The smallest durable owners now enforce those invariants. Site and operator
+account repository mutations accept an authorization callback and invoke it at
+the durable commit boundary; both the file and PostgreSQL Sites adapters follow
+the same contract. Account routes re-resolve the live operator and person
+management boundary before commit. Routing rechecks authority after discovery,
+before tunnel/PF changes, and before publishing active state; enrollment
+rechecks before persisting interface or IP identity. Routing teardown still
+finishes after revocation because cleanup is the fail-closed safety action.
+Operator configuration and `setMainHost` reject a second main host. Async Sites
+and provider reads reauthorize before returning, and proxy-test health changes
+reauthorize before mutation.
+
+Deterministic focused evidence:
+
+- Sites commit-point authorization and main-host invariant: **47/47 passed**;
+- account repository/route authorization and host hierarchy: **33/33 passed**;
+- routing/enrollment authorization boundaries: **38/38 passed**;
+- final Sites/provider stale-response and health-mutation set: **42/42 passed**.
+
+Final complete server suite: **180 files, 1,442 tests, 1,410 passed, 0 failed,
+32 skipped**. The skipped tests still require external PostgreSQL or Redis
+services and are not counted as passing. Desktop suite: **159/159 passed**.
+Both production dependency audits found **0 vulnerabilities**. `node --check`
+passed for all **66** changed or untracked JavaScript entry points;
+`git diff --check` passed; the refined high-confidence credential scan checked
+all **83** changed paths and found **0 matches**.
+
+The refreshed worktree contains **83 paths**: 30 server source/script files, 5
+client files, 33 tests, 12 documentation files, 2 package files, and 1 repository
+configuration file. There are 49 tracked modifications, 34 untracked files, and
+0 staged files. `HEAD` and `origin/main` remain equal at
+`8073f8a89e44f9c567114f470e7e24005c6c8a99`; none of this work is committed or
+pushed. The seven existing logical commit boundaries remain appropriate, with
+these authorization changes hunk-split into the Sites, account/auth, and
+network/WDA groups.
+
+This evidence is local and automated. It does not prove the PostgreSQL adapter
+against a real database, Redis behavior, a Mac build, physical iPhone/WDA or
+iproxy behavior, phone routing, provider egress, deployment, delivery, rendered
+accessibility, or production security.
+
+---
+
+# 2026-09-29 (latest, part 17) — audit and people route boundary
+
+With the P0 defects closed, the next locally eligible maintenance slice moved
+the audit and people HTTP endpoints and their response composition out of
+`server/src/index.js` into `routes/auditPeopleRoutes.js`. This is an extraction,
+not a new state owner: authorized audit reads still belong to `AuditService`;
+presence, assignments, device labels, capabilities, management hierarchy, and
+device grants remain injected from their existing owners. Getter injection
+preserves the composition root's initialization order without caching stale
+state.
+
+The focused route/service unit boundary passed **8/8**. The complete affected
+WebSocket/HTTP integration suite passed **72/72**, including authentication,
+role changes, team-scoped assignment summaries, device filtering, and audit
+filtering. The final complete server suite passed **1,413/1,445**, with **0
+failures** and **32 external PostgreSQL/Redis skips**, across **181 files**.
+Desktop remained **159/159**. Both production audits found **0
+vulnerabilities**; `node --check` passed **68/68** changed or untracked
+JavaScript files; `git diff --check` passed; and the credential scan checked all
+**85** paths with **0 high-confidence matches**.
+
+The final inventory is **85 paths**: 31 server source/script files, 5 client
+files, 34 tests, 12 documentation files, 2 package files, and 1 repository
+configuration file. There are 49 tracked modifications, 36 untracked files, and
+0 staged files. `HEAD` still equals `origin/main` at
+`8073f8a89e44f9c567114f470e7e24005c6c8a99`; no commit or push was performed.
+
+`server/src/index.js` is 4,496 lines and `client/app.js` is 4,620 lines after
+the accumulated feature and hardening work. Further extraction remains useful,
+but the next high-value proofs are gated by a disposable PostgreSQL/Redis
+environment, deployment/owner decisions, or physical Mac/iPhone hardware.
+
+---

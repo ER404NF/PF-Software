@@ -930,6 +930,14 @@ body {
   font-size: 11px;
 }
 
+.proxy-provider-heading {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid #3a3a3c;
+}
+
+.proxy-provider-heading h4 { margin: 0 0 3px; }
+
 #command-form {
   display: flex;
   gap: 8px;
@@ -1094,6 +1102,17 @@ a:focus-visible,
 summary:focus-visible {
   outline: 3px solid var(--ink);
   outline-offset: 2px;
+}
+
+body.keyboard-navigation button:focus,
+body.keyboard-navigation input:focus,
+body.keyboard-navigation select:focus,
+body.keyboard-navigation textarea:focus,
+body.keyboard-navigation a:focus,
+body.keyboard-navigation summary:focus {
+  outline: 3px solid var(--ink);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 3px var(--surface), 0 0 0 6px var(--ink);
 }
 
 button:disabled,
@@ -1839,10 +1858,23 @@ textarea:disabled { opacity: 0.48; cursor: not-allowed; }
 .user-account-actions input { min-width: 180px; flex: 1; }
 .user-account-actions button { border: 1px solid var(--ink); border-radius: 5px; background: var(--ink); color: var(--surface); }
 .user-account-actions button.danger { border-color: var(--line-strong); background: var(--surface); color: var(--ink); }
+.pending-count:empty { display: none; }
+.pending-count {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--loading);
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 700;
+  vertical-align: middle;
+}
 .user-state.approved::before { background: var(--online); }
 .user-state.pending::before { background: var(--loading); }
 .user-state.rejected::before,
 .user-state.inactive::before { background: var(--offline); }
+.user-state.banned::before { background: var(--line-strong); }
 .user-security-flag {
   margin: 4px 0;
   padding: 4px 8px;
@@ -1964,8 +1996,8 @@ textarea:disabled { opacity: 0.48; cursor: not-allowed; }
 :root[data-theme="light"] {
   color-scheme: light;
   --ink: #272a2f;
-  --muted: #747980;
-  --quiet: #9ca1a8;
+  --muted: #666b72;
+  --quiet: #6f747b;
   --line: rgba(39, 42, 47, 0.065);
   --line-strong: #d9dde1;
   --surface: rgba(252, 252, 253, 0.94);
@@ -1989,7 +2021,7 @@ textarea:disabled { opacity: 0.48; cursor: not-allowed; }
   color-scheme: dark;
   --ink: #eceef0;
   --muted: #a7abb1;
-  --quiet: #7e838a;
+  --quiet: #858a91;
   --line: rgba(255, 255, 255, 0.065);
   --line-strong: #3d4147;
   --surface: rgba(31, 33, 37, 0.94);
@@ -2017,6 +2049,18 @@ body {
   font-size: 14px;
   line-height: 1.55;
   letter-spacing: 0;
+}
+
+.visually-hidden {
+  position: absolute !important;
+  width: 1px !important;
+  height: 1px !important;
+  padding: 0 !important;
+  margin: -1px !important;
+  overflow: hidden !important;
+  clip: rect(0, 0, 0, 0) !important;
+  white-space: nowrap !important;
+  border: 0 !important;
 }
 
 h1,
@@ -2265,6 +2309,40 @@ button:not(:disabled):active { transform: translateY(1px); }
 #detail-title { font-size: 26px; font-weight: 600; }
 .admin-heading p { max-width: 640px; font-size: 13px; line-height: 1.6; }
 
+#operations-nav {
+  display: flex;
+  max-width: 1120px;
+  align-items: center;
+  gap: 8px;
+  margin: -8px 0 20px;
+  padding: 10px;
+  overflow-x: auto;
+  border: 1px solid var(--line-strong);
+  border-radius: 16px;
+  background: var(--surface);
+  box-shadow: var(--shadow-soft);
+}
+
+#operations-nav > span { flex: none; padding: 0 6px; color: var(--muted); font-size: 12px; font-weight: 650; }
+#operations-nav a {
+  display: inline-flex;
+  min-height: 44px;
+  flex: none;
+  align-items: center;
+  padding: 0 14px;
+  border-radius: 12px;
+  color: var(--ink);
+  font-size: 12px;
+  font-weight: 600;
+  text-decoration: none;
+}
+#operations-nav a:hover { background: var(--soft-strong); }
+#operations-nav a[aria-current="page"] { background: var(--ink); color: var(--surface); }
+#operations-nav a:focus-visible { outline: 3px solid var(--ink); outline-offset: -3px; }
+.admin-panel { scroll-margin-top: 18px; }
+.admin-panel:focus { outline: none; }
+.admin-panel:focus-visible { outline: 3px solid var(--ink); outline-offset: 3px; }
+
 .admin-panel,
 .assignment-card,
 .user-card,
@@ -2443,6 +2521,7 @@ button:not(:disabled):active { transform: translateY(1px); }
   #detail-device-facts > .device-facts-primary { grid-template-columns: 1fr; }
   .device-facts-secondary-grid .device-fact { grid-template-columns: 1fr; gap: 3px; }
   .admin-panel { padding: 17px; }
+  #operations-nav { margin-inline: -5px; }
   .fleet-group-heading::after,
   .fleet-grid::before,
   .device-card::before { display: none; }

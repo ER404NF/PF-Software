@@ -1,18 +1,21 @@
 import express from "express";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import session from "express-session";
 import multer from "multer";
 import { WebSocketServer } from "ws";
 import { createServer, ServerResponse } from "http";
 import path from "path";
 import fs from "fs";
-import { randomUUID } from "crypto";
+import { createHmac, randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import { isDirectExecution } from "./directExecution.js";
 import { WdaDevice } from "./wdaDevice.js";
 import { StreamHub } from "./streamHub.js";
 import { frameKind } from "./mjpegParser.js";
-import { SiteError } from "./siteStore.js";
 import { createFileSiteRepository } from "./persistence/fileSiteRepository.js";
+import { createPostgresSiteRepository } from "./db/repositories/postgresSiteRepository.js";
+import { resolveDurableRepositoryConfig } from "./durableRepositoryConfig.js";
 import { SiteLinkHub } from "./siteLink.js";
 import { ApprovalError } from "./approvalStore.js";
 import { createFileApprovalRepository } from "./persistence/fileApprovalRepository.js";
@@ -22,7 +25,10 @@ import { PolicyStore } from "./policyStore.js";
 import { createFileInterventionRepository } from "./persistence/fileInterventionRepository.js";
 import { createFleetPolicy, fleetConfigFromEnv, SpendTracker } from "./fleetPolicy.js";
 import { ACTIONS as ALL_ACTIONS } from "./actionCatalog.js";
-import { STORAGE_ROOT, safeFilename, safeDeviceId, assertMediaStorageIsolated } from "./fileStore.js";
+import {
+  STORAGE_ROOT, safeFilename, safeDeviceId, assertMediaStorageIsolated,
+  rejectedMediaUploadReason,
+} from "./fileStore.js";
 import { createFileDeviceMediaRepository } from "./persistence/fileDeviceMediaRepository.js";
 import { createFileResearchRunRepository } from "./persistence/fileResearchRunRepository.js";
 import { parseOptimizationConfig, createOptimizationRuntime } from "./optimizationRuntime.js";
@@ -34,7 +40,20 @@ import {
   assertValidUsername,
   flagAndDeactivateOperator,
   hashPassword, validatePassword,
+  recordOperatorLoginIp,
+  normalizeGmail,
 } from "./authStore.js";
+import { createBanStore } from "./banStore.js";
+import { createFilePushLinkStore } from "./filePushLinkStore.js";
+import { registerFilePushRoutes } from "./routes/filePushRoutes.js";
+import { registerMediaRoutes } from "./routes/mediaRoutes.js";
+import { logOperationalFailure } from "./safeOperationalLog.js";
+import { registerNetworkCheckRoutes } from "./routes/networkCheckRoutes.js";
+import { registerHealthRoutes } from "./routes/healthRoutes.js";
+import { registerMetricsRoutes } from "./routes/metricsRoutes.js";
+import { checkDatabaseHealth } from "./db/health.js";
+import { createHttpMetrics } from "./httpMetrics.js";
+import { sendRoutingHttpFailure } from "./routingHttpError.js";
 import { CAPABILITIES } from "./roleCapabilities.js";
 import { researchWorkspaceFor, researchAccounts, researchAccountDefinitions, researchActionPolicies } from "./researchAccess.js";
 import { createFileAuditEventRepository } from "./persistence/fileAuditEventRepository.js";
@@ -54,6 +73,17 @@ import { loadDeviceNetworkMap, publicNetworkConfig } from "./deviceNetworkConfig
 import { isProxyEgress, setDeviceProxyEnabled } from "./deviceNetworkStore.js";
 import { publicProxy, decryptProxyPassword } from "./proxyPool.js";
 import { createFileProxyPoolRepository } from "./persistence/fileProxyPoolRepository.js";
+import { loadProxyProviderRegistry } from "./proxyProviderRegistry.js";
+import { registerProxyProviderRoutes } from "./routes/proxyProviderRoutes.js";
+import { registerProxyPoolRoutes } from "./routes/proxyPoolRoutes.js";
+import { registerSiteRoutes } from "./routes/siteRoutes.js";
+import { registerAuditPeopleRoutes } from "./routes/auditPeopleRoutes.js";
+import { registerPrivacyRoutes } from "./routes/privacyRoutes.js";
+import { registerSessionAccountRoutes } from "./routes/sessionAccountRoutes.js";
+import { createAssignmentAccess, registerAssignmentRoutes } from "./routes/assignmentRoutes.js";
+import { createPrivacyRequestStore } from "./privacyRequestStore.js";
+import { createPrivacyDeletionProcessor } from "./privacyDeletionProcessor.js";
+import { createPrivacyDataExport } from "./privacyDataExport.js";
 import { testProxy } from "./proxyTester.js";
 import { createNetworkVerifier } from "./networkVerifier.js";
 import { resolveNetworkCheckTarget } from "./networkCheckTarget.js";
@@ -122,6 +152,11 @@ const deployment = resolveDeploymentConfig(process.env, {
   enforceStartup: Boolean(isMain),
   hasMockDevices: rawDeviceConfig.devices?.some(device => device?.type === "mock"),
 });
+const hubOrigin = req => deployment.publicUrl
+  ? String(deployment.publicUrl).replace(/\/+$/, "")
+  : `${req.protocol}://${req.get("host")}`;
+const durableRepositories = resolveDurableRepositoryConfig(process.env);
+const applicationDatabasePool = durableRepositories.requiresDatabase ? createPool() : null;
 
 // One explicit scheduling timezone for /time wall-clock input (PHONE_FARM_TIMEZONE,
 // default America/Los_Angeles) — never whatever zone the OS/process happens to be in.
@@ -130,11 +165,125 @@ const schedulingTimeZone = resolveSchedulingTimeZone(process.env);
 
 const app = express();
 if (deployment.trustProxy) app.set("trust proxy", 1);
+const httpMetrics = createHttpMetrics();
+app.use(httpMetrics.middleware);
+// Production-readiness audit §7: these headers previously existed only in
+// deploy/hub/Caddyfile, for the VPS deployment path — a Railway deployment
+// (the currently leading hosting option; Railway terminates TLS itself and
+// never runs Caddy) would have shipped with none of them. Setting them in
+// the app itself means they apply regardless of which hosting option is
+// chosen; the Caddy versions stay as redundant defense-in-depth on the VPS
+// path. Deliberately not helmet's bare defaults: this app serves its own
+// same-origin WebSocket (frame/control) traffic and renders phone frames via
+// blob: object URLs (phoneStage.js's browserDecode()), both of which a
+// generic default CSP would block.
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"],
+      styleSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "blob:"],
+      connectSrc: ["'self'"], // covers same-origin ws:/wss: per the CSP spec
+      objectSrc: ["'none'"],
+      baseUri: ["'self'"],
+      formAction: ["'self'"],
+      frameAncestors: ["'none'"],
+      // Independent re-verification pass on the production-readiness audit
+      // (2026-09-27, second pass) flagged this as the one reasonable next
+      // layer of polish for §7: without it, a future accidental policy
+      // mismatch (e.g. a new client feature needing a source this policy
+      // doesn't allow) only surfaces if someone happens to check the
+      // browser console manually, the way this project's own verification
+      // passes have had to so far. `report-uri` rather than the newer
+      // Reporting API's `report-to`/`Reporting-Endpoints` header pair —
+      // simpler, and still honored by every browser that sends CSP reports
+      // at all. See the /api/csp-report route below.
+      reportUri: ["/api/csp-report"],
+    },
+  },
+  // This app is same-origin-only (no cross-origin resource embedding of any
+  // kind); COEP/CORP defaults are unnecessary friction here and not what
+  // this fix is about — leave them off rather than debug unrelated
+  // cross-origin isolation breakage.
+  crossOriginEmbedderPolicy: false,
+  crossOriginResourcePolicy: false,
+}));
 app.use(express.static(clientDir));
-// Liveness probe for Docker / uptime monitors. Deliberately unauthenticated and
-// revealing nothing but "the process is answering".
-app.get("/healthz", (req, res) => res.json({ ok: true }));
+registerHealthRoutes({ app, databasePool: applicationDatabasePool, checkDatabaseHealth });
+registerMetricsRoutes({ app, httpMetrics, bearerToken: process.env.METRICS_BEARER_TOKEN || null });
 app.use(express.json());
+
+// The helmet() CSP's own reportUri target above. Browsers send these with
+// Content-Type: application/csp-report (or, for the newer Reporting API,
+// application/reports+json) — neither matches the plain express.json()
+// above (which only reads application/json bodies), so this route parses
+// its own body rather than relying on that global parser having already
+// done it. Deliberately unauthenticated, like /healthz: a violation can
+// happen on the login page itself, before any session exists. Treat the
+// body as hostile, though: browsers may include query strings or a script
+// sample, so retain only bounded diagnostic fields and strip URL secrets.
+// auditLog is defined further down this file but not called until a real
+// request arrives, by which point the whole module has finished loading —
+// same forward-reference pattern every other route below already relies on.
+const cspReportLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: Number(process.env.CSP_REPORT_RATE_LIMIT_MAX) || 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "too many CSP reports", code: "RATE_LIMITED" },
+});
+
+function boundedCspText(value, maxLength = 500) {
+  return typeof value === "string" ? value.slice(0, maxLength) : null;
+}
+
+function cspUrlWithoutSecrets(value) {
+  const text = boundedCspText(value, 2_048);
+  if (!text) return null;
+  try {
+    const parsed = new URL(text);
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString().slice(0, 2_048);
+  } catch {
+    return text.slice(0, 500);
+  }
+}
+
+function safeCspReport(report) {
+  if (!report || typeof report !== "object" || Array.isArray(report)) return null;
+  const safe = {
+    documentUri: cspUrlWithoutSecrets(report["document-uri"] ?? report.documentURL),
+    blockedUri: cspUrlWithoutSecrets(report["blocked-uri"] ?? report.blockedURL),
+    sourceFile: cspUrlWithoutSecrets(report["source-file"] ?? report.sourceFile),
+    referrer: cspUrlWithoutSecrets(report.referrer),
+    effectiveDirective: boundedCspText(report["effective-directive"] ?? report.effectiveDirective),
+    violatedDirective: boundedCspText(report["violated-directive"] ?? report.violatedDirective),
+    disposition: boundedCspText(report.disposition, 50),
+    lineNumber: Number.isSafeInteger(report["line-number"] ?? report.lineNumber)
+      ? report["line-number"] ?? report.lineNumber : null,
+    columnNumber: Number.isSafeInteger(report["column-number"] ?? report.columnNumber)
+      ? report["column-number"] ?? report.columnNumber : null,
+    statusCode: Number.isSafeInteger(report["status-code"] ?? report.statusCode)
+      ? report["status-code"] ?? report.statusCode : null,
+  };
+  return Object.fromEntries(Object.entries(safe).filter(([, value]) => value !== null));
+}
+
+app.post("/api/csp-report", cspReportLimiter, express.json({
+  type: ["application/csp-report", "application/json", "application/reports+json"],
+}), (req, res) => {
+  const report = req.body?.["csp-report"]
+    ?? (Array.isArray(req.body) ? req.body[0]?.body : null)
+    ?? req.body ?? null;
+  const safeReport = safeCspReport(report);
+  if (safeReport) {
+    console.error("CSP violation report:", JSON.stringify(safeReport));
+    logAuditBestEffort({ operator: "system", type: "csp_violation", detail: safeReport }, "CSP violation audit write");
+  }
+  res.status(204).end();
+});
 
 // Env-overridable (not just a fixed path like fileStore.js/researchStore.js)
 // so tests can point these at a disposable temp location instead of the real
@@ -151,9 +300,33 @@ assertMediaStorageIsolated([
 ]);
 const auditEventRepository = createFileAuditEventRepository(auditLogPath);
 const auditLog = createAuditService({ repository: auditEventRepository, canAccessDevice });
+
+function logAuditBestEffort(event, context = "Audit log write") {
+  try {
+    auditLog.logEvent(event);
+    return true;
+  } catch {
+    // The requested authorization outcome or durable mutation remains the
+    // authoritative result. Audit storage degradation is an operational
+    // incident, but must not turn a denial into 500 or make a committed
+    // identity change look as though it failed. Do not include the thrown
+    // message here: a repository error can contain a storage path or data.
+    console.error(`${context} failed`);
+    return false;
+  }
+}
+
 const deviceMediaRepository = createFileDeviceMediaRepository();
 const operatorAccountRepository = createFileOperatorAccountRepository();
 const operatorAccountService = createOperatorAccountService({ repository: operatorAccountRepository });
+const privacyRequestStore = createPrivacyRequestStore({
+  storePath: process.env.PRIVACY_REQUEST_STORE_PATH || path.join(__dirname, "../../storage/privacy-requests.json"),
+});
+let privacyDeletionPolicy = null;
+if (process.env.PRIVACY_DELETION_POLICY_JSON) {
+  try { privacyDeletionPolicy = JSON.parse(process.env.PRIVACY_DELETION_POLICY_JSON); }
+  catch { console.error("Privacy deletion policy is invalid JSON; processing is disabled"); }
+}
 const operatorIdentityRepository = createFileOperatorIdentityRepository();
 const identityService = createIdentityService({ repository: operatorIdentityRepository, verifyPassword });
 const backgroundAuthorizationRepository = createFileBackgroundAuthorizationRepository();
@@ -163,6 +336,16 @@ const accountNotificationStore = createFileNotificationRepository({
   storePath: process.env.ACCOUNT_NOTIFICATION_STORE_PATH || path.join(__dirname, "../../storage/notifications/accounts.json"),
   companyEmail: process.env.COMPANY_FROM_EMAIL || null,
   encryptionKey: process.env.ACCOUNT_NOTIFICATION_ENCRYPTION_KEY || twoFactorMasterKey,
+});
+const banStore = createBanStore({
+  storePath: process.env.BAN_STORE_PATH || path.join(__dirname, "../../storage/security/ip-bans.json"),
+});
+// P4 build (docs/productionization/P4_DEVICE_PUSH_BUILD.md): the phone's own
+// on-device Safari must never receive a real operator session cookie, so it
+// authenticates with a short-lived single-use token instead (see the
+// GET /d/:token route below).
+const filePushLinkStore = createFilePushLinkStore({
+  storePath: process.env.FILE_PUSH_LINK_STORE_PATH || path.join(__dirname, "../../storage/security/file-push-links.json"),
 });
 const mailSender = createMailSender({
   host: process.env.SMTP_HOST || null,
@@ -186,8 +369,17 @@ async function deliverAccountNotification(id) {
     await mailSender.send({ to: content.to, from: content.from, subject: content.subject, body: content.body });
     return accountNotificationStore.markSent(id);
   } catch (error) {
-    console.error("Account notification email send failed:", error);
-    return accountNotificationStore.markFailed(id);
+    logOperationalFailure("Account notification email send failed", error);
+    try {
+      return accountNotificationStore.markFailed(id);
+    } catch (persistenceError) {
+      // The account mutation is already committed and the SMTP attempt has
+      // already failed. Preserve that result even if recording the delivery
+      // failure also encounters a storage outage; reconciliation can inspect
+      // the still-queued outbox entry later.
+      logOperationalFailure("Account notification failure-state write failed", persistenceError);
+      return { id, deliveryState: "pending_reconciliation" };
+    }
   }
 }
 // Same "default to the shared 2FA master key, allow a dedicated override"
@@ -198,6 +390,7 @@ const proxyCredentialEncryptionKey = process.env.PROXY_CREDENTIAL_ENCRYPTION_KEY
 // below (NetworkRoutingOrchestrator, AutoNetworkEnrollment) constructs its
 // own proxyPool.js access directly and is out of scope for this repository.
 const proxyPoolRepository = createFileProxyPoolRepository(proxyPoolStorePath);
+const proxyProviderRegistry = loadProxyProviderRegistry();
 // Cached like `deviceNetwork` below, not re-read from disk on every
 // summary() call — refreshed explicitly after each pool mutation route.
 let proxyPoolCache = proxyPoolRepository.publicList();
@@ -222,6 +415,7 @@ const usbNetworkCache = new Map(Object.entries(loadUsbNetworkRecords(usbNetworkS
 function refreshUsbNetworkCache(deviceId) { usbNetworkCache.set(deviceId, getUsbNetworkRecord(usbNetworkStorePath, deviceId)); }
 function usbNetworkForDevice(deviceId) { return usbNetworkCache.get(deviceId) ?? null; }
 const recoveryThrottle = createRecoveryThrottle();
+const privacyRequestThrottle = createRecoveryThrottle({ windowMs: 60 * 60_000, accountLimit: 3, ipLimit: 10 });
 const passwordLoginThrottle = createAuthenticationThrottle({ accountLimit: 5, ipLimit: 25 });
 const secondFactorThrottle = createAuthenticationThrottle({ accountLimit: 5, ipLimit: 25 });
 const signupThrottle = createAuthenticationThrottle({ windowMs: 60 * 60_000, accountLimit: 2, ipLimit: 10 });
@@ -249,6 +443,79 @@ const sessionParser = session({
 });
 app.use(sessionParser);
 
+// Production-readiness audit §8: login/2FA/signup/recovery already have
+// their own, real, tested per-account+per-IP throttling
+// (createAuthenticationThrottle) — this is the gap next to it: ordinary API
+// routes (/api/devices/*, /api/research/*, file upload/download) had no
+// general request-rate limiter at all, so a signed-in (or compromised)
+// account could hammer them as fast as the network allowed. Keyed by
+// operator username when signed in, not IP: this fleet's VAs can share one
+// office/NAT IP per hub (same reasoning as banStore.js's login exemption in
+// the other handout), so an IP-keyed limit would risk one abusive/broken
+// session collaterally throttling every coworker on the same network. Only
+// truly unauthenticated requests (no session yet) fall back to per-IP.
+// Limit is deliberately generous — this guards against abuse, not normal
+// use, which is already naturally rate-limited by human reaction time.
+const generalApiLimiter = rateLimit({
+  windowMs: Number(process.env.API_RATE_LIMIT_WINDOW_MS) || 60_000,
+  limit: Number(process.env.API_RATE_LIMIT_MAX) || 300,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.session?.operator?.username || req.ip,
+  message: { error: "too many requests; slow down", code: "RATE_LIMITED" },
+});
+app.use("/api", generalApiLimiter);
+
+// Production-readiness audit §1: sameSite: "lax" (the session cookie's own
+// config, above) already blocks the classic cross-site POST vector, but
+// that is not the same guarantee as an explicit CSRF defense, and doesn't
+// help if a route is ever changed to accept GET for a state-changing
+// action. This adds Origin/Referer verification — OWASP's own recommended
+// alternative to a token when a codebase's existing request patterns make
+// full token plumbing impractical (here, ~20 test files' worth of hand-
+// rolled fetch() helpers would need touching for a token, for no gain in
+// this app's actual threat model). A browser cannot be made to omit or
+// spoof the Origin header on a cross-origin state-changing request — that
+// is intrinsic, un-overridable browser behavior, not something a hostile
+// page's JS/HTML controls — so a forged cross-site POST riding the
+// victim's ambient session cookie always carries the *attacker's* origin,
+// never this server's own, and is rejected here specifically because of
+// that mismatch. A request with no Origin/Referer at all (every existing
+// test in this suite, and any non-browser API client) is allowed through
+// unaffected: CSRF is fundamentally a browser-only threat model, and a
+// browser making a real cross-origin state-changing request always sets one.
+//
+// Deliberately scoped to session-cookie-authenticated requests only
+// (req.session.operator already set): the site-agent path (siteLink.js) and
+// the M04 cloud API (createCloudApi.js) authenticate via a site token /
+// bearer token, never req.session.operator, so they never reach this check
+// at all — matching the audit's own scoping ("routes reachable from the
+// browser session, not the site-agent/API-key path"). Login, signup, the
+// loopback host-bootstrap route, and the 2FA verification step all run
+// before a session operator exists, so they're naturally exempt too: none
+// of them is exploitable via CSRF (an attacker forging a login just signs
+// the victim's browser into whatever account the attacker controls, never
+// a state change on the victim's own existing account; 2FA verification
+// requires a real, ephemeral code the attacker can't guess).
+const STATE_CHANGING_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+function requestOrigin(req) {
+  const origin = req.get("Origin");
+  if (origin) return origin;
+  const referer = req.get("Referer");
+  if (!referer) return null;
+  try { return new URL(referer).origin; } catch { return null; }
+}
+app.use("/api", (req, res, next) => {
+  if (!req.session?.operator || !STATE_CHANGING_METHODS.has(req.method)) return next();
+  const origin = requestOrigin(req);
+  if (!origin || origin === `${req.protocol}://${req.get("host")}`) return next();
+  logAuditBestEffort({
+    operator: req.session.operator.username, type: "csrf_check_failed",
+    detail: { method: req.method, path: req.path, origin },
+  }, "CSRF rejection audit write");
+  res.status(403).json({ error: "cross-origin request rejected", code: "CSRF_REJECTED" });
+});
+
 function completeLogin(req, res, operator, { secondFactor = null } = {}) {
   req.session.operator = { username: operator.username, authVersion: operator.authVersion ?? 0 };
   delete req.session.pendingAuth;
@@ -259,7 +526,18 @@ function completeLogin(req, res, operator, { secondFactor = null } = {}) {
     username: operator.username,
     expiresAt: req.session.cookie.expires,
   });
-  auditLog.logEvent({ operator: operator.username, type: "login_success", detail: secondFactor ? { secondFactor } : {} });
+  try {
+    recordOperatorLoginIp(operator.username, req.ip);
+  } catch (error) {
+    // This history only seeds a later defense-in-depth IP ban. Authentication
+    // has already succeeded and must not become an ambiguous 500 because
+    // optional security bookkeeping is temporarily unavailable.
+    logOperationalFailure("Login IP bookkeeping failed", error);
+  }
+  logAuditBestEffort(
+    { operator: operator.username, type: "login_success", detail: secondFactor ? { secondFactor } : {} },
+    "Login audit write",
+  );
   passwordLoginThrottle.succeed({ identifier: operator.username });
   secondFactorThrottle.succeed({ identifier: operator.username });
   res.json(publicOperator(operator));
@@ -283,7 +561,10 @@ function rejectSecondFactorAttempt(req, res, message) {
   if (blocked) {
     delete req.session.pendingAuth;
     delete req.session.twoFactorEnrollmentSecret;
-    auditLog.logEvent({ operator: challenge.username, type: "two_factor_rate_limited" });
+    logAuditBestEffort(
+      { operator: challenge.username, type: "two_factor_rate_limited" },
+      "Two-factor rate-limit audit write",
+    );
     return res.status(429).json({ error: "too many two-factor attempts; try again later" });
   }
   return res.status(401).json({ error: message });
@@ -291,6 +572,7 @@ function rejectSecondFactorAttempt(req, res, message) {
 
 app.post("/api/signup", async (req, res, next) => {
   try {
+    if (banStore.isBanned(req.ip)) return res.status(403).json({ code: "ip_banned", error: "access denied" });
     const identifier = req.body?.email || req.body?.username;
     if (signupThrottle.blocked({ identifier, ip: req.ip })) {
       return res.status(429).json({ error: "too many account applications; try again later" });
@@ -299,7 +581,26 @@ app.post("/api/signup", async (req, res, next) => {
     if (capacity.atCapacity) return res.status(503).json({ error: "account applications are temporarily closed" });
     const operator = await identityService.createSignupAccount(req.body);
     signupThrottle.fail({ identifier, ip: req.ip });
-    auditLog.logEvent({ operator: operator.username, type: "signup_submitted" });
+    // The account mutation is already durable. Audit/outbox degradation is
+    // operationally important, but must not be reported as if signup itself
+    // failed and invite a duplicate retry against the committed username.
+    logAuditBestEffort({ operator: operator.username, type: "signup_submitted" }, "Signup audit write");
+    // Fire-and-forget, same convention as /api/recovery/request just above:
+    // the applicant already has their answer in this HTTP response either
+    // way, so a slow or failed SMTP send must never hold up or fail the
+    // signup itself. createSignupAccount() requires a real email, so this
+    // is not conditional on one existing the way account review's queue()
+    // call is (an operator created before email became mandatory).
+    if (operator.email) {
+      try {
+        const notification = accountNotificationStore.queue({
+          to: operator.email, fullName: operator.fullName || operator.username, username: operator.username, status: "received",
+        });
+        deliverAccountNotification(notification.id);
+      } catch (error) {
+        logOperationalFailure("Signup notification queue failed", error);
+      }
+    }
     res.status(201).json({
       status: "pending",
       message: "Application received. An administrator must accept it before sign-in.",
@@ -346,11 +647,11 @@ app.post("/api/setup/create-admin", async (req, res, next) => {
           "attempted the host bootstrap endpoint after an admin already existed"
         );
         if (flagged) {
-          auditLog.logEvent({
+          logAuditBestEffort({
             operator: current.username,
             type: "self_escalation_attempt_blocked",
             detail: { method: req.method, path: req.path },
-          });
+          }, "Host bootstrap self-escalation audit write");
         }
       }
       return res.status(404).json({ error: "not found" });
@@ -364,7 +665,11 @@ app.post("/api/setup/create-admin", async (req, res, next) => {
       email: req.body?.email ?? null,
       twoFactorRequired: true,
     });
-    auditLog.logEvent({ operator: operator.username, type: "host_bootstrap_admin_created" });
+    // The first administrator is already durable and the bootstrap route is
+    // now permanently locked. Report the successful commit accurately even
+    // if the audit sink needs operator repair.
+    logAuditBestEffort({ operator: operator.username, type: "host_bootstrap_admin_created" },
+      "Host bootstrap audit write");
     res.status(201).json({ operator });
   } catch (error) {
     if (error?.status) return res.status(error.status).json({ error: error.message });
@@ -374,17 +679,29 @@ app.post("/api/setup/create-admin", async (req, res, next) => {
 
 app.post("/api/login", async (req, res, next) => {
   try {
+    // The IP blocklist is deliberately NOT checked here, only at /api/signup:
+    // this team can share one office/NAT IP per hub (see docs/productionization),
+    // and the banned account itself is already fully blocked below via
+    // accountStatus === "banned" regardless of IP. Also gating login on IP
+    // would risk locking out every legitimate coworker on the same network
+    // as whoever was banned, for no real extra security — the login route's
+    // own credential/2FA checks are the actual barrier for every OTHER
+    // account. The blocklist's job is narrower: stop the banned person from
+    // re-registering a fresh identity from that same address.
     const { username, password } = req.body || {};
     if (typeof username !== "string" || typeof password !== "string" || username.length > 100) {
       return res.status(400).json({ error: "username and password are required" });
     }
     if (passwordLoginThrottle.blocked({ identifier: username, ip: req.ip })) {
-      auditLog.logEvent({ operator: username, type: "login_rate_limited" });
+      logAuditBestEffort(
+        { operator: username, type: "login_rate_limited" },
+        "Login rate-limit audit write",
+      );
       return res.status(429).json({ error: "too many sign-in attempts; try again later" });
     }
     const operator = await identityService.authenticatePassword(username, password);
     if (!operator) {
-      auditLog.logEvent({ operator: username, type: "login_failed" });
+      logAuditBestEffort({ operator: username, type: "login_failed" }, "Failed-login audit write");
       if (passwordLoginThrottle.fail({ identifier: username, ip: req.ip })) {
         return res.status(429).json({ error: "too many sign-in attempts; try again later" });
       }
@@ -393,6 +710,7 @@ app.post("/api/login", async (req, res, next) => {
     passwordLoginThrottle.succeed({ identifier: username });
     if (operator.accountStatus === "pending") return res.status(403).json({ code: "approval_pending", error: "account approval is pending" });
     if (operator.accountStatus === "rejected") return res.status(403).json({ code: "account_rejected", error: "account application was not accepted" });
+    if (operator.accountStatus === "banned") return res.status(403).json({ code: "account_banned", error: "account is banned" });
     if (operator.active === false) return res.status(401).json({ error: "invalid credentials" });
     if (operator.twoFactorRequired) {
       if (secondFactorThrottle.blocked({ identifier: operator.username, ip: req.ip })) {
@@ -440,7 +758,7 @@ app.post("/api/2fa/confirm", async (req, res, next) => {
       encryptTotpSecret(secret, twoFactorMasterKey),
       recoveryCodes.map(recoveryCodeDigest),
     );
-    auditLog.logEvent({ operator: operator.username, type: "two_factor_enabled" });
+    logAuditBestEffort({ operator: operator.username, type: "two_factor_enabled" }, "Two-factor enrollment audit write");
     const current = await identityService.getIdentityRecord(operator.username);
     if (!current) return res.status(401).json({ error: "2FA enrollment has expired" });
     req.session.twoFactorRecoveryReceipt = encryptTotpSecret(JSON.stringify(recoveryCodes), twoFactorMasterKey);
@@ -476,7 +794,10 @@ app.post("/api/2fa/acknowledge-recovery", async (req, res, next) => {
     if (!operator || !req.session?.twoFactorRecoveryReceipt) {
       return res.status(401).json({ error: "2FA recovery-code receipt has expired" });
     }
-    auditLog.logEvent({ operator: operator.username, type: "two_factor_recovery_acknowledged" });
+    logAuditBestEffort(
+      { operator: operator.username, type: "two_factor_recovery_acknowledged" },
+      "Two-factor recovery acknowledgement audit write",
+    );
     completeLogin(req, res, operator, { secondFactor: "enrollment" });
   } catch (error) {
     next(error);
@@ -506,19 +827,31 @@ app.post("/api/recovery/request", async (req, res, next) => {
       ? await identityService.createEmailRecoveryToken(identifier)
       : null;
     if (recovery?.token) {
-      const item = accountNotificationStore.queue({
-        to: recovery.operator.email,
-        fullName: recovery.operator.fullName || recovery.operator.username,
-        username: recovery.operator.username,
-        status: "recovery",
-        recoveryToken: recovery.token,
-      });
-      // Deliberately not awaited: awaiting a real SMTP round-trip here would
-      // make a matching identifier's response measurably slower than a
-      // non-matching one, turning this endpoint's identical response message
-      // into an account-enumeration timing side channel. deliverAccountNotification
-      // never rejects (its own try/catch marks the notification failed instead).
-      deliverAccountNotification(item.id);
+      try {
+        const item = accountNotificationStore.queue({
+          to: recovery.operator.email,
+          fullName: recovery.operator.fullName || recovery.operator.username,
+          username: recovery.operator.username,
+          status: "recovery",
+          recoveryToken: recovery.token,
+        });
+        // Deliberately not awaited: awaiting a real SMTP round-trip here would
+        // make a matching identifier's response measurably slower than a
+        // non-matching one, turning this endpoint's identical response message
+        // into an account-enumeration timing side channel. deliverAccountNotification
+        // never rejects (its own try/catch marks the notification failed instead).
+        deliverAccountNotification(item.id);
+      } catch (error) {
+        // Token persistence happened before the cross-store outbox write. Roll
+        // back only this exact generated token so a retry can issue a fresh one
+        // instead of being trapped behind an undeliverable 30-minute token.
+        try {
+          await identityService.discardEmailRecoveryToken(recovery.token);
+        } catch (rollbackError) {
+          logOperationalFailure("Recovery token rollback failed", rollbackError);
+        }
+        logOperationalFailure("Recovery notification queue failed", error);
+      }
     }
     res.json({ ok: true, message: "If the account is eligible, recovery instructions have been queued." });
   } catch (error) {
@@ -529,8 +862,11 @@ app.post("/api/recovery/request", async (req, res, next) => {
 app.post("/api/recovery/complete", async (req, res, next) => {
   try {
     const operator = await identityService.completeEmailRecovery(req.body?.token, req.body?.password, req.body?.passwordConfirmation);
-    auditLog.logEvent({ operator: operator.username, type: "account_recovered" });
+    // The password/authVersion mutation is already committed. Revoke live
+    // sessions before any best-effort side effect so audit degradation cannot
+    // leave an old browser or WebSocket active after recovery succeeded.
     revokeLiveOperatorSessions(operator.username);
+    logAuditBestEffort({ operator: operator.username, type: "account_recovered" }, "Account recovery audit write");
     res.json({ ok: true, requiresTwoFactorSetup: true });
   } catch (error) {
     if (error?.status) return res.status(error.status).json({ error: error.message });
@@ -538,24 +874,120 @@ app.post("/api/recovery/complete", async (req, res, next) => {
   }
 });
 
-app.post("/api/logout", (req, res) => {
-  const username = req.session.operator?.username ?? null;
-  presenceStore.removeSession(req.sessionID);
-  broadcastPresence();
-  // Revoke synchronously before destroying storage, so queued commands and
-  // an in-flight session lookup cannot authorize another action.
-  for (const ws of wss.clients) {
-    if (ws.sessionId === req.sessionID) ws.invalidateSession();
-  }
-  req.session.destroy((error) => {
-    if (error) return res.status(500).json({ error: "Could not destroy session" });
-    if (username) auditLog.logEvent({ operator: username, type: "logout" });
-    res.json({ ok: true });
-  });
+const privacyTombstone = requestId => `deleted-${createHmac("sha256", SESSION_SECRET)
+  .update(`privacy-request:${requestId}`).digest("hex").slice(0, 24)}`;
+const privacyDeletionProcessor = createPrivacyDeletionProcessor({
+  requestStore: privacyRequestStore,
+  policy: privacyDeletionPolicy,
+  resolveTombstone: async ({ requestId, tombstone }) => {
+    const candidate = tombstone ?? privacyTombstone(requestId);
+    const existing = await operatorAccountService.getAccount(candidate);
+    if (existing && !(existing.privacyDeletionState === "completed"
+      && existing.privacyDeletionRequestId === requestId)) {
+      const error = new Error("privacy deletion tombstone unavailable");
+      error.code = "tombstone_collision";
+      error.status = 409;
+      throw error;
+    }
+    return candidate;
+  },
+  operations: {
+    access: {
+      plan: async () => ({ accounts: 1 }),
+      apply: async ({ username }) => {
+        await operatorAccountService.invalidateSessions(username);
+        revokeLiveOperatorSessions(username);
+        return { accounts_revoked: 1 };
+      },
+    },
+    account: {
+      plan: async ({ username, tombstone, requestId }) => ({ accounts:
+        (await operatorAccountService.getAccount(username))
+          || (tombstone && (await operatorAccountService.getAccount(tombstone))?.privacyDeletionRequestId === requestId) ? 1 : 0 }),
+      apply: async ({ username, tombstone, requestId, authorize }) => {
+        await operatorAccountService.finalizePrivacyDeletion(username, tombstone, requestId, { authorize });
+        return { accounts_anonymized: 1 };
+      },
+    },
+    assignments: {
+      plan: async ({ username, mode }) => ({ matched: mode === "retain" ? 0
+        : assignmentStore.list().filter(item => item.assignee === username || item.createdBy === username).length }),
+      apply: async ({ username, tombstone, mode }) => {
+        if (mode === "retain") return { retained: 0 };
+        const matched = assignmentStore.list().filter(item => item.assignee === username || item.createdBy === username).length;
+        assignmentStore.renamePrincipal(username, tombstone, tombstone);
+        return { anonymized_references: matched };
+      },
+    },
+    tasks: {
+      plan: async ({ username, mode }) => ({ matched: mode === "retain" ? 0
+        : taskQueue.listTasks().filter(item => item.createdBy === username).length }),
+      apply: async ({ username, tombstone, mode }) => {
+        if (mode === "retain") return { retained: 0 };
+        const matched = taskQueue.listTasks().filter(item => item.createdBy === username).length;
+        taskQueue.renamePrincipal(username, tombstone);
+        return { anonymized_references: matched };
+      },
+    },
+    // Device media currently belongs to a device/workspace, not an operator.
+    // It is therefore shared operational evidence and cannot safely be
+    // attributed or deleted by this lifecycle. Policy may only retain it.
+    media: {
+      plan: async ({ mode }) => {
+        if (mode !== "retain") throw Object.assign(new Error("account media ownership is unavailable"), { code: "policy_missing" });
+        return { retained_shared: 0 };
+      },
+      apply: async () => ({ retained_shared: 0 }),
+    },
+    shared_records: {
+      plan: async () => ({ retained: 0 }),
+      apply: async () => ({ retained: 0 }),
+    },
+    audit: {
+      plan: async ({ username }) => ({ retained: (await auditLog.listEvents({ operator: username, limit: 1001 })).length }),
+      apply: async ({ tombstone, requestId }) => {
+        auditLog.logEvent({ operator: tombstone, type: "account_deletion_completed",
+          detail: { requestId } });
+        return { completion_events: 1 };
+      },
+    },
+  },
 });
+privacyDeletionProcessor.recoverInterrupted();
 
-app.get("/api/me", requireAuth, (req, res) => {
-  res.json(publicOperator(req.currentOperator));
+registerPrivacyRoutes({
+  app,
+  requireAuth,
+  accountService: operatorAccountService,
+  requestStore: privacyRequestStore,
+  hmacKey: SESSION_SECRET,
+  resolveCurrentSession: req => currentStoredOperator(req),
+  revokeAccountAccess: (username, sessionId) => {
+    presenceStore.removeSession(sessionId);
+    revokeLiveOperatorSessions(username);
+  },
+  destroyCurrentSession: req => new Promise(resolve => req.session.destroy(error => {
+    if (error) logOperationalFailure("Privacy request session-destroy failed", error);
+    resolve();
+  })),
+  recordAudit: event => auditLog.logEvent(event),
+  logFailure: logOperationalFailure,
+  allowPublicRequest: request => privacyRequestThrottle.allow(request),
+  buildDataExport: async username => createPrivacyDataExport({
+    username,
+    account: await operatorAccountService.getAccount(username),
+    assignments: assignmentStore.list(),
+    tasks: taskQueue.listTasks(),
+    // Ask for one beyond the response cap so the export can report that the
+    // bounded audit category was truncated rather than silently implying it
+    // was complete.
+    auditEvents: await auditLog.listEvents({ operator: username, limit: 1001 }),
+    privacyRequests: privacyRequestStore.listForAccount(username),
+  }),
+  normalizeEmail: normalizeGmail,
+  deletionProcessor: privacyDeletionProcessor,
+  requirePrivacyAdmin: requireCapability(CAPABILITIES.MANAGE_USERS),
+  authorizePrivacyAdmin: req => authorizeCurrentOperator(req, [CAPABILITIES.MANAGE_USERS]),
 });
 
 // Resolves `req.currentOperator` fresh through the identity service on
@@ -592,6 +1024,35 @@ function currentStoredOperator(req) {
   });
 }
 
+function httpAuthorizationError(message, status = 403) {
+  return Object.assign(new Error(message), {
+    status,
+    expose: true,
+    code: status === 401 ? "AUTHENTICATION_REQUIRED" : "AUTHORIZATION_REQUIRED",
+  });
+}
+
+async function authorizeCurrentOperator(req, capabilities) {
+  const current = await currentStoredOperator(req);
+  if (!current) throw httpAuthorizationError("not logged in", 401);
+  if (!capabilities.some(capability => hasCapability(current, capability))) {
+    throw httpAuthorizationError("user-management capability required");
+  }
+  return current;
+}
+
+async function authorizeCurrentPersonManager(req, username, capabilities) {
+  const current = await authorizeCurrentOperator(req, capabilities);
+  if (!canManagePerson(current, username)) throw httpAuthorizationError("not authorized to manage this account");
+  return current;
+}
+
+async function authorizeRoutingMutation(req, deviceId) {
+  const current = await authorizeCurrentOperator(req, [CAPABILITIES.MANAGE_ROUTING]);
+  if (!canAccessDevice(current, deviceId)) throw httpAuthorizationError("not authorized for this device");
+  return current;
+}
+
 // A capability-gated route whose :username param can equal the caller's own
 // username is a self-privilege-escalation vector (e.g. a VA trying to PATCH
 // their own role to admin), not an ordinary permission failure. Routes that
@@ -604,11 +1065,11 @@ function flagSelfEscalationIfTargeted(req, current, label) {
     `attempted to modify their own account via an admin-only route (${label})`
   );
   if (flagged) {
-    auditLog.logEvent({
+    logAuditBestEffort({
       operator: current.username,
       type: "self_escalation_attempt_blocked",
       detail: { method: req.method, path: req.path, capability: label },
-    });
+    }, "Self-escalation audit write");
   }
 }
 
@@ -624,11 +1085,11 @@ function requireCapability(capability, { flagSelfEscalation = false } = {}) {
       if (!current) return res.status(401).json({ error: "not logged in" });
       req.currentOperator = current;
       if (!hasCapability(current, capability)) {
-        auditLog.logEvent({
+        logAuditBestEffort({
           operator: req.session.operator.username,
           type: "capability_access_denied",
           detail: { method: req.method, path: req.path, capability },
-        });
+        }, "Capability-denial audit write");
         if (flagSelfEscalation) flagSelfEscalationIfTargeted(req, current, capability);
         return res.status(403).json({ error: `${capability} capability required` });
       }
@@ -651,11 +1112,11 @@ function requireAnyCapability(...args) {
       if (!current) return res.status(401).json({ error: "not logged in" });
       req.currentOperator = current;
       if (!capabilities.some(capability => hasCapability(current, capability))) {
-        auditLog.logEvent({
+        logAuditBestEffort({
           operator: current.username,
           type: "capability_access_denied",
           detail: { method: req.method, path: req.path, capabilities },
-        });
+        }, "Capability-denial audit write");
         if (options.flagSelfEscalation) flagSelfEscalationIfTargeted(req, current, capabilities.join("|"));
         return res.status(403).json({ error: "user-management capability required" });
       }
@@ -672,45 +1133,35 @@ function requireAnyCapability(...args) {
 app.use("/api/devices", requireAuth);
 app.use("/api/research", requireAuth);
 
+const assignmentAccess = createAssignmentAccess({
+  hasDevice: id => devices.has(id),
+  hasResearchAccount: id => researchAccounts.has(id),
+  canAccessDevice,
+  researchWorkspaceFor,
+  operatorForUsername: username => backgroundAuthorization.operatorForUsername(username),
+  hasCapability,
+  manageAssignmentsCapability: CAPABILITIES.MANAGE_ASSIGNMENTS,
+  canManagePerson,
+  canSelfProgress: role => SELF_PROGRESS_ROLES.has(role),
+});
+const { canViewAssignment, publicAssignmentFor } = assignmentAccess;
+
 // Raw audit history is an admin/dev oversight surface. VAs still generate
 // audit events through normal device work but cannot read the global log.
-function authorizedAuditEvents(operator, { operator: operatorFilter, deviceId, limit = 200 } = {}) {
-  return auditLog.listAuthorizedEvents(operator, { operator: operatorFilter, deviceId, limit });
-}
-
-app.get("/api/audit", requireCapability(CAPABILITIES.VIEW_AUDIT), (req, res) => {
-  const { operator, deviceId, limit } = req.query;
-  res.json({ events: authorizedAuditEvents(req.currentOperator, { operator, deviceId, limit }) });
-});
-
-function publicPeople(viewer = null) {
-  const visibleAssignments = viewer
-    ? assignmentStore.list().filter(item => canViewAssignment(item, viewer))
-    : [];
-  return presenceStore.listPeople(operators.values()).map(person => {
-    const assignment = visibleAssignments.find(item => item.assignee === person.username
-      && ["assigned", "in_progress"].includes(item.status)) ?? null;
-    return {
-      ...person,
-      canAssign: Boolean(viewer && hasCapability(viewer, CAPABILITIES.MANAGE_ASSIGNMENTS)
-        && canManagePerson(viewer, person.username)),
-      currentDeviceIds: person.currentDeviceIds.filter(id => viewer && canAccessDevice(viewer, id)),
-      currentPhones: person.currentDeviceIds
-        .filter(id => viewer && canAccessDevice(viewer, id))
-        .map(id => ({ id, label: devices.get(id)?.label ?? id })),
-      assignment: assignment ? {
-        id: assignment.id,
-        deviceId: assignment.deviceId,
-        status: assignment.status,
-        startAt: assignment.startAt ?? null,
-        endAt: assignment.endAt ?? null,
-      } : null,
-    };
-  });
-}
-
-app.get("/api/people", requireCapability(CAPABILITIES.VIEW_PEOPLE), (req, res) => {
-  res.json({ people: publicPeople(req.currentOperator) });
+// Getters keep this route boundary independent of initialization order: device
+// and assignment state are composed later, before any request can run.
+const { authorizedAuditEvents, publicPeople } = registerAuditPeopleRoutes({
+  app,
+  requireCapability,
+  capabilities: CAPABILITIES,
+  auditLog,
+  listAssignments: () => assignmentStore.list(),
+  listPeople: () => presenceStore.listPeople(operators.values()),
+  deviceLabelFor: id => devices.get(id)?.label ?? id,
+  canViewAssignment,
+  hasCapability,
+  canManagePerson,
+  canAccessDevice,
 });
 
 // Phase 1 (docs/productionization/PHASE1_TEAM_ROLLOUT_HANDOUT.md task P2):
@@ -721,10 +1172,7 @@ app.get("/api/people", requireCapability(CAPABILITIES.VIEW_PEOPLE), (req, res) =
 // (invite/accept/login/logout/MFA) sitting in front of it, per the
 // handout's own recommended default (§4 task P2, step 6).
 if (process.env.CLOUD_API_ENABLED === "true") {
-  if (!process.env.DATABASE_URL) {
-    throw new Error("CLOUD_API_ENABLED=true requires DATABASE_URL to be set");
-  }
-  const cloudPool = createPool();
+  const cloudPool = applicationDatabasePool;
   await ensureDefaultOrganization(cloudPool);
 
   const cloudOrganizationRepository = createOrganizationRepository(cloudPool);
@@ -782,6 +1230,8 @@ const server = createServer(app);
 // of text) is under 1KB. Capping well above that but far below ws's 100MB
 // default means one connection can't buffer/JSON.parse an oversized payload.
 const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 });
+registerSessionAccountRoutes({ app, requireAuth, publicOperator, presenceStore, wss,
+  broadcastPresence, logAuditBestEffort });
 
 // express-session's middleware works on any (req, res, next) triple, not
 // just ones Express itself dispatches — reusing it here means the WS upgrade
@@ -791,7 +1241,7 @@ server.on("upgrade", (request, socket, head) => {
   // Site agents (other locations' Mac minis) authenticate with a site token, not an
   // operator session.
   if (String(request.url ?? "").split("?")[0] === "/agent-link") {
-    siteLinkHub.handleUpgrade(request, socket, head);
+    void siteLinkHub.handleUpgrade(request, socket, head);
     return;
   }
   // A real (if disconnected) ServerResponse, not a bare {} — express-session
@@ -870,8 +1320,10 @@ for (const discovered of discoveredIosDevices) {
 }
 
 // ---- sites: other locations that link their phones to this hub ----------------------
-const siteStore = createFileSiteRepository(process.env.SITE_STORE_PATH || path.join(STORAGE_ROOT, "sites.json"),
-  { defaultTimeZone: schedulingTimeZone });
+const siteStore = durableRepositories.sites === "postgres"
+  ? await createPostgresSiteRepository(applicationDatabasePool, { defaultTimeZone: schedulingTimeZone })
+  : createFileSiteRepository(process.env.SITE_STORE_PATH || path.join(STORAGE_ROOT, "sites.json"),
+    { defaultTimeZone: schedulingTimeZone });
 const siteLinkHub = new SiteLinkHub({
   siteStore,
   devices,
@@ -887,7 +1339,10 @@ const siteLinkHub = new SiteLinkHub({
     deviceHost.delete(device.id);
     deviceMonitorConfig.delete(device.id);
   },
-  onSiteEvent: event => auditLog.logEvent({ operator: "system", type: event.type, detail: { siteId: event.siteId, ...event.detail } }),
+  onSiteEvent: event => logAuditBestEffort(
+    { operator: "system", type: event.type, detail: { siteId: event.siteId, ...event.detail } },
+    "Site lifecycle audit write",
+  ),
 });
 
 function validateOperatorResources(input) {
@@ -932,21 +1387,22 @@ async function reconcileLiveOperatorAccess(username, { authorizationChanged = tr
 app.get("/api/admin/users", requireAnyCapability(CAPABILITIES.MANAGE_USERS, CAPABILITIES.MANAGE_TEAM_MEMBERS), async (req, res, next) => {
   try {
     expireAssignments();
-    const people = new Map(publicPeople(req.currentOperator).map(person => [person.username, person]));
-    const visibleAssignments = assignmentStore.list().filter(item => canViewAssignment(item, req.currentOperator));
     const allUsers = await operatorAccountService.listAccounts();
+    const current = await authorizeCurrentOperator(req, [CAPABILITIES.MANAGE_USERS, CAPABILITIES.MANAGE_TEAM_MEMBERS]);
+    const people = new Map(publicPeople(current).map(person => [person.username, person]));
+    const visibleAssignments = assignmentStore.list().filter(item => canViewAssignment(item, current));
     const activeAdminCount = allUsers.filter(user => user.active !== false
       && (user.accountStatus ?? "approved") === "approved"
       && user.role === OPERATOR_ROLES.ADMIN).length;
-    const visibleUsers = allUsers.filter(user => canManagePerson(req.currentOperator, user.username));
+    const visibleUsers = allUsers.filter(user => canManagePerson(current, user.username));
     res.json({ users: visibleUsers.map(user => ({
       ...user,
-      canRename: req.currentOperator.role === OPERATOR_ROLES.ADMIN || user.username !== req.currentOperator.username,
-      canReview: user.username !== req.currentOperator.username
+      canRename: current.role === OPERATOR_ROLES.ADMIN || user.username !== current.username,
+      canReview: user.username !== current.username
         && !(user.role === OPERATOR_ROLES.ADMIN && user.active !== false
           && (user.accountStatus ?? "approved") === "approved" && activeAdminCount === 1),
-      actionReason: user.username === req.currentOperator.username
-        ? req.currentOperator.role === OPERATOR_ROLES.MANAGER
+      actionReason: user.username === current.username
+        ? current.role === OPERATOR_ROLES.MANAGER
           ? "You cannot rename or review the account you are currently using."
           : "You cannot reject the account you are currently using."
         : user.role === OPERATOR_ROLES.ADMIN && user.active !== false
@@ -955,9 +1411,9 @@ app.get("/api/admin/users", requireAnyCapability(CAPABILITIES.MANAGE_USERS, CAPA
           : null,
       presence: people.get(user.username) ?? { online: false, activeSessions: 0, currentPhones: [], lastSeenAt: null },
       assignments: visibleAssignments.filter(item => item.assignee === user.username || item.createdBy === user.username),
-      recentAudit: hasCapability(req.currentOperator, CAPABILITIES.VIEW_AUDIT)
+      recentAudit: hasCapability(current, CAPABILITIES.VIEW_AUDIT)
         ? auditLog.listEvents({ operator: user.username, limit: 200 })
-          .filter(event => !event.deviceId || canAccessDevice(req.currentOperator, event.deviceId)).slice(0, 10)
+          .filter(event => !event.deviceId || canAccessDevice(current, event.deviceId)).slice(0, 10)
         : [],
     })) });
   } catch (error) { next(error); }
@@ -971,40 +1427,101 @@ app.patch("/api/admin/users/:username/status", requireAnyCapability(CAPABILITIES
     if (req.currentOperator.role === OPERATOR_ROLES.MANAGER && req.params.username === req.currentOperator.username) {
       return res.status(403).json({ error: "a manager cannot review their own account" });
     }
-    if (req.body?.status === "rejected" && req.params.username === req.currentOperator.username) {
-      return res.status(403).json({ error: "you cannot reject the account you are currently using" });
+    if ((req.body?.status === "rejected" || req.body?.status === "banned")
+      && req.params.username === req.currentOperator.username) {
+      return res.status(403).json({ error: `you cannot ${req.body.status === "banned" ? "ban" : "reject"} the account you are currently using` });
     }
     const target = await operatorAccountService.getAccount(req.params.username);
-    if (!target?.email) return res.status(409).json({ error: "account must have a Gmail address before review" });
-    const notification = accountNotificationStore.queue({
-      to: target.email,
-      fullName: target.fullName || target.username,
-      username: target.username,
-      status: req.body.status,
-      holdForCommit: true,
-    });
+    if (!target) return res.status(404).json({ error: "operator not found" });
+    // Lifting a ban is reserved for host-tier operators: undoing the most
+    // severe account action available deserves a higher bar than the
+    // approve/reject/ban actions that can put an account into that state.
+    if (target.accountStatus === "banned" && req.body?.status !== "banned"
+      && req.currentOperator.role !== OPERATOR_ROLES.HOST) {
+      return res.status(403).json({ error: "only a host can lift a ban" });
+    }
+    // Approve/reject notify the applicant by email; a ban deliberately does
+    // not (see docs/productionization) — no email support is queued at all,
+    // so this must not require the account to have one on file. Lifting a
+    // ban (banned -> anything else) also never emails: whatever transition
+    // put the account in that severe state didn't email them either, and a
+    // host restoring/reviewing it isn't the same event as an ordinary
+    // approve/reject decision.
+    const sendsEmail = (req.body?.status === "approved" || req.body?.status === "rejected")
+      && target.accountStatus !== "banned";
+    if (sendsEmail && !target.email) return res.status(409).json({ error: "account must have a Gmail address before review" });
+
+    const authorizeStatusCommit = async () => {
+      const current = await authorizeCurrentPersonManager(req, req.params.username,
+        [CAPABILITIES.MANAGE_USERS, CAPABILITIES.MANAGE_TEAM_MEMBERS]);
+      if ((req.body?.status === "rejected" || req.body?.status === "banned")
+        && req.params.username === current.username) {
+        throw httpAuthorizationError(`you cannot ${req.body.status === "banned" ? "ban" : "reject"} the account you are currently using`);
+      }
+      const currentTarget = operators.get(req.params.username);
+      if (currentTarget?.accountStatus === "banned" && req.body?.status !== "banned"
+        && current.role !== OPERATOR_ROLES.HOST) {
+        throw httpAuthorizationError("only a host can lift a ban");
+      }
+      return current;
+    };
+    await authorizeStatusCommit();
+
+    let notification = null;
+    if (sendsEmail) {
+      notification = accountNotificationStore.queue({
+        to: target.email,
+        fullName: target.fullName || target.username,
+        username: target.username,
+        status: req.body.status,
+        holdForCommit: true,
+      });
+    }
     let operator;
-    try { operator = await operatorAccountService.setAccountStatus(req.params.username, req.body?.status); }
-    catch (error) {
-      try { accountNotificationStore.markAborted(notification.id); }
-      catch (abortError) { console.error("Account review outbox abort failed:", abortError); }
+    let currentAtCommit = null;
+    try {
+      operator = await operatorAccountService.setAccountStatus(req.params.username, req.body?.status,
+        req.body?.status === "banned" ? {
+          reason: req.body?.reason ?? null,
+          bannedBy: req.currentOperator.username,
+        } : undefined, {
+          authorize: async () => { currentAtCommit = await authorizeStatusCommit(); return currentAtCommit; },
+        });
+      if (!currentAtCommit) throw new Error("account repository did not perform its required commit authorization");
+      if (req.body.status === "banned") {
+        try {
+          const recentLoginIps = await operatorAccountService.getRecentLoginIps(operator.username);
+          banStore.banIps(recentLoginIps, { username: operator.username, reason: operator.bannedReason });
+        } catch (error) {
+          // The account record is the authoritative ban. The IP list is only
+          // defense-in-depth and must not turn a completed account ban into a
+          // misleading failed response that an operator may retry blindly.
+          logOperationalFailure("Account ban IP blocklist update failed", error);
+        }
+      }
+    } catch (error) {
+      if (notification) {
+        try { accountNotificationStore.markAborted(notification.id); }
+        catch (abortError) { logOperationalFailure("Account review outbox abort failed", abortError); }
+      }
       throw error;
     }
-    let notificationState;
-    try { notificationState = accountNotificationStore.markCommitted(notification.id)?.deliveryState; }
-    catch (error) {
-      notificationState = "pending_reconciliation";
-      console.error("Account review outbox commit failed:", error);
-    }
-    if (notificationState === "queued") {
-      notificationState = (await deliverAccountNotification(notification.id))?.deliveryState ?? notificationState;
+    let notificationState = null;
+    if (notification) {
+      try { notificationState = accountNotificationStore.markCommitted(notification.id)?.deliveryState; }
+      catch (error) {
+        notificationState = "pending_reconciliation";
+        logOperationalFailure("Account review outbox commit failed", error);
+      }
+      if (notificationState === "queued") {
+        notificationState = (await deliverAccountNotification(notification.id))?.deliveryState ?? notificationState;
+      }
     }
     revokeLiveOperatorSessions(operator.username);
     broadcastPresence();
-    try {
-      auditLog.logEvent({ operator: req.currentOperator.username, type: `operator_${req.body.status}`,
-        detail: { target: operator.username, teamId: operator.teamId || null, notificationState } });
-    } catch (error) { console.error("Account review audit failed:", error); }
+    logAuditBestEffort({ operator: currentAtCommit.username, type: `operator_${req.body.status}`,
+      detail: { target: operator.username, teamId: operator.teamId || null, notificationState } },
+    "Account review audit write");
     res.json({ operator, notification: { deliveryState: notificationState } });
   } catch (error) {
     if (error?.status) return res.status(error.status).json({ error: error.message });
@@ -1039,16 +1556,27 @@ app.patch("/api/admin/users/:username/rename", requireAnyCapability(CAPABILITIES
     }
     assertValidUsername(nextUsername);
     if (await operatorAccountService.usernameExists(nextUsername)) return res.status(409).json({ error: "username already exists" });
+    const authorizeRenameCommit = async () => {
+      const current = await authorizeCurrentPersonManager(req, previousUsername,
+        [CAPABILITIES.MANAGE_USERS, CAPABILITIES.MANAGE_TEAM_MEMBERS]);
+      if (current.role === OPERATOR_ROLES.MANAGER && previousUsername === current.username) {
+        throw httpAuthorizationError("a manager cannot rename their own account");
+      }
+      return current;
+    };
+    await authorizeRenameCommit();
     taskQueue.renamePrincipal(previousUsername, nextUsername);
     tasksMigrated = true;
     assignmentStore.renamePrincipal(previousUsername, nextUsername, req.currentOperator.username);
     assignmentsMigrated = true;
-    const operator = await operatorAccountService.renameAccount(previousUsername, nextUsername);
+    let currentAtCommit = null;
+    const operator = await operatorAccountService.renameAccount(previousUsername, nextUsername, {
+      authorize: async () => { currentAtCommit = await authorizeRenameCommit(); return currentAtCommit; },
+    });
+    if (!currentAtCommit) throw new Error("account repository did not perform its required commit authorization");
     accountMigrated = true;
-    try {
-      auditLog.logEvent({ operator: req.currentOperator.username, type: "operator_renamed",
-        detail: { previousUsername, username: operator.username } });
-    } catch (error) { console.error("Operator rename audit failed:", error); }
+    logAuditBestEffort({ operator: currentAtCommit.username, type: "operator_renamed",
+      detail: { previousUsername, username: operator.username } }, "Operator rename audit write");
     revokeLiveOperatorSessions(previousUsername);
     broadcastPresence();
     broadcastDeviceList();
@@ -1078,16 +1606,32 @@ app.get("/api/admin/account-notifications", requireCapability(CAPABILITIES.MANAG
 
 app.post("/api/admin/users", requireCapability(CAPABILITIES.MANAGE_USERS), async (req, res, next) => {
   try {
+    if (!maxAssignableRoles(req.currentOperator).has(req.body?.role)) {
+      return res.status(403).json({ error: "not authorized to assign this role" });
+    }
     const resourceError = validateOperatorResources(req.body);
     if (resourceError) return res.status(400).json({ error: resourceError });
-    const operator = await operatorAccountService.createAccount({ ...req.body, twoFactorRequired: true });
-    auditLog.logEvent({
-      operator: req.currentOperator.username,
-      type: "operator_created",
-      detail: { target: operator.username, role: operator.role, active: operator.active },
+    // isMainHost is never accepted from a request body — createOperatorAccount
+    // has no such input field at all; see authStore.js's setMainHost.
+    let currentAtCommit = null;
+    const operator = await operatorAccountService.createAccount({ ...req.body, twoFactorRequired: true }, {
+      authorize: async () => {
+        const current = await authorizeCurrentOperator(req, [CAPABILITIES.MANAGE_USERS]);
+        if (!maxAssignableRoles(current).has(req.body?.role)) {
+          throw httpAuthorizationError("not authorized to assign this role");
+        }
+        currentAtCommit = current;
+        return current;
+      },
     });
+    if (!currentAtCommit) throw new Error("account repository did not perform its required commit authorization");
     broadcastPresence();
     broadcastDeviceList();
+    logAuditBestEffort({
+      operator: currentAtCommit.username,
+      type: "operator_created",
+      detail: { target: operator.username, role: operator.role, active: operator.active },
+    }, "Operator creation audit write");
     res.status(201).json({ operator });
   } catch (error) {
     if (error?.status) return res.status(error.status).json({ error: error.message });
@@ -1097,22 +1641,46 @@ app.post("/api/admin/users", requireCapability(CAPABILITIES.MANAGE_USERS), async
 
 app.patch("/api/admin/users/:username", requireCapability(CAPABILITIES.MANAGE_USERS, { flagSelfEscalation: true }), async (req, res, next) => {
   try {
+    if (!canManagePerson(req.currentOperator, req.params.username)) {
+      return res.status(403).json({ error: "not authorized to manage this account" });
+    }
+    if (Object.hasOwn(req.body ?? {}, "role") && !maxAssignableRoles(req.currentOperator).has(req.body.role)) {
+      return res.status(403).json({ error: "not authorized to assign this role" });
+    }
     const resourceError = validateOperatorResources(req.body);
     if (resourceError) return res.status(400).json({ error: resourceError });
-    const result = await operatorAccountService.updateAccount(req.params.username, req.body);
-    auditLog.logEvent({
-      operator: req.currentOperator.username,
-      type: "operator_updated",
-      detail: { target: result.operator.username, fields: Object.keys(req.body).sort() },
+    let currentAtCommit = null;
+    const result = await operatorAccountService.updateAccount(req.params.username, req.body, {
+      authorize: async () => {
+        const current = await authorizeCurrentPersonManager(req, req.params.username, [CAPABILITIES.MANAGE_USERS]);
+        if (Object.hasOwn(req.body ?? {}, "role") && !maxAssignableRoles(current).has(req.body.role)) {
+          throw httpAuthorizationError("not authorized to assign this role");
+        }
+        currentAtCommit = current;
+        return current;
+      },
     });
+    if (!currentAtCommit) throw new Error("account repository did not perform its required commit authorization");
     if (result.invalidatesSessions) revokeLiveOperatorSessions(result.operator.username);
     else {
       const authorizationChanged = ["role", "allowedDevices", "allowedResearchWorkspaces", "teamId"]
         .some(field => Object.hasOwn(req.body, field));
-      await reconcileLiveOperatorAccess(result.operator.username, { authorizationChanged });
+      try {
+        await reconcileLiveOperatorAccess(result.operator.username, { authorizationChanged });
+      } catch (error) {
+        // reconcileLiveOperatorAccess suspends affected sockets before any
+        // asynchronous refresh, so a refresh failure is fail-closed. Keep the
+        // durable account result authoritative and leave the socket suspended.
+        logOperationalFailure("Operator live access reconciliation failed", error);
+      }
       broadcastPresence();
     }
     broadcastDeviceList();
+    logAuditBestEffort({
+      operator: currentAtCommit.username,
+      type: "operator_updated",
+      detail: { target: result.operator.username, fields: Object.keys(req.body).sort() },
+    }, "Operator update audit write");
     res.json({ operator: result.operator });
   } catch (error) {
     if (error?.status) return res.status(error.status).json({ error: error.message });
@@ -1122,13 +1690,23 @@ app.patch("/api/admin/users/:username", requireCapability(CAPABILITIES.MANAGE_US
 
 app.post("/api/admin/users/:username/revoke-sessions", requireCapability(CAPABILITIES.MANAGE_USERS), async (req, res, next) => {
   try {
-    const operator = await operatorAccountService.invalidateSessions(req.params.username);
-    auditLog.logEvent({
-      operator: req.currentOperator.username,
+    if (!canManagePerson(req.currentOperator, req.params.username)) {
+      return res.status(403).json({ error: "not authorized to manage this account" });
+    }
+    let currentAtCommit = null;
+    const operator = await operatorAccountService.invalidateSessions(req.params.username, {
+      authorize: async () => {
+        currentAtCommit = await authorizeCurrentPersonManager(req, req.params.username, [CAPABILITIES.MANAGE_USERS]);
+        return currentAtCommit;
+      },
+    });
+    if (!currentAtCommit) throw new Error("account repository did not perform its required commit authorization");
+    revokeLiveOperatorSessions(operator.username);
+    logAuditBestEffort({
+      operator: currentAtCommit.username,
       type: "operator_sessions_revoked",
       detail: { target: operator.username },
-    });
-    revokeLiveOperatorSessions(operator.username);
+    }, "Operator session revocation audit write");
     res.json({ operator });
   } catch (error) {
     if (error?.status) return res.status(error.status).json({ error: error.message });
@@ -1138,13 +1716,23 @@ app.post("/api/admin/users/:username/revoke-sessions", requireCapability(CAPABIL
 
 app.post("/api/admin/users/:username/2fa/reset", requireCapability(CAPABILITIES.MANAGE_USERS), async (req, res, next) => {
   try {
-    const operator = await operatorAccountService.resetSecondFactor(req.params.username);
-    auditLog.logEvent({
-      operator: req.currentOperator.username,
+    if (!canManagePerson(req.currentOperator, req.params.username)) {
+      return res.status(403).json({ error: "not authorized to manage this account" });
+    }
+    let currentAtCommit = null;
+    const operator = await operatorAccountService.resetSecondFactor(req.params.username, {
+      authorize: async () => {
+        currentAtCommit = await authorizeCurrentPersonManager(req, req.params.username, [CAPABILITIES.MANAGE_USERS]);
+        return currentAtCommit;
+      },
+    });
+    if (!currentAtCommit) throw new Error("account repository did not perform its required commit authorization");
+    revokeLiveOperatorSessions(operator.username);
+    logAuditBestEffort({
+      operator: currentAtCommit.username,
       type: "operator_two_factor_reset",
       detail: { target: operator.username },
-    });
-    revokeLiveOperatorSessions(operator.username);
+    }, "Operator two-factor reset audit write");
     res.json({ operator });
   } catch (error) {
     if (error?.status) return res.status(error.status).json({ error: error.message });
@@ -1225,12 +1813,22 @@ fleetPolicy = createFleetPolicy({
 const assignmentStorePath = process.env.ASSIGNMENT_STORE_PATH
   || path.join(__dirname, "../../storage/assignments/assignments.json");
 const assignmentStore = createFileAssignmentRepository({ storePath: assignmentStorePath });
+httpMetrics.setStateProviders({
+  devices: () => [...devices.values()].map(device => {
+    const connected = !["offline", "disconnected"].includes(device.status);
+    const route = networkRoutingOrchestrator?.getRoute(device.id) ?? null;
+    return { connected, controllable: connected && ["idle", "in-use"].includes(device.status),
+      routed: Boolean(route), protected: route?.protected === true };
+  }),
+  tasks: () => taskQueue.listTasks().map(task => ({ kind: task.kind, state: task.state })),
+  interventions: () => interventionQueue.list().map(item => ({ state: item.state, kind: item.kind })),
+});
 
 function expireAssignments(at = new Date()) {
   const expired = assignmentStore.expireDue(at);
   for (const assignment of expired) {
     const lastAction = assignment.history.at(-1)?.action;
-    auditLog.logEvent({
+    logAuditBestEffort({
       operator: "system",
       type: lastAction === "recurrence_conflict" ? "assignment_recurrence_conflict"
         : assignment.status === "expired" ? "assignment_expired" : "assignment_recurrence_advanced",
@@ -1241,7 +1839,7 @@ function expireAssignments(at = new Date()) {
         recurrence: assignment.recurrence ?? "once",
         occurrence: assignment.occurrence ?? 1,
       },
-    });
+    }, "Assignment expiry audit write");
   }
   if (expired.length) {
     broadcastDeviceList();
@@ -1266,151 +1864,52 @@ const SELF_PROGRESS_ROLES = new Set([
 function canManagePerson(operator, username) {
   const target = operators.get(username);
   if (!target) return false;
-  if (operator.role === OPERATOR_ROLES.ADMIN) return true;
+  if (operator.role === OPERATOR_ROLES.HOST) return true;
+  // Host sits above admin (see maxAssignableRoles below): an admin manages
+  // everyone except a host account, mirroring how an admin can never be
+  // demoted/removed by anyone but another admin-or-higher today.
+  if (operator.role === OPERATOR_ROLES.ADMIN) return target.role !== OPERATOR_ROLES.HOST;
   return operator.role === OPERATOR_ROLES.MANAGER
     && Boolean(operator.teamId)
     && target.teamId === operator.teamId
     && (username === operator.username || MANAGER_ASSIGNABLE_ROLES.has(target.role));
 }
 
-function assignmentScopeAllowed(assignment, operator) {
-  if (assignment.deviceId && !canAccessDevice(operator, assignment.deviceId)) return false;
-  if (assignment.accountId && !researchWorkspaceFor(operator, assignment.accountId)) return false;
-  return true;
+// Who a given operator is allowed to create/promote someone into (POST
+// /api/admin/users and PATCH /api/admin/users/:username's role field) —
+// separate from canManagePerson, which governs whether an existing account
+// can be reviewed/edited at all. admin -> up to manager; host -> up to
+// admin; only the main host -> up to and including host itself. Matches the
+// hub-ownership hierarchy: each hub has one host who owns it, and only the
+// main hub's host stands up a new hub's host account.
+const ADMIN_ASSIGNABLE_ROLES = new Set([
+  OPERATOR_ROLES.VA, OPERATOR_ROLES.CONTENT_CREATOR, OPERATOR_ROLES.EDITOR, OPERATOR_ROLES.MANAGER,
+]);
+const HOST_ASSIGNABLE_ROLES = new Set([...ADMIN_ASSIGNABLE_ROLES, OPERATOR_ROLES.ADMIN]);
+const MAIN_HOST_ASSIGNABLE_ROLES = new Set([...HOST_ASSIGNABLE_ROLES, OPERATOR_ROLES.HOST]);
+function maxAssignableRoles(operator) {
+  if (operator.role === OPERATOR_ROLES.HOST) {
+    return operator.isMainHost ? MAIN_HOST_ASSIGNABLE_ROLES : HOST_ASSIGNABLE_ROLES;
+  }
+  if (operator.role === OPERATOR_ROLES.ADMIN) return ADMIN_ASSIGNABLE_ROLES;
+  return new Set();
 }
 
-function assigneeScopeAllowed(assignment, username) {
-  const assignee = backgroundAuthorization.operatorForUsername(username);
-  return Boolean(assignee) && assignmentScopeAllowed(assignment, assignee);
-}
-
-function canViewAssignment(assignment, operator) {
-  if (assignment.assignee === operator.username || assignment.createdBy === operator.username) {
-    return assignmentScopeAllowed(assignment, operator);
-  }
-  return hasCapability(operator, CAPABILITIES.MANAGE_ASSIGNMENTS)
-    && canManagePerson(operator, assignment.assignee)
-    && assignmentScopeAllowed(assignment, operator);
-}
-
-function publicAssignmentFor(assignment, operator) {
-  const canProgress = SELF_PROGRESS_ROLES.has(operator.role)
-    && assignment.assignee === operator.username
-    && ((assignment.status === "assigned") || (assignment.status === "in_progress"));
-  return { ...assignment, canProgress };
-}
-
-function validateAssignmentScope(body, operator) {
-  const deviceId = body.deviceId ?? null;
-  const accountId = body.accountId ?? null;
-  if (deviceId !== null) {
-    if (typeof deviceId !== "string" || !devices.has(deviceId)) return { error: "unknown device", status: 400 };
-    if (!canAccessDevice(operator, deviceId)) return { error: "not authorized for this device", status: 403 };
-  }
-  if (accountId !== null) {
-    if (typeof accountId !== "string" || !researchAccounts.has(accountId)) return { error: "unknown research account", status: 400 };
-    if (!researchWorkspaceFor(operator, accountId)) return { error: "not authorized for this research account", status: 403 };
-  }
-  return { deviceId, accountId };
-}
-
-app.get("/api/assignments", requireCapability(CAPABILITIES.VIEW_ASSIGNMENTS), (req, res) => {
-  expireAssignments();
-  res.json({ assignments: assignmentStore.list().filter(item => canViewAssignment(item, req.currentOperator))
-    .map(item => publicAssignmentFor(item, req.currentOperator)) });
-});
-
-app.post("/api/assignments", requireCapability(CAPABILITIES.MANAGE_ASSIGNMENTS), (req, res, next) => {
-  try {
-    expireAssignments();
-    const { assignee, instructions } = req.body || {};
-    if (typeof assignee !== "string" || !backgroundAuthorization.operatorForUsername(assignee)) return res.status(400).json({ error: "unknown or inactive assignee" });
-    if (!canManagePerson(req.currentOperator, assignee)) return res.status(403).json({ error: "not authorized to assign this person" });
-    const scope = validateAssignmentScope(req.body || {}, req.currentOperator);
-    if (scope.error) return res.status(scope.status).json({ error: scope.error });
-    if (!assigneeScopeAllowed(scope, assignee)) {
-      return res.status(403).json({ error: "assignee is not authorized for the referenced phone or account" });
-    }
-    const assignment = assignmentStore.create({
-      instructions,
-      assignee,
-      createdBy: req.currentOperator.username,
-      deviceId: scope.deviceId,
-      accountId: scope.accountId,
-      startAt: req.body?.startAt ?? null,
-      endAt: req.body?.endAt ?? null,
-      exclusive: req.body?.exclusive ?? true,
-      recurrence: req.body?.recurrence ?? "once",
-      timezone: req.body?.timezone ?? "UTC",
-    });
-    auditLog.logEvent({ operator: req.currentOperator.username, type: "assignment_created",
-      deviceId: assignment.deviceId, detail: {
-        assignmentId: assignment.id, assignee: assignment.assignee, accountId: assignment.accountId,
-        startAt: assignment.startAt, endAt: assignment.endAt, exclusive: assignment.exclusive,
-        recurrence: assignment.recurrence, occurrence: assignment.occurrence,
-      } });
-    broadcastDeviceList();
-    broadcastPresence();
-    res.status(201).json({ assignment });
-  } catch (error) {
-    if (/overlaps/.test(error.message)) return res.status(409).json({ error: error.message });
-    if (/instructions|deviceId|accountId|schedule|startAt|endAt|exclusive|recurrence/.test(error.message)) return res.status(400).json({ error: error.message });
-    next(error);
-  }
-});
-
-app.patch("/api/assignments/:assignmentId", requireCapability(CAPABILITIES.VIEW_ASSIGNMENTS), (req, res, next) => {
-  try {
-    expireAssignments();
-    const current = assignmentStore.get(req.params.assignmentId);
-    if (!current) return res.status(404).json({ error: "unknown assignment" });
-    if (!canViewAssignment(current, req.currentOperator)) return res.status(403).json({ error: "not authorized for this assignment" });
-    const hasManage = hasCapability(req.currentOperator, CAPABILITIES.MANAGE_ASSIGNMENTS)
-      && canManagePerson(req.currentOperator, current.assignee)
-      && assignmentScopeAllowed(current, req.currentOperator);
-    const wantsReassign = Object.prototype.hasOwnProperty.call(req.body || {}, "assignee");
-    const wantsStatus = Object.prototype.hasOwnProperty.call(req.body || {}, "status");
-    const wantsSchedule = ["startAt", "endAt", "exclusive"].some(key => Object.prototype.hasOwnProperty.call(req.body || {}, key));
-    if ([wantsReassign, wantsStatus, wantsSchedule].filter(Boolean).length > 1) {
-      return res.status(400).json({ error: "change assignee, status, or schedule separately" });
-    }
-    if (!wantsReassign && !wantsStatus && !wantsSchedule) return res.status(400).json({ error: "status, assignee, or schedule is required" });
-
-    let assignment;
-    if (wantsReassign) {
-      if (!hasManage) return res.status(403).json({ error: "assignment management capability required" });
-      if (typeof req.body.assignee !== "string" || !backgroundAuthorization.operatorForUsername(req.body.assignee)) return res.status(400).json({ error: "unknown or inactive assignee" });
-      if (!canManagePerson(req.currentOperator, req.body.assignee)) return res.status(403).json({ error: "not authorized to assign this person" });
-      if (!assigneeScopeAllowed(current, req.body.assignee)) {
-        return res.status(403).json({ error: "assignee is not authorized for the referenced phone or account" });
-      }
-      assignment = assignmentStore.reassign(current.id, req.body.assignee, req.currentOperator.username);
-    } else if (wantsStatus) {
-      if (!ASSIGNMENT_STATUSES.includes(req.body.status)) return res.status(400).json({ error: "invalid assignment status" });
-      const ownWorkerProgress = SELF_PROGRESS_ROLES.has(req.currentOperator.role)
-        && current.assignee === req.currentOperator.username
-        && ((current.status === "assigned" && req.body.status === "in_progress")
-          || (current.status === "in_progress" && req.body.status === "completed"));
-      if (!hasManage && !ownWorkerProgress) return res.status(403).json({ error: "assignment management capability required" });
-      assignment = assignmentStore.setStatus(current.id, req.body.status, req.currentOperator.username);
-    } else {
-      if (!hasManage) return res.status(403).json({ error: "assignment management capability required" });
-      assignment = assignmentStore.reschedule(current.id, {
-        startAt: Object.hasOwn(req.body, "startAt") ? req.body.startAt : current.startAt ?? null,
-        endAt: Object.hasOwn(req.body, "endAt") ? req.body.endAt : current.endAt ?? null,
-        exclusive: Object.hasOwn(req.body, "exclusive") ? req.body.exclusive : current.exclusive !== false,
-      }, req.currentOperator.username);
-    }
-    auditLog.logEvent({ operator: req.currentOperator.username, type: "assignment_updated",
-      deviceId: assignment.deviceId, detail: { assignmentId: assignment.id, assignee: assignment.assignee, status: assignment.status } });
-    broadcastDeviceList();
-    broadcastPresence();
-    res.json({ assignment: publicAssignmentFor(assignment, req.currentOperator) });
-  } catch (error) {
-    if (/cannot move|cannot start|in-progress|terminal|invalid assignment|overlaps/.test(error.message)) return res.status(409).json({ error: error.message });
-    if (/schedule|startAt|endAt|exclusive|recurrence/.test(error.message)) return res.status(400).json({ error: error.message });
-    next(error);
-  }
+registerAssignmentRoutes({
+  app,
+  requireCapability,
+  capabilities: CAPABILITIES,
+  assignmentStatuses: ASSIGNMENT_STATUSES,
+  assignmentStore,
+  access: assignmentAccess,
+  expireAssignments,
+  operatorForUsername: username => backgroundAuthorization.operatorForUsername(username),
+  hasCapability,
+  canManagePerson,
+  canSelfProgress: role => SELF_PROGRESS_ROLES.has(role),
+  logAuditBestEffort,
+  broadcastDeviceList,
+  broadcastPresence,
 });
 // MS13: opt-in optimizations (model routing, state cache, adaptive pacing). Off unless
 // PHONE_FARM_OPTIMIZATIONS says otherwise; see optimizationRuntime.js.
@@ -1742,238 +2241,79 @@ const mediaQuota = createMediaQuotaManager({
 const upload = multer({
   storage: createQuotaStorage({ ensureDeviceDir: deviceMediaRepository.ensureDeviceDir, safeFilename, quotaManager: mediaQuota }),
   limits: { fileSize: 2 * 1024 * 1024 * 1024 }, // 2GB — generous for source video
+  // Production-readiness audit §3: previously no fileFilter at all — any
+  // extension, any content, was accepted. multer calls this before storage
+  // ever sees the file, so a rejected upload never touches disk or counts
+  // against quota. The thrown error's MEDIA_ -prefixed code routes it
+  // through the existing generic error handler's `err.code?.startsWith
+  // ("MEDIA_")` branch below, the same clean-4xx path every other media
+  // error already uses — not a new error-handling path.
+  fileFilter: (req, file, callback) => {
+    const reason = rejectedMediaUploadReason(file.originalname, file.mimetype);
+    if (!reason) return callback(null, true);
+    const error = new Error(reason);
+    error.code = "MEDIA_TYPE_REJECTED";
+    callback(error);
+  },
 });
 
-// requireAuth (above) already guarantees req.currentOperator exists here
-// (freshly re-resolved from the live registry, not the stale session
-// snapshot — see requireAuth's own comment); each check below only asks
-// whether THAT operator may reach THIS device.
-app.get("/api/devices/:deviceId/files", (req, res) => {
-  if (!hasCapability(req.currentOperator, CAPABILITIES.ACCESS_MEDIA)) return res.status(403).json({ error: "media access is not permitted for this role" });
-  if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
-  if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
-    return res.status(403).json({ error: "not authorized for this device" });
-  }
-  res.json({ files: deviceMediaRepository.listFiles(req.params.deviceId) });
+registerMediaRoutes({
+  app,
+  upload,
+  mediaQuota,
+  deviceMediaRepository,
+  hasCapability,
+  accessMediaCapability: CAPABILITIES.ACCESS_MEDIA,
+  knownDevice,
+  canAccessDevice,
+  currentStoredOperator,
+  auditLog,
+  recordAudit: logAuditBestEffort,
+  withNetworkEgress,
 });
 
-app.post("/api/devices/:deviceId/files", (req, res, next) => {
-  if (!hasCapability(req.currentOperator, CAPABILITIES.ACCESS_MEDIA)) return res.status(403).json({ error: "media access is not permitted for this role" });
-  if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
-  if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
-    return res.status(403).json({ error: "not authorized for this device" });
-  }
-  next();
-}, upload.single("file"), async (req, res, next) => {
-  if (!req.file) return res.status(400).json({ error: "no file, or invalid filename" });
-  const name = safeFilename(req.file.originalname);
-  const discardStagedUpload = () => {
-    mediaQuota.abort(req.file.quotaReservation);
-    fs.rmSync(req.file.path, { force: true });
-  };
-  try {
-    if (!name) throw new Error("invalid filename");
-    const current = await currentStoredOperator(req);
-    if (!current) {
-      discardStagedUpload();
-      return res.status(401).json({ error: "not logged in" });
-    }
-    if (!hasCapability(current, CAPABILITIES.ACCESS_MEDIA)
-      || !canAccessDevice(current, req.params.deviceId)) {
-      discardStagedUpload();
-      return res.status(403).json({ error: "media access is no longer permitted for this device" });
-    }
-    req.currentOperator = current;
-    // Same-directory rename commits only a fully validated multipart upload.
-    // A failed replacement preserves the old file; never unlink it first.
-    fs.renameSync(req.file.path, path.join(req.file.destination, name));
-    mediaQuota.commit(req.file.quotaReservation);
-  } catch (error) {
-    discardStagedUpload();
-    return next(error);
-  }
-  auditLog.logEvent({
-    operator: req.currentOperator.username,
-    type: "file_uploaded",
-    deviceId: req.params.deviceId,
-    detail: withNetworkEgress(req.params.deviceId, { name, size: req.file.size }),
-  });
-  res.json({ ok: true, name, size: req.file.size });
+registerFilePushRoutes({
+  app,
+  hasCapability,
+  accessMediaCapability: CAPABILITIES.ACCESS_MEDIA,
+  knownDevice,
+  canAccessDevice,
+  deviceMediaRepository,
+  filePushLinkStore,
+  auditLog,
+  hubOrigin,
+  deviceLease,
+  devices,
+  currentStoredOperator,
+  recordAudit: logAuditBestEffort,
 });
 
-app.get("/api/devices/:deviceId/files/:filename", (req, res) => {
-  if (!hasCapability(req.currentOperator, CAPABILITIES.ACCESS_MEDIA)) return res.status(403).end();
-  if (!knownDevice(req.params.deviceId)) return res.status(404).end();
-  if (!canAccessDevice(req.currentOperator, req.params.deviceId)) return res.status(403).end();
-  const full = deviceMediaRepository.resolveFile(req.params.deviceId, req.params.filename);
-  if (!full) return res.status(404).end();
-  auditLog.logEvent({
-    operator: req.session.operator.username,
-    type: "file_downloaded",
-    deviceId: req.params.deviceId,
-    detail: withNetworkEgress(req.params.deviceId, { name: req.params.filename }),
-  });
-  res.download(full);
-});
-
-app.delete("/api/devices/:deviceId/files/:filename", (req, res) => {
-  if (!hasCapability(req.currentOperator, CAPABILITIES.ACCESS_MEDIA)) return res.status(403).end();
-  if (!knownDevice(req.params.deviceId)) return res.status(404).end();
-  if (!canAccessDevice(req.currentOperator, req.params.deviceId)) return res.status(403).end();
-  const deleted = deviceMediaRepository.deleteFile(req.params.deviceId, req.params.filename);
-  auditLog.logEvent({
-    operator: req.session.operator.username,
-    type: "file_deleted",
-    deviceId: req.params.deviceId,
-    detail: withNetworkEgress(req.params.deviceId, { name: req.params.filename, deleted }),
-  });
-  res.json({ ok: deleted });
-});
-
-// Production checks use the server-side configured URL. Tests may opt into a
-// disposable caller URL explicitly; accepting arbitrary URLs in normal mode
-// would turn this privileged feature into a server-side request forgery path.
-app.post("/api/devices/:deviceId/network-check", (req, res) => {
-  if (!hasCapability(req.currentOperator, CAPABILITIES.RUN_NETWORK_CHECK)) {
-    return res.status(403).json({ error: "network verification is not permitted for this role" });
-  }
-  if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
-  if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
-    return res.status(403).json({ error: "not authorized for this device" });
-  }
-  const configuredNetwork = deviceNetwork.get(req.params.deviceId);
-  if (isProxyEgress(configuredNetwork?.egress) && configuredNetwork?.enabled === false) {
-    return res.status(409).json({ error: "network verification is unavailable while this proxy assignment is disabled" });
-  }
-  let checkUrl;
-  try {
-    checkUrl = resolveNetworkCheckTarget({
-      configuredUrl: configuredNetwork?.checkUrl,
-      requestedUrl: req.body?.checkUrl,
-    });
-  } catch (error) {
-    return res.status(error.status ?? 400).json({ error: error.message });
-  }
-  if (typeof checkUrl !== "string" || checkUrl.length === 0) {
-    const assigned = poolProxyForDevice(req.params.deviceId);
-    if (!assigned) {
-      return res.status(409).json({
-        error: "No automatic network verification path is available until a saved proxy is assigned to this phone.",
-        code: "V201",
-      });
-    }
-    if (!proxyCredentialEncryptionKey) {
-      return res.status(503).json({ error: "proxy verification is unavailable until the credential encryption key is configured", code: "V201" });
-    }
-    const record = proxyPoolRepository.get(assigned.id);
-    if (!record) return res.status(409).json({ error: "the assigned proxy no longer exists", code: "V201" });
-    checkUrl = null;
-    void (async () => {
-      const proxyResult = await testProxy({
-        protocol: record.protocol, host: record.host, port: record.port, username: record.username,
-        password: decryptProxyPassword(record, proxyCredentialEncryptionKey), country: record.country,
-      });
-      proxyPoolRepository.updateHealth(record.id, proxyResult);
-      refreshProxyPoolCache();
-      await networkRoutingOrchestrator?.checkHealth();
-      return networkVerifier.recordInfrastructureCheck(req.params.deviceId, {
-        proxyResult,
-        route: networkRoutingOrchestrator?.getRoute(req.params.deviceId) ?? null,
-      });
-    })().then(async (result) => {
-      const access = networkDecision(req.params.deviceId);
-      if (!access.allowed) {
-        taskQueue.stopDevice(req.params.deviceId, "network_policy");
-        for (const client of wss.clients) client.releaseUnauthorizedSelection?.("network_policy");
-      }
-      broadcastDeviceList();
-      const current = await identityService.resolveSessionPrincipal(req.session?.operator);
-      if (!current) return res.status(401).json({ error: "authentication required" });
-      if (!hasCapability(current, CAPABILITIES.RUN_NETWORK_CHECK)
-        || !canAccessDevice(current, req.params.deviceId)) return res.status(403).json({ error: "network verification is not permitted" });
-      auditLog.logEvent({ operator: current.username, type: "network_check", deviceId: req.params.deviceId,
-        detail: { proxyId: record.id, level: result.networkVerificationLevel, protected: false } });
-      res.json({ network: { ...(publicNetworkConfig(configuredNetwork) ?? {}), ...result } });
-    }).catch(error => {
-      console.error("Automatic proxy verification failed:", error?.code || error?.name || "Error");
-      const diagnostic = error?.diagnostic;
-      res.status(error?.status || 502).json({ error: diagnostic?.name || "network verification failed",
-        code: diagnostic?.code || "V201", diagnostic: diagnostic || null });
-    });
-    return;
-  }
-  networkVerifier
-    .checkDevice(req.params.deviceId, checkUrl)
-    .then(async (result) => {
-      if (result.networkMismatch && isProxyEgress(configuredNetwork?.egress)) {
-        await networkRoutingOrchestrator?.quarantineRoute(req.params.deviceId, {
-          code: result.networkLatestError?.code || "V204",
-          why: result.networkMismatchReason || "End-to-end verification detected an unexpected route.",
-        });
-      }
-      const access = networkDecision(req.params.deviceId);
-      if (!access.allowed) {
-        taskQueue.stopDevice(req.params.deviceId, "network_policy");
-        for (const client of wss.clients) client.releaseUnauthorizedSelection?.("network_policy");
-      } else {
-        taskQueue.tick(new Date());
-      }
-      broadcastDeviceList();
-      // A network probe may take seconds. Resolve the current account again
-      // after that await and before returning IP/region/health data or writing
-      // requester-attributed audit detail. A stale request snapshot is not
-      // authority to receive the result.
-      const current = await identityService.resolveSessionPrincipal(req.session?.operator);
-      if (!current) return res.status(401).json({ error: "authentication required" });
-      if (!hasCapability(current, CAPABILITIES.RUN_NETWORK_CHECK)) {
-        return res.status(403).json({ error: "network verification is not permitted for this role" });
-      }
-      if (!canAccessDevice(current, req.params.deviceId)) {
-        return res.status(403).json({ error: "not authorized for this device" });
-      }
-      auditLog.logEvent({
-        operator: current.username,
-        type: "network_check",
-        deviceId: req.params.deviceId,
-        detail: withNetworkEgress(req.params.deviceId, {
-          observedIp: result.networkObservedIp,
-          verified: result.networkVerified,
-          mismatch: result.networkMismatch,
-          mismatchReason: result.networkMismatchReason,
-        }),
-      });
-      res.json({ network: { ...(publicNetworkConfig(configuredNetwork) ?? {}), ...result } });
-    })
-    .catch((error) => {
-      console.error("Network verification failed:", error?.code || error?.name || "Error");
-      res.status(502).json({ error: "network verification failed", code: "NETWORK_CHECK_FAILED" });
-    });
-});
-
-app.patch("/api/admin/devices/:deviceId/proxy", requireCapability(CAPABILITIES.MANAGE_PROXY), (req, res, next) => {
-  try {
-    if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
-    if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
-      return res.status(403).json({ error: "not authorized for this device" });
-    }
-    const network = setDeviceProxyEnabled({
-      configPath,
-      deviceId: req.params.deviceId,
-      enabled: req.body?.enabled,
-    });
-    deviceNetwork.set(req.params.deviceId, network);
-    auditLog.logEvent({
-      operator: req.currentOperator.username,
-      type: "proxy_setting_changed",
-      deviceId: req.params.deviceId,
-      detail: { enabled: network.enabled, networkEgress: network.egress },
-    });
-    broadcastDeviceList();
-    res.json({ network: publicNetworkConfig(network) });
-  } catch (error) {
-    if (error?.status) return res.status(error.status).json({ error: error.message });
-    next(error);
-  }
+registerNetworkCheckRoutes({
+  app,
+  hasCapability,
+  runNetworkCheckCapability: CAPABILITIES.RUN_NETWORK_CHECK,
+  knownDevice,
+  canAccessDevice,
+  deviceNetwork,
+  isProxyEgress,
+  resolveNetworkCheckTarget,
+  poolProxyForDevice,
+  proxyCredentialEncryptionKey,
+  proxyPoolRepository,
+  testProxy,
+  decryptProxyPassword,
+  refreshProxyPoolCache,
+  networkRoutingOrchestrator,
+  networkVerifier,
+  networkDecision,
+  taskQueue,
+  wss,
+  broadcastDeviceList,
+  identityService,
+  auditLog,
+  recordAudit: logAuditBestEffort,
+  publicNetworkConfig,
+  withNetworkEgress,
 });
 
 // Manual recovery for a device stuck in `user_action_required` (e.g. a
@@ -1988,11 +2328,11 @@ app.post("/api/admin/devices/:deviceId/retry-provisioning", requireCapability(CA
   }
   const ok = deviceProvisioner.retryDevice(req.params.deviceId);
   if (!ok) return res.status(409).json({ error: "this device is not currently managed by automatic provisioning" });
-  auditLog.logEvent({
+  logAuditBestEffort({
     operator: req.currentOperator.username,
     type: "provisioning_retry",
     deviceId: req.params.deviceId,
-  });
+  }, "Provisioning retry audit write");
   res.json({ ok: true });
 });
 
@@ -2004,199 +2344,55 @@ app.post("/api/admin/devices/:deviceId/retry-provisioning", requireCapability(CA
 // password to the browser. Actually starting a tunnel for a leased proxy
 // (TUN/PF) is a later step and does not exist yet — this is the pool and
 // exclusive per-device lease only.
-// ---- sites ------------------------------------------------------------------------
-const publicSite = site => ({ ...site, ...siteLinkHub.siteStatus(site.id) });
-const siteError = (res, error) => {
-  if (error instanceof SiteError) {
-    return res.status(error.code === "unknown_site" ? 404 : error.code === "duplicate_site" ? 409 : 400)
-      .json({ error: error.message, code: error.code });
-  }
-  throw error;
-};
-function hubOrigin(req) {
-  return deployment.publicUrl ? String(deployment.publicUrl).replace(/\/+$/, "") : `${req.protocol}://${req.get("host")}`;
-}
-
-app.get("/api/admin/sites", requireCapability(CAPABILITIES.MANAGE_SITES), (req, res) => {
-  res.json({ sites: siteStore.list().map(publicSite), defaultTimeZone: schedulingTimeZone });
+registerSiteRoutes({
+  app,
+  siteStore,
+  siteLinkHub,
+  requireCapability,
+  manageSitesCapability: CAPABILITIES.MANAGE_SITES,
+  auditLog,
+  recordAudit: logAuditBestEffort,
+  hubOrigin,
+  schedulingTimeZone,
+  broadcastDeviceList,
+  currentStoredOperator,
+  hasCapability,
 });
 
-app.post("/api/admin/sites", requireCapability(CAPABILITIES.MANAGE_SITES), (req, res) => {
-  try {
-    const { site, token } = siteStore.create({ name: req.body?.name, timeZone: req.body?.timeZone || undefined });
-    auditLog.logEvent({ operator: req.currentOperator.username, type: "site_created", detail: { siteId: site.id, name: site.name, timeZone: site.timeZone } });
-    // The token is shown this once; only its hash is stored.
-    res.status(201).json({ site: publicSite(site), token, hubUrl: hubOrigin(req) });
-  } catch (error) {
-    siteError(res, error);
-  }
+const { leaseByDevice: proxyProviderLeaseByDevice } = registerProxyProviderRoutes({
+  app,
+  registry: proxyProviderRegistry,
+  requireCapability,
+  capabilities: CAPABILITIES,
+  currentStoredOperator,
+  hasCapability,
+  canAccessDevice,
+  knownDevice,
+  auditLog,
+  recordAudit: logAuditBestEffort,
 });
 
-app.patch("/api/admin/sites/:siteId", requireCapability(CAPABILITIES.MANAGE_SITES), (req, res) => {
-  try {
-    const site = siteStore.update(req.params.siteId, { name: req.body?.name, timeZone: req.body?.timeZone });
-    auditLog.logEvent({ operator: req.currentOperator.username, type: "site_updated", detail: { siteId: site.id, name: site.name, timeZone: site.timeZone } });
-    broadcastDeviceList();
-    res.json({ site: publicSite(site) });
-  } catch (error) {
-    siteError(res, error);
-  }
-});
-
-app.post("/api/admin/sites/:siteId/rotate-token", requireCapability(CAPABILITIES.MANAGE_SITES), (req, res) => {
-  try {
-    const { site, token } = siteStore.rotate(req.params.siteId);
-    siteLinkHub.disconnect(site.id); // the agent holding the old token is cut off at once
-    auditLog.logEvent({ operator: req.currentOperator.username, type: "site_token_rotated", detail: { siteId: site.id } });
-    res.json({ site: publicSite(site), token, hubUrl: hubOrigin(req) });
-  } catch (error) {
-    siteError(res, error);
-  }
-});
-
-app.delete("/api/admin/sites/:siteId", requireCapability(CAPABILITIES.MANAGE_SITES), (req, res) => {
-  const site = siteStore.get(req.params.siteId);
-  if (!site) return res.status(404).json({ error: "Unknown site.", code: "unknown_site" });
-  // Revoke the token before closing the socket. Otherwise the agent can reconnect
-  // in the small window between close() and durable removal, re-registering phones
-  // after removeSite() has already swept the fleet.
-  siteStore.remove(site.id);
-  siteLinkHub.removeSite(site.id);
-  auditLog.logEvent({ operator: req.currentOperator.username, type: "site_removed", detail: { siteId: site.id, name: site.name } });
-  res.json({ ok: true });
-});
-
-app.get("/api/admin/proxies", requireCapability(CAPABILITIES.VIEW_PROXY_POOL), (req, res) => {
-  res.json({ proxies: proxyPoolCache });
-});
-
-app.post("/api/admin/proxies", requireCapability(CAPABILITIES.MANAGE_PROXY), (req, res) => {
-  if (!proxyCredentialEncryptionKey) {
-    return res.status(503).json({ error: "the proxy pool is unavailable until TWO_FACTOR_MASTER_KEY (or PROXY_CREDENTIAL_ENCRYPTION_KEY) is configured" });
-  }
-  try {
-    const record = proxyPoolRepository.create({
-      provider: req.body?.provider,
-      protocol: req.body?.protocol,
-      host: req.body?.host,
-      port: req.body?.port,
-      username: req.body?.username,
-      password: req.body?.password,
-      country: req.body?.country,
-      label: req.body?.label,
-    }, proxyCredentialEncryptionKey);
-    refreshProxyPoolCache();
-    auditLog.logEvent({
-      operator: req.currentOperator.username,
-      type: "proxy_pool_created",
-      detail: { proxyId: record.id, provider: record.provider, country: record.country },
-    });
-    res.status(201).json({ proxy: publicProxy(record) });
-  } catch (error) {
-    if (error?.status) return res.status(error.status).json({ error: error.message });
-    throw error;
-  }
-});
-
-function proxyTestFields(body = {}) {
-  return {
-    protocol: body.protocol,
-    host: body.host,
-    port: body.port,
-    username: body.username,
-    password: body.password,
-    country: body.country,
-  };
-}
-
-function proxyTestFailure(res, error) {
-  const diagnostic = error?.diagnostic;
-  return res.status(error?.status || 502).json({
-    error: diagnostic?.name || "Proxy test failed",
-    code: diagnostic?.code || "P111",
-    diagnostic: diagnostic || null,
-  });
-}
-
-app.post("/api/admin/proxies/test", requireCapability(CAPABILITIES.MANAGE_PROXY), async (req, res) => {
-  try {
-    const result = await testProxy(proxyTestFields(req.body));
-    res.json({ result });
-  } catch (error) {
-    proxyTestFailure(res, error);
-  }
-});
-
-app.post("/api/admin/proxies/:proxyId/test", requireCapability(CAPABILITIES.MANAGE_PROXY), async (req, res) => {
-  if (!proxyCredentialEncryptionKey) {
-    return res.status(503).json({ error: "proxy testing is unavailable until the credential encryption key is configured" });
-  }
-  const record = proxyPoolRepository.get(req.params.proxyId);
-  if (!record) return res.status(404).json({ error: "unknown proxy" });
-  try {
-    const result = await testProxy({
-      protocol: record.protocol, host: record.host, port: record.port, username: record.username,
-      password: decryptProxyPassword(record, proxyCredentialEncryptionKey), country: record.country,
-    });
-    proxyPoolRepository.updateHealth(record.id, result);
-    refreshProxyPoolCache();
-    auditLog.logEvent({ operator: req.currentOperator.username, type: "proxy_test_succeeded",
-      detail: { proxyId: record.id, publicIpv4: result.publicIpv4, country: result.country, latencyMs: result.latencyMs } });
-    res.json({ result, proxy: publicProxy(proxyPoolRepository.get(record.id)) });
-  } catch (error) {
-    const diagnostic = error?.diagnostic;
-    proxyPoolRepository.updateHealth(record.id, {
-      status: "failed", checkedAt: new Date().toISOString(),
-      errorCode: diagnostic?.code || "P111", errorName: diagnostic?.name || "Proxy test failed",
-    });
-    refreshProxyPoolCache();
-    auditLog.logEvent({ operator: req.currentOperator.username, type: "proxy_test_failed",
-      detail: { proxyId: record.id, errorCode: diagnostic?.code || "P111" } });
-    proxyTestFailure(res, error);
-  }
-});
-
-app.delete("/api/admin/proxies/:proxyId", requireCapability(CAPABILITIES.MANAGE_PROXY), (req, res) => {
-  try {
-    const deleted = proxyPoolRepository.remove(req.params.proxyId);
-    if (!deleted) return res.status(404).json({ error: "unknown proxy" });
-    refreshProxyPoolCache();
-    auditLog.logEvent({
-      operator: req.currentOperator.username,
-      type: "proxy_pool_deleted",
-      detail: { proxyId: req.params.proxyId },
-    });
-    res.json({ ok: true });
-  } catch (error) {
-    if (error?.status) return res.status(error.status).json({ error: error.message });
-    throw error;
-  }
-});
-
-app.patch("/api/admin/devices/:deviceId/proxy-assignment", requireCapability(CAPABILITIES.ASSIGN_PROXY), (req, res) => {
-  if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
-  if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
-    return res.status(403).json({ error: "not authorized for this device" });
-  }
-  const proxyId = req.body?.proxyId;
-  if (proxyId !== null && typeof proxyId !== "string") {
-    return res.status(400).json({ error: "proxyId must be a string or null" });
-  }
-  try {
-    proxyPoolRepository.assignToDevice({ deviceId: req.params.deviceId, proxyId });
-    refreshProxyPoolCache();
-    auditLog.logEvent({
-      operator: req.currentOperator.username,
-      type: "proxy_pool_assignment_changed",
-      deviceId: req.params.deviceId,
-      detail: { proxyId },
-    });
-    broadcastDeviceList();
-    res.json({ proxy: poolProxyForDevice(req.params.deviceId) });
-  } catch (error) {
-    if (error?.status) return res.status(error.status).json({ error: error.message });
-    throw error;
-  }
+registerProxyPoolRoutes({
+  app,
+  requireCapability,
+  capabilities: CAPABILITIES,
+  authorizeCurrentOperator,
+  knownDevice,
+  canAccessDevice,
+  proxyPoolRepository,
+  proxyCredentialEncryptionKey,
+  decryptProxyPassword,
+  publicProxy,
+  publicNetworkConfig,
+  testProxy,
+  getProxyPool: () => proxyPoolCache,
+  refreshProxyPoolCache,
+  setDeviceProxyEnabled,
+  configPath,
+  deviceNetwork,
+  recordAudit: logAuditBestEffort,
+  broadcastDeviceList,
+  poolProxyForDevice,
 });
 
 // Network enrollment (Automation Architecture guide §4.4): binding this
@@ -2216,10 +2412,11 @@ app.post("/api/admin/devices/:deviceId/network-enrollment/start", requireCapabil
   }
   try {
     const before = await listBridgeMembers({ bridgeIface: networkRoutingOrchestrator.bridgeIface });
+    await authorizeRoutingMutation(req, req.params.deviceId);
     networkEnrollmentSnapshots.set(req.params.deviceId, before);
     res.json({ ok: true, before });
   } catch (error) {
-    res.status(502).json({ error: error.message });
+    sendRoutingHttpFailure(res, error, { code: "N201" });
   }
 });
 
@@ -2238,17 +2435,18 @@ app.post("/api/admin/devices/:deviceId/network-enrollment/confirm", requireCapab
     const after = await listBridgeMembers({ bridgeIface: networkRoutingOrchestrator.bridgeIface });
     const diff = diffBridgeMembers(before, after);
     if (diff.state !== "assigned") return res.status(409).json({ error: diff.reason, newMembers: diff.newMembers });
+    const currentAtCommit = await authorizeRoutingMutation(req, req.params.deviceId);
     const record = setUsbIface(usbNetworkStorePath, req.params.deviceId, diff.iface);
     refreshUsbNetworkCache(req.params.deviceId);
     networkEnrollmentSnapshots.delete(req.params.deviceId);
-    auditLog.logEvent({
-      operator: req.currentOperator.username, type: "network_enrollment_confirmed",
+    logAuditBestEffort({
+      operator: currentAtCommit.username, type: "network_enrollment_confirmed",
       deviceId: req.params.deviceId, detail: { usbIface: diff.iface },
-    });
+    }, "Network enrollment audit write");
     broadcastDeviceList();
     res.json({ network: record });
   } catch (error) {
-    res.status(502).json({ error: error.message });
+    sendRoutingHttpFailure(res, error, { code: "N201" });
   }
 });
 
@@ -2268,16 +2466,17 @@ app.post("/api/admin/devices/:deviceId/discover-ip", requireCapability(CAPABILIT
     const capture = await captureDeviceTraffic({ iface: enrolled.usbIface });
     const result = discoverDeviceIp(capture, { excludeIps: [ownIp] });
     if (result.state !== "resolved") return res.status(409).json({ error: result.reason, state: result.state, candidates: result.candidates });
+    const currentAtCommit = await authorizeRoutingMutation(req, req.params.deviceId);
     const record = setUsbIp(usbNetworkStorePath, req.params.deviceId, result.ip);
     refreshUsbNetworkCache(req.params.deviceId);
-    auditLog.logEvent({
-      operator: req.currentOperator.username, type: "usb_ip_discovered",
+    logAuditBestEffort({
+      operator: currentAtCommit.username, type: "usb_ip_discovered",
       deviceId: req.params.deviceId, detail: { usbIp: result.ip },
-    });
+    }, "USB address discovery audit write");
     broadcastDeviceList();
     res.json({ network: record });
   } catch (error) {
-    res.status(502).json({ error: error.message });
+    sendRoutingHttpFailure(res, error, { code: "N202" });
   }
 });
 
@@ -2297,23 +2496,31 @@ app.post("/api/admin/devices/:deviceId/start-routing", requireCapability(CAPABIL
     return res.status(400).json({ error: "usbIp is required (supply it, or run network enrollment + IP discovery for this device first)" });
   }
   try {
-    const route = await networkRoutingOrchestrator.startRouting(req.params.deviceId, { usbIp });
-    auditLog.logEvent({
-      operator: req.currentOperator.username,
+    let currentAtCommit = null;
+    const route = await networkRoutingOrchestrator.startRouting(req.params.deviceId, {
+      usbIp,
+      authorize: async () => {
+        currentAtCommit = await authorizeRoutingMutation(req, req.params.deviceId);
+        return currentAtCommit;
+      },
+    });
+    if (!currentAtCommit) throw new Error("routing orchestrator did not perform its required commit authorization");
+    logAuditBestEffort({
+      operator: currentAtCommit.username,
       type: "routing_started",
       deviceId: req.params.deviceId,
       detail: { state: route.state, tunIface: route.tunIface },
-    });
+    }, "Routing-start audit write");
     broadcastDeviceList();
     res.json({ routing: route });
   } catch (error) {
-    auditLog.logEvent({
+    logAuditBestEffort({
       operator: req.currentOperator.username,
       type: "routing_start_failed",
       deviceId: req.params.deviceId,
-      detail: { error: error.message },
-    });
-    res.status(error.status || 502).json({ error: error.message });
+      detail: { code: error?.code || "ROUTING_START_FAILED" },
+    }, "Routing-failure audit write");
+    sendRoutingHttpFailure(res, error, { code: "T202" });
   }
 });
 
@@ -2324,12 +2531,17 @@ app.post("/api/admin/devices/:deviceId/stop-routing", requireCapability(CAPABILI
     return res.status(403).json({ error: "not authorized for this device" });
   }
   try {
+    // Once teardown has begun it is a fail-closed safety operation. Finish it
+    // even if the initiating session is revoked while PF/tunnel cleanup waits.
     await networkRoutingOrchestrator.stopRouting(req.params.deviceId);
-    auditLog.logEvent({ operator: req.currentOperator.username, type: "routing_stopped", deviceId: req.params.deviceId });
+    logAuditBestEffort(
+      { operator: req.currentOperator.username, type: "routing_stopped", deviceId: req.params.deviceId },
+      "Routing-stop audit write",
+    );
     broadcastDeviceList();
     res.json({ ok: true });
   } catch (error) {
-    res.status(502).json({ error: error.message });
+    sendRoutingHttpFailure(res, error, { code: "F202" });
   }
 });
 
@@ -2348,8 +2560,8 @@ app.get("/api/research", (req, res) => {
 app.use("/api/research/:account", (req, res, next) => {
   const workspaceId = researchWorkspaceFor(req.currentOperator, req.params.account);
   if (!workspaceId) {
-    auditLog.logEvent({ operator: req.session.operator.username, type: "research_access_denied",
-      detail: { account: req.params.account, method: req.method } });
+    logAuditBestEffort({ operator: req.session.operator.username, type: "research_access_denied",
+      detail: { account: req.params.account, method: req.method } }, "Research access-denial audit write");
     return res.status(403).json({ error: "not authorized for this research account" });
   }
   req.researchWorkspaceId = workspaceId;
@@ -2394,8 +2606,9 @@ app.post("/api/research/:account/runs", (req, res) => {
     return res.status(400).json({ error: "candidates must be an array" });
   }
   const run = researchRunRepository.createRun(req.researchWorkspaceId, req.params.account, { platform, timeWindow, overview, candidates });
-  auditLog.logEvent({ operator: req.session.operator.username, type: "research_run_created",
-    detail: { workspaceId: req.researchWorkspaceId, account: req.params.account, runId: run.id } });
+  logAuditBestEffort({ operator: req.session.operator.username, type: "research_run_created",
+    detail: { workspaceId: req.researchWorkspaceId, account: req.params.account, runId: run.id } },
+  "Research-run audit write");
   res.json({ run });
 });
 
@@ -2404,11 +2617,11 @@ app.patch("/api/research/:account/runs/:runId/candidates/:candidateId", (req, re
   const status = req.body?.status;
   const candidate = researchRunRepository.setCandidateStatus(req.researchWorkspaceId, req.params.account, req.params.runId, req.params.candidateId, status);
   if (!candidate) return res.status(400).json({ error: "invalid status, or run/candidate not found" });
-  auditLog.logEvent({
+  logAuditBestEffort({
     operator: req.session.operator.username,
     type: "candidate_status_changed",
     detail: { workspaceId: req.researchWorkspaceId, account: req.params.account, runId: req.params.runId, candidateId: req.params.candidateId, status },
-  });
+  }, "Research-candidate audit write");
   res.json({ candidate });
 });
 
@@ -2428,8 +2641,9 @@ app.put("/api/research/:account/policies/:action", (req, res) => {
   if (denyUnless(req, res, CAPABILITIES.MANAGE_ACTION_POLICY, "changing action policy requires an administrator")) return;
   try {
     const entry = policyStore.set(req.params.account, req.params.action, req.body?.policy, req.currentOperator.username);
-    auditLog.logEvent({ operator: req.currentOperator.username, type: "action_policy_changed",
-      detail: { workspaceId: req.researchWorkspaceId, account: req.params.account, action: req.params.action, policy: entry.value } });
+    logAuditBestEffort({ operator: req.currentOperator.username, type: "action_policy_changed",
+      detail: { workspaceId: req.researchWorkspaceId, account: req.params.account, action: req.params.action, policy: entry.value } },
+    "Action-policy audit write");
     res.json({ policy: { action: req.params.action, policy: entry.value, source: "runtime" } });
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -2445,8 +2659,8 @@ app.post("/api/research/:account/templates", (req, res) => {
   if (denyUnless(req, res, CAPABILITIES.MANAGE_ACTION_POLICY, "managing preset comments requires an administrator")) return;
   try {
     const template = templateLibrary.add({ workspaceId: req.researchWorkspaceId, text: req.body?.text, tags: req.body?.tags, createdBy: req.currentOperator.username });
-    auditLog.logEvent({ operator: req.currentOperator.username, type: "comment_template_added",
-      detail: { workspaceId: req.researchWorkspaceId, templateId: template.id } });
+    logAuditBestEffort({ operator: req.currentOperator.username, type: "comment_template_added",
+      detail: { workspaceId: req.researchWorkspaceId, templateId: template.id } }, "Comment-template audit write");
     res.status(201).json({ template });
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -2456,8 +2670,8 @@ app.post("/api/research/:account/templates", (req, res) => {
 app.delete("/api/research/:account/templates/:templateId", (req, res) => {
   if (denyUnless(req, res, CAPABILITIES.MANAGE_ACTION_POLICY, "managing preset comments requires an administrator")) return;
   if (!templateLibrary.remove(req.researchWorkspaceId, req.params.templateId)) return res.status(404).json({ error: "template not found" });
-  auditLog.logEvent({ operator: req.currentOperator.username, type: "comment_template_removed",
-    detail: { workspaceId: req.researchWorkspaceId, templateId: req.params.templateId } });
+  logAuditBestEffort({ operator: req.currentOperator.username, type: "comment_template_removed",
+    detail: { workspaceId: req.researchWorkspaceId, templateId: req.params.templateId } }, "Comment-template audit write");
   res.json({ ok: true });
 });
 
@@ -2478,17 +2692,9 @@ app.post("/api/research/:account/approvals/:id/:decision(approve|reject)", (req,
   if (!ownApproval(req, req.params.id)) return res.status(404).json({ error: "approval not found" });
   try {
     const approval = approvalStore.decide(req.params.id, { decision: req.params.decision, decidedBy: req.currentOperator.username, reason: req.body?.reason });
-    try {
-      auditLog.logEvent({ operator: req.currentOperator.username, type: "approval_decided",
-        detail: { workspaceId: approval.workspaceId, account: approval.accountId, approvalId: approval.id, action: approval.action,
-          target: approval.target, decision: approval.state, taskId: approval.taskId } });
-    } catch (error) {
-      // The approval decision is already durably committed. Do not turn an
-      // audit-disk problem into a misleading failed response (or an
-      // unhandled Express 4 async rejection) that invites a conflicting
-      // retry of the now-final decision.
-      console.error("Approval decision audit failed:", error);
-    }
+    logAuditBestEffort({ operator: req.currentOperator.username, type: "approval_decided",
+      detail: { workspaceId: approval.workspaceId, account: approval.accountId, approvalId: approval.id, action: approval.action,
+        target: approval.target, decision: approval.state, taskId: approval.taskId } }, "Approval-decision audit write");
     res.json({ approval, note: approval.state === "APPROVED"
       ? "Approved. The action runs the next time the paused task is resumed and reaches this step." : "Rejected." });
   } catch (error) {
@@ -2558,8 +2764,9 @@ function interventionAction(action) {
       const updated = action === "claim"
         ? interventionQueue.claim(item.id, req.currentOperator.username)
         : interventionQueue.resolve(item.id, { by: req.currentOperator.username, resolution: req.body?.resolution });
-      auditLog.logEvent({ operator: req.currentOperator.username, type: `intervention_${action}`, deviceId: item.deviceId,
-        detail: { interventionId: item.id, taskId: item.taskId, accountId: item.accountId, kind: item.kind } });
+      logAuditBestEffort({ operator: req.currentOperator.username, type: `intervention_${action}`, deviceId: item.deviceId,
+        detail: { interventionId: item.id, taskId: item.taskId, accountId: item.accountId, kind: item.kind } },
+      "Intervention audit write");
       res.json({ intervention: updated });
     } catch (error) {
       res.status(409).json({ error: error.message });
@@ -2769,8 +2976,8 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null, client
       }
       try {
         const selection = modelSelection.set(parsed.providerName, { scope: parsed.scope, scopeId: parsed.scopeId });
-        auditLog.logEvent({ operator: operator.username, type: "model_provider_selected", deviceId: parsed.scope === "device" ? parsed.scopeId : null,
-          detail: selection });
+        logAuditBestEffort({ operator: operator.username, type: "model_provider_selected", deviceId: parsed.scope === "device" ? parsed.scopeId : null,
+          detail: selection }, "Command model-selection audit write");
         return { selection };
       } catch (error) {
         return { error: error.message };
@@ -2816,12 +3023,18 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null, client
         } catch (e) {
           return { error: e.message };
         }
-        auditLog.logEvent({ operator: operator.username, type: "switched_to_ai", deviceId: parsed.deviceId });
+        logAuditBestEffort(
+          { operator: operator.username, type: "switched_to_ai", deviceId: parsed.deviceId },
+          "Command AI-mode audit write",
+        );
       } else {
         const taskDenied = activeDeviceTaskAccessError(parsed.deviceId, operator);
         if (taskDenied) return taskAccessResult(taskDenied);
         await taskQueue.takeoverDevice(parsed.deviceId);
-        auditLog.logEvent({ operator: operator.username, type: "takeover", deviceId: parsed.deviceId });
+        logAuditBestEffort(
+          { operator: operator.username, type: "takeover", deviceId: parsed.deviceId },
+          "Command takeover audit write",
+        );
       }
       // Explicit, not left to a taskQueue event: the "ai" branch above never
       // touches taskQueue at all, and takeoverDevice() (the "human" branch)
@@ -2864,7 +3077,10 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null, client
       const taskDenied = activeDeviceTaskAccessError(parsed.deviceId, operator);
       if (taskDenied) return taskAccessResult(taskDenied);
       const task = taskQueue.stopDevice(parsed.deviceId);
-      auditLog.logEvent({ operator: operator.username, type: "ai_stop", deviceId: parsed.deviceId });
+      logAuditBestEffort(
+        { operator: operator.username, type: "ai_stop", deviceId: parsed.deviceId },
+        "Command AI-stop audit write",
+      );
       broadcastDeviceList();
       return { task: task ?? null };
     }
@@ -2877,7 +3093,10 @@ async function executeCommand(parsed, operator, workspaceDeviceId = null, client
       const taskDenied = activeDeviceTaskAccessError(parsed.deviceId, operator);
       if (taskDenied) return taskAccessResult(taskDenied);
       const task = await taskQueue.takeoverDevice(parsed.deviceId);
-      auditLog.logEvent({ operator: operator.username, type: "takeover", deviceId: parsed.deviceId });
+      logAuditBestEffort(
+        { operator: operator.username, type: "takeover", deviceId: parsed.deviceId },
+        "Command takeover audit write",
+      );
       broadcastDeviceList();
       return { task: task ?? null, controllerMode: deviceLease.getMode(parsed.deviceId) };
     }
@@ -2905,8 +3124,9 @@ app.post("/api/queue/command", requireCapability(CAPABILITIES.MANAGE_QUEUE), asy
       }
       const decision = deviceWatchDecision(devices.get(workspaceDeviceId), req.currentOperator);
       if (!decision.canWatch || decision.watchState !== "ai_read_only") {
-        auditLog.logEvent({ operator: req.currentOperator.username, type: "device_workspace_command_denied",
-          deviceId: workspaceDeviceId, detail: { reason: decision.watchState } });
+        logAuditBestEffort({ operator: req.currentOperator.username, type: "device_workspace_command_denied",
+          deviceId: workspaceDeviceId, detail: { reason: decision.watchState } },
+        "Command workspace-denial audit write");
         return res.status(403).json({ error: decision.watchReason });
       }
     }
@@ -2945,15 +3165,38 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "request failed", code: "INTERNAL_ERROR" });
 });
 
+function sendWebSocketJsonBestEffort(client, message, context) {
+  try {
+    client.send(JSON.stringify(message), error => {
+      if (!error) return;
+      logOperationalFailure(context, error);
+      try { client.terminate?.(); } catch { /* the peer is already unusable */ }
+    });
+    return true;
+  } catch (error) {
+    // A peer can close between the readyState check and send(). Broadcasts
+    // are derived notifications, not part of the durable mutation that
+    // triggered them, so one stale peer must never change the HTTP result.
+    logOperationalFailure(context, error);
+    try { client.terminate?.(); } catch { /* the peer is already unusable */ }
+    return false;
+  }
+}
+
 function broadcastDeviceList() {
   for (const client of wss.clients) {
     if (client.readyState !== client.OPEN) continue;
-    client.releaseUnauthorizedWatch?.("fleet_updated");
-    const operator = client.currentOperator?.();
-    const visibleDevices = operator && hasCapability(operator, CAPABILITIES.VIEW_FLEET)
-      ? [...devices.values()].map(device => summary(device, operator, client))
-      : [];
-    client.send(JSON.stringify({ type: "device_list", devices: visibleDevices }));
+    try {
+      client.releaseUnauthorizedWatch?.("fleet_updated");
+      const operator = client.currentOperator?.();
+      const visibleDevices = operator && hasCapability(operator, CAPABILITIES.VIEW_FLEET)
+        ? [...devices.values()].map(device => summary(device, operator, client))
+        : [];
+      sendWebSocketJsonBestEffort(client, { type: "device_list", devices: visibleDevices }, "Device-list broadcast failed");
+    } catch (error) {
+      logOperationalFailure("Device-list broadcast failed", error);
+      try { client.terminate?.(); } catch { /* the peer is already unusable */ }
+    }
   }
 }
 
@@ -2977,7 +3220,13 @@ function runtimeMonitorState(deviceId) {
 function broadcastPresence() {
   for (const client of wss.clients) {
     if (client.readyState !== client.OPEN) continue;
-    client.send(JSON.stringify({ type: "presence_list", people: publicPeople(client.currentOperator?.()) }));
+    try {
+      sendWebSocketJsonBestEffort(client,
+        { type: "presence_list", people: publicPeople(client.currentOperator?.()) }, "Presence broadcast failed");
+    } catch (error) {
+      logOperationalFailure("Presence broadcast failed", error);
+      try { client.terminate?.(); } catch { /* the peer is already unusable */ }
+    }
   }
 }
 
@@ -3094,12 +3343,12 @@ wss.on("connection", (ws, request) => {
   // feature-role gate, so admin does not imply access to every phone.
   const requireAiManagerWs = (deviceId, action) => {
     if (hasCapability(currentOperator(), CAPABILITIES.MANAGE_AI_CONTROLLER)) return true;
-    auditLog.logEvent({
+    logAuditBestEffort({
       operator: operator.username,
       type: "capability_access_denied",
       deviceId: deviceId ?? null,
       detail: { action, capability: CAPABILITIES.MANAGE_AI_CONTROLLER },
-    });
+    }, "WebSocket capability-denial audit write");
     ws.send(JSON.stringify({
       type: "error",
       deviceId: deviceId ?? undefined,
@@ -3184,8 +3433,8 @@ wss.on("connection", (ws, request) => {
   const revokeSelectedAccess = (action, target = selected, generation = selectionGeneration) => {
     if (!selected || selected !== target || selectionGeneration !== generation) return false;
     const revokedId = selected.id;
-    auditLog.logEvent({ operator: operator.username, type: "device_access_revoked", deviceId: revokedId,
-      detail: { action } });
+    logAuditBestEffort({ operator: operator.username, type: "device_access_revoked", deviceId: revokedId,
+      detail: { action } }, "WebSocket access-revocation audit write");
     releaseSelection();
     broadcastDeviceList();
     broadcastPresence();
@@ -3208,8 +3457,8 @@ wss.on("connection", (ws, request) => {
     if (streamTarget && streamTarget === watched) stopStream();
     watched = null;
     ws.watchedDeviceId = null;
-    auditLog.logEvent({ operator: operator.username, type: "device_watch_stopped", deviceId: watchedId,
-      detail: { action } });
+    logAuditBestEffort({ operator: operator.username, type: "device_watch_stopped", deviceId: watchedId,
+      detail: { action } }, "WebSocket watch-stop audit write");
     if (notify && ws.readyState === ws.OPEN) {
       ws.send(JSON.stringify({ type: "watch_stopped", deviceId: watchedId,
         message: "This read-only device session is no longer available." }));
@@ -3267,8 +3516,8 @@ wss.on("connection", (ws, request) => {
     if (failures >= OFFLINE_AFTER_FAILURES && target.status !== "offline") {
         const offlineId = target.id;
         target.status = "offline";
-        auditLog.logEvent({ operator: operator.username, type: "device_became_offline", deviceId: offlineId,
-          detail: { consecutiveFailures: failures } });
+        logAuditBestEffort({ operator: operator.username, type: "device_became_offline", deviceId: offlineId,
+          detail: { consecutiveFailures: failures } }, "WebSocket device-offline audit write");
         releaseSelection();
         broadcastDeviceList();
         broadcastPresence();
@@ -3462,12 +3711,12 @@ wss.on("connection", (ws, request) => {
         revokeSelectedAccess(`${msg.type}_result`, target, generation);
         return;
       }
-      auditLog.logEvent({
+      logAuditBestEffort({
         operator: operator.username,
         type: auditType,
         deviceId: target.id,
         detail: withNetworkEgress(target.id, detail),
-      });
+      }, "WebSocket device-input audit write");
       recordSuccess(target.id);
       await afterAction(label, msg);
     } catch (err) {
@@ -3483,8 +3732,8 @@ wss.on("connection", (ws, request) => {
     if (!await ws.validateSession()) return;
     const decision = deviceOpenDecision(target, currentOperator(), ws);
     if (!decision.canOpen) {
-      auditLog.logEvent({ operator: operator.username, type: "device_select_denied", deviceId: target.id,
-        detail: { reason: decision.accessState } });
+      logAuditBestEffort({ operator: operator.username, type: "device_select_denied", deviceId: target.id,
+        detail: { reason: decision.accessState } }, "WebSocket selection-denial audit write");
       ws.send(JSON.stringify({ type: "error", code: "device_open_denied", deviceId: target.id, message: decision.openReason }));
       return;
     }
@@ -3496,12 +3745,12 @@ wss.on("connection", (ws, request) => {
     humanOwners.set(target.id, ws);
     presenceStore.setDevice(ws.presenceConnectionId, target.id);
     selected.status = "in-use";
-    auditLog.logEvent({
+    logAuditBestEffort({
       operator: operator.username,
       type: "device_selected",
       deviceId: selected.id,
       detail: withNetworkEgress(selected.id),
-    });
+    }, "WebSocket device-selection audit write");
     await sendFrame();
     broadcastDeviceList();
     broadcastPresence();
@@ -3522,7 +3771,7 @@ wss.on("connection", (ws, request) => {
   const enqueue = (fn) => {
     queuedMessages += 1;
     actionQueue = actionQueue.then(fn).catch((err) => {
-      console.error("Unexpected error in connection message queue:", err);
+      logOperationalFailure("Unexpected error in connection message queue", err);
     }).finally(() => { queuedMessages -= 1; });
   };
 
@@ -3537,8 +3786,9 @@ wss.on("connection", (ws, request) => {
 
     if (["pause", "resume", "stop", "pause_task", "resume_task", "stop_task"].includes(msg.type)) {
       if (!hasCapability(currentOperator(), CAPABILITIES.MANAGE_QUEUE)) {
-        auditLog.logEvent({ operator: operator.username, type: "capability_access_denied",
-          deviceId: msg.deviceId ?? null, detail: { action: msg.type, capability: CAPABILITIES.MANAGE_QUEUE } });
+        logAuditBestEffort({ operator: operator.username, type: "capability_access_denied",
+          deviceId: msg.deviceId ?? null, detail: { action: msg.type, capability: CAPABILITIES.MANAGE_QUEUE } },
+        "WebSocket queue-denial audit write");
         ws.send(JSON.stringify({ type: "error", code: "capability_denied", deviceId: msg.deviceId,
           message: "Queue management capability required." }));
         return;
@@ -3556,8 +3806,8 @@ wss.on("connection", (ws, request) => {
       }
       const decision = deviceOpenDecision(target, currentOperator(), ws);
       if (!decision.canOpen) {
-        auditLog.logEvent({ operator: operator.username, type: "device_select_denied", deviceId: msg.deviceId,
-          detail: { reason: decision.accessState } });
+        logAuditBestEffort({ operator: operator.username, type: "device_select_denied", deviceId: msg.deviceId,
+          detail: { reason: decision.accessState } }, "WebSocket selection-denial audit write");
         ws.send(JSON.stringify({
           type: "error",
           code: "device_open_denied",
@@ -3583,16 +3833,17 @@ wss.on("connection", (ws, request) => {
       }
       const decision = deviceWatchDecision(target, currentOperator(), ws);
       if (!decision.canWatch) {
-        auditLog.logEvent({ operator: operator.username, type: "device_watch_denied", deviceId: target.id,
-          detail: { reason: decision.watchState } });
+        logAuditBestEffort({ operator: operator.username, type: "device_watch_denied", deviceId: target.id,
+          detail: { reason: decision.watchState } }, "WebSocket watch-denial audit write");
         ws.send(JSON.stringify({ type: "error", code: "watch_denied", deviceId: target.id, message: decision.watchReason }));
         return;
       }
       if (watched && watched !== target) clearWatch("switched_device");
       watched = target;
       ws.watchedDeviceId = target.id;
-      auditLog.logEvent({ operator: operator.username, type: "device_watch_started", deviceId: target.id,
-        detail: { activeOperator: humanOwners.get(target.id)?.operatorUsername ?? null, watchState: decision.watchState } });
+      logAuditBestEffort({ operator: operator.username, type: "device_watch_started", deviceId: target.id,
+        detail: { activeOperator: humanOwners.get(target.id)?.operatorUsername ?? null, watchState: decision.watchState } },
+      "WebSocket watch-start audit write");
       ws.send(JSON.stringify({ type: "watch_started", deviceId: target.id,
         operator: humanOwners.get(target.id)?.operatorUsername ?? null, watchState: decision.watchState }));
       try {
@@ -3673,7 +3924,10 @@ wss.on("connection", (ws, request) => {
         ws.send(JSON.stringify({ type: "error", deviceId: msg.deviceId, message: err.message }));
         return;
       }
-      auditLog.logEvent({ operator: operator.username, type: "switched_to_ai", deviceId: msg.deviceId });
+      logAuditBestEffort(
+        { operator: operator.username, type: "switched_to_ai", deviceId: msg.deviceId },
+        "WebSocket AI-mode audit write",
+      );
       broadcastDeviceList();
       return;
     }
@@ -3711,7 +3965,10 @@ wss.on("connection", (ws, request) => {
       // command) can reliably prevent.
       if (claimConflict(target)) return;
       await taskQueue.takeoverDevice(msg.deviceId);
-      auditLog.logEvent({ operator: operator.username, type: "takeover", deviceId: msg.deviceId });
+      logAuditBestEffort(
+        { operator: operator.username, type: "takeover", deviceId: msg.deviceId },
+        "WebSocket takeover audit write",
+      );
       await claimDevice(target);
       return;
     }
@@ -3748,7 +4005,10 @@ wss.on("connection", (ws, request) => {
       // it — the same zombie-task class of bug the `takeover` handler above
       // was already fixed for.
       taskQueue.emergencyStopDevice(msg.deviceId);
-      auditLog.logEvent({ operator: operator.username, type: "emergency_stop", deviceId: msg.deviceId });
+      logAuditBestEffort(
+        { operator: operator.username, type: "emergency_stop", deviceId: msg.deviceId },
+        "WebSocket emergency-stop audit write",
+      );
       broadcastDeviceList();
       return;
     }
@@ -3812,8 +4072,8 @@ wss.on("connection", (ws, request) => {
     }
 
     if (["tap", "swipe", "home", "type_text", "release_device", "drag", "long_press", "double_tap"].includes(msg.type) && watched && !selected) {
-      auditLog.logEvent({ operator: operator.username, type: "device_watch_input_denied", deviceId: msg.deviceId ?? watched.id,
-        detail: { action: msg.type } });
+      logAuditBestEffort({ operator: operator.username, type: "device_watch_input_denied", deviceId: msg.deviceId ?? watched.id,
+        detail: { action: msg.type } }, "WebSocket watch-input-denial audit write");
       ws.send(JSON.stringify({ type: "error", code: "watch_read_only", deviceId: msg.deviceId ?? watched.id,
         message: "Live watching is read-only." }));
       return;
@@ -3861,12 +4121,12 @@ wss.on("connection", (ws, request) => {
           revokeSelectedAccess("tap_result", target, generation);
           return;
         }
-        auditLog.logEvent({
+        logAuditBestEffort({
           operator: operator.username,
           type: "action_tap",
           deviceId: target.id,
           detail: withNetworkEgress(target.id, { x: msg.x, y: msg.y }),
-        });
+        }, "WebSocket tap audit write");
         recordSuccess(target.id);
         await afterAction("Tap", msg);
       } catch (err) {
@@ -3893,12 +4153,12 @@ wss.on("connection", (ws, request) => {
           revokeSelectedAccess("swipe_result", target, generation);
           return;
         }
-        auditLog.logEvent({
+        logAuditBestEffort({
           operator: operator.username,
           type: "action_swipe",
           deviceId: target.id,
           detail: withNetworkEgress(target.id, { direction: msg.direction }),
-        });
+        }, "WebSocket swipe audit write");
         recordSuccess(target.id);
         await afterAction("Swipe", msg);
       } catch (err) {
@@ -3919,12 +4179,12 @@ wss.on("connection", (ws, request) => {
           revokeSelectedAccess("home_result", target, generation);
           return;
         }
-        auditLog.logEvent({
+        logAuditBestEffort({
           operator: operator.username,
           type: "action_home",
           deviceId: target.id,
           detail: withNetworkEgress(target.id),
-        });
+        }, "WebSocket Home audit write");
         recordSuccess(target.id);
         await afterAction("Home", msg);
       } catch (err) {
@@ -3954,12 +4214,12 @@ wss.on("connection", (ws, request) => {
         }
         // Length only, never the text itself — this goes straight to a
         // real keyboard and the audit log isn't the place to retain that.
-        auditLog.logEvent({
+        logAuditBestEffort({
           operator: operator.username,
           type: "action_type_text",
           deviceId: target.id,
           detail: withNetworkEgress(target.id, { length: msg.text.length }),
-        });
+        }, "WebSocket text-input audit write");
         recordSuccess(target.id);
         await afterAction("Text input", msg);
       } catch (err) {
@@ -4028,12 +4288,12 @@ wss.on("connection", (ws, request) => {
       const releaseWasAuthorized = hasCapability(currentOperator(), CAPABILITIES.CONTROL_DEVICE)
         && canAccessDevice(currentOperator(), releasedId)
         && humanOwners.get(releasedId) === ws && deviceLease.canHumanSelect(releasedId);
-      auditLog.logEvent({
+      logAuditBestEffort({
         operator: operator.username,
         type: releaseWasAuthorized ? "device_released" : "device_access_revoked",
         deviceId: releasedId,
         detail: withNetworkEgress(releasedId, releaseWasAuthorized ? {} : { action: "release_device" }),
-      });
+      }, "WebSocket device-release audit write");
       releaseSelection();
       broadcastDeviceList();
       broadcastPresence();
@@ -4057,13 +4317,13 @@ wss.on("connection", (ws, request) => {
       }
       liveFramePending = true;
       void handleLiveFrame(parsed)
-        .catch(error => console.error("Live frame refresh failed:", error))
+        .catch(error => logOperationalFailure("Live frame refresh failed", error))
         .finally(() => { liveFramePending = false; });
       return;
     }
     const emergency = messageType === "emergency_stop";
     if (emergency) void handleMessage(raw).catch(error => {
-      console.error("Emergency control failed:", error);
+      logOperationalFailure("Emergency control failed", error);
     });
     else if (queuedMessages >= MAX_QUEUED_INPUT_MESSAGES) {
       ws.send(JSON.stringify({ type: "error", code: "input_backlog",
@@ -4119,7 +4379,7 @@ if (isMain) {
   }, QUEUE_TICK_INTERVAL_MS);
   const WDA_READINESS_INTERVAL_MS = 10_000;
   wdaReadinessTimer = setInterval(() => {
-    void refreshWdaReadiness().catch(error => console.error("WDA readiness refresh failed:", error));
+    void refreshWdaReadiness().catch(error => logOperationalFailure("WDA readiness refresh failed", error));
   }, WDA_READINESS_INTERVAL_MS);
 
   // Opt-in (AUTO_PROVISION_WDA=true): find USB iPhones and set up WebDriverAgent on
@@ -4172,7 +4432,10 @@ if (isMain) {
               await enableInternetSharing({ primaryInterface });
               console.log(`Internet Sharing enabled automatically (${primaryInterface} -> USB). This uses an undocumented macOS mechanism — verify it actually worked via the fleet UI's network enrollment status.`);
             } catch (error) {
-              console.error("Automatic Internet Sharing setup failed — enable it manually in System Settings > General > Sharing > Internet Sharing:", error.message);
+              logOperationalFailure(
+                "Automatic Internet Sharing setup failed — enable it manually in System Settings > General > Sharing > Internet Sharing",
+                error,
+              );
             }
           })();
         }
@@ -4190,13 +4453,19 @@ if (isMain) {
           autoNetworkEnrollment.start();
         }
       } catch (error) {
-        console.error("Automatic proxy tunnel routing is disabled:", error.message);
+        logOperationalFailure("Automatic proxy tunnel routing is disabled", error);
       }
     }
   }
 }
 
-server.on("close", () => { streamHub.closeAll(); siteLinkHub.closeAll(); });
+server.on("close", () => {
+  streamHub.closeAll();
+  siteLinkHub.closeAll();
+  void applicationDatabasePool?.end().catch(error => {
+    logOperationalFailure("PostgreSQL pool shutdown failed", error);
+  });
+});
 
 export {
   app,
@@ -4204,6 +4473,7 @@ export {
   streamHub,
   siteStore,
   siteLinkHub,
+  durableRepositories,
   approvalStore,
   commentLedger,
   templateLibrary,
@@ -4227,11 +4497,15 @@ export {
   modelSelection,
   presenceStore,
   assignmentStore,
+  accountNotificationStore,
   schedulerGuard,
   wdaReadinessTimer,
   deviceProvisioner,
   networkRoutingOrchestrator,
   autoNetworkEnrollment,
+  proxyProviderRegistry,
+  proxyProviderLeaseByDevice,
   publicPeople,
+  privacyRequestStore,
   isLoopbackAddress,
 };

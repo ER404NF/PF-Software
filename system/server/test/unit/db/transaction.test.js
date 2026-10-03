@@ -79,14 +79,29 @@ test("withTransaction rolls back and re-throws when the callback fails, and stil
 
 test("withTransaction releases the client even when ROLLBACK itself fails", async () => {
   let released = false;
+  const errors = [];
+  const originalError = console.error;
   const client = {
-    query: async (text) => { if (text === "ROLLBACK") throw new Error("connection already closed"); },
+    query: async (text) => {
+      if (text === "ROLLBACK") {
+        const error = new Error("postgres://private:password@database transaction failed");
+        error.code = "ECONNRESET";
+        throw error;
+      }
+    },
     release: () => { released = true; },
   };
   const pool = { connect: async () => client };
-  await assert.rejects(
-    () => withTransaction(pool, async () => { throw new Error("original failure"); }),
-    /original failure/,
-  );
+  console.error = (...values) => errors.push(values.map(String).join(" "));
+  try {
+    await assert.rejects(
+      () => withTransaction(pool, async () => { throw new Error("original failure"); }),
+      /original failure/,
+    );
+  } finally {
+    console.error = originalError;
+  }
   assert.equal(released, true);
+  assert.deepEqual(errors, ["Rollback failed after a transaction error: ECONNRESET"]);
+  assert.equal(errors.some(value => /private|password|database/.test(value)), false);
 });

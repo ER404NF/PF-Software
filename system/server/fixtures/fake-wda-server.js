@@ -47,6 +47,13 @@ let hanging = false;
 let responseDelayMs = 0;
 let ready = true;
 let failNextScreenshot = false;
+let holdScreenshots = false;
+const screenshotWaiters = [];
+
+function releaseScreenshots() {
+  holdScreenshots = false;
+  for (const resolve of screenshotWaiters.splice(0)) resolve();
+}
 
 function record(type, extra = {}) {
   history.push({ type, at: new Date().toISOString(), ...extra });
@@ -55,6 +62,9 @@ function record(type, extra = {}) {
 async function respond(req, res, type, extra, send) {
   record(type, extra);
   if (hanging) return;
+  if (type === "screenshot" && holdScreenshots) {
+    await new Promise((resolve) => screenshotWaiters.push(resolve));
+  }
   if (responseDelayMs > 0) await new Promise((r) => setTimeout(r, responseDelayMs));
   send();
 }
@@ -96,11 +106,19 @@ app.post("/session/:id/wda/keys", (req, res) => {
 });
 
 app.get("/session/:id/screenshot", (req, res) => {
+  // Bind a one-shot failure to the request that consumed it. Two held
+  // screenshots can be released together, so deciding inside the eventual
+  // response callback would make which request fails depend on scheduling.
+  const failThisScreenshot = failNextScreenshot;
+  if (failThisScreenshot) failNextScreenshot = false;
   respond(req, res, "screenshot", {}, () => {
-    if (failNextScreenshot) {
-      failNextScreenshot = false;
+    if (failThisScreenshot) {
+      record("screenshot-response", { status: 500 });
       res.status(500).json({ value: { error: "screenshot failed" } });
-    } else res.json({ value: FAKE_SCREENSHOT });
+    } else {
+      record("screenshot-response", { status: 200 });
+      res.json({ value: FAKE_SCREENSHOT });
+    }
   });
 });
 
@@ -146,6 +164,7 @@ app.get("/debug/history", (req, res) => {
 });
 
 app.post("/debug/reset", (req, res) => {
+  releaseScreenshots();
   history.length = 0;
   sessionCounter = 0;
   hanging = false;
@@ -153,6 +172,20 @@ app.post("/debug/reset", (req, res) => {
   ready = true;
   failNextScreenshot = false;
   res.json({ ok: true });
+});
+
+// Hold only screenshot responses. Input endpoints continue normally, which
+// lets concurrency tests observe that taps reach WDA while a live capture is
+// pending without putting either operation on a timeout boundary.
+app.post("/debug/hold-screenshots", (req, res) => {
+  holdScreenshots = true;
+  res.json({ ok: true });
+});
+
+app.post("/debug/release-screenshots", (req, res) => {
+  const released = screenshotWaiters.length;
+  releaseScreenshots();
+  res.json({ ok: true, released });
 });
 
 app.post("/debug/ready", (req, res) => {

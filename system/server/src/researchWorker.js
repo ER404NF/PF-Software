@@ -9,6 +9,7 @@ import { executeSkillAction } from "./platformSkill.js";
 import { TASK_STATES, hasExecutionExpired } from "./taskSpec.js";
 import { checkComment, COMMENT_REJECTION_TEXT } from "./commentGuard.js";
 import { isCommentAction } from "./actionCatalog.js";
+import { logOperationalFailure, operationalErrorKind } from "./safeOperationalLog.js";
 
 const CHALLENGE_STATES = new Set(["mfa", "captcha", "security_challenge", "account_recovery", "login_ambiguity"]);
 
@@ -43,6 +44,13 @@ export async function runResearchStep({
   if (typeof canAccessAccount !== "function") throw new Error("research step requires a live account authorization check");
   if (!Number.isFinite(confidenceThreshold) || confidenceThreshold < 0 || confidenceThreshold > 1) {
     throw new Error("confidenceThreshold must be between 0 and 1");
+  }
+  function recordAudit(event) {
+    try {
+      auditLog?.logEvent(event);
+    } catch (error) {
+      logOperationalFailure("Research worker audit write failed", error);
+    }
   }
   if (hasExecutionExpired(task)) {
     taskQueue.tick(new Date());
@@ -87,8 +95,9 @@ export async function runResearchStep({
       permittedActions: Array.isArray(task.allowedActions) ? task.allowedActions : [],
     });
   } catch (error) {
-    const outcome = await reportIfRunning(canAccessAccount() ? TASK_STATES.FAILED_RETRYABLE : TASK_STATES.FAILED_FINAL, error.message);
-    return { outcome, error: error.message, observation: observation ?? null };
+    const message = `research planning failed (${operationalErrorKind(error)})`;
+    const outcome = await reportIfRunning(canAccessAccount() ? TASK_STATES.FAILED_RETRYABLE : TASK_STATES.FAILED_FINAL, message);
+    return { outcome, error: message, observation: observation ?? null };
   }
 
   // A late model response must not replace the new owner's pending action.
@@ -101,7 +110,7 @@ export async function runResearchStep({
       ? `security or account challenge: ${decision.screen_state}`
       : `model confidence ${decision.confidence} is below ${confidenceThreshold}`;
     const outcome = await reportIfRunning(TASK_STATES.NEEDS_HUMAN, detail);
-    auditLog?.logEvent({ type: "research_needs_human", deviceId: device.id,
+    recordAudit({ type: "research_needs_human", deviceId: device.id,
       operator: task.createdBy, detail: { taskId: task.id, accountId, workspaceId, reason: detail } });
     return { outcome, decision, observation, detail };
   }
@@ -118,7 +127,7 @@ export async function runResearchStep({
     const detail = approval
       ? `${decision.action} is waiting for approval (${approval.id})`
       : `${decision.action} requires explicit approval`;
-    auditLog?.logEvent({ type: "approval_requested", deviceId: device.id, operator: task.createdBy,
+    recordAudit({ type: "approval_requested", deviceId: device.id, operator: task.createdBy,
       detail: { taskId: task.id, accountId, workspaceId, action: decision.action, target: decision.target,
         approvalId: approval?.id ?? null } });
     const outcome = await reportIfRunning(TASK_STATES.NEEDS_HUMAN, detail);
@@ -144,7 +153,7 @@ export async function runResearchStep({
       workspaceId, accountId, ledger: commentLedger, groundingText, template, policy: commentPolicy });
     if (!guard.ok) {
       const detail = `comment not sent: ${guard.reasons.map(reason => COMMENT_REJECTION_TEXT[reason] ?? reason).join("; ")}`;
-      auditLog?.logEvent({ type: "comment_rejected", deviceId: device.id, operator: task.createdBy,
+      recordAudit({ type: "comment_rejected", deviceId: device.id, operator: task.createdBy,
         detail: { taskId: task.id, accountId, workspaceId, reasons: guard.reasons } });
       const outcome = await reportIfRunning(TASK_STATES.NEEDS_HUMAN, detail);
       return { outcome, decision, observation, policyResult, detail, guard };
@@ -181,7 +190,7 @@ export async function runResearchStep({
   try {
     result = await actionPromise;
   } catch (error) {
-    const message = error?.message || String(error);
+    const message = `research action failed (${operationalErrorKind(error)})`;
     const outcome = await reportIfRunning(TASK_STATES.FAILED_RETRYABLE, message);
     return { outcome, error: message, decision, observation, policyResult };
   } finally {
@@ -199,7 +208,7 @@ export async function runResearchStep({
       const mirrored = located && recordPlatformAction?.(workspaceId, accountId, located.runId, located.candidate.id, {
         action: decision.action, status, text: commentText, task_id: task.id,
         approval_id: policyResult.approvalId ?? null, source: decision.comment?.source ?? null });
-      auditLog?.logEvent({ type: "platform_action", deviceId: device.id, operator: task.createdBy,
+      recordAudit({ type: "platform_action", deviceId: device.id, operator: task.createdBy,
         detail: { taskId: task.id, accountId, workspaceId, action: decision.action, target: decision.target, status,
           policy: policyResult.policy, approvalId: policyResult.approvalId ?? null,
           candidateId: located?.candidate?.id ?? null, mirrored: Boolean(mirrored) } });
@@ -211,8 +220,8 @@ export async function runResearchStep({
   // have partly taken effect, and repeating it could be seen by other people. A human checks.
   if (policyResult.platformVisible && ["FAILED", "FAILED_VERIFICATION"].includes(result.outcome) && ownsTask()) {
     const detail = `${decision.action} could not be confirmed (${result.error || result.outcome}); check the account before repeating it`;
-    auditLog?.logEvent({ type: "platform_action_unconfirmed", deviceId: device.id, operator: task.createdBy,
-      detail: { taskId: task.id, accountId, workspaceId, action: decision.action, target: decision.target, reason: result.error || result.outcome } });
+    recordAudit({ type: "platform_action_unconfirmed", deviceId: device.id, operator: task.createdBy,
+      detail: { taskId: task.id, accountId, workspaceId, action: decision.action, target: decision.target, outcome: result.outcome } });
     const outcome = await reportIfRunning(canAccessAccount() ? TASK_STATES.NEEDS_HUMAN : TASK_STATES.FAILED_FINAL, detail);
     return { ...result, outcome, decision, observation, policyResult, detail };
   }

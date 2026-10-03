@@ -195,6 +195,9 @@ test("an unreachable video port keeps retrying without throwing", async () => {
   const stream = wda.openStream({ onFrame() {}, onState: (state, detail) => states.push([state, detail ?? null]), reconnectDelayMs: 30, maxReconnectDelayMs: 60 });
   try {
     await until(() => states.filter(([state]) => state === "reconnecting").length >= 3, { label: "3 retries" });
+    assert.ok(states.filter(([state]) => state === "reconnecting")
+      .every(([, detail]) => detail === "stream connection interrupted"));
+    assert.doesNotMatch(JSON.stringify(states), /ECONNREFUSED|127\.0\.0\.1/);
   } finally {
     stream.close();
   }

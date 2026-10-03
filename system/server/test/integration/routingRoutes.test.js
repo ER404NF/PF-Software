@@ -21,6 +21,7 @@ process.env.SESSION_STORE_DIR = path.join(tmpStorageRoot, "sessions");
 process.env.AUDIT_LOG_PATH = path.join(tmpStorageRoot, "audit.log");
 process.env.QUEUE_STORE_PATH = path.join(tmpStorageRoot, "tasks.json");
 process.env.PROXY_POOL_STORE_PATH = path.join(tmpStorageRoot, "proxy-pool.json");
+process.env.DEVICE_CONFIG_PATH = path.resolve("server/fixtures/network-devices.config.json");
 process.env.TWO_FACTOR_MASTER_KEY = "a".repeat(32);
 process.env.NODE_ENV = "test";
 // Explicitly NOT set: AUTO_ROUTE_PROXY_TUNNELS, SHARED_BRIDGE_IFACE.

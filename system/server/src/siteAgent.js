@@ -7,7 +7,8 @@
 
 import WebSocket from "ws";
 import { StreamHub } from "./streamHub.js";
-import { PROTOCOL_VERSION, RPC_METHODS, packFrame } from "./siteProtocol.js";
+import { PROTOCOL_VERSION, RPC_METHODS, packFrame, publicSiteRpcError } from "./siteProtocol.js";
+import { operationalErrorKind } from "./safeOperationalLog.js";
 
 const VIDEO_BACKPRESSURE_BYTES = 1_000_000;
 
@@ -20,7 +21,16 @@ export class SiteAgent {
     log = () => {},
   }) {
     if (!hubUrl || !siteId || !token) throw new Error("A site agent needs a hub URL, a site id and a site token.");
-    this.url = `${String(hubUrl).replace(/\/+$/, "").replace(/^http/, "ws")}/agent-link`;
+    const linkUrl = new URL(String(hubUrl));
+    if (!["http:", "https:", "ws:", "wss:"].includes(linkUrl.protocol) || linkUrl.username || linkUrl.password) {
+      throw new Error("A site agent needs an HTTP(S) hub URL without embedded credentials.");
+    }
+    if (linkUrl.protocol === "http:") linkUrl.protocol = "ws:";
+    if (linkUrl.protocol === "https:") linkUrl.protocol = "wss:";
+    linkUrl.pathname = "/agent-link";
+    linkUrl.search = "";
+    linkUrl.hash = "";
+    this.url = linkUrl.href.replace(/\/$/, "");
     this.siteId = siteId;
     this.token = token;
     this.devices = devices;
@@ -85,12 +95,12 @@ export class SiteAgent {
     });
     ws.on("message", (data, isBinary) => {
       if (isBinary) return; // the hub never sends binary
-      void this._onMessage(data).catch(error => this.log(`message failed: ${error?.message}`));
+      void this._onMessage(data).catch(error => this.log(`message failed: ${operationalErrorKind(error)}`));
     });
     ws.on("unexpected-response", (_request, response) => {
       this.log(`hub refused the link: HTTP ${response.statusCode}`);
     });
-    ws.on("error", error => this.log(`link error: ${error?.message}`));
+    ws.on("error", error => this.log(`link error: ${operationalErrorKind(error)}`));
     ws.on("close", () => {
       clearInterval(this.summaryTimer);
       this._dropStreams();
@@ -163,7 +173,7 @@ export class SiteAgent {
       const value = await device[method](...(Array.isArray(args) ? args.slice(0, 6) : []));
       reply({ ok: true, value: value ?? null });
     } catch (error) {
-      reply({ ok: false, error: { message: String(error?.message ?? "Action failed").slice(0, 300), code: error?.code } });
+      reply({ ok: false, error: publicSiteRpcError(error) });
     }
   }
 

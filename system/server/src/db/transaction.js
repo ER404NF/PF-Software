@@ -4,6 +4,8 @@
 // boundary is in place and tested before any domain becomes
 // database-authoritative.
 
+import { logOperationalFailure } from "../safeOperationalLog.js";
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export class TenantContextError extends Error {
@@ -51,7 +53,7 @@ export async function withTransaction(pool, fn, { organizationId = null, userId 
     try {
       await client.query("ROLLBACK");
     } catch (rollbackError) {
-      console.error("Rollback failed after a transaction error:", rollbackError.message);
+      logOperationalFailure("Rollback failed after a transaction error", rollbackError);
     }
     throw error;
   } finally {

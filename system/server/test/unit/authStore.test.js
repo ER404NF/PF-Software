@@ -97,6 +97,7 @@ test("operator config rejects malformed authorization state instead of applying 
   for (const patch of [{ active: "false" }, { accountStatus: "pendng" }, { role: "administrator" }, { authVersion: -1 }]) {
     assert.throws(() => validateOperatorConfig({ operators: [{ ...base, ...patch }] }), /invalid/);
   }
+  assert.doesNotThrow(() => validateOperatorConfig({ operators: [{ ...base, accountStatus: "banned" }] }));
 });
 
 test("canAccessDevice: no operator at all is never allowed", () => {
@@ -127,8 +128,27 @@ test("publicOperator returns only safe browser fields", () => {
   assert.equal("passwordHash" in safe, false);
 });
 
-test("five roles use explicit capabilities without a numeric rank", () => {
+test("operator config rejects an isMainHost flag on a non-host role, and rejects non-string recentLoginIps entries", () => {
+  const base = { username: "flag-user", passwordHash: hashPassword("flag-test-password"), role: "admin", allowedDevices: null };
+  assert.throws(() => validateOperatorConfig({ operators: [{ ...base, isMainHost: "yes" }] }), /isMainHost/);
+  assert.throws(() => validateOperatorConfig({ operators: [{ ...base, isMainHost: true }] }), /isMainHost but not role host/);
+  assert.doesNotThrow(() => validateOperatorConfig({ operators: [{ ...base, role: "host", isMainHost: true }] }));
+  assert.throws(() => validateOperatorConfig({ operators: [{ ...base, recentLoginIps: ["1.2.3.4", 42] }] }), /recentLoginIps/);
+  assert.doesNotThrow(() => validateOperatorConfig({ operators: [{ ...base, recentLoginIps: ["1.2.3.4", "::1"] }] }));
+});
+
+test("operator config rejects more than one main host", () => {
+  const passwordHash = hashPassword("main-host-config-test-password");
+  assert.throws(() => validateOperatorConfig({ operators: [
+    { username: "main-host-a", passwordHash, role: "host", allowedDevices: null, isMainHost: true },
+    { username: "main-host-b", passwordHash, role: "host", allowedDevices: null, isMainHost: true },
+  ] }), /more than one main host/);
+});
+
+test("six roles use explicit capabilities without a numeric rank", () => {
   assert.deepEqual(Object.keys(ROLE_CAPABILITIES).sort(), Object.values(OPERATOR_ROLES).sort());
+  assert.equal(hasCapability({ role: "host" }, CAPABILITIES.MANAGE_SECURITY), true);
+  assert.equal(hasCapability({ role: "host" }, CAPABILITIES.MANAGE_USERS), true);
   assert.equal(hasCapability({ role: "admin" }, CAPABILITIES.MANAGE_SECURITY), true);
   assert.equal(hasCapability({ role: "manager" }, CAPABILITIES.MANAGE_QUEUE), true);
   assert.equal(hasCapability({ role: "manager" }, CAPABILITIES.MANAGE_USERS), false);

@@ -1,10 +1,13 @@
 // Async-first persistence port for administrative operator-account lifecycle.
 // File-backed implementations may complete immediately, but every method
 // returns a Promise so a later PostgreSQL adapter does not force another API
-// rewrite at the route/service boundary.
+// rewrite at the route/service boundary. Mutation methods accept an optional
+// `{ authorize }` callback that adapters invoke immediately before their
+// durable write.
 
 export const OPERATOR_ACCOUNT_REPOSITORY_METHODS = Object.freeze([
   "getAccount",
+  "getRecentLoginIps",
   "listAccounts",
   "createAccount",
   "updateAccount",
@@ -12,6 +15,9 @@ export const OPERATOR_ACCOUNT_REPOSITORY_METHODS = Object.freeze([
   "renameAccount",
   "invalidateSessions",
   "resetSecondFactor",
+  "validateDeletion",
+  "requestDeletion",
+  "finalizePrivacyDeletion",
 ]);
 
 export function assertOperatorAccountRepository(repository) {

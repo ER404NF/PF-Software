@@ -16,7 +16,8 @@ test("checkDatabaseHealth reports unhealthy and still releases the client when t
   const pool = { connect: async () => ({ query: async () => { throw new Error("connection refused"); }, release: () => { released = true; } }) };
   const result = await checkDatabaseHealth(pool);
   assert.equal(result.healthy, false);
-  assert.match(result.error, /connection refused/);
+  assert.equal(result.errorKind, "Error");
+  assert.equal("error" in result, false);
   assert.equal(released, true);
 });
 
@@ -24,7 +25,8 @@ test("checkDatabaseHealth reports unhealthy when connect() itself fails", async 
   const pool = { connect: async () => { throw new Error("pool exhausted"); } };
   const result = await checkDatabaseHealth(pool);
   assert.equal(result.healthy, false);
-  assert.match(result.error, /pool exhausted/);
+  assert.equal(result.errorKind, "Error");
+  assert.equal("error" in result, false);
 });
 
 test("checkDatabaseHealth times out a hanging query instead of waiting forever", async () => {
@@ -35,6 +37,6 @@ test("checkDatabaseHealth times out a hanging query instead of waiting forever",
   }) };
   const result = await checkDatabaseHealth(pool, { timeoutMs: 20 });
   assert.equal(result.healthy, false);
-  assert.match(result.error, /timed out/);
+  assert.equal(result.errorKind, "HEALTH_CHECK_TIMEOUT");
   assert.equal(released, true);
 });

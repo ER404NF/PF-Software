@@ -29,6 +29,8 @@
 // a "session" is) — callers provide `load`/`persist` for their own backend
 // and get back a plain synchronous key-value surface.
 
+import { logOperationalFailure } from "./safeOperationalLog.js";
+
 export class SyncCacheError extends Error {
   constructor(message) {
     super(message);
@@ -49,8 +51,8 @@ export class SyncCacheError extends Error {
 export async function createSyncCache({
   load, persist,
   refreshIntervalMs = 0,
-  onPersistError = (error) => console.error("SyncCache: durable write failed:", error.message),
-  onRefreshError = (error) => console.error("SyncCache: periodic refresh failed:", error.message),
+  onPersistError = (error) => logOperationalFailure("SyncCache: durable write failed", error),
+  onRefreshError = (error) => logOperationalFailure("SyncCache: periodic refresh failed", error),
 } = {}) {
   if (typeof load !== "function") throw new SyncCacheError("load() is required");
   if (typeof persist !== "function") throw new SyncCacheError("persist() is required");
