@@ -1,0 +1,3 @@
+#!/bin/bash
+[ -n "${FAKE_TRANSLATED:-}" ] && echo "$FAKE_TRANSLATED" && exit 0
+exit 1

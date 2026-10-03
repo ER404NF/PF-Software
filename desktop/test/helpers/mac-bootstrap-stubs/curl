@@ -1,0 +1,28 @@
+#!/bin/bash
+# Fake curl for macBootstrapInstaller.test.js: answers from $FAKE_ROUTES ("URL ACTION [ARG]"
+# per line) and logs every call to $FAKE_LOG.
+out=""; wout=""; range=""; url=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --output|-o) out="$2"; shift ;;
+    --write-out|-w) wout="$2"; shift ;;
+    --range|-r) range="$2"; shift ;;
+    --connect-timeout|--retry|--retry-delay|--max-time) shift ;;
+    http*) url="$1" ;;
+  esac
+  shift
+done
+echo "curl $url" >> "$FAKE_LOG"
+route="$(awk -v u="$url" '$1 == u { $1 = ""; sub(/^ /, ""); print; exit }' "$FAKE_ROUTES")"
+action="${route%% *}"; arg="${route#* }"
+emit() { if [ -n "$out" ] && [ "$out" != /dev/null ]; then cat > "$out"; else cat > /dev/null; fi; }
+case "$action" in
+  ok) printf '' | emit ;;
+  file) if [ -n "$range" ]; then head -c 1 "$arg" | emit; else emit < "$arg"; fi ;;
+  redirect) printf '' | emit; [ -n "$wout" ] && printf '%s' "$arg"; exit 0 ;;
+  partial) head -c 10 "$arg" | emit; echo "curl: (18) transfer closed" >&2; exit 18 ;;
+  exit) echo "curl: ($arg) failed" >&2; exit "$arg" ;;
+  *) echo "curl: (22) The requested URL returned error: 404" >&2; exit 22 ;;
+esac
+[ -n "$wout" ] && printf '%s' "$url"
+exit 0

@@ -57,10 +57,19 @@ if it is the app that misbehaves).
 
 3. `.github/workflows/mac-installer.yml` runs. It fails if the tag and `desktop/package.json` disagree.
 4. On success the signed/notarized Release **Phone Farm v0.2.0** contains the stable download
-   `Phone-Farm-macOS.pkg`, versioned architecture packages (universal is best effort), and
-   `SHA256SUMS.txt`. The Windows workflow adds `Phone-Farm-Windows.exe` to the same release.
-   An explicitly allowed unsigned prerelease keeps only its clearly marked `-UNSIGNED` or
-   `-NOT-NOTARIZED` filename; it never receives the stable macOS alias.
+   `Phone-Farm-macOS.pkg`, versioned architecture packages (universal is best effort), one
+   `<package>.sha256` per package and `SHA256SUMS.txt`. The Windows workflow adds `Phone-Farm-Windows.exe`
+   to the same release. An explicitly allowed unsigned build keeps only its clearly marked `-UNSIGNED` or
+   `-NOT-NOTARIZED` filename; it never receives the stable macOS alias. The release is not marked
+   pre-release for it: the in-app update check and `Install Phone Farm.command` both use the latest
+   *stable* release, and the Windows installer shares it.
+
+`Install Phone Farm.command` at the repository root is how a cloned Mac installs Phone Farm. It reads
+`/releases/latest`, picks `Phone-Farm-<version>-arm64[-NOT-NOTARIZED|-UNSIGNED].pkg` (Intel Macs:
+`-universal`), downloads it and its `.sha256` (falling back to `SHA256SUMS.txt`), verifies it with
+`shasum -a 256`, marks it with the normal download quarantine flag and opens Installer. **A release without
+these assets is invisible to it**, so keep the names produced by `build-mac-pkg.cjs` and keep the `.sha256`
+upload in the release job. Its offline tests are `desktop/test/macBootstrapInstaller.test.js`.
 
 Branch pushes and pull requests build and verify the same way but publish nothing (the package is an
 Actions artifact for 30 days). **Run workflow** (manual) can also build the universal package.
@@ -68,8 +77,9 @@ Actions artifact for 30 days). **Run workflow** (manual) can also build the univ
 ## One-time setup: Apple credentials (repository → Settings → Secrets and variables → Actions)
 
 Without these the workflow still runs, but the package is built `-UNSIGNED` and a **tagged release fails**
-(set the repository *variable* `ALLOW_UNSIGNED_RELEASE` to `true` to publish a clearly named, pre-release
-`-UNSIGNED` package instead — Gatekeeper will warn users).
+(set the repository *variable* `ALLOW_UNSIGNED_RELEASE` to `true` to publish a clearly named
+`-UNSIGNED` DEVELOPMENT package instead — Gatekeeper will warn users, and they allow it under
+System Settings → Privacy & Security → Open Anyway).
 
 | Secret | What |
 |---|---|
@@ -102,6 +112,9 @@ license, and rebuild. `prepare-wda.cjs` refuses a tag that does not resolve to t
 
 ## Local build (developers)
 
-`cd desktop && npm ci && npm test && npm run dist:mac` on a Mac (unsigned unless credentials are in the
-environment; see `desktop/README.md`). These maintainer commands are intentionally kept inside `desktop/`;
-there are no installer-looking build commands at repository root.
+`desktop/scripts/build-macos-installer.sh [arm64|universal] [--skip-tests]` on a Mac installs both lockfiles,
+runs both suites, builds `desktop/dist/Phone-Farm-<version>-<arch>[-UNSIGNED].pkg` and writes its `.sha256`
+(or by hand: `cd desktop && npm ci && npm test && npm run dist:mac`). It is unsigned unless credentials are in
+the environment; see `desktop/README.md`. Build commands are intentionally kept inside `desktop/`. The only
+script at repository root is `Install Phone Farm.command`, which downloads a published release and never
+builds anything.

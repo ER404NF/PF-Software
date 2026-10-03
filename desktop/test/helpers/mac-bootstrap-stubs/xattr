@@ -1,0 +1,3 @@
+#!/bin/bash
+echo "xattr $*" >> "$FAKE_LOG"
+exit "${FAKE_XATTR_EXIT:-0}"

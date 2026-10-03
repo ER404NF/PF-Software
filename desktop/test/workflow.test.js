@@ -17,6 +17,9 @@ test("the workflow parses and triggers on version tags, main and pull requests",
   assert.deepEqual(workflow.on.push.tags, ["v*"]);
   assert.ok(workflow.on.pull_request);
   assert.ok(workflow.on.workflow_dispatch);
+  for (const trigger of [workflow.on.push, workflow.on.pull_request]) {
+    assert.ok(trigger.paths.includes("Install Phone Farm.command"), "changes to the root installer must run the macOS tests");
+  }
 });
 
 test("packaging runs on a macOS runner", () => {
@@ -106,7 +109,13 @@ test("the release job publishes the .pkg files to a GitHub Release, only for ver
   assert.match(script, /\.pkg/);
   assert.match(script, /SHA256SUMS/);
   assert.match(script, /UNSIGNED/, "unsigned packages must be flagged on the release");
-  assert.match(script, /--prerelease/);
+  // The Windows installer shares the release and the update check / bootstrap only use the latest
+  // stable release, so the unsigned macOS package is marked by its filename, not by --prerelease.
+  assert.doesNotMatch(script, /--prerelease/);
+  assert.match(script, /! -s "\$\{pkg\}"/, "an empty package must never be published");
+  assert.match(script, /shasum -a 256 "\$\{name\}" > "\$\{name\}\.sha256"/, "every package gets its own .sha256");
+  assert.match(script, /shasum -a 256 -c/, "checksums are re-verified before upload");
+  assert.match(script, /\.\/\*\.pkg\.sha256/, "the .sha256 files are uploaded with the packages");
   assert.match(script, /Phone-Farm-macOS\.pkg/, "the release must include a stable direct-download name");
   assert.match(script, /Never hide an unsigned\/not-notarized build/, "an unsigned package must retain its warning filename");
 });

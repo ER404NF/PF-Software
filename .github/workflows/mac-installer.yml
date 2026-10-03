@@ -28,11 +28,13 @@ on:
     paths:
       - "desktop/**"
       - "system/**"
+      - "Install Phone Farm.command"
       - ".github/workflows/mac-installer.yml"
   pull_request:
     paths:
       - "desktop/**"
       - "system/**"
+      - "Install Phone Farm.command"
       - ".github/workflows/mac-installer.yml"
   workflow_dispatch:
     inputs:
@@ -261,21 +263,39 @@ jobs:
             echo "The arm64 installer is missing." >&2
             exit 1
           fi
+          # Every package must be a real, non-empty file before anything is published.
+          for pkg in ./*.pkg; do
+            if [[ ! -s "${pkg}" ]]; then
+              echo "${pkg} is missing or empty." >&2
+              exit 1
+            fi
+          done
+          # One <package>.sha256 per package - what "Install Phone Farm.command" verifies before it opens
+          # the installer - plus the combined list. Both are re-checked before upload.
+          for pkg in ./*.pkg; do
+            name="${pkg#./}"
+            shasum -a 256 "${name}" > "${name}.sha256"
+            shasum -a 256 -c "${name}.sha256"
+          done
           shasum -a 256 ./*.pkg | sed 's# \./# #' > SHA256SUMS.txt
-          prerelease=()
+          shasum -a 256 -c SHA256SUMS.txt
           notes="Download **${download}** below, double-click it, and follow the installer. You do not need Node.js, npm, Terminal or the source code.
 
           Which file: \`arm64\` = Apple silicon Macs; \`universal\` = Apple silicon and Intel Macs.
-          Verify the download with \`SHA256SUMS.txt\`."
+          Each package has a matching \`.sha256\` file (also listed in \`SHA256SUMS.txt\`). From a clone of the repository, double-click \`Install Phone Farm.command\` to download, verify and open the right package automatically."
+          # An unsigned/not-notarized package is only published when ALLOW_UNSIGNED_RELEASE allowed the build.
+          # It keeps its warning filename, but the release is NOT marked pre-release: the Windows installer
+          # shares this release, and both the in-app update check and "Install Phone Farm.command" only use
+          # the latest stable release.
           if ls ./*UNSIGNED.pkg ./*NOT-NOTARIZED.pkg > /dev/null 2>&1; then
-            prerelease=(--prerelease)
             notes="${notes}
 
           **WARNING - not signed/notarized.** The package(s) named UNSIGNED or NOT-NOTARIZED were built without complete Apple signing credentials. macOS Gatekeeper will show a warning: open the package with Control-click > Open, or allow it under System Settings > Privacy & Security. This is a development build, not the final seamless installer."
           fi
-          if gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" ./*.pkg SHA256SUMS.txt --clobber
-          else
-            gh release create "${GITHUB_REF_NAME}" ./*.pkg SHA256SUMS.txt \
-              --title "Phone Farm ${GITHUB_REF_NAME}" --notes "${notes}" "${prerelease[@]}"
+          assets=(./*.pkg ./*.pkg.sha256 SHA256SUMS.txt)
+          # The Windows workflow may create the same release at the same moment; then upload instead.
+          if gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1 ||
+             ! gh release create "${GITHUB_REF_NAME}" "${assets[@]}" --title "Phone Farm ${GITHUB_REF_NAME}" --notes "${notes}"; then
+            gh release upload "${GITHUB_REF_NAME}" "${assets[@]}" --clobber
           fi
+          gh release view "${GITHUB_REF_NAME}" --json assets --jq '.assets[].name'

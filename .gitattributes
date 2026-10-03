@@ -5,3 +5,6 @@
 deploy/**/*.sh text eol=lf
 deploy/hub/Dockerfile text eol=lf
 deploy/hub/Caddyfile text eol=lf
+
+desktop/test/helpers/mac-bootstrap-stubs/* text eol=lf
+desktop/scripts/*.sh text eol=lf

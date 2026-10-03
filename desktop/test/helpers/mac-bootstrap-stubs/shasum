@@ -1,0 +1,4 @@
+#!/bin/bash
+echo "shasum $*" >> "$FAKE_LOG"
+if [ -x /usr/bin/shasum ]; then exec /usr/bin/shasum "$@"; fi
+shift 2; exec sha256sum "$@"

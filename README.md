@@ -2,18 +2,47 @@
 
 ## DOWNLOAD PHONE FARM
 
-Installers are release downloads or CI artifacts, not scripts in the source repository:
+### Mac installation from a cloned repository
+
+1. Clone or pull PF-Software (`git pull --ff-only origin main`).
+2. Open the PF-Software folder in Finder.
+3. Double-click **`Install Phone Farm.command`**.
+4. The latest compatible installer is downloaded and its SHA-256 checksum is verified.
+5. Follow the standard macOS Installer.
+
+What it does, and what it needs:
+
+- **Internet is required.** It checks that GitHub is reachable first and says so plainly if it is not.
+- **Where the installer comes from:** the newest stable release on
+  [GitHub Releases](https://github.com/ER404NF/PF-Software/releases/latest), the same release the app's own
+  update check uses. The version is never hard-coded. The installer is downloaded into a temporary folder,
+  never into the repository, so `git status` stays clean.
+- **Supported Macs:** Apple silicon (arm64) uses `Phone-Farm-<version>-arm64.pkg`. Intel Macs need the
+  `universal` package; if a release has none, the script says so and stops rather than installing something
+  incompatible. macOS 12 or newer.
+- **Checksum verification:** every package is published with `<package>.sha256` (and `SHA256SUMS.txt`). The
+  script compares the downloaded file with it using `shasum -a 256`. On a mismatch, a missing checksum, or an
+  interrupted download it deletes the file, does **not** open the Installer, and exits with an error.
+- **Signing status:** Apple Developer ID signing and notarization are supported by the release workflow but the
+  Apple credentials are not configured yet. Until they are, a published macOS package is a DEVELOPMENT build
+  named `...-UNSIGNED.pkg`, and the script says so.
+- **If macOS blocks an unsigned DEVELOPMENT build:** open **System Settings → Privacy & Security** and click
+  **Open Anyway** next to the Phone Farm package (or Control-click the package and choose **Open**). The script
+  never disables Gatekeeper or removes the quarantine flag; it marks the download exactly like a browser does,
+  so macOS performs its normal checks. Once the release is signed and notarized this step disappears.
+- It needs no Node.js, npm, Xcode or build step. If a release has no macOS package yet, it says so and stops.
+
+Developers who need a package built from their own checkout use `desktop/scripts/build-macos-installer.sh`
+(see [docs/MAC_RELEASE.md](docs/MAC_RELEASE.md)). That is not the normal way to install.
+
+### Other downloads
 
 - [Download Phone Farm for Windows](https://github.com/ER404NF/PF-Software/releases/latest/download/Phone-Farm-Windows.exe)
-- macOS: the [latest verified Apple-silicon test package](https://github.com/ER404NF/PF-Software/actions/runs/35893483741)
-  is available under **Artifacts → phone-farm-pkg-arm64**. It is unsigned and macOS will warn. The stable
-  `Phone-Farm-macOS.pkg` release link will be added only after Apple signing and notarization are configured.
 - [See all releases and checksums](https://github.com/ER404NF/PF-Software/releases/latest)
 
-On macOS, unzip the CI artifact and double-click its `.pkg`; on Windows, double-click
-`Phone-Farm-Windows.exe`. The release workflows build and verify these files. Installer binaries are
-deliberately not committed into Git history, so pulling the source repository does not download a stale
-100+ MB executable.
+On Windows, double-click `Phone-Farm-Windows.exe`. The release workflows build and verify these files.
+Installer binaries are deliberately not committed into Git history, so pulling the source repository does not
+download a stale 100+ MB executable. The small root script downloads the published package instead.
 
 Installing either package does **not** require the source code, Node.js, npm, Terminal, or this repository.
 Everything Phone Farm needs to run — including its server and the WebDriverAgent it
