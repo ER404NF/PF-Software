@@ -81,6 +81,26 @@ test("a current packaged version is allowed without opening an installer", async
   assert.equal(opened, false);
 });
 
+test("a packaged version newer than the latest release remains usable", async () => {
+  let quits = 0;
+  const result = await enforceReleaseVersion({
+    app: { isPackaged: true, getVersion: () => "0.2.4", quit: () => { quits += 1; } },
+    dialog: { showMessageBox: async () => assert.fail("no prompt expected") },
+    shell: { openPath: async () => assert.fail("must not open") },
+    logger: { info() {}, warn() {}, error() {} },
+    platform: "darwin",
+    arch: "arm64",
+    fetchImpl: async () => response(null, { json: [release("0.2.2")] }),
+  });
+  assert.deepEqual(result, {
+    allowed: true,
+    status: "ahead",
+    version: "0.2.4",
+    availableVersion: "0.2.2",
+  });
+  assert.equal(quits, 0);
+});
+
 test("declining a mismatched version quits and never downloads", async () => {
   let quits = 0;
   let requests = 0;

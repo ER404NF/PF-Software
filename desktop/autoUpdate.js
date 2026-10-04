@@ -225,7 +225,16 @@ async function enforceReleaseVersion({
       const release = selectRelease(await fetchReleases({ fetchImpl, apiUrl }));
       if (!release) throw new Error("No published Phone Farm release is available.");
       const available = normalizedVersion(release.tag_name);
-      if (compareVersions(current, available) === 0) return { allowed: true, status: "current", version: current.text };
+      const comparison = compareVersions(current, available);
+      if (comparison === 0) return { allowed: true, status: "current", version: current.text };
+      if (comparison > 0) {
+        return {
+          allowed: true,
+          status: "ahead",
+          version: current.text,
+          availableVersion: available.text,
+        };
+      }
 
       let asset = selectInstallerAsset(release, platform, arch);
       if (!asset && release.assets_url) {
@@ -239,7 +248,7 @@ async function enforceReleaseVersion({
         type: "warning",
         title: "Phone Farm update required",
         message: `Phone Farm ${available.text} is required`,
-        detail: `This computer has Phone Farm ${current.text}. It cannot continue until the versions match.`,
+        detail: `This computer has Phone Farm ${current.text}. It must update before it can continue.`,
         buttons: ["Update now", "No — exit"],
         defaultId: 0,
         cancelId: 1,
