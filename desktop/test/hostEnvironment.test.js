@@ -98,7 +98,18 @@ test("tun2proxy is required only when routing was explicitly enabled", () => {
   assert.equal(resolveMacHostDependencies(options).ok, true);
   const routing = resolveMacHostDependencies({ ...options, routingEnabled: true });
   assert.equal(routing.ok, false);
+  assert.equal(routing.routingEnabled, true);
   assert.equal(routing.checks.find(check => check.id === "tun2proxy").ok, false);
+});
+
+test("an enabled routing setting reaches the packaged server environment", () => {
+  const resolved = resolveMacHostDependencies({
+    ...fakeMac({ prefix: "/opt/homebrew/bin", tunName: "tun2proxy-bin" }),
+    routingEnabled: true,
+  });
+  const env = buildHostEnvironment({}, resolved);
+  assert.equal(env.AUTO_ROUTE_PROXY_TUNNELS, "true");
+  assert.equal(env.TUN2PROXY_BIN, "/opt/homebrew/bin/tun2proxy-bin");
 });
 
 // ---- bundled (managed) WebDriverAgent + signing -------------------------

@@ -56,14 +56,22 @@ test("diagnostics are copied to the clipboard and hold no secret", async () => {
   fs.rmSync(configFile);
 });
 
-test("the Help menu offers diagnostics, the log folder and start-at-login", () => {
+test("the Help menu offers diagnostics, host startup and explicit proxy routing", async () => {
   const help = menus.at(-1).find(item => item.label === "Help");
   assert.deepEqual(help.submenu.filter(item => item.label).map(item => item.label),
-    ["Copy Diagnostics", "Show Log Folder", "Start Phone Farm When This Mac Starts"]);
+    ["Copy Diagnostics", "Show Log Folder", "Start Phone Farm When This Mac Starts", "Enable Proxy Routing on This Mac"]);
   assert.equal(help.submenu.at(-1).type, "checkbox");
   help.submenu[0].click();
   assert.match(clipboardWrites.at(-1), /^Phone Farm diagnostics/);
   assert.equal(shown.at(-1).message, "Diagnostics copied");
+
+  fs.writeFileSync(configFile, JSON.stringify({ mode: "host" }));
+  const hostHelp = menus.at(-1).find(item => item.label === "Help");
+  hostHelp.submenu.at(-1).click({ checked: true });
+  await wait(0);
+  assert.equal(JSON.parse(fs.readFileSync(configFile, "utf8")).autoRouteProxyTunnels, true);
+  assert.equal(shown.at(-1).message, "Proxy routing enabled");
+  fs.rmSync(configFile);
 });
 
 test("start-at-login is remembered, defaults on for a host, and a development run never registers a login item", async () => {

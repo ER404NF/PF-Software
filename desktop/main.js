@@ -229,6 +229,19 @@ function setLaunchAtLogin(enabled) {
   buildMenu();
 }
 
+function setProxyRoutingEnabled(enabled) {
+  const config = readConfig() ?? {};
+  writeConfig({ ...config, autoRouteProxyTunnels: Boolean(enabled) });
+  buildMenu();
+  void dialog.showMessageBox({
+    type: "info",
+    message: enabled ? "Proxy routing enabled" : "Proxy routing disabled",
+    detail: "Quit and reopen Phone Farm to apply this host setting.",
+    buttons: ["OK"],
+    noLink: true,
+  });
+}
+
 function rememberServerOutput(chunk) {
   for (const line of String(chunk).split(/\r?\n/)) {
     if (!line.trim()) continue;
@@ -737,6 +750,13 @@ function buildMenu() {
           checked: launchAtLoginEnabled(),
           enabled: app.isPackaged,
           click: item => setLaunchAtLogin(item.checked),
+        },
+        {
+          label: "Enable Proxy Routing on This Mac",
+          type: "checkbox",
+          checked: readConfig()?.autoRouteProxyTunnels === true,
+          enabled: readConfig()?.mode === "host",
+          click: item => setProxyRoutingEnabled(item.checked),
         },
       ],
     },

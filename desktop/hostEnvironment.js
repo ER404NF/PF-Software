@@ -232,6 +232,7 @@ function resolveMacHostDependencies({
   return {
     ok: checks.every(check => check.ok || check.optional),
     autoProvision: true,
+    routingEnabled: Boolean(routingEnabled),
     tools,
     wdaRepoPath,
     wdaSource: wda?.source ?? null,
@@ -265,6 +266,7 @@ function buildHostEnvironment(baseEnv, resolved) {
   env.IDEVICEINFO_BIN = resolved.tools.ideviceInfo;
   env.IPROXY_BIN = resolved.tools.iproxy;
   if (resolved.tools.tun2proxy) env.TUN2PROXY_BIN = resolved.tools.tun2proxy;
+  if (resolved.routingEnabled) env.AUTO_ROUTE_PROXY_TUNNELS = "true";
   return env;
 }
 

@@ -30,7 +30,10 @@ iPhone gets its own `xcodebuild` WDA instance (unique derived-data path and port
 Finder's `PATH`. No Terminal is needed to operate the app after installation.
 
 `AUTO_ROUTE_PROXY_TUNNELS`, `AUTO_NETWORK_ENROLLMENT` and `AUTO_ENABLE_INTERNET_SHARING` are not
-enabled by desktop startup.
+enabled by default. A configured host can explicitly enable the routing orchestrator from
+**Help > Enable Proxy Routing on This Mac**, then quit and reopen Phone Farm. This setting requires
+`tun2proxy` and exposes the per-phone enrollment/start/stop controls; Internet Sharing and automatic
+network enrollment remain manual unless separately configured.
 
 ### Bundled WebDriverAgent
 
