@@ -125,6 +125,39 @@ test("the universal installer is optional; the arm64 installer is not", () => {
   assert.match(workflow.jobs.plan.steps.at(-1).run, /"arm64","universal"/);
 });
 
+test("the verified main-branch arm64 package is committed through an isolated LFS writer", () => {
+  const prebuilt = workflow.jobs.prebuilt;
+  assert.equal(prebuilt.needs, "build");
+  assert.match(prebuilt.if, /github\.event_name == 'push'/);
+  assert.match(prebuilt.if, /github\.ref == 'refs\/heads\/main'/);
+  assert.deepEqual(prebuilt.strategy.matrix.arch, ["arm64"]);
+  assert.equal(prebuilt.permissions.contents, "write");
+  assert.equal(workflow.permissions.contents, "read", "the workflow default remains read-only");
+
+  const commit = prebuilt.steps.find(step => /Commit verified arm64 installer/.test(step.name || ""));
+  assert.ok(commit, "the prebuilt commit step must exist");
+  assert.match(commit.if, /matrix\.arch == 'arm64'/);
+  assert.match(commit.if, /github\.event_name == 'push'/, "pull requests must not commit binaries");
+  assert.match(commit.if, /github\.ref == 'refs\/heads\/main'/, "tag builds must not commit binaries");
+  assert.match(commit.run, /prebuilt\/mac\/Phone-Farm\.pkg/);
+  assert.match(commit.run, /prebuilt\/mac\/Phone-Farm\.pkg\.sha256/);
+  assert.match(commit.run, /prebuilt\/mac\/SIGNING_LEVEL\.txt/);
+  assert.match(commit.run, /\[skip ci\]/, "the generated commit must not trigger an Actions loop");
+  assert.match(commit.run, /git lfs install --local/);
+  assert.doesNotMatch(commit.run, /build-mac-pkg\.cjs/, "the verified package must be reused, not rebuilt");
+
+  const prebuiltScript = prebuilt.steps.map(step => step.run || "").join("\n");
+  assert.doesNotMatch(prebuiltScript, /build-mac-pkg\.cjs/);
+  const download = prebuilt.steps.find(step => /download-artifact/.test(step.uses || ""));
+  assert.equal(download.with.name, "phone-farm-pkg-${{ matrix.arch }}");
+});
+
+test("the fixed prebuilt installer and checksum are tracked through Git LFS", () => {
+  const attributes = fs.readFileSync(path.join(repoRoot, ".gitattributes"), "utf8");
+  assert.match(attributes, /^prebuilt\/mac\/\*\.pkg filter=lfs diff=lfs merge=lfs -text$/m);
+  assert.match(attributes, /^prebuilt\/mac\/\*\.sha256 filter=lfs diff=lfs merge=lfs -text$/m);
+});
+
 test("every script the workflow calls exists", () => {
   for (const match of text.matchAll(/(?:desktop\/)?scripts\/([\w-]+\.cjs)/g)) {
     assert.ok(fs.existsSync(path.join(repoRoot, "desktop", "scripts", match[1])), match[1]);

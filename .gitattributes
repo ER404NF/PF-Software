@@ -8,3 +8,9 @@ deploy/hub/Caddyfile text eol=lf
 
 desktop/test/helpers/mac-bootstrap-stubs/* text eol=lf
 desktop/scripts/*.sh text eol=lf
+
+# The current main-branch Apple-silicon installer is committed by CI for
+# internal/dev distribution. Keep both the package and checksum in LFS so the
+# repository itself does not absorb a new ~130 MB blob on every successful build.
+prebuilt/mac/*.pkg filter=lfs diff=lfs merge=lfs -text
+prebuilt/mac/*.sha256 filter=lfs diff=lfs merge=lfs -text

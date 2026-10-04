@@ -2,6 +2,25 @@
 
 ## DOWNLOAD PHONE FARM
 
+### Direct arm64 installer from `git pull` (internal/development use)
+
+The latest successful `main` build is also stored at `prebuilt/mac/Phone-Farm.pkg`. This is the fixed internal
+path for the Apple-silicon (`arm64`) installer; public versioned packages and the existing
+`Install Phone Farm.command` flow continue to use GitHub Releases.
+
+Git LFS is required because the package is about 130 MB:
+
+1. Install Git LFS, then run `git lfs install` once on that Mac.
+2. Run `git pull --ff-only origin main` normally.
+3. Open `prebuilt/mac/Phone-Farm.pkg`. Check `prebuilt/mac/SIGNING_LEVEL.txt` for `unsigned`, `signed`, or
+   `notarized`; `prebuilt/mac/Phone-Farm.pkg.sha256` contains the package checksum.
+4. Until the file is notarized, Control-click **Phone-Farm.pkg**, choose **Open**, and confirm the macOS warning.
+
+Important: a plain `git pull` performed before Git LFS is installed can silently leave a small LFS pointer file
+at that path instead of the real installer. If the package is unexpectedly tiny, run `git lfs install`, then
+`git lfs pull`. Git LFS storage and download bandwidth are metered by GitHub, so the repository owner must monitor
+usage as this package is refreshed and downloaded.
+
 ### Mac installation from a cloned repository
 
 1. Clone or pull PF-Software (`git pull --ff-only origin main`).
@@ -41,8 +60,9 @@ Developers who need a package built from their own checkout use `desktop/scripts
 - [See all releases and checksums](https://github.com/ER404NF/PF-Software/releases/latest)
 
 On Windows, double-click `Phone-Farm-Windows.exe`. The release workflows build and verify these files.
-Installer binaries are deliberately not committed into Git history, so pulling the source repository does not
-download a stale 100+ MB executable. The small root script downloads the published package instead.
+Windows and public versioned installers are not committed into ordinary Git history. The one exception is the
+single current internal arm64 package under `prebuilt/mac/`, stored through Git LFS and overwritten after each
+successful `main` build. The small root script continues to download the published Release package instead.
 
 Installing either package does **not** require the source code, Node.js, npm, Terminal, or this repository.
 Everything Phone Farm needs to run — including its server and the WebDriverAgent it

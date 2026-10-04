@@ -228,6 +228,66 @@ jobs:
           fi
           rm -f "${RUNNER_TEMP}/AuthKey.p8"
 
+  # GitHub Actions has no step-level permissions. Isolate the write token in a
+  # post-build job instead of exposing it to dependency installation, tests or
+  # packaging. This job reuses the verified arm64 artifact; it never rebuilds it.
+  prebuilt:
+    name: Commit current arm64 installer to main
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        arch: [arm64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          lfs: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: phone-farm-pkg-${{ matrix.arch }}
+          path: ${{ runner.temp }}/phone-farm-prebuilt
+
+      - name: Commit verified arm64 installer through Git LFS
+        if: matrix.arch == 'arm64' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          mapfile -t packages < <(find "${RUNNER_TEMP}/phone-farm-prebuilt" -type f -name '*.pkg' -print)
+          if [[ "${#packages[@]}" -ne 1 ]]; then
+            echo "Expected exactly one arm64 package; found ${#packages[@]}." >&2
+            exit 1
+          fi
+
+          package_name="$(basename "${packages[0]}")"
+          case "${package_name}" in
+            *-UNSIGNED.pkg) signing_level="unsigned" ;;
+            *-NOT-NOTARIZED.pkg) signing_level="signed" ;;
+            *.pkg) signing_level="notarized" ;;
+            *) echo "Unsupported package name: ${package_name}" >&2; exit 1 ;;
+          esac
+
+          git lfs install --local
+          install -d prebuilt/mac
+          cp -- "${packages[0]}" prebuilt/mac/Phone-Farm.pkg
+          printf '%s\n' "${signing_level}" > prebuilt/mac/SIGNING_LEVEL.txt
+          (cd prebuilt/mac && shasum -a 256 Phone-Farm.pkg > Phone-Farm.pkg.sha256)
+
+          test "$(git check-attr filter -- prebuilt/mac/Phone-Farm.pkg | awk '{print $3}')" = lfs
+          test "$(git check-attr filter -- prebuilt/mac/Phone-Farm.pkg.sha256 | awk '{print $3}')" = lfs
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- prebuilt/mac/Phone-Farm.pkg prebuilt/mac/Phone-Farm.pkg.sha256 prebuilt/mac/SIGNING_LEVEL.txt
+          if git diff --cached --quiet; then
+            echo "The tracked arm64 installer is already current."
+            exit 0
+          fi
+          git commit -m "chore: update arm64 macOS installer (${signing_level}) [skip ci]"
+          git push origin HEAD:main
+
   release:
     name: Publish GitHub Release
     needs: build
