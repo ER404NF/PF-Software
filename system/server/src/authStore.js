@@ -534,7 +534,7 @@ export function updateOperatorAccount(username, patch) {
   }
 
   const removesActiveAdmin = current.active !== false && current.role === OPERATOR_ROLES.ADMIN
-    && (next.active === false || normalizeRole(next.role) !== OPERATOR_ROLES.ADMIN);
+    && (next.active === false || ![OPERATOR_ROLES.ADMIN, OPERATOR_ROLES.HOST].includes(normalizeRole(next.role)));
   if (removesActiveAdmin) {
     const hasAnother = raw.operators.some((operator, operatorIndex) => operatorIndex !== index
       && operator?.active !== false && normalizeRole(operator?.role) === OPERATOR_ROLES.ADMIN);
