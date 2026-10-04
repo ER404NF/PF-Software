@@ -57,7 +57,7 @@ export class WdaProcessManager {
     this.xcodebuildBin = xcodebuildBin;
     this.developmentTeam = developmentTeam;
     this.bundleId = developmentTeam ? (bundleId || `com.phonefarm.wda.${developmentTeam.toLowerCase()}`) : null;
-    this.group = new SupervisedProcessGroup({ spawn, restartBackoffMs, logRingSize: 200 });
+    this.group = new SupervisedProcessGroup({ spawn, restartBackoffMs, logRingSize: 200, retryIndefinitely: true });
   }
 
   on(...args) { this.group.on(...args); return this; }

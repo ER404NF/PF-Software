@@ -7,7 +7,7 @@ import { SupervisedProcessGroup } from "./processSupervisor.js";
 export class IProxyManager {
   constructor({ spawn = nodeSpawn, bin = process.env.IPROXY_BIN || "iproxy", restartBackoffMs } = {}) {
     this.bin = bin;
-    this.group = new SupervisedProcessGroup({ spawn, restartBackoffMs, logRingSize: 100 });
+    this.group = new SupervisedProcessGroup({ spawn, restartBackoffMs, logRingSize: 100, retryIndefinitely: true });
   }
 
   on(...args) { this.group.on(...args); return this; }

@@ -7,13 +7,14 @@ import { EventEmitter } from "events";
 // mechanics both need identically, so that logic exists exactly once.
 export class SupervisedProcessGroup extends EventEmitter {
   constructor({ spawn, restartBackoffMs, logRingSize = 100, stableRunMs = 5 * 60_000,
-    setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) {
+    retryIndefinitely = false, setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) {
     super();
     if (typeof spawn !== "function") throw new Error("a spawn function is required");
     this.spawn = spawn;
     this.restartBackoffMs = restartBackoffMs ?? [1000, 2000, 5000, 15000, 30000];
     this.logRingSize = logRingSize;
     this.stableRunMs = stableRunMs;
+    this.retryIndefinitely = retryIndefinitely;
     this.setTimeoutFn = setTimeoutFn;
     this.clearTimeoutFn = clearTimeoutFn;
     this.entries = new Map(); // key -> { child, log, restartCount, restartTimer, stopped }
@@ -40,7 +41,7 @@ export class SupervisedProcessGroup extends EventEmitter {
   // behavior of simply inheriting the parent process's environment.
   start(key, bin, args, env) {
     if (this.isRunning(key)) return;
-    const entry = { child: null, log: [], restartCount: 0, restartTimer: null,
+    const entry = { child: null, log: [], currentRunLog: [], restartCount: 0, restartTimer: null,
       stableTimer: null, stopped: false, state: "starting", bin, args, env };
     this.entries.set(key, entry);
     this._spawnNow(key, bin, args, env);
@@ -48,12 +49,18 @@ export class SupervisedProcessGroup extends EventEmitter {
 
   _appendLog(entry, line) {
     entry.log.push(line);
+    entry.currentRunLog.push(line);
     if (entry.log.length > this.logRingSize) entry.log.shift();
+    if (entry.currentRunLog.length > this.logRingSize) entry.currentRunLog.shift();
   }
 
   _spawnNow(key, bin, args, env) {
     const entry = this.entries.get(key);
     if (!entry || entry.stopped) return;
+    // Failure classification must only inspect this launch. Keeping output
+    // from an old signing failure here could misclassify a later USB blip as
+    // a still-unresolved manual prerequisite and stop automatic recovery.
+    entry.currentRunLog = [];
     let child;
     try {
       child = this.spawn(bin, args, {
@@ -105,19 +112,26 @@ export class SupervisedProcessGroup extends EventEmitter {
   _processFailed(key, entry, code, signal) {
     if (entry.stopped || this.entries.get(key) !== entry) return;
     entry.child = null;
-    this.emit("exit", { key, code, signal, log: [...entry.log] });
+    this.emit("exit", { key, code, signal, log: [...entry.currentRunLog] });
     // An exit listener may classify the failure as requiring a human action
     // and deliberately stop/delete this entry. Respect that decision before
     // scheduling a retry or publishing a generic restart-limit failure.
     if (entry.stopped || this.entries.get(key) !== entry) return;
     if (entry.restartCount >= this.restartBackoffMs.length) {
+      if (this.retryIndefinitely) {
+        const delay = this.restartBackoffMs.at(-1) ?? 30_000;
+        entry.state = "restarting";
+        entry.restartTimer = this.setTimeoutFn(() => this._spawnNow(key, entry.bin, entry.args, entry.env), delay);
+        entry.restartTimer.unref?.();
+        return;
+      }
       // Permanently dead, not merely between restarts — isRunning(key)
       // must reflect that (a caller like a health-check loop depends on
       // it to detect this exact case), while getLog(key) still works for
       // post-mortem diagnostics since the entry itself is kept.
       entry.stopped = true;
       entry.state = "failed";
-      this.emit("restart-limit-exceeded", { key, restartCount: entry.restartCount, log: [...entry.log] });
+      this.emit("restart-limit-exceeded", { key, restartCount: entry.restartCount, log: [...entry.currentRunLog] });
       return;
     }
     const delay = this.restartBackoffMs[entry.restartCount];

@@ -148,6 +148,54 @@ test("getLog() still works after restart-limit-exceeded, for post-mortem diagnos
   assert.deepEqual(group.getLog("udid-1"), ["fatal error"]);
 });
 
+test("exit classification receives only the current launch log while getLog keeps bounded history", async () => {
+  const children = [];
+  const spawn = () => { const child = fakeChild(); children.push(child); return child; };
+  const group = new SupervisedProcessGroup({ spawn, restartBackoffMs: [5], logRingSize: 10 });
+  const exitLogs = [];
+  group.on("exit", event => exitLogs.push(event.log));
+  group.start("udid-1", "xcodebuild", []);
+
+  children[0].stderr.emit("data", Buffer.from("Signing requires a development team"));
+  children[0].emit("exit", 1, null);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  children[1].stderr.emit("data", Buffer.from("Lost connection to the phone"));
+  children[1].emit("exit", 1, null);
+
+  assert.deepEqual(exitLogs, [
+    ["Signing requires a development team"],
+    ["Lost connection to the phone"],
+  ]);
+  assert.deepEqual(group.getLog("udid-1"), [
+    "Signing requires a development team",
+    "Lost connection to the phone",
+  ]);
+});
+
+test("indefinite supervision keeps retrying at the capped delay instead of requiring a manual click", async () => {
+  const children = [];
+  const spawn = () => { const child = fakeChild(); children.push(child); return child; };
+  const group = new SupervisedProcessGroup({
+    spawn,
+    restartBackoffMs: [5],
+    retryIndefinitely: true,
+  });
+  let limitEvents = 0;
+  group.on("restart-limit-exceeded", () => { limitEvents += 1; });
+  group.start("udid-1", "xcodebuild", []);
+
+  children[0].emit("exit", 1, null);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  children[1].emit("exit", 1, null);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  children[2].emit("exit", 1, null);
+  await new Promise(resolve => setTimeout(resolve, 20));
+
+  assert.equal(children.length, 4);
+  assert.equal(limitEvents, 0);
+  assert.equal(group.getStatus("udid-1").state, "running");
+});
+
 test("a stable run resets old restart failures before a later crash", async () => {
   const children = [];
   const spawn = () => { const child = fakeChild(); children.push(child); return child; };
