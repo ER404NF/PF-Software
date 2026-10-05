@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { spawn } from "child_process";
 import path from "path";
 import { fileURLToPath } from "url";
-import { WdaDevice } from "../../src/wdaDevice.js";
+import { WdaDevice, deviceControlPathReady } from "../../src/wdaDevice.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const fixturePath = path.join(__dirname, "../../fixtures/fake-wda-server.js");
@@ -91,6 +91,28 @@ test("repeated readiness failures cross the threshold and a success fully recove
   assert.equal(device.status, "idle");
   assert.equal(device.readiness.state, "HEALTHY");
   assert.equal(device.readiness.consecutiveFailures, 0);
+});
+
+test("a healthy WDA response cannot overwrite a restarting supervised tunnel", async () => {
+  const device = new WdaDevice("wda-1", "Test iPhone", { port: PORT });
+  device.setComponentHealth({ iproxy: "RESTARTING", control: "DEGRADED", recovery: "IPROXY" });
+  device.setComponentError("iproxy", { code: "I205", name: "iproxy local port already in use" });
+
+  assert.equal(await device.checkReadiness(), true);
+  const health = device.healthSnapshot();
+  assert.equal(health.wdaEndpoint, "HEALTHY");
+  assert.equal(health.control, "UNAVAILABLE");
+  assert.equal(health.recovery, "IPROXY");
+  assert.equal(health.latestError.code, "I205");
+  assert.equal(deviceControlPathReady(device), false);
+});
+
+test("control-path readiness is required only for devices that publish component health", async () => {
+  const device = new WdaDevice("wda-1", "Test iPhone", { port: PORT });
+  assert.equal(deviceControlPathReady(device), false);
+  assert.equal(await device.checkReadiness(), true);
+  assert.equal(deviceControlPathReady(device), true);
+  assert.equal(deviceControlPathReady({ id: "mock-without-component-health" }), true);
 });
 
 test("tap sends normalized coordinates scaled to the window size", async () => {

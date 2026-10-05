@@ -110,8 +110,12 @@ before(async () => {
   VIDEO_PORT = video;
   FAKE_URL = `http://127.0.0.1:${control}`;
 
-  devices.set("stream-wda", new WdaDevice("stream-wda", "Streaming WDA", { port: CONTROL_PORT, mjpegPort: VIDEO_PORT, timeoutMs: 1000 }));
-  devices.set("plain-wda", new WdaDevice("plain-wda", "Plain WDA", { port: CONTROL_PORT, timeoutMs: 1000 }));
+  const streamWda = new WdaDevice("stream-wda", "Streaming WDA", { port: CONTROL_PORT, mjpegPort: VIDEO_PORT, timeoutMs: 1000 });
+  const plainWda = new WdaDevice("plain-wda", "Plain WDA", { port: CONTROL_PORT, timeoutMs: 1000 });
+  assert.equal(await streamWda.checkReadiness(), true, "streaming WDA fixture must pass the production readiness gate");
+  assert.equal(await plainWda.checkReadiness(), true, "plain WDA fixture must pass the production readiness gate");
+  devices.set("stream-wda", streamWda);
+  devices.set("plain-wda", plainWda);
   // Read-only watching needs a configured monitor adapter for the device.
   deviceMonitorConfig.set("stream-wda", { adapter: "wda", physicallyValidated: false });
   for (const [username, role, allowedDevices] of [

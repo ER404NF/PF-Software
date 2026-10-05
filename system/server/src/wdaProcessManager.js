@@ -65,7 +65,7 @@ export class WdaProcessManager {
   getStatus(udid) { return this.group.getStatus(udid); }
   getLog(udid) { return this.group.getLog(udid); }
   stop(udid) { this.group.stop(udid); }
-  stopAll() { this.group.stopAll(); }
+  stopAll() { return this.group.stopAll(); }
 
   start({ udid, derivedDataPath }) {
     if (!this.wdaRepoPath) throw new Error("WDA_REPO_PATH is not configured");

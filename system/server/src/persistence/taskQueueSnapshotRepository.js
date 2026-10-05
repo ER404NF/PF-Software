@@ -35,11 +35,23 @@ export function normalizeQueueSnapshot(stored) {
   }
   const tasks = isLegacyArray ? stored : stored.tasks;
   const taskIds = new Set();
+  const clientRequestIds = new Set();
   for (let index = 0; index < tasks.length; index += 1) {
     const taskId = tasks[index]?.id;
     if (typeof taskId !== "string" || !taskId) throw new Error(`invalid queue snapshot task[${index}].id`);
     if (taskIds.has(taskId)) throw new Error(`invalid queue snapshot: duplicate task id ${taskId}`);
     taskIds.add(taskId);
+    const requestId = tasks[index]?.clientRequestId;
+    const createdBy = tasks[index]?.createdBy;
+    if (requestId != null) {
+      if (typeof requestId !== "string" || !requestId
+        || (createdBy != null && typeof createdBy !== "string")) {
+        throw new Error(`invalid queue snapshot task[${index}] client request identity`);
+      }
+      const key = JSON.stringify([createdBy ?? null, requestId]);
+      if (clientRequestIds.has(key)) throw new Error(`invalid queue snapshot: duplicate client request id for ${createdBy ?? "anonymous"}`);
+      clientRequestIds.add(key);
+    }
   }
   const paused = isLegacyArray ? false : stored.paused === true;
   const humanHolds = new Set(isLegacyArray || !Array.isArray(stored.humanHolds)

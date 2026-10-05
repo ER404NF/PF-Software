@@ -10,7 +10,7 @@ import fs from "fs";
 import { createHmac, randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import { isDirectExecution } from "./directExecution.js";
-import { WdaDevice } from "./wdaDevice.js";
+import { WdaDevice, deviceControlPathReady } from "./wdaDevice.js";
 import { StreamHub } from "./streamHub.js";
 import { frameKind } from "./mjpegParser.js";
 import { createFileSiteRepository } from "./persistence/fileSiteRepository.js";
@@ -243,11 +243,14 @@ function cspUrlWithoutSecrets(value) {
   if (!text) return null;
   try {
     const parsed = new URL(text);
+    if (!["http:", "https:"].includes(parsed.protocol)) return null;
     parsed.search = "";
     parsed.hash = "";
-    return parsed.toString().slice(0, 2_048);
+    parsed.username = "";
+    parsed.password = "";
+    return parsed.origin;
   } catch {
-    return text.slice(0, 500);
+    return null;
   }
 }
 
@@ -1292,6 +1295,10 @@ let deviceProvisioner;
 // only when AUTO_ROUTE_PROXY_TUNNELS is enabled, declared here so the
 // start/stop-routing routes below can close over it.
 let networkRoutingOrchestrator;
+let networkRoutingSetupState = process.env.AUTO_ROUTE_PROXY_TUNNELS === "true"
+  ? (process.env.SHARED_BRIDGE_IFACE ? { state: "starting", message: "Routing is starting." }
+    : { state: "bridge_missing", message: "Proxy routing is enabled, but no Internet Sharing bridge is configured." })
+  : { state: "disabled", message: "Proxy routing is disabled on this host." };
 // Populated only when AUTO_NETWORK_ENROLLMENT is also enabled — automates
 // the network-enrollment/discover-ip routes above instead of requiring an
 // admin to click through them.
@@ -1750,6 +1757,7 @@ app.post("/api/admin/users/:username/2fa/reset", requireCapability(CAPABILITIES.
 const deviceNetwork = loadDeviceNetworkMap(rawDeviceConfig);
 const networkVerifier = createNetworkVerifier({ deviceNetwork });
 const networkMaxAgeMs = networkVerificationMaxAge();
+const knownRouteStates = new Map();
 const networkDecision = (deviceId, now = new Date()) => networkAccessDecision({
   network: deviceNetwork.get(deviceId),
   status: networkVerifier.getStatus(deviceId),
@@ -2051,6 +2059,9 @@ function deviceOpenDecision(d, viewer, viewerSocket = null) {
   if (d.discoveryState === "disconnected") {
     return { assignedToViewer: true, canOpen: false, accessState: "disconnected", openReason: d.discoveryStateMessage || "Unplugged." };
   }
+  if (!deviceControlPathReady(d)) {
+    return { assignedToViewer: true, canOpen: false, accessState: "control_unavailable", openReason: "The phone control tunnel is not ready. Automatic recovery is in progress." };
+  }
   if (d.status === "offline") {
     return { assignedToViewer: true, canOpen: false, accessState: "offline", openReason: "This assigned phone is offline." };
   }
@@ -2128,6 +2139,19 @@ const summary = (d, viewer = null, viewerSocket = null) => {
   const mayManageAccess = hasCapability(viewer, CAPABILITIES.MANAGE_ACCESS);
   const mayAccessMedia = Boolean(viewer && hasCapability(viewer, CAPABILITIES.ACCESS_MEDIA)
     && canAccessDevice(viewer, d.id));
+  const mayViewDiagnostics = hasCapability(viewer, CAPABILITIES.MANAGE_DEVICES);
+  const healthDetails = typeof d.healthSnapshot === "function" ? d.healthSnapshot() : null;
+  const networkDetails = networkVerifier.getStatus(d.id);
+  const safeNetworkDetails = mayViewDiagnostics ? networkDetails : {
+    networkCheckedAt: networkDetails.networkCheckedAt,
+    networkVerified: networkDetails.networkVerified,
+    networkMismatch: networkDetails.networkMismatch,
+    networkProxyHealthy: networkDetails.networkProxyHealthy,
+    networkRouteMatch: networkDetails.networkRouteMatch,
+    networkVerificationLevel: networkDetails.networkVerificationLevel,
+    networkProtectionState: networkDetails.networkProtectionState,
+    networkVerificationMessage: networkDetails.networkVerified ? "Network verification passed." : "Network verification needs attention.",
+  };
   return {
     id: d.id,
     label: d.label,
@@ -2140,7 +2164,17 @@ const summary = (d, viewer = null, viewerSocket = null) => {
     siteOnline: d.isRemote ? d.siteOnline : null,
     timeZone: d.timeZone ?? null,
     ...getHealth(d.id),
-    componentHealth: typeof d.healthSnapshot === "function" ? d.healthSnapshot() : null,
+    componentHealth: mayViewDiagnostics ? healthDetails : healthDetails ? {
+      deviceAttachment: healthDetails.deviceAttachment,
+      wdaProcess: healthDetails.wdaProcess,
+      iproxy: healthDetails.iproxy,
+      wdaEndpoint: healthDetails.wdaEndpoint,
+      control: healthDetails.control,
+      recovery: healthDetails.recovery,
+      readiness: { ready: healthDetails.readiness?.ready, state: healthDetails.readiness?.state },
+      latestError: null,
+      recentEvents: [],
+    } : null,
     controllerMode: deviceLease.getMode(d.id),
     currentOperator: humanOwners.get(d.id)?.operatorUsername ?? null,
     ...deviceOpenDecision(d, viewer, viewerSocket),
@@ -2168,6 +2202,7 @@ const summary = (d, viewer = null, viewerSocket = null) => {
     monitor: runtimeMonitorState(d.id),
     network: publicNetworkConfig(deviceNetwork.get(d.id)),
     poolProxy: hasCapability(viewer, CAPABILITIES.VIEW_PROXY_POOL) ? poolProxyForDevice(d.id) : null,
+    routingFeature: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? { ...networkRoutingSetupState } : null,
     routing: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? (networkRoutingOrchestrator?.getRoute(d.id) ?? null) : null,
     networkRouteHealth: (() => {
       const route = networkRoutingOrchestrator?.getRoute(d.id);
@@ -2179,7 +2214,7 @@ const summary = (d, viewer = null, viewerSocket = null) => {
     })(),
     usbNetwork: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? usbNetworkForDevice(d.id) : null,
     autoEnrollment: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? (autoNetworkEnrollment?.getStatus(d.id) ?? null) : null,
-    ...networkVerifier.getStatus(d.id),
+    ...safeNetworkDetails,
   };
 };
 const knownDevice = (id) => devices.has(id);
@@ -2205,6 +2240,7 @@ app.get("/api/admin/devices/:deviceId/diagnostics", requireCapability(CAPABILITI
     deviceId: device.id,
     health: typeof device.healthSnapshot === "function" ? device.healthSnapshot() : null,
     routing: networkRoutingOrchestrator?.getRoute(device.id) ?? null,
+    routingFeature: { ...networkRoutingSetupState },
     network: networkVerifier.getStatus(device.id),
   });
 });
@@ -2393,6 +2429,8 @@ registerProxyPoolRoutes({
   recordAudit: logAuditBestEffort,
   broadcastDeviceList,
   poolProxyForDevice,
+  networkRoutingOrchestrator,
+  invalidateNetworkVerification: deviceId => networkVerifier.invalidate(deviceId),
 });
 
 // Network enrollment (Automation Architecture guide §4.4): binding this
@@ -3187,6 +3225,7 @@ function broadcastDeviceList() {
   for (const client of wss.clients) {
     if (client.readyState !== client.OPEN) continue;
     try {
+      client.releaseUnauthorizedSelection?.("fleet_updated", false);
       client.releaseUnauthorizedWatch?.("fleet_updated");
       const operator = client.currentOperator?.();
       const visibleDevices = operator && hasCapability(operator, CAPABILITIES.VIEW_FLEET)
@@ -3426,17 +3465,18 @@ wss.on("connection", (ws, request) => {
     && hasCapability(currentOperator(), CAPABILITIES.CONTROL_DEVICE)
     && canAccessDevice(currentOperator(), target.id)
     && humanOwners.get(target.id) === ws
+    && deviceControlPathReady(target)
     && deviceLease.canHumanSelect(target.id)
     && networkDecision(target.id).allowed;
   const selectionAccessActive = (target, generation) => selected === target
     && selectionGeneration === generation && selectedAccessActive(target);
-  const revokeSelectedAccess = (action, target = selected, generation = selectionGeneration) => {
+  const revokeSelectedAccess = (action, target = selected, generation = selectionGeneration, broadcastChanges = true) => {
     if (!selected || selected !== target || selectionGeneration !== generation) return false;
     const revokedId = selected.id;
     logAuditBestEffort({ operator: operator.username, type: "device_access_revoked", deviceId: revokedId,
       detail: { action } }, "WebSocket access-revocation audit write");
     releaseSelection();
-    broadcastDeviceList();
+    if (broadcastChanges) broadcastDeviceList();
     broadcastPresence();
     if (ws.readyState === ws.OPEN) {
       ws.send(JSON.stringify({ type: "error", code: "device_access_revoked", deviceId: revokedId,
@@ -3444,9 +3484,9 @@ wss.on("connection", (ws, request) => {
     }
     return true;
   };
-  ws.releaseUnauthorizedSelection = (action = "operator_updated") => {
+  ws.releaseUnauthorizedSelection = (action = "operator_updated", broadcastChanges = true) => {
     if (!selected || selectedAccessActive(selected)) return false;
-    revokeSelectedAccess(action);
+    revokeSelectedAccess(action, selected, selectionGeneration, broadcastChanges);
     return true;
   };
   const watchAccessActive = (target = watched) => Boolean(target)
@@ -4360,7 +4400,7 @@ if (isMain) {
   // createTaskQueue() would emit recovered work before either subscriber can
   // see it, leaving a restarted research task RUNNING with no consumer.
   schedulerGuard.run(new Date());
-  void refreshWdaReadiness();
+  void refreshWdaReadiness().catch(error => logOperationalFailure("Initial WDA readiness refresh failed", error));
   const PORT = process.env.PORT || 4173;
   server.listen(PORT, deployment.host, () => {
     // server.address().port (not the raw PORT var) so this is still correct
@@ -4403,6 +4443,7 @@ if (isMain) {
     if (!bridgeIface) {
       console.error("Automatic proxy tunnel routing is disabled — SHARED_BRIDGE_IFACE is not configured.");
     } else if (!proxyCredentialEncryptionKey) {
+      networkRoutingSetupState = { state: "setup_failed", message: "Proxy routing credentials cannot be decrypted on this host." };
       console.error("Automatic proxy tunnel routing is disabled — TWO_FACTOR_MASTER_KEY (or PROXY_CREDENTIAL_ENCRYPTION_KEY) is not configured.");
     } else {
       try {
@@ -4412,8 +4453,16 @@ if (isMain) {
           tunManager: new TunManager(),
           privilegedOps: new PrivilegedOps({ anchor: process.env.PF_ANCHOR || "com.apple/phonefarm" }),
           bridgeIface,
-          onStateChanged: () => broadcastDeviceList(),
+          onStateChanged: (deviceId, route) => {
+            const state = route?.state ?? null;
+            if (knownRouteStates.get(deviceId) !== state) {
+              networkVerifier.invalidate(deviceId, "The route changed; run a new device network check.");
+              knownRouteStates.set(deviceId, state);
+            }
+            broadcastDeviceList();
+          },
         });
+        networkRoutingSetupState = { state: "enabled", message: "Proxy routing is enabled and the Internet Sharing bridge is configured." };
         networkRoutingOrchestrator.startHealthChecks({
           intervalMs: Number(process.env.ROUTING_HEALTH_CHECK_INTERVAL_MS) || undefined,
         });
@@ -4453,6 +4502,7 @@ if (isMain) {
           autoNetworkEnrollment.start();
         }
       } catch (error) {
+        networkRoutingSetupState = { state: "setup_failed", message: "Proxy routing could not be initialized. Review host diagnostics." };
         logOperationalFailure("Automatic proxy tunnel routing is disabled", error);
       }
     }
@@ -4462,9 +4512,20 @@ if (isMain) {
 server.on("close", () => {
   streamHub.closeAll();
   siteLinkHub.closeAll();
-  void applicationDatabasePool?.end().catch(error => {
-    logOperationalFailure("PostgreSQL pool shutdown failed", error);
-  });
+  clearInterval(heartbeatTimer);
+  if (queueTickTimer) clearInterval(queueTickTimer);
+  if (wdaReadinessTimer) clearInterval(wdaReadinessTimer);
+  void (async () => {
+    autoNetworkEnrollment?.stop();
+    networkRoutingOrchestrator?.stopHealthChecks();
+    await researchTaskRunner.stop();
+    for (const deviceId of networkRoutingOrchestrator?.routes.keys() ?? []) {
+      try { await networkRoutingOrchestrator.stopRouting(deviceId); }
+      catch (error) { logOperationalFailure("Proxy route shutdown cleanup failed", error); }
+    }
+    await deviceProvisioner?.stop();
+    await applicationDatabasePool?.end();
+  })().catch(error => logOperationalFailure("Server shutdown cleanup failed", error));
 });
 
 export {

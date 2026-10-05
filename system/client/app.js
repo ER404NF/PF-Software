@@ -253,7 +253,9 @@ async function requestJson(url, options = {}, {
       }
     }
     if (!response.ok) {
-      throw new RequestFailure(body?.error || `Phone Farm rejected the request (HTTP ${response.status}).`, {
+      const action = typeof body?.diagnostic?.operatorAction === "string" ? body.diagnostic.operatorAction : "";
+      const base = body?.error || `Phone Farm rejected the request (HTTP ${response.status}).`;
+      throw new RequestFailure(action ? `${base}. ${action}` : base, {
         kind: "http", status: response.status,
       });
     }
@@ -1780,6 +1782,10 @@ const enrollmentPendingDeviceIds = new Set();
 const ROUTING_TERMINAL_ERROR_STATES = new Set(["tun_error", "pf_syntax_error", "route_lost"]);
 
 function networkRoutingNextAction(device) {
+  if (device.routingFeature?.state === "disabled") return { label: "Routing disabled", action: null, disabled: true };
+  if (device.routingFeature?.state === "bridge_missing") return { label: "Bridge required", action: null, disabled: true };
+  if (device.routingFeature?.state === "setup_failed") return { label: "Setup failed", action: null, disabled: true };
+  if (device.routingFeature?.state === "starting") return { label: "Routing starting…", action: null, disabled: true };
   const routingState = device.routing?.state;
   if (routingState === "routed") return { label: "Stop routing", action: "stop-routing", kind: "stop" };
   if (routingState && !ROUTING_TERMINAL_ERROR_STATES.has(routingState)) {
@@ -1793,6 +1799,7 @@ function networkRoutingNextAction(device) {
 
 function networkRoutingStatusText(device) {
   const parts = [];
+  if (device.routingFeature?.message) parts.push(device.routingFeature.message);
   // Informational only — the auto-enrollment background loop (when
   // enabled) drives usbNetwork/routing on its own; the manual buttons
   // below remain available as a fallback/override regardless, e.g. if
@@ -2088,6 +2095,13 @@ function diagnosticForDevice(device) {
   return device?.componentHealth?.latestError || device?.routing?.latestError || device?.networkLatestError || null;
 }
 
+function diagnosticRetryKind(diagnostic) {
+  const component = diagnostic?.component;
+  if (["device-discovery", "wda-process", "wda-endpoint", "iproxy", "device-reconciler"].includes(component)) return "provisioning";
+  if (component === "network-verification") return "network";
+  return null;
+}
+
 function buildComponentHealthPanel(device, { compact = false } = {}) {
   const panel = document.createElement("div");
   panel.className = `component-health${compact ? " compact" : ""}`;
@@ -2109,17 +2123,17 @@ function buildComponentHealthPanel(device, { compact = false } = {}) {
 
 async function retryDeviceDiagnostic(device, button, statusEl) {
   const diagnostic = diagnosticForDevice(device);
+  const retryKind = diagnosticRetryKind(diagnostic);
   button.disabled = true;
   try {
-    if (["device-discovery", "wda-process", "wda-endpoint", "iproxy", "device-reconciler"].includes(diagnostic?.component)
-      && can(UI_CAPABILITIES.MANAGE_DEVICES)) {
+    if (retryKind === "provisioning" && can(UI_CAPABILITIES.MANAGE_DEVICES)) {
       await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/retry-provisioning`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
       });
       statusEl.textContent = `Retrying automatic setup for ${device.label}.`;
       return;
     }
-    if (can(UI_CAPABILITIES.RUN_NETWORK_CHECK)) {
+    if (retryKind === "network" && can(UI_CAPABILITIES.RUN_NETWORK_CHECK)) {
       await requestJson(`/api/devices/${encodeURIComponent(device.id)}/network-check`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
       }, { timeoutMs: 30_000, uncertain: true });
@@ -2162,7 +2176,10 @@ function buildDeviceErrorCard(device, statusEl = selectErrorEl) {
 
   const actions = document.createElement("div");
   actions.className = "device-error-actions";
-  if (error.retryable && (can(UI_CAPABILITIES.MANAGE_DEVICES) || can(UI_CAPABILITIES.RUN_NETWORK_CHECK))) {
+  const retryKind = diagnosticRetryKind(error);
+  const canRetry = retryKind === "provisioning" ? can(UI_CAPABILITIES.MANAGE_DEVICES)
+    : retryKind === "network" ? can(UI_CAPABILITIES.RUN_NETWORK_CHECK) : false;
+  if (error.retryable && canRetry) {
     const retry = document.createElement("button");
     retry.type = "button";
     retry.textContent = "Retry";

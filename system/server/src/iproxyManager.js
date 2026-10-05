@@ -5,9 +5,9 @@ import { SupervisedProcessGroup } from "./processSupervisor.js";
 // guide §11 E-IPROXY-002: omitting -u risks silently forwarding to a
 // *different* attached phone when more than one is connected).
 export class IProxyManager {
-  constructor({ spawn = nodeSpawn, bin = process.env.IPROXY_BIN || "iproxy", restartBackoffMs } = {}) {
+  constructor({ spawn = nodeSpawn, bin = process.env.IPROXY_BIN || "iproxy", restartBackoffMs, stableRunMs = 2000 } = {}) {
     this.bin = bin;
-    this.group = new SupervisedProcessGroup({ spawn, restartBackoffMs, logRingSize: 100, retryIndefinitely: true });
+    this.group = new SupervisedProcessGroup({ spawn, restartBackoffMs, stableRunMs, logRingSize: 100, retryIndefinitely: true });
   }
 
   on(...args) { this.group.on(...args); return this; }
@@ -15,7 +15,7 @@ export class IProxyManager {
   getStatus(udid) { return this.group.getStatus(udid); }
   getLog(udid) { return this.group.getLog(udid); }
   stop(udid) { this.group.stop(udid); }
-  stopAll() { this.group.stopAll(); }
+  stopAll() { return this.group.stopAll(); }
 
   // One iproxy process forwards both WDA's control port (8100) and, when
   // `mjpegLocalPort` is given, its MJPEG video port (9100): iproxy (libusbmuxd

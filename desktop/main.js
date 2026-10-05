@@ -8,7 +8,7 @@ const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const http = require("http");
-const { buildHostEnvironment, resolveMacHostDependencies } = require("./hostEnvironment");
+const { buildHostEnvironment, detectInternetSharingBridges, resolveMacHostDependencies } = require("./hostEnvironment");
 const {
   agentEntryPath, parseAgentStatus, siteAgentEnvironment, validateSiteSettings,
 } = require("./siteAgentConfig");
@@ -168,6 +168,7 @@ function resolveHostSetup(config) {
     developmentTeam: team.teamId,
     signingCandidates: team.candidates,
     routingEnabled,
+    sharedBridgeIface: config?.sharedBridgeIface || process.env.SHARED_BRIDGE_IFACE || null,
   });
 }
 
@@ -229,17 +230,60 @@ function setLaunchAtLogin(enabled) {
   buildMenu();
 }
 
-function setProxyRoutingEnabled(enabled) {
+async function setProxyRoutingEnabled(enabled) {
   const config = readConfig() ?? {};
-  writeConfig({ ...config, autoRouteProxyTunnels: Boolean(enabled) });
+  let sharedBridgeIface = config.sharedBridgeIface ?? null;
+  if (enabled && process.platform === "darwin") {
+    const candidates = detectInternetSharingBridges();
+    if (candidates.length === 0) {
+      buildMenu();
+      await dialog.showMessageBox({
+        type: "error", message: "Proxy routing was not enabled",
+        detail: "No active macOS Internet Sharing bridge was found. Turn on Internet Sharing for the connected phone, then try again.",
+        buttons: ["OK"], noLink: true,
+      });
+      return false;
+    }
+    if (candidates.length === 1) {
+      const confirmation = await dialog.showMessageBox({
+        type: "question", message: `Use ${candidates[0]} for phone proxy routing?`,
+        detail: "Phone Farm verified that this bridge is active and has a connected member.",
+        buttons: ["Enable routing", "Cancel"], defaultId: 0, cancelId: 1, noLink: true,
+      });
+      if (confirmation.response !== 0) { buildMenu(); return false; }
+      sharedBridgeIface = candidates[0];
+    } else {
+      const selection = await dialog.showMessageBox({
+        type: "question", message: "Select the Internet Sharing bridge",
+        detail: "Several active bridges were found. Select the bridge used by the connected iPhone. Phone Farm will not guess.",
+        buttons: [...candidates, "Cancel"], cancelId: candidates.length, noLink: true,
+      });
+      if (selection.response < 0 || selection.response >= candidates.length) { buildMenu(); return false; }
+      sharedBridgeIface = candidates[selection.response];
+    }
+  }
+  try {
+    writeConfig({ ...config, autoRouteProxyTunnels: Boolean(enabled), ...(enabled && sharedBridgeIface ? { sharedBridgeIface } : {}) });
+  } catch {
+    buildMenu();
+    await dialog.showMessageBox({
+      type: "error",
+      message: "Proxy routing setting was not saved",
+      detail: "Phone Farm could not save this setting. Check that the app settings folder is writable and that the disk has free space, then try again.",
+      buttons: ["OK"],
+      noLink: true,
+    });
+    return false;
+  }
   buildMenu();
-  void dialog.showMessageBox({
+  await dialog.showMessageBox({
     type: "info",
     message: enabled ? "Proxy routing enabled" : "Proxy routing disabled",
     detail: "Quit and reopen Phone Farm to apply this host setting.",
     buttons: ["OK"],
     noLink: true,
   });
+  return true;
 }
 
 function rememberServerOutput(chunk) {
@@ -756,7 +800,7 @@ function buildMenu() {
           type: "checkbox",
           checked: readConfig()?.autoRouteProxyTunnels === true,
           enabled: readConfig()?.mode === "host",
-          click: item => setProxyRoutingEnabled(item.checked),
+          click: item => { void setProxyRoutingEnabled(item.checked); },
         },
       ],
     },

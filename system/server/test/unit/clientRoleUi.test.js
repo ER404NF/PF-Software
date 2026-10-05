@@ -157,6 +157,7 @@ test("role and error-handling audit controls are explicit and recoverable", () =
   assert.match(app, /content_creator: "Content Creator"/);
   assert.match(app, /class RequestFailure extends Error/);
   assert.match(app, /Phone Farm could not be reached\. Your change was not confirmed/);
+  assert.match(app, /body\?\.diagnostic\?\.operatorAction/);
   assert.match(app, /LOGOUT_PENDING_KEY = "phone-farm-logout-pending"/);
   assert.match(app, /server could not confirm session revocation/);
   assert.match(html, /id="logout-retry-button"/);

@@ -1,6 +1,7 @@
 import { spawn as nodeSpawn, execFile as execFileCb } from "child_process";
 import { EventEmitter } from "events";
 import { SupervisedProcessGroup } from "./processSupervisor.js";
+import { isIP } from "node:net";
 
 const PROTOCOLS = new Set(["http", "https", "socks5"]);
 
@@ -29,7 +30,9 @@ export function buildProxyUrl({ protocol, host, port, username, password }) {
   if (typeof host !== "string" || !host.trim()) throw new Error("proxy host is required");
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw new Error("proxy port must be an integer from 1 to 65535");
   const auth = username ? `${encodeURIComponent(username)}:${encodeURIComponent(password || "")}@` : "";
-  return `${protocol}://${auth}${host}:${port}`;
+  const unwrappedHost = host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+  const urlHost = isIP(unwrappedHost) === 6 ? `[${unwrappedHost}]` : unwrappedHost;
+  return `${protocol}://${auth}${urlHost}:${port}`;
 }
 
 // One tun2proxy per device, run through `sudo -n` (unattended — the host
@@ -56,7 +59,7 @@ export class TunManager {
   getStatus(deviceId) { return this.group.getStatus(deviceId); }
   getLog(deviceId) { return this.group.getLog(deviceId).map(redactProxyCredentials); }
   stop(deviceId) { this.group.stop(deviceId); }
-  stopAll() { this.group.stopAll(); }
+  stopAll() { return this.group.stopAll(); }
 
   // `proxy` is the plaintext-decrypted credential object from
   // proxyPool.js's decryptProxyPassword — call sites must decrypt

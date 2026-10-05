@@ -7,7 +7,8 @@ import { EventEmitter } from "events";
 // mechanics both need identically, so that logic exists exactly once.
 export class SupervisedProcessGroup extends EventEmitter {
   constructor({ spawn, restartBackoffMs, logRingSize = 100, stableRunMs = 5 * 60_000,
-    retryIndefinitely = false, setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) {
+    retryIndefinitely = false, stopGraceMs = 2000, killWaitMs = 5000,
+    setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) {
     super();
     if (typeof spawn !== "function") throw new Error("a spawn function is required");
     this.spawn = spawn;
@@ -15,9 +16,14 @@ export class SupervisedProcessGroup extends EventEmitter {
     this.logRingSize = logRingSize;
     this.stableRunMs = stableRunMs;
     this.retryIndefinitely = retryIndefinitely;
+    this.stopGraceMs = stopGraceMs;
+    this.killWaitMs = killWaitMs;
     this.setTimeoutFn = setTimeoutFn;
     this.clearTimeoutFn = clearTimeoutFn;
     this.entries = new Map(); // key -> { child, log, restartCount, restartTimer, stopped }
+    this.pendingStops = new Map();
+    this.generations = new Map();
+    this.blockedStops = new Map();
   }
 
   isRunning(key) {
@@ -29,6 +35,7 @@ export class SupervisedProcessGroup extends EventEmitter {
   }
 
   getStatus(key) {
+    if (this.blockedStops.has(key)) return { state: "stop_failed", restartCount: 0, error: this.blockedStops.get(key) };
     const entry = this.entries.get(key);
     if (!entry) return { state: "stopped", restartCount: 0 };
     return { state: entry.state, restartCount: entry.restartCount };
@@ -40,11 +47,35 @@ export class SupervisedProcessGroup extends EventEmitter {
   // WDA's MJPEG tuning vars) — omitting it keeps the previous, unchanged
   // behavior of simply inheriting the parent process's environment.
   start(key, bin, args, env) {
+    if (this.blockedStops.has(key)) {
+      this.emit("replacement-blocked", { key, reason: this.blockedStops.get(key) });
+      return false;
+    }
     if (this.isRunning(key)) return;
-    const entry = { child: null, log: [], currentRunLog: [], restartCount: 0, restartTimer: null,
-      stableTimer: null, stopped: false, state: "starting", bin, args, env };
-    this.entries.set(key, entry);
-    this._spawnNow(key, bin, args, env);
+    const generation = (this.generations.get(key) ?? 0) + 1;
+    this.generations.set(key, generation);
+    const launch = () => {
+      if (this.generations.get(key) !== generation || this.isRunning(key)) return;
+      const entry = { child: null, log: [], currentRunLog: [], restartCount: 0, restartTimer: null,
+        stableTimer: null, stopped: false, state: "starting", persistentFailureReported: false, bin, args, env };
+      this.entries.set(key, entry);
+      this._spawnNow(key, bin, args, env);
+    };
+    const pendingStop = this.pendingStops.get(key);
+    if (pendingStop) {
+      // A replacement must not bind the same local ports until the old
+      // process has actually exited. A later stop invalidates this generation
+      // so a detach cannot leave a deferred orphan behind.
+      pendingStop.then(result => {
+        if (result?.ok === false || this.blockedStops.has(key)) {
+          this.emit("replacement-blocked", { key, reason: result?.error || this.blockedStops.get(key) });
+          return;
+        }
+        launch();
+      });
+    } else {
+      launch();
+    }
   }
 
   _appendLog(entry, line) {
@@ -83,6 +114,7 @@ export class SupervisedProcessGroup extends EventEmitter {
       entry.stableTimer = this.setTimeoutFn(() => {
         if (settled || entry.stopped || this.entries.get(key) !== entry || entry.child !== child) return;
         entry.restartCount = 0;
+        entry.persistentFailureReported = false;
         entry.stableTimer = null;
         this.emit("stable", { key });
       }, this.stableRunMs);
@@ -119,6 +151,15 @@ export class SupervisedProcessGroup extends EventEmitter {
     if (entry.stopped || this.entries.get(key) !== entry) return;
     if (entry.restartCount >= this.restartBackoffMs.length) {
       if (this.retryIndefinitely) {
+        if (!entry.persistentFailureReported) {
+          entry.persistentFailureReported = true;
+          this.emit("persistent-failure", {
+            key,
+            restartCount: entry.restartCount,
+            log: [...entry.currentRunLog],
+          });
+          if (entry.stopped || this.entries.get(key) !== entry) return;
+        }
         const delay = this.restartBackoffMs.at(-1) ?? 30_000;
         entry.state = "restarting";
         entry.restartTimer = this.setTimeoutFn(() => this._spawnNow(key, entry.bin, entry.args, entry.env), delay);
@@ -143,16 +184,69 @@ export class SupervisedProcessGroup extends EventEmitter {
 
   stop(key) {
     const entry = this.entries.get(key);
-    if (!entry) return;
+    this.generations.set(key, (this.generations.get(key) ?? 0) + 1);
+    if (!entry) return this.pendingStops.get(key);
     entry.stopped = true;
     entry.state = "stopped";
     if (entry.restartTimer) this.clearTimeoutFn(entry.restartTimer);
     if (entry.stableTimer) this.clearTimeoutFn(entry.stableTimer);
-    entry.child?.kill?.();
     this.entries.delete(key);
+    const child = entry.child;
+    if (!child) return;
+
+    let settle;
+    const stopped = new Promise(resolve => { settle = resolve; });
+    this.pendingStops.set(key, stopped);
+    let forceTimer = null;
+    let killWaitTimer = null;
+    let done = false;
+    const finish = (result = { ok: true }) => {
+      if (done) return;
+      done = true;
+      if (forceTimer) this.clearTimeoutFn(forceTimer);
+      if (killWaitTimer) this.clearTimeoutFn(killWaitTimer);
+      child.off?.("exit", finish);
+      child.off?.("close", finish);
+      child.off?.("error", onKillError);
+      if (this.pendingStops.get(key) === stopped) this.pendingStops.delete(key);
+      settle(result);
+    };
+    const onKillError = error => {
+      // ESRCH proves the old process is already gone. Other kill errors (for
+      // example EPERM) do not prove termination, so keep the replacement
+      // queued until an exit/close event confirms that its ports are free.
+      if (error?.code === "ESRCH") finish();
+    };
+    child.once?.("exit", finish);
+    child.once?.("close", finish);
+    child.on?.("error", onKillError);
+    try {
+      child.kill?.();
+    } catch (error) {
+      onKillError(error);
+    }
+    if (done) return stopped;
+    if (child.exitCode !== null && child.exitCode !== undefined) {
+      finish();
+      return stopped;
+    }
+    forceTimer = this.setTimeoutFn(() => {
+      try { child.kill?.("SIGKILL"); } catch (error) { onKillError(error); }
+      if (!done) {
+        killWaitTimer = this.setTimeoutFn(() => {
+          const reason = "process did not confirm exit after SIGKILL; replacement is blocked until relay restart";
+          this.blockedStops.set(key, reason);
+          this.emit("stop-timeout", { key, reason });
+          finish({ ok: false, error: reason });
+        }, this.killWaitMs);
+        killWaitTimer.unref?.();
+      }
+    }, this.stopGraceMs);
+    forceTimer.unref?.();
+    return stopped;
   }
 
   stopAll() {
-    for (const key of [...this.entries.keys()]) this.stop(key);
+    return Promise.allSettled([...new Set([...this.entries.keys(), ...this.pendingStops.keys()])].map(key => this.stop(key)));
   }
 }

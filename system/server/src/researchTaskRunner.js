@@ -61,6 +61,7 @@ export function createResearchTaskRunner({
   const providersByTask = new Map(); // taskId -> provider in use, so a routing provider can be told the session ended
   const budgets = new Map(); // taskId -> SessionBudget, for the live monitor and reports
   let started = false;
+  let stopping = false;
 
   function recordAudit(event) {
     try {
@@ -96,7 +97,7 @@ export function createResearchTaskRunner({
 
     const canAccessAccount = () => {
       const operator = operatorForUsername(task.createdBy);
-      return canAccessDevice(operator, deviceId) && canUseDevice(deviceId)
+      return !stopping && canAccessDevice(operator, deviceId) && canUseDevice(deviceId)
         && workspaceForOperatorAccount(operator, accountId) === workspaceId;
     };
 
@@ -146,6 +147,7 @@ export function createResearchTaskRunner({
     }
 
     while (true) {
+      if (stopping) return { outcome: "SHUTTING_DOWN" };
       const current = taskQueue.getTask(task.id);
       if (!current || [TASK_STATES.CANCELLED, TASK_STATES.NEEDS_HUMAN, TASK_STATES.FAILED_FINAL,
         TASK_STATES.SUCCEEDED, TASK_STATES.PARTIAL, TASK_STATES.EXPIRED].includes(current.state)) {
@@ -307,12 +309,20 @@ export function createResearchTaskRunner({
 
   function start() {
     if (started) return;
+    stopping = false;
     started = true;
     taskQueue.on("dispatched", launch);
   }
 
+  async function stop() {
+    stopping = true;
+    if (started) taskQueue.off?.("dispatched", launch);
+    started = false;
+    await Promise.allSettled([...active.values()]);
+  }
+
   return {
-    start, launch, runTask, waitForTask: (taskId) => active.get(taskId) ?? null,
+    start, stop, launch, runTask, waitForTask: (taskId) => active.get(taskId) ?? null,
     // Live view of a session's budget (for the fleet monitor and the report endpoint).
     sessionBudget: taskId => budgets.get(taskId) ?? null,
     sessionSummaries: () => [...budgets].map(([taskId, budget]) => ({ taskId, steps: budget.state.steps })),

@@ -1,6 +1,7 @@
 const DEFAULT_WINDOW_MS = 15 * 60_000;
 const DEFAULT_ACCOUNT_LIMIT = 3;
 const DEFAULT_IP_LIMIT = 10;
+const DEFAULT_MAX_KEYS = 10_000;
 
 function normalizedKey(value) {
   const key = String(value ?? "").trim().toLowerCase();
@@ -11,16 +12,24 @@ export function createRecoveryThrottle({
   windowMs = DEFAULT_WINDOW_MS,
   accountLimit = DEFAULT_ACCOUNT_LIMIT,
   ipLimit = DEFAULT_IP_LIMIT,
+  maxKeys = DEFAULT_MAX_KEYS,
   now = () => Date.now(),
 } = {}) {
   if (!Number.isSafeInteger(windowMs) || windowMs <= 0) throw new Error("recovery throttle window must be positive");
   if (!Number.isSafeInteger(accountLimit) || accountLimit <= 0) throw new Error("recovery account limit must be positive");
   if (!Number.isSafeInteger(ipLimit) || ipLimit <= 0) throw new Error("recovery IP limit must be positive");
+  if (!Number.isSafeInteger(maxKeys) || maxKeys <= 0) throw new Error("recovery throttle maxKeys must be positive");
 
   const accounts = new Map();
   const ips = new Map();
 
   function consume(entries, key, limit, timestamp) {
+    if (!entries.has(key) && entries.size >= maxKeys) {
+      for (const [oldKey, entry] of entries) {
+        if (timestamp - entry.startedAt >= windowMs) entries.delete(oldKey);
+      }
+      if (entries.size >= maxKeys) entries.delete(entries.keys().next().value);
+    }
     const existing = entries.get(key);
     const entry = !existing || timestamp - existing.startedAt >= windowMs
       ? { startedAt: timestamp, count: 0 }
@@ -48,12 +57,14 @@ export function createAuthenticationThrottle({
   accountLimit = 5,
   ipLimit = 20,
   globalLimit = 100,
+  maxKeys = DEFAULT_MAX_KEYS,
   now = () => Date.now(),
 } = {}) {
   if (!Number.isSafeInteger(windowMs) || windowMs <= 0) throw new Error("authentication throttle window must be positive");
   if (!Number.isSafeInteger(accountLimit) || accountLimit <= 0) throw new Error("authentication account limit must be positive");
   if (!Number.isSafeInteger(ipLimit) || ipLimit <= 0) throw new Error("authentication IP limit must be positive");
   if (!Number.isSafeInteger(globalLimit) || globalLimit <= 0) throw new Error("authentication global limit must be positive");
+  if (!Number.isSafeInteger(maxKeys) || maxKeys <= 0) throw new Error("authentication throttle maxKeys must be positive");
   const accounts = new Map();
   const ips = new Map();
   const global = new Map();
@@ -65,6 +76,16 @@ export function createAuthenticationThrottle({
       return null;
     }
     return existing;
+  }
+
+  function setBounded(entries, key, entry, timestamp) {
+    if (!entries.has(key) && entries.size >= maxKeys) {
+      for (const [oldKey, oldEntry] of entries) {
+        if (timestamp - oldEntry.startedAt >= windowMs) entries.delete(oldKey);
+      }
+      if (entries.size >= maxKeys) entries.delete(entries.keys().next().value);
+    }
+    entries.set(key, entry);
   }
 
   function blocked({ identifier, ip }) {
@@ -83,7 +104,7 @@ export function createAuthenticationThrottle({
     ]) {
       const entry = current(entries, key, timestamp) ?? { startedAt: timestamp, count: 0 };
       entry.count += 1;
-      entries.set(key, entry);
+      setBounded(entries, key, entry, timestamp);
     }
     return blocked({ identifier, ip });
   }

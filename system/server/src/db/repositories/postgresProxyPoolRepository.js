@@ -104,7 +104,7 @@ export async function createPostgresProxyPoolRepository(pool, { now = () => new 
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, $11, $11)
            RETURNING *`,
           [id, organizationId, fields.provider.trim(), fields.protocol, fields.host.trim(), fields.port,
-            fields.username.trim(), encryptTotpSecret(fields.password, masterKey), fields.country.toUpperCase(),
+            fields.username, encryptTotpSecret(fields.password, masterKey), fields.country.toUpperCase(),
             fields.label?.trim() || `${fields.provider.trim()} ${fields.country.toUpperCase()}`, at],
         );
         return toRecord(result.rows[0]);

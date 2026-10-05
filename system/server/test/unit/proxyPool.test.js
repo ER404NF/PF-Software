@@ -42,6 +42,15 @@ test("createProxy persists a record and encrypts the password at rest", () => {
   assert.ok(!JSON.stringify(onDisk).includes("s3cret-pass"), "plaintext password must never hit disk");
 });
 
+test("saved proxies preserve exact provider username syntax and password bytes", () => {
+  const storePath = tempStorePath();
+  const username = " customer-country-US-session-abc ";
+  const password = " p@ss:/?#[] ";
+  const record = createProxy(storePath, sampleFields({ username, password }), MASTER_KEY);
+  assert.equal(record.username, username);
+  assert.equal(decryptProxyPassword(record, MASTER_KEY), password);
+});
+
 test("createProxy defaults the label from provider + country when omitted", () => {
   const storePath = tempStorePath();
   const record = createProxy(storePath, sampleFields({ label: undefined }), MASTER_KEY);

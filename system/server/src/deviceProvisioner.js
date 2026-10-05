@@ -29,6 +29,19 @@ export function classifyWdaFailure(logText) {
   return null;
 }
 
+const IPROXY_FAILURES = [
+  { pattern: /address already in use|EADDRINUSE|bind(?:ing)?.{0,40}failed/i, code: "I205" },
+  { pattern: /usage:\s*iproxy|unknown option|too many arguments|invalid.{0,30}(?:argument|port|mapping)/i, code: "I204" },
+  { pattern: /no device found|device.{0,30}(?:not found|unavailable)|could not connect to device/i, code: "I206" },
+  { pattern: /usbmuxd|usbmux.{0,30}(?:failed|error)|error connecting to socket/i, code: "I207" },
+  { pattern: /\bENOENT\b|\bEACCES\b|permission denied|spawn error:.{0,80}not found/i, code: "I208" },
+];
+
+export function classifyIproxyFailure(logText) {
+  const match = IPROXY_FAILURES.find(candidate => candidate.pattern.test(String(logText)));
+  return match ? diagnosticError(match.code, { technical: { category: match.code } }) : null;
+}
+
 // Drives "plug in a phone, it comes online with no manual xcodebuild/iproxy
 // typing" (Automation Architecture guide §5-6, trimmed to what Phase A
 // covers — no proxy/TUN/PF yet; "online" here just means "controllable via
@@ -83,7 +96,11 @@ export class DeviceProvisioner {
     this.iproxyManager.on("exit", ({ key, log }) => this._onProcessExit("iproxy", key, log));
     this.iproxyManager.on("starting", ({ key }) => this._onProcessStarting("iproxy", key));
     this.iproxyManager.on("stable", ({ key }) => this._onProcessStable("iproxy", key));
+    this.iproxyManager.on("persistent-failure", ({ key, log }) => this._onPersistentFailure("iproxy", key, log));
+    this.wdaProcessManager.on("persistent-failure", ({ key, log }) => this._onPersistentFailure("WDA", key, log));
     this.iproxyManager.on("restart-limit-exceeded", ({ key, log }) => this._onRestartLimitExceeded("iproxy", key, log));
+    this.wdaProcessManager.on("replacement-blocked", ({ key }) => this._onReplacementBlocked("WDA", key));
+    this.iproxyManager.on("replacement-blocked", ({ key }) => this._onReplacementBlocked("iproxy", key));
   }
 
   start() {
@@ -93,11 +110,10 @@ export class DeviceProvisioner {
     this.timer.unref?.();
   }
 
-  stop() {
+  async stop() {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
-    this.wdaProcessManager.stopAll();
-    this.iproxyManager.stopAll();
+    await Promise.allSettled([this.wdaProcessManager.stopAll(), this.iproxyManager.stopAll()]);
   }
 
   async pollOnce() {
@@ -159,6 +175,8 @@ export class DeviceProvisioner {
     wdaDevice.discoveryState = "provisioning";
     wdaDevice.discoveryStateMessage = "Starting WDA. Starting the USB tunnel. Waiting for device readiness. This can take a minute.";
     wdaDevice.status = "offline";
+    wdaDevice.setComponentError("wdaProcess", null);
+    wdaDevice.setComponentError("iproxy", null);
     wdaDevice.setComponentHealth({
       deviceAttachment: "CONNECTED",
       wdaProcess: "STARTING",
@@ -193,6 +211,8 @@ export class DeviceProvisioner {
       // settles, while still reporting the physical truth immediately.
       // Component health must never claim an unplugged phone is attached.
       if (entry.wdaDevice.status !== "in-use") entry.wdaDevice.status = "offline";
+      entry.wdaDevice.setComponentError("wdaProcess", null);
+      entry.wdaDevice.setComponentError("iproxy", null);
       entry.wdaDevice.discoveryState = "disconnected";
       entry.wdaDevice.discoveryStateMessage = "Unplugged. Reconnect the cable to resume automatic setup.";
       entry.wdaDevice.setComponentHealth({
@@ -223,12 +243,20 @@ export class DeviceProvisioner {
       const { wdaDevice } = entry;
       const wdaState = this._managerState(this.wdaProcessManager, udid);
       const iproxyState = this._managerState(this.iproxyManager, udid);
+      const currentIproxyHealth = wdaDevice.componentHealth.iproxy;
       wdaDevice.setComponentHealth({
         deviceAttachment: "CONNECTED",
         wdaProcess: processHealthState(wdaState),
-        iproxy: processHealthState(iproxyState),
+        iproxy: iproxyState === "running" && currentIproxyHealth === "STARTING"
+          ? "STARTING" : processHealthState(iproxyState),
       });
-      if (wdaDevice.discoveryState === "provisioning" && wdaDevice.status !== "offline") {
+      if (wdaDevice.discoveryState === "provisioning"
+        && wdaDevice.status !== "offline"
+        && wdaDevice.readiness?.state === "HEALTHY"
+        && wdaDevice.componentHealth.control === "READY"
+        && wdaState === "running"
+        && iproxyState === "running"
+        && wdaDevice.componentHealth.iproxy === "RUNNING") {
         wdaDevice.discoveryState = null;
         wdaDevice.discoveryStateMessage = null;
         entry.recovery = { stage: null, attempts: 0, lastAttemptAt: 0 };
@@ -296,7 +324,13 @@ export class DeviceProvisioner {
   _onProcessStarting(kind, udid) {
     const entry = this.runtime.get(udid);
     if (!entry) return;
-    entry.wdaDevice.setComponentHealth(kind === "WDA" ? { wdaProcess: "RUNNING" } : { iproxy: "RUNNING" });
+    if (entry.wdaDevice.discoveryState === "provisioning_error") {
+      entry.wdaDevice.discoveryState = "provisioning";
+      entry.wdaDevice.discoveryStateMessage = `Recovering ${kind === "WDA" ? "WebDriverAgent" : "the device tunnel"}. The phone will be available after a fresh readiness check.`;
+    }
+    entry.wdaDevice.invalidateReadiness(kind);
+    entry.wdaDevice.setComponentHealth(kind === "WDA" ? { wdaProcess: "STARTING" } : { iproxy: "STARTING" });
+    entry.wdaDevice.refreshControlHealth();
     entry.wdaDevice.recordDiagnosticEvent(`${kind === "WDA" ? "WDA" : "IPROXY"}_STARTING`);
     this.onDeviceListChanged();
   }
@@ -304,19 +338,27 @@ export class DeviceProvisioner {
   _onProcessStable(kind, udid) {
     const entry = this.runtime.get(udid);
     if (!entry) return;
+    const component = kind === "WDA" ? "wdaProcess" : "iproxy";
+    entry.wdaDevice.setComponentHealth({ [component]: "RUNNING" });
+    entry.wdaDevice.setComponentError(component, null);
+    entry.wdaDevice.refreshControlHealth();
     entry.wdaDevice.recordDiagnosticEvent(`${kind === "WDA" ? "WDA" : "IPROXY"}_STABLE`);
+    this.onDeviceListChanged();
   }
 
   _onProcessExit(kind, udid, log) {
     const entry = this.runtime.get(udid);
     if (!entry) return;
     const code = kind === "WDA" ? "W202" : "I201";
-    const detail = diagnosticError(code);
+    const detail = kind === "WDA" ? diagnosticError(code) : (classifyIproxyFailure(log.join("")) ?? diagnosticError(code));
+    entry.wdaDevice.invalidateReadiness(kind);
     entry.wdaDevice.readiness.lastError = detail;
+    entry.wdaDevice.setComponentError(kind === "WDA" ? "wdaProcess" : "iproxy", detail);
     entry.wdaDevice.setComponentHealth(kind === "WDA"
       ? { wdaProcess: "RESTARTING", control: "DEGRADED" }
-      : { iproxy: "RESTARTING", control: "DEGRADED" });
+      : { iproxy: "RESTARTING", control: "UNAVAILABLE" });
     entry.wdaDevice.recordDiagnosticEvent(`${kind === "WDA" ? "WDA" : "IPROXY"}_FAILED`, { error: detail });
+    this.onDeviceListChanged();
     // classifyWdaFailure's patterns (untrusted cert, Developer Mode, App ID
     // limit) are all about Xcode/WDA app installation and don't apply to
     // iproxy (a USB port-forwarder) — misapplying them to an iproxy exit
@@ -330,6 +372,8 @@ export class DeviceProvisioner {
     entry.wdaDevice.discoveryState = "user_action_required";
     entry.wdaDevice.discoveryStateMessage = known;
     entry.wdaDevice.status = "offline";
+    entry.wdaDevice.setComponentError("wdaProcess", manualError);
+    entry.wdaDevice.setComponentError("iproxy", null);
     entry.wdaDevice.readiness.lastError = manualError;
     entry.wdaDevice.setComponentHealth({
       wdaProcess: "FAILED", iproxy: "UNKNOWN", wdaEndpoint: "UNKNOWN",
@@ -340,6 +384,42 @@ export class DeviceProvisioner {
     // stop trying until a human resolves it and retries explicitly.
     this.wdaProcessManager.stop(udid);
     this.iproxyManager.stop(udid);
+    this.onDeviceListChanged();
+  }
+
+  _onPersistentFailure(kind, udid, log) {
+    const entry = this.runtime.get(udid);
+    if (!entry) return;
+    const detail = kind === "iproxy"
+      ? (classifyIproxyFailure(log.join("")) ?? diagnosticError("I203"))
+      : diagnosticError("W202", { technical: { retriesExhausted: true } });
+    entry.wdaDevice.discoveryState = "provisioning_error";
+    entry.wdaDevice.discoveryStateMessage = `${detail.name}. ${detail.operatorAction} Automatic retry continues.`;
+    if (entry.wdaDevice.status !== "in-use") entry.wdaDevice.status = "offline";
+    entry.wdaDevice.readiness.lastError = detail;
+    const component = kind === "WDA" ? "wdaProcess" : "iproxy";
+    entry.wdaDevice.setComponentError(component, detail);
+    entry.wdaDevice.setComponentHealth(kind === "WDA"
+      ? { wdaProcess: "RESTARTING", control: "UNAVAILABLE", recovery: "RETRYING" }
+      : { iproxy: "RESTARTING", control: "UNAVAILABLE", recovery: "RETRYING_CAPPED" });
+    entry.wdaDevice.recordDiagnosticEvent(`${kind === "WDA" ? "WDA" : "IPROXY"}_PERSISTENT_FAILURE`, { error: detail });
+    this.onDeviceListChanged();
+  }
+
+  _onReplacementBlocked(kind, udid) {
+    const entry = this.runtime.get(udid);
+    if (!entry) return;
+    const component = kind === "WDA" ? "wdaProcess" : "iproxy";
+    const detail = diagnosticError(kind === "WDA" ? "W202" : "I203", {
+      why: "The previous process did not confirm that it exited, so a replacement was blocked to prevent a port conflict.",
+    });
+    entry.wdaDevice.discoveryState = "provisioning_error";
+    entry.wdaDevice.discoveryStateMessage = `${detail.name}. ${detail.operatorAction}`;
+    if (entry.wdaDevice.status !== "in-use") entry.wdaDevice.status = "offline";
+    entry.wdaDevice.readiness.lastError = detail;
+    entry.wdaDevice.setComponentError(component, detail);
+    entry.wdaDevice.setComponentHealth({ [component]: "FAILED", control: "UNAVAILABLE", recovery: "FAILED" });
+    entry.wdaDevice.recordDiagnosticEvent(`${kind === "WDA" ? "WDA" : "IPROXY"}_REPLACEMENT_BLOCKED`, { error: detail });
     this.onDeviceListChanged();
   }
 
@@ -381,6 +461,8 @@ export class DeviceProvisioner {
     entry.wdaDevice.discoveryState = "provisioning";
     entry.wdaDevice.discoveryStateMessage = "Retrying automatic setup.";
     entry.wdaDevice.status = "offline";
+    entry.wdaDevice.setComponentError("wdaProcess", null);
+    entry.wdaDevice.setComponentError("iproxy", null);
     entry.recovery = { stage: null, attempts: 0, lastAttemptAt: 0 };
     entry.wdaDevice.setComponentHealth({
       deviceAttachment: "CONNECTED", wdaProcess: "STARTING", iproxy: "STARTING",

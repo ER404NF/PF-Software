@@ -3,6 +3,7 @@ import net from "node:net";
 import tls from "node:tls";
 import { isIP } from "node:net";
 import { diagnosticError } from "./errorCatalog.js";
+import { isPublicIpv4 } from "./publicIp.js";
 
 const HOST_RE = /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$/;
 const PROTOCOLS = new Set(["http", "https", "socks5"]);
@@ -29,9 +30,18 @@ export function validateProxyForTest(proxy) {
     || typeof proxy.username !== "string" || typeof proxy.password !== "string") {
     throw new ProxyTestError("P108");
   }
-  const host = String(proxy.host || "").trim();
-  if (!host || (!isIP(host) && !HOST_RE.test(host))) throw new ProxyTestError("P101");
-  return { ...proxy, host };
+  const host = validateProxyHost(proxy.host);
+  if (proxy.country != null && (typeof proxy.country !== "string" || !/^[A-Za-z]{2}$/.test(proxy.country))) {
+    throw new ProxyTestError("P108", { why: "Country must be a two-letter ISO code." });
+  }
+  return { ...proxy, host, country: proxy.country?.toUpperCase() ?? null };
+}
+
+export function validateProxyHost(value) {
+  const rawHost = String(value || "").trim();
+  const host = rawHost.startsWith("[") && rawHost.endsWith("]") ? rawHost.slice(1, -1) : rawHost;
+  if (!host || /[\u0000-\u0020\u007f/@?#]/.test(host) || (!isIP(host) && !HOST_RE.test(host))) throw new ProxyTestError("P101");
+  return host;
 }
 
 function classifyTransportError(error, fallback = "P103") {
@@ -124,48 +134,62 @@ function connect({ host, port, secure, timeoutMs }) {
   });
 }
 
-async function socks5Connect(socket, proxy, target) {
+export async function socks5Connect(socket, proxy, target) {
   const reader = new SocketReader(socket);
-  const hasAuth = Boolean(proxy.username);
-  socket.write(Buffer.from([5, 1, hasAuth ? 2 : 0]));
-  const greeting = await reader.readExactly(2);
-  if (greeting[0] !== 5 || greeting[1] === 0xff) throw new ProxyTestError("P106");
-  if (greeting[1] === 2) {
-    const user = Buffer.from(proxy.username);
-    const password = Buffer.from(proxy.password);
-    if (user.length > 255 || password.length > 255) throw new ProxyTestError("P108");
-    socket.write(Buffer.concat([Buffer.from([1, user.length]), user, Buffer.from([password.length]), password]));
-    const auth = await reader.readExactly(2);
-    if (auth[0] !== 1 || auth[1] !== 0) throw new ProxyTestError("P107");
-  } else if (greeting[1] !== 0) {
-    throw new ProxyTestError("P106");
+  try {
+    const hasAuth = Boolean(proxy.username);
+    socket.write(Buffer.from([5, 1, hasAuth ? 2 : 0]));
+    const greeting = await reader.readExactly(2);
+    if (greeting[0] !== 5 || greeting[1] === 0xff) throw new ProxyTestError("P106");
+    if ((hasAuth && greeting[1] !== 2) || (!hasAuth && greeting[1] !== 0)) {
+      throw new ProxyTestError("P106", { technical: { protocol: "socks5", phase: "method", selectedMethod: greeting[1] } });
+    }
+    if (greeting[1] === 2) {
+      const user = Buffer.from(proxy.username);
+      const password = Buffer.from(proxy.password);
+      if (user.length > 255 || password.length > 255) throw new ProxyTestError("P108");
+      socket.write(Buffer.concat([Buffer.from([1, user.length]), user, Buffer.from([password.length]), password]));
+      const auth = await reader.readExactly(2);
+      if (auth[0] !== 1 || auth[1] !== 0) {
+        throw new ProxyTestError("P107", { technical: { protocol: "socks5", phase: "authentication", socksAuthStatus: auth[1] } });
+      }
+    }
+    const name = Buffer.from(target.hostname);
+    socket.write(Buffer.concat([Buffer.from([5, 1, 0, 3, name.length]), name,
+      Buffer.from([(target.port >> 8) & 0xff, target.port & 0xff])]));
+    const head = await reader.readExactly(4);
+    if (head[0] !== 5) throw new ProxyTestError("P106");
+    if (head[1] !== 0) {
+      // SOCKS reply 2 means the CONNECT request was rejected by a ruleset;
+      // it is not the username/password sub-negotiation response. P107 is
+      // reserved for a real authentication rejection.
+      throw new ProxyTestError("P109", { technical: { protocol: "socks5", phase: "connect", socksReply: head[1] } });
+    }
+    const addressLength = head[3] === 1 ? 4 : head[3] === 4 ? 16 : head[3] === 3 ? (await reader.readExactly(1))[0] : 0;
+    if (!addressLength) throw new ProxyTestError("P106");
+    await reader.readExactly(addressLength + 2);
+  } finally {
+    reader.dispose();
   }
-  const name = Buffer.from(target.hostname);
-  socket.write(Buffer.concat([Buffer.from([5, 1, 0, 3, name.length]), name,
-    Buffer.from([(target.port >> 8) & 0xff, target.port & 0xff])]));
-  const head = await reader.readExactly(4);
-  if (head[0] !== 5) throw new ProxyTestError("P106");
-  if (head[1] !== 0) throw new ProxyTestError(head[1] === 2 ? "P107" : "P109", { technical: { socksReply: head[1] } });
-  const addressLength = head[3] === 1 ? 4 : head[3] === 4 ? 16 : head[3] === 3 ? (await reader.readExactly(1))[0] : 0;
-  if (!addressLength) throw new ProxyTestError("P106");
-  await reader.readExactly(addressLength + 2);
-  reader.dispose();
 }
 
-function proxyAuthorization(proxy) {
+export function proxyAuthorization(proxy) {
   return !proxy.username ? ""
     : `Proxy-Authorization: Basic ${Buffer.from(`${proxy.username}:${proxy.password}`).toString("base64")}\r\n`;
 }
 
-async function httpConnectTunnel(socket, proxy, target) {
+export async function httpConnectTunnel(socket, proxy, target) {
   const reader = new SocketReader(socket);
-  socket.write(`CONNECT ${target.hostname}:${target.port} HTTP/1.1\r\nHost: ${target.hostname}:${target.port}\r\n${proxyAuthorization(proxy)}Connection: keep-alive\r\n\r\n`);
-  const headerBytes = await reader.readUntil("\r\n\r\n");
-  const status = Number(/^HTTP\/\d(?:\.\d)?\s+(\d{3})/i.exec(headerBytes.toString("latin1"))?.[1]);
-  reader.dispose();
-  if (!status) throw new ProxyTestError("P106");
-  if (status === 407) throw new ProxyTestError("P107");
-  if (status < 200 || status >= 300) throw new ProxyTestError("P109", { technical: { httpStatus: status } });
+  try {
+    socket.write(`CONNECT ${target.hostname}:${target.port} HTTP/1.1\r\nHost: ${target.hostname}:${target.port}\r\n${proxyAuthorization(proxy)}Connection: keep-alive\r\n\r\n`);
+    const headerBytes = await reader.readUntil("\r\n\r\n");
+    const status = Number(/^HTTP\/\d(?:\.\d)?\s+(\d{3})/i.exec(headerBytes.toString("latin1"))?.[1]);
+    if (!status) throw new ProxyTestError("P106");
+    if (status === 407) throw new ProxyTestError("P107", { technical: { protocol: proxy.protocol, phase: "connect", httpStatus: 407 } });
+    if (status < 200 || status >= 300) throw new ProxyTestError("P109", { technical: { httpStatus: status } });
+  } finally {
+    reader.dispose();
+  }
 }
 
 function secureTargetSocket(socket, target, timeoutMs) {
@@ -199,15 +223,18 @@ function decodeChunked(body) {
 
 async function readHttpResponse(socket) {
   const reader = new SocketReader(socket);
-  const headerBytes = await reader.readUntil("\r\n\r\n");
-  const headerText = headerBytes.toString("latin1");
-  const status = Number(/^HTTP\/\d(?:\.\d)?\s+(\d{3})/i.exec(headerText)?.[1]);
-  if (!status) throw new ProxyTestError("P106");
-  if (status === 407) throw new ProxyTestError("P107");
-  const remainder = await reader.readAll();
-  reader.dispose();
-  const body = /transfer-encoding:\s*chunked/i.test(headerText) ? decodeChunked(remainder) : remainder;
-  return { status, body: body.toString("utf8") };
+  try {
+    const headerBytes = await reader.readUntil("\r\n\r\n");
+    const headerText = headerBytes.toString("latin1");
+    const status = Number(/^HTTP\/\d(?:\.\d)?\s+(\d{3})/i.exec(headerText)?.[1]);
+    if (!status) throw new ProxyTestError("P106");
+    if (status === 407) throw new ProxyTestError("P107", { technical: { phase: "request", httpStatus: 407 } });
+    const remainder = await reader.readAll();
+    const body = /transfer-encoding:\s*chunked/i.test(headerText) ? decodeChunked(remainder) : remainder;
+    return { status, body: body.toString("utf8") };
+  } finally {
+    reader.dispose();
+  }
 }
 
 function parseObservedIdentity(body) {
@@ -215,12 +242,12 @@ function parseObservedIdentity(body) {
   let value;
   try { value = JSON.parse(trimmed); } catch { value = { ip: trimmed }; }
   const ip = value.ip || value.ip_addr || value.address;
-  if (typeof ip !== "string" || isIP(ip) !== 4) throw new ProxyTestError("P109", { why: "The proxy test response did not contain a public IPv4 address." });
+  if (!isPublicIpv4(ip)) throw new ProxyTestError("P109", { why: "The proxy test response did not contain a public IPv4 address." });
   const country = value.country_iso || value.country_code || value.country || null;
   return { publicIpv4: ip, country: typeof country === "string" ? country.toUpperCase() : null };
 }
 
-export async function probeProxy(proxy, provider, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+export async function probeProxy(proxy, provider, { timeoutMs = DEFAULT_TIMEOUT_MS, connectFn = connect } = {}) {
   const targetUrl = new URL(provider.url);
   if (!["http:", "https:"].includes(targetUrl.protocol)) {
     throw new ProxyTestError("P111", { why: "The configured proxy-test provider must use HTTP or HTTPS." });
@@ -229,7 +256,7 @@ export async function probeProxy(proxy, provider, { timeoutMs = DEFAULT_TIMEOUT_
   const target = { hostname: targetUrl.hostname, port: Number(targetUrl.port) || (secureTarget ? 443 : 80) };
   let socket;
   try {
-    socket = await connect({ host: proxy.host, port: proxy.port, secure: proxy.protocol === "https", timeoutMs });
+    socket = await connectFn({ host: proxy.host, port: proxy.port, secure: proxy.protocol === "https", timeoutMs });
     if (proxy.protocol === "socks5") await socks5Connect(socket, proxy, target);
     else if (secureTarget) await httpConnectTunnel(socket, proxy, target);
     if (secureTarget) socket = await secureTargetSocket(socket, target, timeoutMs);

@@ -50,6 +50,11 @@ export function assertAuthorized(authorize) {
   if (typeof authorize === "function" && authorize() !== true) throw new WdaAuthorizationError();
 }
 
+export function deviceControlPathReady(device) {
+  if (!device || typeof device.healthSnapshot !== "function") return true;
+  return device.healthSnapshot()?.control === "READY";
+}
+
 function validWindowSize(value) {
   return value && typeof value === "object"
     && Number.isFinite(value.width) && value.width > 0 && value.width <= MAX_IOS_LOGICAL_DIMENSION
@@ -95,6 +100,7 @@ export class WdaDevice {
       control: "UNAVAILABLE",
       recovery: "IDLE",
     };
+    this.componentErrors = { wdaProcess: null, iproxy: null };
     this.diagnosticEvents = [];
     this.baseUrl = `http://${host}:${port}`;
     this.timeoutMs = timeoutMs;
@@ -102,9 +108,11 @@ export class WdaDevice {
     this.sessionPromise = null;
     this.sessionGeneration = 0;
     this.windowSize = null;
+    this.readinessGeneration = 0;
   }
 
   async checkReadiness() {
+    const generation = this.readinessGeneration;
     const checkedAt = new Date().toISOString();
     try {
       const response = await fetch(`${this.baseUrl}/status`, { signal: AbortSignal.timeout(this.timeoutMs) });
@@ -121,6 +129,9 @@ export class WdaDevice {
         error.readinessReason = "not_ready";
         throw error;
       }
+      // A status response from an older WDA/iproxy process must never restore
+      // readiness after that process has been replaced.
+      if (generation !== this.readinessGeneration) return false;
       this.readiness = {
         ready: true,
         state: "HEALTHY",
@@ -129,11 +140,13 @@ export class WdaDevice {
         consecutiveFailures: 0,
         lastError: null,
       };
-      this.setComponentHealth({ wdaEndpoint: "HEALTHY", control: "READY", recovery: "IDLE" });
+      this.setComponentHealth({ wdaEndpoint: "HEALTHY" });
+      this.refreshControlHealth();
       this.recordDiagnosticEvent("WDA_READY", { checkedAt });
       if (this.status !== "in-use") this.status = "idle";
       return true;
     } catch (error) {
+      if (generation !== this.readinessGeneration) return false;
       const failures = (this.readiness.consecutiveFailures ?? 0) + 1;
       const state = failures === 1 ? "SUSPECT"
         : failures < this.readinessFailureThreshold ? "DEGRADED" : "FAILED";
@@ -177,6 +190,37 @@ export class WdaDevice {
     return this.componentHealth;
   }
 
+  setComponentError(component, error) {
+    if (!Object.hasOwn(this.componentErrors, component)) throw new Error(`unknown process component: ${component}`);
+    this.componentErrors[component] = error ?? null;
+    return this.componentErrors[component];
+  }
+
+  invalidateReadiness(component) {
+    this.readinessGeneration += 1;
+    this.readiness = {
+      ...this.readiness,
+      ready: false,
+      state: "RECOVERING",
+      checkedAt: null,
+      consecutiveFailures: 0,
+    };
+    this.setComponentHealth({ wdaEndpoint: "RECOVERING", control: "UNAVAILABLE", recovery: component });
+    if (this.status !== "in-use") this.status = "offline";
+    this.recordDiagnosticEvent("WDA_READINESS_INVALIDATED", { component });
+  }
+
+  refreshControlHealth() {
+    const blocking = ["STARTING", "RESTARTING", "FAILED"];
+    const unavailable = this.componentHealth.deviceAttachment === "DISCONNECTED"
+      || blocking.includes(this.componentHealth.wdaProcess)
+      || blocking.includes(this.componentHealth.iproxy);
+    this.componentHealth.control = unavailable ? "UNAVAILABLE"
+      : this.readiness.ready ? "READY" : "DEGRADED";
+    if (!unavailable && this.readiness.ready) this.componentHealth.recovery = "IDLE";
+    return this.componentHealth.control;
+  }
+
   recordDiagnosticEvent(type, detail = {}) {
     const event = { type, at: new Date().toISOString(), ...detail };
     this.diagnosticEvents.push(event);
@@ -185,16 +229,18 @@ export class WdaDevice {
   }
 
   beginRecovery(component) {
+    this.readinessGeneration += 1;
     this.readiness = { ...this.readiness, ready: false, state: "RECOVERING", consecutiveFailures: 0 };
     this.setComponentHealth({ wdaEndpoint: "RECOVERING", control: "DEGRADED", recovery: component });
     this.recordDiagnosticEvent("WDA_RECOVERING", { component });
   }
 
   healthSnapshot() {
+    const processError = this.componentErrors.iproxy ?? this.componentErrors.wdaProcess;
     return {
       ...this.componentHealth,
       readiness: { ...this.readiness },
-      latestError: this.readiness.lastError ?? null,
+      latestError: processError ?? this.readiness.lastError ?? null,
       recentEvents: this.diagnosticEvents.slice(-10),
     };
   }

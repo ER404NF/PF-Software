@@ -6,7 +6,7 @@ import os from "os";
 import path from "path";
 import { WdaDevice } from "../../src/wdaDevice.js";
 import { discoveredDeviceId } from "../../src/deviceDiscovery.js";
-import { DeviceProvisioner, classifyWdaFailure } from "../../src/deviceProvisioner.js";
+import { DeviceProvisioner, classifyIproxyFailure, classifyWdaFailure } from "../../src/deviceProvisioner.js";
 
 test("classifyWdaFailure recognizes known manual-prerequisite failures", () => {
   assert.match(classifyWdaFailure("please Trust This Computer on the device"), /Trust this computer/);
@@ -18,6 +18,22 @@ test("classifyWdaFailure recognizes known manual-prerequisite failures", () => {
 
 test("classifyWdaFailure returns null for an unrecognized error", () => {
   assert.equal(classifyWdaFailure("connection reset by peer"), null);
+});
+
+test("classifyIproxyFailure exposes safe root-cause categories without returning raw process output", () => {
+  assert.equal(classifyIproxyFailure("bind: Address already in use").code, "I205");
+  assert.equal(classifyIproxyFailure("Usage: iproxy [OPTIONS] LOCAL_PORT:DEVICE_PORT").code, "I204");
+  assert.equal(classifyIproxyFailure("No device found with udid SECRET-DEVICE-ID").code, "I206");
+  assert.equal(classifyIproxyFailure("usbmuxd connection failed for /Users/private/path").code, "I207");
+  assert.equal(classifyIproxyFailure("spawn /private/tool EACCES").code, "I208");
+  assert.equal(classifyIproxyFailure("unknown failure"), null);
+  for (const sample of [
+    "No device found with udid SECRET-DEVICE-ID",
+    "usbmuxd connection failed for /Users/private/path",
+  ]) {
+    const detail = classifyIproxyFailure(sample);
+    assert.doesNotMatch(JSON.stringify(detail), /SECRET-DEVICE-ID|Users\/private/);
+  }
 });
 
 // Stands in for WdaProcessManager/IProxyManager — same on/start/stop/stopAll
@@ -36,6 +52,7 @@ class FakeProcessManager {
   getStatus(udid) { return { state: this.running.has(udid) ? "running" : "stopped", restartCount: 0 }; }
   emitExit(udid, log = []) { this.emitter.emit("exit", { key: udid, code: 1, signal: null, log }); }
   emitRestartLimitExceeded(udid, log = []) { this.emitter.emit("restart-limit-exceeded", { key: udid, restartCount: 99, log }); }
+  emitPersistentFailure(udid, log = []) { this.emitter.emit("persistent-failure", { key: udid, restartCount: 99, log }); }
 }
 
 function tempStorePath() {
@@ -238,6 +255,25 @@ test("an iproxy exit is never classified with WDA-specific failure patterns, eve
 
   const device = devices.get(discoveredDeviceId("UDID-00000001"));
   assert.equal(device.discoveryState, "provisioning"); // unchanged — not misclassified as user_action_required
+});
+
+test("a deterministic iproxy failure remains visible while capped automatic retry continues", async () => {
+  const { iproxyManager, devices, state, provisioner } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+
+  iproxyManager.emitExit("UDID-00000001", ["bind: Address already in use on a private host path\n"]);
+  iproxyManager.emitPersistentFailure("UDID-00000001", ["bind: Address already in use on a private host path\n"]);
+
+  const device = devices.get(discoveredDeviceId("UDID-00000001"));
+  assert.equal(device.discoveryState, "provisioning_error");
+  assert.equal(device.componentHealth.iproxy, "RESTARTING");
+  assert.equal(device.componentHealth.control, "UNAVAILABLE");
+  assert.equal(device.componentHealth.recovery, "RETRYING_CAPPED");
+  assert.equal(device.healthSnapshot().latestError.code, "I205");
+  assert.doesNotMatch(JSON.stringify(device.healthSnapshot()), /private host path/);
+  assert.match(device.discoveryStateMessage, /local port/i);
+  assert.match(device.discoveryStateMessage, /automatic retry/i);
 });
 
 test("an unrecognized process exit is left to the restart/backoff path, not surfaced as a banner", async () => {

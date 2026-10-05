@@ -115,6 +115,37 @@ test("stop() is terminal — no restart follows a deliberate stop", async () => 
   assert.equal(children.length, 1); // still no restart
 });
 
+test("a replacement waits for the old process to exit before reusing its ports", async () => {
+  const children = [];
+  const spawn = () => { const child = fakeChild(); children.push(child); return child; };
+  const group = new SupervisedProcessGroup({ spawn, stopGraceMs: 1000 });
+  group.start("udid-1", "iproxy", ["8101:8100"]);
+
+  group.stop("udid-1");
+  group.start("udid-1", "iproxy", ["8101:8100"]);
+  assert.equal(children.length, 1, "replacement must not race the old process's port cleanup");
+
+  children[0].emit("exit", 0, null);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(children.length, 2);
+});
+
+test("a detach cancels a replacement that was waiting for the old process to exit", async () => {
+  const children = [];
+  const spawn = () => { const child = fakeChild(); children.push(child); return child; };
+  const group = new SupervisedProcessGroup({ spawn, stopGraceMs: 1000 });
+  group.start("udid-1", "iproxy", ["8101:8100"]);
+
+  group.stop("udid-1");
+  group.start("udid-1", "iproxy", ["8101:8100"]);
+  group.stop("udid-1");
+  children[0].emit("exit", 0, null);
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(children.length, 1, "a detached phone must not gain an orphaned deferred tunnel");
+  assert.equal(group.isRunning("udid-1"), false);
+});
+
 test("restart-limit-exceeded fires once the backoff schedule is exhausted", async () => {
   const children = [];
   const spawn = () => { const child = fakeChild(); children.push(child); return child; };
@@ -181,7 +212,9 @@ test("indefinite supervision keeps retrying at the capped delay instead of requi
     retryIndefinitely: true,
   });
   let limitEvents = 0;
+  const persistentFailures = [];
   group.on("restart-limit-exceeded", () => { limitEvents += 1; });
+  group.on("persistent-failure", event => persistentFailures.push(event));
   group.start("udid-1", "xcodebuild", []);
 
   children[0].emit("exit", 1, null);
@@ -193,6 +226,8 @@ test("indefinite supervision keeps retrying at the capped delay instead of requi
 
   assert.equal(children.length, 4);
   assert.equal(limitEvents, 0);
+  assert.equal(persistentFailures.length, 1, "the capped retry loop must be visible without stopping recovery");
+  assert.equal(persistentFailures[0].key, "udid-1");
   assert.equal(group.getStatus("udid-1").state, "running");
 });
 

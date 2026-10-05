@@ -475,6 +475,23 @@ test("networkRoutingNextAction offers a retry for every terminal routing error, 
   assert.equal(inProgress.action, null);
 });
 
+test("routing host setup states are explicit and cannot send enrollment requests", () => {
+  const context = vm.createContext({ enrollmentPendingDeviceIds: new Set() });
+  vm.runInContext(section("const ROUTING_TERMINAL_ERROR_STATES", "function networkRoutingStatusText"), context);
+  const expected = new Map([
+    ["disabled", "Routing disabled"],
+    ["bridge_missing", "Bridge required"],
+    ["setup_failed", "Setup failed"],
+    ["starting", "Routing starting…"],
+  ]);
+  for (const [state, label] of expected) {
+    const action = vm.runInContext(`networkRoutingNextAction({ routingFeature: { state: "${state}" } })`, context);
+    assert.equal(action.label, label);
+    assert.equal(action.action, null);
+    assert.equal(action.disabled, true);
+  }
+});
+
 test("the re-enroll escape hatch appears once enrolled and idle, but not while start-enrollment is already offered or while actively routed", () => {
   const context = vm.createContext({
     document: { createElement: element },

@@ -18,6 +18,11 @@ test("buildProxyUrl percent-encodes credentials with special characters", () => 
   assert.equal(url, "socks5://user1:p%40ss%2Fword@proxy.example.com:7000");
 });
 
+test("buildProxyUrl preserves provider username syntax and surrounding whitespace through percent-encoding", () => {
+  const proxy = { ...SAMPLE_PROXY, username: " customer-country-US-session-abc ", password: " p@ss:/?#[] " };
+  assert.equal(buildProxyUrl(proxy), `socks5://${encodeURIComponent(proxy.username)}:${encodeURIComponent(proxy.password)}@proxy.example.com:7000`);
+});
+
 test("buildProxyUrl omits the auth segment entirely when there is no username", () => {
   const url = buildProxyUrl({ protocol: "http", host: "proxy.example.com", port: 8080, username: "", password: "" });
   assert.equal(url, "http://proxy.example.com:8080");

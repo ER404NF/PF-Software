@@ -143,7 +143,7 @@ export class NetworkRoutingOrchestrator {
     for (const [deviceId, route] of this.routes) {
       if (deviceId === excludeDeviceId || !route.usbIp) continue;
       if ([ROUTING_STATES.ROUTE_LOST, ROUTING_STATES.TUN_ERROR, ROUTING_STATES.PF_SYNTAX_ERROR,
-        ROUTING_STATES.PF_CLEANUP_ERROR].includes(route.state)) ips.push(route.usbIp);
+        ROUTING_STATES.PF_CLEANUP_ERROR, ROUTING_STATES.STOP_ERROR].includes(route.state)) ips.push(route.usbIp);
     }
     return ips;
   }
@@ -206,7 +206,7 @@ export class NetworkRoutingOrchestrator {
       error.code = "ROUTING_ALREADY_ACTIVE";
       throw error;
     }
-    if (active) this.tunManager.stop(deviceId);
+    if (active) await this.tunManager.stop(deviceId);
 
     const proxyRecord = proxyForDevice(this.proxyPoolStorePath, deviceId);
     if (!proxyRecord) throw new Error("no pool proxy is assigned to this device — assign one before starting routing");
@@ -227,6 +227,13 @@ export class NetworkRoutingOrchestrator {
       this._setState(deviceId, ROUTING_STATES.TUN_STARTING, { usbIp, proxyId: proxyRecord.id, tunIface });
       this._recordEvent(deviceId, "TUNNEL_STARTING");
 
+      const currentProxy = proxyForDevice(this.proxyPoolStorePath, deviceId);
+      if (!currentProxy || currentProxy.id !== proxyRecord.id || currentProxy.leasedToDeviceId !== deviceId) {
+        const error = new Error("proxy assignment changed while the route was starting; retry with the current assignment");
+        error.status = 409;
+        error.expose = true;
+        throw error;
+      }
       const password = decryptProxyPassword(proxyRecord, this.proxyCredentialEncryptionKey);
       this.tunManager.start({
         deviceId, tunIface,
@@ -275,7 +282,7 @@ export class NetworkRoutingOrchestrator {
           state = ROUTING_STATES.PF_CLEANUP_ERROR;
         }
       }
-      this.tunManager.stop(deviceId);
+      await this.tunManager.stop(deviceId);
       const errorCode = state === ROUTING_STATES.PF_SYNTAX_ERROR ? "F201"
         : state === ROUTING_STATES.PF_CLEANUP_ERROR ? "F202"
           : "T202";
@@ -311,7 +318,7 @@ export class NetworkRoutingOrchestrator {
       // A supervisor/process-manager race can leave a tunnel alive after its
       // in-memory route record has already disappeared. Stopping an unknown
       // route is therefore also a cheap defensive process cleanup.
-      this.tunManager.stop(deviceId);
+      await this.tunManager.stop(deviceId);
       return;
     }
     // Keep the route until privileged cleanup succeeds. STOPPING is ignored
@@ -322,12 +329,13 @@ export class NetworkRoutingOrchestrator {
     const recoveryTimer = this.recoveryTimers.get(deviceId);
     if (recoveryTimer) this.clearTimeoutFn(recoveryTimer);
     this.recoveryTimers.delete(deviceId);
-    this.tunManager.stop(deviceId);
+    await this.tunManager.stop(deviceId);
     try {
       await this._removeDeviceFromPf(deviceId);
       if (route.usbIp) await this.privilegedOps.clearState(route.usbIp);
     } catch (error) {
       this._recordFailure(deviceId, ROUTING_STATES.STOP_ERROR, "F202", error);
+      try { await this._applyFailClosed(deviceId); } catch { /* STOP_ERROR remains visible and included in the next desired block set */ }
       throw error;
     }
     this.routes.delete(deviceId);
@@ -364,7 +372,10 @@ export class NetworkRoutingOrchestrator {
         await this._handleRouteLost(deviceId, "T206", "tunnel process is no longer running");
         continue;
       }
-      if (counters === null) continue;
+      if (counters === null) {
+        await this._handleRouteLost(deviceId, "F203", "PF rules could not be inspected; route health is unknown");
+        continue;
+      }
 
       const entry = counters.find(c => c.usbIp === route.usbIp);
       if (!entry) {
@@ -404,11 +415,30 @@ export class NetworkRoutingOrchestrator {
       await this._applyFailClosed(deviceId);
     } catch (error) {
       const pf = diagnosticError("F202", { technical: { errorKind: operationalErrorKind(error) } });
-      this.routes.set(deviceId, { ...this.routes.get(deviceId), latestError: pf, internetBlocked: false });
+      await this.tunManager.stop(deviceId);
+      this.routes.set(deviceId, { ...this.routes.get(deviceId), latestError: pf, protected: false, internetBlocked: false });
       this.onStateChanged(deviceId, this.routes.get(deviceId));
+      this._scheduleProtectionRetry(deviceId);
       return;
     }
     this._scheduleRecovery(deviceId);
+  }
+
+  _scheduleProtectionRetry(deviceId) {
+    if (this.recoveryTimers.has(deviceId)) return;
+    const timer = this.setTimeoutFn(async () => {
+      this.recoveryTimers.delete(deviceId);
+      const route = this.routes.get(deviceId);
+      if (!route || route.state !== ROUTING_STATES.ROUTE_LOST || route.internetBlocked === true) return;
+      try {
+        await this._applyFailClosed(deviceId);
+      } catch {
+        this._scheduleProtectionRetry(deviceId);
+        return;
+      }
+    }, Math.max(this.recoveryDelayMs, 5000));
+    timer.unref?.();
+    this.recoveryTimers.set(deviceId, timer);
   }
 
   async quarantineRoute(deviceId, { code = "V204", why = "End-to-end verification could not prove the protected route." } = {}) {
@@ -428,7 +458,7 @@ export class NetworkRoutingOrchestrator {
     } finally {
       // Even if PF itself is unavailable, stop the tunnel so an existing
       // route-to rule cannot keep forwarding through an unverified exit.
-      this.tunManager.stop(deviceId);
+      await this.tunManager.stop(deviceId);
     }
     this.onStateChanged(deviceId, this.routes.get(deviceId));
     return this.routes.get(deviceId);
@@ -446,7 +476,7 @@ export class NetworkRoutingOrchestrator {
       if (!current || current.state !== ROUTING_STATES.ROUTE_LOST) return;
       this.routes.set(deviceId, { ...current, recoveryAttempts: attempts + 1 });
       this._recordEvent(deviceId, "NETWORK_RECOVERY_STARTED", { attempt: attempts + 1 });
-      this.tunManager.stop(deviceId);
+      await this.tunManager.stop(deviceId);
       try {
         await this.startRouting(deviceId, { usbIp: current.usbIp });
       } catch (error) {

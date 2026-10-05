@@ -45,6 +45,8 @@ export function registerProxyPoolRoutes({
   recordAudit,
   broadcastDeviceList,
   poolProxyForDevice,
+  networkRoutingOrchestrator,
+  invalidateNetworkVerification = () => {},
   now = () => new Date(),
 }) {
   app.patch("/api/admin/devices/:deviceId/proxy", requireCapability(capabilities.MANAGE_PROXY), (req, res, next) => {
@@ -53,8 +55,12 @@ export function registerProxyPoolRoutes({
       if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
         return res.status(403).json({ error: "not authorized for this device" });
       }
+      if (networkRoutingOrchestrator?.getRoute(req.params.deviceId)) {
+        return res.status(409).json({ error: "Stop the active route before changing this phone's proxy setting." });
+      }
       const network = setDeviceProxyEnabled({ configPath, deviceId: req.params.deviceId, enabled: req.body?.enabled });
       deviceNetwork.set(req.params.deviceId, network);
+      invalidateNetworkVerification(req.params.deviceId);
       recordAudit({
         operator: req.currentOperator.username,
         type: "proxy_setting_changed",
@@ -103,6 +109,7 @@ export function registerProxyPoolRoutes({
 
   app.post("/api/admin/proxies/test", requireCapability(capabilities.MANAGE_PROXY), async (req, res, next) => {
     try {
+      await authorizeCurrentOperator(req, [capabilities.MANAGE_PROXY]);
       const result = await testProxy(proxyTestFields(req.body));
       await authorizeCurrentOperator(req, [capabilities.MANAGE_PROXY]);
       return res.json({ result });
@@ -125,6 +132,7 @@ export function registerProxyPoolRoutes({
     }
     if (!record) return res.status(404).json({ error: "unknown proxy" });
     try {
+      await authorizeCurrentOperator(req, [capabilities.MANAGE_PROXY]);
       const result = await testProxy({
         protocol: record.protocol,
         host: record.host,
@@ -195,12 +203,16 @@ export function registerProxyPoolRoutes({
     if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
       return res.status(403).json({ error: "not authorized for this device" });
     }
+    if (networkRoutingOrchestrator?.getRoute(req.params.deviceId)) {
+      return res.status(409).json({ error: "Stop the active route before changing this phone's proxy assignment." });
+    }
     const proxyId = req.body?.proxyId;
     if (proxyId !== null && typeof proxyId !== "string") {
       return res.status(400).json({ error: "proxyId must be a string or null" });
     }
     try {
       proxyPoolRepository.assignToDevice({ deviceId: req.params.deviceId, proxyId });
+      invalidateNetworkVerification(req.params.deviceId);
       refreshProxyPoolCache();
       recordAudit({
         operator: req.currentOperator.username,

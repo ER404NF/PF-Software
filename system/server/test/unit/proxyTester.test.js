@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ProxyTestError, testProxy, validateProxyForTest, verificationProviders } from "../../src/proxyTester.js";
+import { EventEmitter } from "node:events";
+import {
+  ProxyTestError, httpConnectTunnel, probeProxy, proxyAuthorization, socks5Connect,
+  testProxy, validateProxyForTest, verificationProviders,
+} from "../../src/proxyTester.js";
 
 function proxy(overrides = {}) {
   return {
@@ -9,9 +13,113 @@ function proxy(overrides = {}) {
   };
 }
 
+class ScriptedSocket extends EventEmitter {
+  constructor(onWrite) {
+    super();
+    this.onWrite = onWrite;
+    this.writes = [];
+  }
+  write(value) {
+    const bytes = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    this.writes.push(bytes);
+    this.onWrite?.(bytes, this.writes.length, this);
+    return true;
+  }
+  setTimeout() {}
+  destroy() { this.destroyed = true; }
+}
+
 test("proxy validation rejects malformed fields and invalid hostnames with stable codes", () => {
   assert.throws(() => validateProxyForTest(proxy({ protocol: "ftp" })), error => error.code === "P108");
   assert.throws(() => validateProxyForTest(proxy({ host: "bad host/with-path" })), error => error.code === "P101");
+});
+
+test("proxy validation preserves username and password exactly, including surrounding whitespace", () => {
+  const input = proxy({ username: " customer-country-US-session-abc ", password: " p@ss:/?#[] " });
+  const validated = validateProxyForTest(input);
+  assert.equal(validated.username, input.username);
+  assert.equal(validated.password, input.password);
+});
+
+test("HTTP CONNECT sends exact Basic authentication and classifies an actual 407 without leaking it", async () => {
+  const credentials = proxy({ protocol: "http", username: "customer-country-US-session-abc", password: "p@ss:/word" });
+  const socket = new ScriptedSocket((_bytes, writeNumber, current) => {
+    if (writeNumber === 1) queueMicrotask(() => current.emit("data", Buffer.from("HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")));
+  });
+  await assert.rejects(
+    () => httpConnectTunnel(socket, credentials, { hostname: "example.test", port: 443 }),
+    error => {
+      assert.equal(error.code, "P107");
+      assert.equal(error.diagnostic.technical.httpStatus, 407);
+      assert.equal(error.diagnostic.technical.phase, "connect");
+      assert.doesNotMatch(JSON.stringify(error.diagnostic), /customer-country|p@ss/);
+      return true;
+    },
+  );
+  const request = socket.writes[0].toString("latin1");
+  assert.match(request, /CONNECT example\.test:443 HTTP\/1\.1/);
+  assert.equal(request.includes(proxyAuthorization(credentials).trim()), true);
+  assert.equal(Buffer.from(/Basic ([^\r\n]+)/.exec(request)[1], "base64").toString(), `${credentials.username}:${credentials.password}`);
+});
+
+test("HTTPS proxy selection opens a TLS transport before sending the HTTP request", async () => {
+  let connectOptions = null;
+  const socket = new ScriptedSocket((_bytes, writeNumber, current) => {
+    if (writeNumber === 1) queueMicrotask(() => {
+      current.emit("data", Buffer.from("HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{\"ip\":\"203.0.113.8\"}"));
+      current.emit("end");
+    });
+  });
+  const result = await probeProxy(proxy({ protocol: "https" }), { id: "fixture", url: "http://identity.test/ip" }, {
+    connectFn: async options => { connectOptions = options; return socket; },
+  });
+  assert.equal(connectOptions.secure, true);
+  assert.equal(connectOptions.host, "proxy.example.com");
+  assert.equal(result.publicIpv4, "203.0.113.8");
+});
+
+test("SOCKS5 authentication uses UTF-8 byte lengths and preserves provider credential bytes", async () => {
+  const credentials = proxy({ username: "customer-country-US-session-å", password: "päss:/?#" });
+  const socket = new ScriptedSocket((_bytes, writeNumber, current) => queueMicrotask(() => {
+    if (writeNumber === 1) current.emit("data", Buffer.from([5, 2]));
+    if (writeNumber === 2) current.emit("data", Buffer.from([1, 0]));
+    if (writeNumber === 3) current.emit("data", Buffer.from([5, 0, 0, 1, 127, 0, 0, 1, 1, 187]));
+  }));
+  await socks5Connect(socket, credentials, { hostname: "identity.test", port: 443 });
+  const auth = socket.writes[1];
+  const userBytes = Buffer.from(credentials.username);
+  const passwordBytes = Buffer.from(credentials.password);
+  assert.equal(auth[1], userBytes.length);
+  assert.deepEqual(auth.subarray(2, 2 + userBytes.length), userBytes);
+  const passwordOffset = 2 + userBytes.length;
+  assert.equal(auth[passwordOffset], passwordBytes.length);
+  assert.deepEqual(auth.subarray(passwordOffset + 1), passwordBytes);
+});
+
+test("SOCKS5 rejects a server-selected method the client did not offer", async () => {
+  const credentials = proxy({ username: "provider-user", password: "provider-password" });
+  const socket = new ScriptedSocket((_bytes, writeNumber, current) => {
+    if (writeNumber === 1) queueMicrotask(() => current.emit("data", Buffer.from([5, 0])));
+  });
+  await assert.rejects(
+    () => socks5Connect(socket, credentials, { hostname: "identity.test", port: 443 }),
+    error => error.code === "P106" && error.diagnostic.technical.phase === "method",
+  );
+});
+
+test("SOCKS5 CONNECT ruleset rejection is not mislabeled as bad credentials", async () => {
+  const credentials = proxy({ username: "provider-user", password: "provider-password" });
+  const socket = new ScriptedSocket((_bytes, writeNumber, current) => queueMicrotask(() => {
+    if (writeNumber === 1) current.emit("data", Buffer.from([5, 2]));
+    if (writeNumber === 2) current.emit("data", Buffer.from([1, 0]));
+    if (writeNumber === 3) current.emit("data", Buffer.from([5, 2, 0, 1]));
+  }));
+  await assert.rejects(
+    () => socks5Connect(socket, credentials, { hostname: "identity.test", port: 443 }),
+    error => error.code === "P109"
+      && error.diagnostic.technical.phase === "connect"
+      && error.diagnostic.technical.socksReply === 2,
+  );
 });
 
 test("DNS failure is classified separately before a connection is attempted", async () => {

@@ -205,3 +205,51 @@ test("public pool and successful test responses contain no stored credentials", 
     assert.equal(serialized.includes("ciphertext"), false);
   }
 });
+
+test("saved and unsaved tests pass the same exact credential bytes to the tester", async () => {
+  const calls = [];
+  const exactUsername = " customer-country-US-session-abc ";
+  const exactPassword = " p@ss:/?#[] ";
+  const fixture = setup({
+    decryptProxyPassword: () => exactPassword,
+    testProxy: async fields => { calls.push(fields); return { status: "healthy", publicIpv4: "198.51.100.5", latencyMs: 1 }; },
+  });
+  fixture.records.get("px_1").username = exactUsername;
+
+  await fixture.routes.get("POST /api/admin/proxies/test").handler(request({ body: {
+    protocol: "socks5", host: "secret.example", port: 1080,
+    username: exactUsername, password: exactPassword, country: "IT",
+  } }), response(), assert.fail);
+  await fixture.routes.get("POST /api/admin/proxies/:proxyId/test").handler(
+    request({ params: { proxyId: "px_1" } }), response(), assert.fail,
+  );
+
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0].username, exactUsername);
+  assert.equal(calls[0].password, exactPassword);
+  assert.equal(calls[1].username, exactUsername);
+  assert.equal(calls[1].password, exactPassword);
+});
+
+test("P107 responses expose safe troubleshooting metadata without credentials", async () => {
+  const username = "private-user-country-US";
+  const password = "private-password";
+  const failure = new Error("Proxy authentication rejected");
+  failure.status = 502;
+  failure.diagnostic = {
+    code: "P107", name: "Proxy authentication rejected",
+    operatorAction: "Verify endpoint, port, protocol, username format, password, and provider IP allowlisting.",
+    technical: { protocol: "http", httpStatus: 407 },
+  };
+  const { routes } = setup({ testProxy: async () => { throw failure; } });
+  const res = response();
+  await routes.get("POST /api/admin/proxies/test").handler(request({ body: {
+    protocol: "http", host: "proxy.example", port: 8080, username, password, country: "US",
+  } }), res, assert.fail);
+  const serialized = JSON.stringify(res.body);
+  assert.equal(res.statusCode, 502);
+  assert.equal(res.body.code, "P107");
+  assert.equal(res.body.diagnostic.technical.httpStatus, 407);
+  assert.equal(serialized.includes(username), false);
+  assert.equal(serialized.includes(password), false);
+});

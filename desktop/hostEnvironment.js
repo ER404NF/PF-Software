@@ -121,6 +121,36 @@ function runXcodebuild(xcodebuildBin, execFile = execFileSync) {
   }
 }
 
+function validBridgeName(value) {
+  return typeof value === "string" && /^bridge\d+$/.test(value);
+}
+
+function activeSharingBridge(output) {
+  const text = String(output || "");
+  return /^\s*member:/mi.test(text) && /^\s*status:\s*active\s*$/mi.test(text);
+}
+
+function detectInternetSharingBridges({ execFile = execFileSync } = {}) {
+  let interfaces;
+  try {
+    interfaces = String(execFile("/sbin/ifconfig", ["-l"], {
+      encoding: "utf8", timeout: 5000, windowsHide: true,
+    })).trim().split(/\s+/).filter(validBridgeName);
+  } catch {
+    return [];
+  }
+  const candidates = [];
+  for (const iface of interfaces) {
+    try {
+      const output = execFile("/sbin/ifconfig", [iface], {
+        encoding: "utf8", timeout: 5000, windowsHide: true,
+      });
+      if (activeSharingBridge(output)) candidates.push(iface);
+    } catch { /* an interface can disappear while macOS changes sharing state */ }
+  }
+  return candidates;
+}
+
 function resolveMacHostDependencies({
   env = process.env,
   platform = process.platform,
@@ -134,6 +164,7 @@ function resolveMacHostDependencies({
   readdirSync = fs.readdirSync,
   execFile = execFileSync,
   routingEnabled = false,
+  sharedBridgeIface = null,
   pathImpl = platform === "darwin" ? path.posix : path,
 } = {}) {
   if (platform !== "darwin") {
@@ -228,11 +259,28 @@ function resolveMacHostDependencies({
       ok: Boolean(tools.tun2proxy),
       message: tools.tun2proxy ? "Ready" : "Proxy routing is enabled but neither tun2proxy nor tun2proxy-bin was found.",
     });
+    const bridgeCandidates = detectInternetSharingBridges({ execFile });
+    const savedBridge = validBridgeName(sharedBridgeIface) ? sharedBridgeIface : null;
+    const resolvedBridge = savedBridge && bridgeCandidates.includes(savedBridge) ? savedBridge : null;
+    checks.push({
+      id: "shared-bridge",
+      label: "Internet Sharing bridge",
+      ok: Boolean(resolvedBridge),
+      message: resolvedBridge ? `Ready (${resolvedBridge})`
+        : savedBridge ? `${savedBridge} is not an active Internet Sharing bridge. Re-enable proxy routing from the Help menu.`
+          : bridgeCandidates.length > 1
+            ? `Several active bridge interfaces were found (${bridgeCandidates.join(", ")}). Select one from Help > Enable Proxy Routing on This Mac.`
+            : bridgeCandidates.length === 1
+              ? `${bridgeCandidates[0]} is active but has not been confirmed. Enable proxy routing from the Help menu to confirm it.`
+              : "No active Internet Sharing bridge was found. Turn on macOS Internet Sharing for the phone, then enable proxy routing again from Help.",
+    });
+    sharedBridgeIface = resolvedBridge;
   }
   return {
     ok: checks.every(check => check.ok || check.optional),
     autoProvision: true,
     routingEnabled: Boolean(routingEnabled),
+    sharedBridgeIface: routingEnabled ? sharedBridgeIface : null,
     tools,
     wdaRepoPath,
     wdaSource: wda?.source ?? null,
@@ -267,6 +315,7 @@ function buildHostEnvironment(baseEnv, resolved) {
   env.IPROXY_BIN = resolved.tools.iproxy;
   if (resolved.tools.tun2proxy) env.TUN2PROXY_BIN = resolved.tools.tun2proxy;
   if (resolved.routingEnabled) env.AUTO_ROUTE_PROXY_TUNNELS = "true";
+  if (resolved.routingEnabled && resolved.sharedBridgeIface) env.SHARED_BRIDGE_IFACE = resolved.sharedBridgeIface;
   return env;
 }
 
@@ -275,6 +324,7 @@ module.exports = {
   buildHostEnvironment,
   discoverWdaRepo,
   discoverWdaSource,
+  detectInternetSharingBridges,
   resolveBinary,
   resolveMacHostDependencies,
   searchDirectories,

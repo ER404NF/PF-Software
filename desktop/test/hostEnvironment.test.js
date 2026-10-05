@@ -5,6 +5,7 @@ const {
   buildHostEnvironment,
   discoverWdaRepo,
   discoverWdaSource,
+  detectInternetSharingBridges,
   resolveMacHostDependencies,
 } = require("../hostEnvironment");
 
@@ -29,6 +30,10 @@ function fakeMac({ prefix, tunName = null, wdaPath = "/Users/operator/WebDriverA
     accessSync: () => {},
     execFile: (command, args) => {
       if (command === "/usr/bin/xcode-select") return "/Applications/Xcode.app/Contents/Developer\n";
+      if (command === "/sbin/ifconfig" && args[0] === "-l") return "lo0 en0 bridge100 utun0\n";
+      if (command === "/sbin/ifconfig" && args[0] === "bridge100") {
+        return "bridge100: flags=8863<UP,BROADCAST,RUNNING>\n\tmember: en5 flags=3<LEARNING,DISCOVER>\n\tstatus: active\n";
+      }
       assert.deepEqual([command, args], ["/usr/bin/xcodebuild", ["-version"]]);
       return "Xcode 16.0\n";
     },
@@ -106,10 +111,38 @@ test("an enabled routing setting reaches the packaged server environment", () =>
   const resolved = resolveMacHostDependencies({
     ...fakeMac({ prefix: "/opt/homebrew/bin", tunName: "tun2proxy-bin" }),
     routingEnabled: true,
+    sharedBridgeIface: "bridge100",
   });
   const env = buildHostEnvironment({}, resolved);
   assert.equal(env.AUTO_ROUTE_PROXY_TUNNELS, "true");
   assert.equal(env.TUN2PROXY_BIN, "/opt/homebrew/bin/tun2proxy-bin");
+  assert.equal(env.SHARED_BRIDGE_IFACE, "bridge100");
+});
+
+test("Internet Sharing bridge discovery requires one active bridge with a member", () => {
+  const outputs = new Map([
+    ["-l", "lo0 bridge0 bridge100 bridge101 utun0\n"],
+    ["bridge0", "bridge0: flags=8863<UP,RUNNING>\n\tstatus: inactive\n"],
+    ["bridge100", "bridge100: flags=8863<UP,RUNNING>\n\tmember: en5 flags=3<LEARNING,DISCOVER>\n\tstatus: active\n"],
+    ["bridge101", "bridge101: flags=8863<UP,RUNNING>\n\tstatus: active\n"],
+  ]);
+  const candidates = detectInternetSharingBridges({ execFile: (_bin, args) => outputs.get(args[0]) });
+  assert.deepEqual(candidates, ["bridge100"]);
+});
+
+test("routing setup fails closed when several active bridges make selection ambiguous", () => {
+  const options = fakeMac({ prefix: "/opt/homebrew/bin", tunName: "tun2proxy-bin" });
+  const execFile = (command, args) => {
+    if (command === "/sbin/ifconfig" && args[0] === "-l") return "bridge100 bridge101\n";
+    if (command === "/sbin/ifconfig") return `${args[0]}: flags=8863<UP,RUNNING>\n\tmember: en5 flags=3<LEARNING,DISCOVER>\n\tstatus: active\n`;
+    return options.execFile(command, args);
+  };
+  const result = resolveMacHostDependencies({ ...options, execFile, routingEnabled: true });
+  const bridge = result.checks.find(check => check.id === "shared-bridge");
+  assert.equal(result.ok, false);
+  assert.equal(bridge.ok, false);
+  assert.match(bridge.message, /Several active bridge interfaces/);
+  assert.equal(result.sharedBridgeIface, null);
 });
 
 // ---- bundled (managed) WebDriverAgent + signing -------------------------

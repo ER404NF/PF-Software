@@ -190,7 +190,9 @@ before(async () => {
   // Short timeout: the mid-session-failure test needs the tap to actually
   // time out within the test's own timeout budget, and 250ms per-request
   // delays elsewhere in this file stay well under it.
-  devices.set("test-wda", new WdaDevice("test-wda", "Test WDA", { port: FAKE_WDA_PORT, timeoutMs: 500 }));
+  const testWda = new WdaDevice("test-wda", "Test WDA", { port: FAKE_WDA_PORT, timeoutMs: 500 });
+  assert.equal(await testWda.checkReadiness(), true, "the injected WDA fixture must satisfy the production control-readiness gate");
+  devices.set("test-wda", testWda);
 
   // Test-only operators, injected directly (like the device above) rather
   // than via operators.config.json. "test-va" has full access; "test-va-
@@ -656,7 +658,7 @@ test("a stale live-frame failure cannot damage a released and reclaimed WDA devi
   const deviceId = "test-wda-stale-live";
   const username = "test-va-stale-live";
   const staleDevice = new WdaDevice(deviceId, "Stale Live WDA", { port: FAKE_WDA_PORT, timeoutMs: 500 });
-  staleDevice.status = "idle";
+  assert.equal(await staleDevice.checkReadiness(), true);
   devices.set(deviceId, staleDevice);
   operators.set(username, {
     username,

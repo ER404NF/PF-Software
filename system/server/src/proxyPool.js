@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import { randomUUID } from "crypto";
 import { encryptTotpSecret, decryptTotpSecret } from "./twoFactor.js";
+import { validateProxyHost } from "./proxyTester.js";
 
 // A shared pool of proxy credentials an Admin configures once — Phase B of
 // Phone_Farm_Automation_Architecture.md §4.6/§13. Entering credentials here
@@ -65,6 +66,8 @@ export function validateFields({ provider, protocol, host, port, username, passw
   }
   if (!PROTOCOLS.has(protocol)) throw poolError(`protocol must be one of ${[...PROTOCOLS].join(", ")}`, 400);
   if (typeof host !== "string" || !host.trim() || host.length > 255) throw poolError("host is required", 400);
+  try { validateProxyHost(host); }
+  catch { throw poolError("host must be a hostname or IP address without a scheme or path", 400); }
   if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw poolError("port must be an integer from 1 to 65535", 400);
   if (typeof username !== "string" || !username.trim() || username.length > 200) throw poolError("username is required", 400);
   if (typeof password !== "string" || !password || password.length > 1000) throw poolError("password is required (max 1000 characters)", 400);
@@ -105,7 +108,11 @@ export function createProxy(storePath, fields, masterKey) {
     protocol: fields.protocol,
     host: fields.host.trim(),
     port: fields.port,
-    username: fields.username.trim(),
+    // Provider usernames can carry country/session routing syntax and some
+    // providers permit surrounding whitespace. Validation only checks that
+    // the value is not all whitespace; persist the exact bytes used by the
+    // successful unsaved test so saved tests and tun2proxy cannot diverge.
+    username: fields.username,
     passwordEncrypted: encryptTotpSecret(fields.password, masterKey),
     country: fields.country.toUpperCase(),
     label: fields.label?.trim() || `${fields.provider.trim()} ${fields.country.toUpperCase()}`,

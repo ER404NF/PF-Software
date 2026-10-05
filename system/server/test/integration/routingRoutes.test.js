@@ -117,6 +117,22 @@ test("device_list never exposes a routing field to a viewer without routing:mana
   assert.equal(mock1.routing, null);
   assert.equal(mock1.usbNetwork, null);
   assert.equal(mock1.autoEnrollment, null);
+  assert.equal(mock1.routingFeature, null);
+});
+
+test("Admin device summaries distinguish a disabled routing feature from an unenrolled phone", async () => {
+  const ws = new (await import("ws")).WebSocket(httpUrl.replace("http", "ws"), { headers: { Cookie: adminCookie } });
+  const deviceListMsg = await new Promise((resolve, reject) => {
+    ws.on("message", raw => { const msg = JSON.parse(raw.toString()); if (msg.type === "device_list") resolve(msg); });
+    ws.on("error", reject);
+  });
+  ws.close();
+  const mock1 = deviceListMsg.devices.find(device => device.id === "mock-1");
+  assert.deepEqual(mock1.routingFeature, {
+    state: "disabled",
+    message: "Proxy routing is disabled on this host.",
+  });
+  assert.equal(mock1.routing, null);
 });
 
 test("network-enrollment and discover-ip routes require authentication", async () => {
