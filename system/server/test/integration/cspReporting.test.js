@@ -53,8 +53,10 @@ test("the CSP declares a report-uri, and a real violation report posted there is
     const events = auditLog.listEvents({ limit: 10 });
     const logged = events.find(event => event.type === "csp_violation");
     assert.ok(logged, "expected the violation to be recorded in the audit log");
-    assert.equal(logged.detail.blockedUri, "https://evil.example/inject.js");
-    assert.equal(logged.detail.documentUri, `${baseUrl}/`);
+    // Audit data keeps the actionable origin while stripping the path and
+    // query, which may contain tokens or other private page information.
+    assert.equal(logged.detail.blockedUri, "https://evil.example");
+    assert.equal(logged.detail.documentUri, baseUrl);
     assert.equal(JSON.stringify(logged).includes("must-not-be-logged"), false);
     assert.equal(JSON.stringify(logged).includes("private inline content"), false);
   } finally {

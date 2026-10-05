@@ -532,7 +532,7 @@ test("verification quarantine stops the tunnel even when the fail-closed PF relo
   assert.equal(orchestrator.getRoute("mock-1").protected, false);
 });
 
-test("checkHealth never fails a device over a transient inspectRules error — it just skips the PF check that tick", async () => {
+test("checkHealth fails closed when PF rules cannot be inspected", async () => {
   const storePath = tempStorePath();
   const proxy = createProxy(storePath, samplePayload(), MASTER_KEY);
   assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxy.id });
@@ -542,7 +542,10 @@ test("checkHealth never fails a device over a transient inspectRules error — i
 
   await orchestrator.checkHealth();
 
-  assert.equal(orchestrator.getRoute("mock-1").state, ROUTING_STATES.ROUTED);
+  const route = orchestrator.getRoute("mock-1");
+  assert.equal(route.state, ROUTING_STATES.ROUTE_LOST);
+  assert.equal(route.latestError.code, "F203");
+  assert.equal(route.internetBlocked, true);
 });
 
 test("checkHealth only ever inspects PF once per tick, even with multiple routed devices", async () => {

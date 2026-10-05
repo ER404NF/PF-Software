@@ -17,7 +17,7 @@ const PORT = process.argv[2] === undefined ? 8299 : Number(process.argv[2]);
 const app = express();
 app.use(express.json());
 
-let currentIp = "203.0.113.10"; // TEST-NET-3 (RFC 5737) — obviously not a routable real IP
+let currentIp = "8.8.8.8";
 let hanging = false;
 let delayMs = 0;
 
@@ -67,7 +67,7 @@ app.post("/debug/delay", (req, res) => {
 });
 
 app.post("/debug/reset", (req, res) => {
-  currentIp = "203.0.113.10";
+  currentIp = "8.8.8.8";
   hanging = false;
   delayMs = 0;
   res.json({ ok: true });

@@ -328,7 +328,10 @@ export class DeviceProvisioner {
       entry.wdaDevice.discoveryState = "provisioning";
       entry.wdaDevice.discoveryStateMessage = `Recovering ${kind === "WDA" ? "WebDriverAgent" : "the device tunnel"}. The phone will be available after a fresh readiness check.`;
     }
-    entry.wdaDevice.invalidateReadiness(kind);
+    // Keep component identifiers consistent with the public health model.
+    // Process-manager events use lowercase `iproxy`, while recovery states
+    // and diagnostics intentionally expose `IPROXY`/`WDA`.
+    entry.wdaDevice.invalidateReadiness(kind === "WDA" ? "WDA" : "IPROXY");
     entry.wdaDevice.setComponentHealth(kind === "WDA" ? { wdaProcess: "STARTING" } : { iproxy: "STARTING" });
     entry.wdaDevice.refreshControlHealth();
     entry.wdaDevice.recordDiagnosticEvent(`${kind === "WDA" ? "WDA" : "IPROXY"}_STARTING`);

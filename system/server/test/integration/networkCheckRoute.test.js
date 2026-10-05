@@ -167,7 +167,7 @@ test("device RBAC applies the same as every other device route", async () => {
 
 test("revocation during a delayed network check returns no observed network data", async () => {
   await fetch(`${CHECK_URL.replace("/ip", "/debug/set-ip")}`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ip: "198.51.100.93" }),
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ip: "8.8.4.4" }),
   });
   await fetch(`${CHECK_URL.replace("/ip", "/debug/delay")}`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ms: 100 }),
@@ -186,7 +186,7 @@ test("revocation during a delayed network check returns no observed network data
     assert.equal(response.status, 403);
     const body = await response.json();
     assert.deepEqual(body, { error: "not authorized for this device" });
-    assert.equal(JSON.stringify(body).includes("198.51.100.93"), false);
+    assert.equal(JSON.stringify(body).includes("8.8.4.4"), false);
     assert.equal(JSON.stringify(body).includes("test-region"), false);
   } finally {
     operator.allowedDevices = previousGrant;
@@ -200,7 +200,7 @@ test("a successful check updates the device summary and is audited with the assi
   await fetch(`${CHECK_URL.replace("/ip", "/debug/set-ip")}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ip: "198.51.100.77" }),
+    body: JSON.stringify({ ip: "64.6.64.6" }),
   });
 
   const res = await fetch(`${httpUrl}/api/devices/mock-1/network-check`, {
@@ -213,7 +213,7 @@ test("a successful check updates the device summary and is audited with the assi
   assert.equal(network.egress, "cellular-sim"); // mock-1's real devices.config.json assignment
   assert.equal(network.simIdentifierSuffix, "0001");
   assert.equal("simIccid" in network, false);
-  assert.equal(network.networkObservedIp, "198.51.100.77");
+  assert.equal(network.networkObservedIp, "64.6.64.6");
   assert.equal(network.networkVerified, true);
 
   const meta = await fetch(`${httpUrl}/api/audit?deviceId=mock-1&limit=5`, { headers: { Cookie: cookie } }).then((r) =>
@@ -222,14 +222,14 @@ test("a successful check updates the device summary and is audited with the assi
   const checkEvent = meta.events.find((e) => e.type === "network_check");
   assert.ok(checkEvent, "expected a network_check audit event");
   assert.equal(checkEvent.detail.networkEgress, "cellular-sim");
-  assert.equal(checkEvent.detail.observedIp, "198.51.100.77");
+  assert.equal(checkEvent.detail.observedIp, "64.6.64.6");
 });
 
 test("a completed network check remains successful when audit storage is unavailable", async () => {
   await fetch(`${CHECK_URL.replace("/ip", "/debug/set-ip")}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ip: "198.51.100.77" }),
+    body: JSON.stringify({ ip: "64.6.64.6" }),
   });
   const originalAuditWrite = auditLog.logEvent;
   try {
@@ -241,7 +241,7 @@ test("a completed network check remains successful when audit storage is unavail
     });
     assert.equal(response.status, 200);
     const { network } = await response.json();
-    assert.equal(network.networkObservedIp, "198.51.100.77");
+    assert.equal(network.networkObservedIp, "64.6.64.6");
     assert.equal(network.networkVerified, true);
   } finally {
     auditLog.logEvent = originalAuditWrite;
@@ -317,7 +317,7 @@ test("only a proxy manager can persist and broadcast the safe proxy assignment s
 
 test("fail-closed mismatch blocks Human selection and AI dispatch until a fresh passing check", async () => {
   await fetch(`${CHECK_URL.replace("/ip", "/debug/set-ip")}`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ip: "198.51.100.91" }),
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ip: "1.1.1.1" }),
   });
   for (const deviceId of ["mock-2", "mock-1"]) {
     const response = await fetch(`${httpUrl}/api/devices/${deviceId}/network-check`, {
@@ -338,7 +338,7 @@ test("fail-closed mismatch blocks Human selection and AI dispatch until a fresh 
   assert.equal(deviceLease.getMode("mock-1"), "HUMAN");
 
   await fetch(`${CHECK_URL.replace("/ip", "/debug/set-ip")}`, {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ip: "198.51.100.92" }),
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ip: "9.9.9.9" }),
   });
   const restored = await fetch(`${httpUrl}/api/devices/mock-1/network-check`, {
     method: "POST", headers: { "Content-Type": "application/json", Cookie: cookie },

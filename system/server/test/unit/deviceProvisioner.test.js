@@ -160,6 +160,8 @@ test("clears the provisioning banner once the existing WDA readiness loop marks 
   // flips status via checkReadiness() — this provisioner never polls
   // /status itself, it only observes the resulting status change.
   device.status = "idle";
+  device.readiness = { ...device.readiness, ready: true, state: "HEALTHY" };
+  device.setComponentHealth({ wdaProcess: "RUNNING", iproxy: "RUNNING", wdaEndpoint: "HEALTHY", control: "READY" });
   await provisioner.pollOnce();
   assert.equal(device.discoveryState, null);
   assert.equal(device.discoveryStateMessage, null);

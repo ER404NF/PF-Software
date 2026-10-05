@@ -65,7 +65,7 @@ test("checkDevice against a lone device on its own SIM is verified with no misma
     { id: "d1", network: { egress: "cellular-sim", simIccid: "111", controlIface: "usb" } },
   ]);
   const result = await verifier.checkDevice("d1", CHECK_URL);
-  assert.equal(result.networkObservedIp, "203.0.113.10");
+  assert.equal(result.networkObservedIp, "8.8.8.8");
   assert.equal(result.networkVerified, true);
   assert.equal(result.networkMismatch, false);
   assert.equal(result.networkMismatchReason, null);
@@ -76,6 +76,8 @@ test("getStatus for a never-checked device returns all-null defaults", () => {
   const verifier = makeVerifier([{ id: "d1", network: { egress: "cellular-sim", simIccid: "111", controlIface: "usb" } }]);
   assert.deepEqual(verifier.getStatus("d1"), {
     networkObservedIp: null,
+    networkHostObservedIpv4: null,
+    networkHostObservedRegion: null,
     networkCheckedAt: null,
     networkVerified: null,
     networkMismatch: null,
@@ -97,7 +99,7 @@ test("getStatus for a never-checked device returns all-null defaults", () => {
 test("proxy and host-route checks remain VERIFYING until a device-originated egress probe passes", () => {
   const verifier = makeVerifier([{ id: "d1", network: { egress: "commercial-proxy", profileId: "p1", controlIface: "usb" } }]);
   const result = verifier.recordInfrastructureCheck("d1", {
-    proxyResult: { status: "healthy", publicIpv4: "198.51.100.10", country: "US", checkedAt: new Date().toISOString() },
+    proxyResult: { status: "healthy", publicIpv4: "8.8.8.8", country: "US", checkedAt: new Date().toISOString() },
     route: { state: "routed" },
   });
   assert.equal(result.networkProxyHealthy, true);
@@ -113,14 +115,14 @@ test("two devices on different SIMs sharing an observed IP are both flagged as a
     { id: "d2", network: { egress: "cellular-sim", simIccid: "222", controlIface: "usb" } },
   ]);
 
-  await setIp("198.51.100.5");
+  await setIp("1.1.1.1");
   const first = await verifier.checkDevice("d1", CHECK_URL);
   assert.equal(first.networkVerified, true); // nothing to collide with yet
 
   const second = await verifier.checkDevice("d2", CHECK_URL); // still the same IP
   assert.equal(second.networkVerified, false);
   assert.equal(second.networkMismatch, true);
-  assert.match(second.networkMismatchReason, /shares egress IP 198\.51\.100\.5 with device "d1"/);
+  assert.match(second.networkMismatchReason, /shares egress IP 1\.1\.1\.1 with device "d1"/);
 
   // d1's own record must be corrected retroactively too, not just d2's.
   const d1Status = verifier.getStatus("d1");
@@ -141,7 +143,7 @@ test("two devices on the SAME vlanId sharing an observed IP is expected, not a m
     { id: "d2", network: { egress: "vlan-proxy", vlanId: "vlan-7", controlIface: "usb" } },
   ]);
 
-  await setIp("198.51.100.9");
+  await setIp("9.9.9.9");
   await verifier.checkDevice("d1", CHECK_URL);
   const second = await verifier.checkDevice("d2", CHECK_URL);
 
@@ -155,7 +157,7 @@ test("a device with no network assignment yet still gets a real collision check 
   // sharing an IP between them is not flagged — there's no isolation claim
   // to violate yet for either.
   const verifier = makeVerifier([{ id: "d1" }, { id: "d2" }]);
-  await setIp("198.51.100.20");
+  await setIp("8.8.4.4");
   await verifier.checkDevice("d1", CHECK_URL);
   const second = await verifier.checkDevice("d2", CHECK_URL);
   assert.equal(second.networkVerified, true);
@@ -167,7 +169,7 @@ test("an unassigned device colliding with an assigned device IS flagged — unas
     { id: "d1", network: { egress: "cellular-sim", simIccid: "111", controlIface: "usb" } },
     { id: "d2" },
   ]);
-  await setIp("198.51.100.30");
+  await setIp("1.0.0.1");
   await verifier.checkDevice("d1", CHECK_URL);
   const second = await verifier.checkDevice("d2", CHECK_URL);
   assert.equal(second.networkVerified, false);
@@ -204,13 +206,13 @@ test("network verification does not follow redirects", async () => {
 
 test("re-checking a device replaces its status rather than accumulating stale fields", async () => {
   const verifier = makeVerifier([{ id: "d1", network: { egress: "cellular-sim", simIccid: "111", controlIface: "usb" } }]);
-  await setIp("198.51.100.40");
+  await setIp("4.2.2.1");
   const first = await verifier.checkDevice("d1", CHECK_URL);
-  await setIp("198.51.100.41");
+  await setIp("4.2.2.2");
   const second = await verifier.checkDevice("d1", CHECK_URL);
 
   assert.notEqual(first.networkObservedIp, second.networkObservedIp);
-  assert.equal(verifier.getStatus("d1").networkObservedIp, "198.51.100.41");
+  assert.equal(verifier.getStatus("d1").networkObservedIp, "4.2.2.2");
 });
 
 test("verification compares configured IPv4 and IPv6 policy and records safe health metadata", async () => {
@@ -218,10 +220,10 @@ test("verification compares configured IPv4 and IPv6 policy and records safe hea
     id: "d1",
     network: {
       egress: "cellular-sim", simIccid: "111", controlIface: "usb",
-      expectedPublicIpv4: "198.51.100.99", expectedIpv6Policy: "required",
+      expectedPublicIpv4: "208.67.222.222", expectedIpv6Policy: "required",
     },
   }]);
-  await setIp("198.51.100.98");
+  await setIp("208.67.220.220");
   const result = await verifier.checkDevice("d1", CHECK_URL);
   assert.equal(result.networkVerified, false);
   assert.equal(result.networkRouteMatch, false);

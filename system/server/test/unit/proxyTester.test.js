@@ -66,7 +66,7 @@ test("HTTPS proxy selection opens a TLS transport before sending the HTTP reques
   let connectOptions = null;
   const socket = new ScriptedSocket((_bytes, writeNumber, current) => {
     if (writeNumber === 1) queueMicrotask(() => {
-      current.emit("data", Buffer.from("HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{\"ip\":\"203.0.113.8\"}"));
+      current.emit("data", Buffer.from("HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\n{\"ip\":\"8.8.8.8\"}"));
       current.emit("end");
     });
   });
@@ -75,7 +75,7 @@ test("HTTPS proxy selection opens a TLS transport before sending the HTTP reques
   });
   assert.equal(connectOptions.secure, true);
   assert.equal(connectOptions.host, "proxy.example.com");
-  assert.equal(result.publicIpv4, "203.0.113.8");
+  assert.equal(result.publicIpv4, "8.8.8.8");
 });
 
 test("SOCKS5 authentication uses UTF-8 byte lengths and preserves provider credential bytes", async () => {
@@ -151,13 +151,13 @@ test("verification providers fail over and a passing result records safe health 
       seen.push(provider.id);
       if (provider.id === "first") throw new ProxyTestError("P109");
       clock += 42;
-      return { publicIpv4: "198.51.100.20", country: "US" };
+      return { publicIpv4: "8.8.4.4", country: "US" };
     },
     now: () => clock,
   });
   assert.deepEqual(seen, ["first", "second"]);
   assert.equal(result.status, "healthy");
-  assert.equal(result.publicIpv4, "198.51.100.20");
+  assert.equal(result.publicIpv4, "8.8.4.4");
   assert.equal(result.country, "US");
   assert.equal(result.latencyMs, 42);
   assert.equal(result.stages.authentication, "passed");
@@ -167,7 +167,7 @@ test("a country mismatch is specific and does not fall through as a service outa
   await assert.rejects(() => testProxy(proxy({ country: "US" }), {
     lookup: async () => ({ address: "203.0.113.10" }),
     providers: [{ id: "fixture", url: "http://example.test/ip" }],
-    probe: async () => ({ publicIpv4: "198.51.100.20", country: "DE" }),
+    probe: async () => ({ publicIpv4: "8.8.4.4", country: "DE" }),
   }), error => error.code === "P110" && error.diagnostic.technical.expectedCountry === "US");
 });
 

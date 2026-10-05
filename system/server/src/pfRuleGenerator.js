@@ -79,7 +79,11 @@ export function generatePfRuleset({ bridgeIface, devices = [], blockedIps = [], 
 // pass, udp block). A usbIp with no entry in the result means its rule is
 // no longer loaded — the orchestrator's own health check treats that as
 // "route lost", not as "traffic is merely idle right now".
-const ROUTED_PASS_IP_RE = /^\s*pass\b.*\broute-to\s+\([^)]*\).*\bfrom\s+(\d{1,3}(?:\.\d{1,3}){3})\s+to\s+any\b/i;
+// `pfctl -vvs rules` prefixes loaded rules with their anchor rule number
+// (for example `@1 pass ...`). Accept that diagnostic prefix while still
+// requiring both a pass rule and route-to so fail-closed block counters can
+// never be mistaken for routed traffic.
+const ROUTED_PASS_IP_RE = /^\s*(?:@\d+\s+)?pass\b.*\broute-to\s+\([^)]*\).*\bfrom\s+(\d{1,3}(?:\.\d{1,3}){3})\s+to\s+any\b/i;
 const COUNTER_RE = /Packets:\s*(\d+)/;
 
 export function parsePfCounters(inspectOutput) {
