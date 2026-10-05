@@ -11,7 +11,7 @@
   },
   "scripts": {
     "start": "electron .",
-    "test": "node --test test/*.test.js",
+    "test": "node --test --test-concurrency=1 test/*.test.js",
     "ensure:electron": "node scripts/ensure-electron.cjs",
     "prepare:runtime": "node scripts/prepare-runtime.cjs",
     "prepare:wda": "node scripts/prepare-wda.cjs",
