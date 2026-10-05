@@ -124,7 +124,9 @@ test("the release job publishes the .pkg files to a GitHub Release, only for ver
 
 test("the universal installer is optional; the arm64 installer is not", () => {
   assert.match(String(build["continue-on-error"]), /matrix\.arch == 'universal'/);
-  assert.match(workflow.jobs.plan.steps.at(-1).run, /"arm64","universal"/);
+  assert.equal(workflow.jobs.plan, undefined, "a separate runner must not be able to block installer planning");
+  assert.match(String(build.strategy.matrix.arch), /arm64.*universal/);
+  assert.doesNotMatch(String(build.strategy.matrix.arch), /needs\.plan/);
 });
 
 test("the verified main-branch arm64 package is committed through an isolated LFS writer", () => {
