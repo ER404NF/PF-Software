@@ -389,6 +389,7 @@ async function startHostServer() {
   activeHostSecrets = secrets;
   const env = buildHostEnvironment({
     ...process.env,
+    PHONE_FARM_APP_VERSION: app.getVersion(),
     ...hostStorageEnvironment(secrets),
   }, resolution);
   // A fresh desktop install intentionally has no DEVICE_CONFIG_PATH. Auto

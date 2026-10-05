@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'none'" />
-<title>Phone Farm setup</title>
+<title>Bodun setup</title>
 <style>
   body { font-family: -apple-system, "Segoe UI", sans-serif; background: #111; color: #eee; margin: 0; padding: 48px; }
   .card { max-width: 560px; margin: 0 auto; }
@@ -38,19 +38,19 @@
 <body>
   <div class="card">
     <div id="choice-view">
-      <h1>Set up Phone Farm</h1>
+      <h1>Set up Bodun</h1>
       <p class="sub">Choose how this machine is being used.</p>
       <button class="choice" id="host-choice">
         Set up a new host on this machine
-        <small>This machine will run the Phone Farm server and control the connected phones.</small>
+        <small>This machine will run the Bodun server and control the connected phones.</small>
       </button>
       <button class="choice" id="client-choice">
-        Connect to an existing Phone Farm host
+        Connect to an existing Bodun host
         <small>Sign in or apply for access on a host that's already running elsewhere. Use this for remote operators.</small>
       </button>
       <button class="choice" id="site-choice">
         This is a remote site's Mac mini
-        <small>Link this Mac's iPhones to your company's Phone Farm hub. Nobody operates the phones from this Mac; your team uses the hub.</small>
+        <small>Link this Mac's iPhones to your company's Bodun hub. Nobody operates the phones from this Mac; your team uses the hub.</small>
       </button>
     </div>
 
@@ -65,7 +65,7 @@
       <input id="site-id" placeholder="bucharest" autocomplete="off" spellcheck="false" />
       <label for="site-token">Site token</label>
       <input id="site-token" type="password" placeholder="pfs_..." autocomplete="off" spellcheck="false" />
-      <label class="check-row"><input type="checkbox" id="site-launch-login" checked /> Start Phone Farm automatically when this Mac starts</label>
+      <label class="check-row"><input type="checkbox" id="site-launch-login" checked /> Start Bodun automatically when this Mac starts</label>
       <button class="primary" id="site-start">Save and link this site</button>
       <p class="error" id="site-error"></p>
       <p class="sub" id="site-state" role="status"></p>
@@ -75,7 +75,7 @@
     <div id="host-setup-view" hidden>
       <button class="back" id="host-back">&larr; Back</button>
       <h1>Host setup</h1>
-      <p class="sub">Phone Farm is checking the local tools needed to detect and control connected iPhones automatically.</p>
+      <p class="sub">Bodun is checking the local tools needed to detect and control connected iPhones automatically.</p>
       <div class="status-list" id="host-status-list"></div>
       <div id="team-block" hidden>
         <label for="team-id">Apple Developer Team ID</label>
@@ -84,7 +84,7 @@
         <p class="error" id="team-error"></p>
       </div>
       <p class="error" id="host-error"></p>
-      <label class="check-row"><input type="checkbox" id="host-launch-login" checked /> Start Phone Farm automatically when this Mac starts</label>
+      <label class="check-row"><input type="checkbox" id="host-launch-login" checked /> Start Bodun automatically when this Mac starts</label>
       <button class="primary" id="host-retry" hidden>Check again</button>
       <button class="primary" id="host-continue" hidden>Create the first admin</button>
     </div>
@@ -135,7 +135,7 @@
   if (/Windows/i.test(navigator.userAgent)) {
     document.getElementById("host-choice").hidden = true;
     document.getElementById("site-choice").hidden = true;
-    document.querySelector("#choice-view .sub").textContent = "Connect to your company's Phone Farm hub to operate its phones.";
+    document.querySelector("#choice-view .sub").textContent = "Connect to your company's Bodun hub to operate its phones.";
   }
 
   function show(view) {

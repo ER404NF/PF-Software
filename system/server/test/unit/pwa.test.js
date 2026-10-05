@@ -39,6 +39,9 @@ test("the page links the manifest, icons and theme colour, and registers the ser
   assert.match(html, /viewport-fit=cover/);
   assert.match(read("app.js"), /serviceWorker\.register\("\/sw\.js"\)/);
   assert.doesNotMatch(html, /\(dev\)/, "no development label in the shipped title");
+  assert.match(html, /<title>Bodun<\/title>/);
+  assert.match(html, /id="app-version"/);
+  assert.match(read("app.js"), /fetch\("\/api\/app-info"/);
 });
 
 test("the service worker never caches per-operator data and fetches the shell network-first", () => {

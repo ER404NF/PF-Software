@@ -17,7 +17,7 @@ function researchReset() {
 window.addEventListener("operator-profile-changed", researchReset);
 
 async function researchFetch(url, options) {
-  if (typeof window.phoneFarmRequestJson !== "function") throw new Error("Phone Farm request service is unavailable. Refresh and try again.");
+  if (typeof window.phoneFarmRequestJson !== "function") throw new Error("Bodun request service is unavailable. Refresh and try again.");
   const { body } = await window.phoneFarmRequestJson(url, options, {
     timeoutMs: 10_000,
     uncertain: ["POST", "PATCH", "PUT", "DELETE"].includes(options?.method),

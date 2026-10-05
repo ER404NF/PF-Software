@@ -6,17 +6,17 @@
   <meta name="theme-color" content="#17191d" />
   <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
-  <meta name="apple-mobile-web-app-title" content="Phone Farm" />
+  <meta name="apple-mobile-web-app-title" content="Bodun" />
   <link rel="manifest" href="manifest.webmanifest" />
-  <link rel="icon" href="icons/icon.svg" type="image/svg+xml" />
-  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
-  <title>Phone Farm</title>
+  <link rel="icon" href="icons/bodun-logo.png" type="image/png" />
+  <link rel="apple-touch-icon" href="icons/bodun-logo.png" />
+  <title>Bodun</title>
   <script src="theme-bootstrap.js"></script>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
   <form id="login-form">
-    <div class="login-brand"><span class="brand-mark" aria-hidden="true">PF</span><div><strong>PHONE FARM</strong><span>Device operations</span></div></div>
+    <div class="login-brand"><span class="brand-mark" aria-hidden="true"><img src="icons/bodun-logo.png" alt="" /></span><div><strong>BODUN</strong><span>Device operations</span></div></div>
     <h1>Sign in</h1>
     <p class="login-intro">Use your operator account to continue.</p>
     <label class="login-field">Username<input type="text" id="login-username" autocomplete="username" required /></label>
@@ -28,7 +28,7 @@
   </form>
 
   <form id="signup-form" hidden>
-    <div class="login-brand"><span class="brand-mark" aria-hidden="true">PF</span><div><strong>PHONE FARM</strong><span>Account application</span></div></div>
+    <div class="login-brand"><span class="brand-mark" aria-hidden="true"><img src="icons/bodun-logo.png" alt="" /></span><div><strong>BODUN</strong><span>Account application</span></div></div>
     <h1>Create account</h1>
     <p class="login-intro">Applications require manual approval and two-factor setup.</p>
     <label class="login-field">Full name<input id="signup-full-name" autocomplete="name" maxlength="150" required /></label>
@@ -42,7 +42,7 @@
   </form>
 
   <form id="two-factor-form" hidden>
-    <div class="login-brand"><span class="brand-mark" aria-hidden="true">PF</span><div><strong>PHONE FARM</strong><span>Protected sign in</span></div></div>
+    <div class="login-brand"><span class="brand-mark" aria-hidden="true"><img src="icons/bodun-logo.png" alt="" /></span><div><strong>BODUN</strong><span>Protected sign in</span></div></div>
     <h1 id="two-factor-heading">Two-factor authentication</h1>
     <p id="two-factor-intro" class="login-intro">Enter the six-digit code from your authenticator or a recovery code.</p>
     <div id="two-factor-setup" hidden>
@@ -57,7 +57,7 @@
   </form>
 
   <form id="recovery-form" hidden>
-    <div class="login-brand"><span class="brand-mark" aria-hidden="true">PF</span><div><strong>PHONE FARM</strong><span>Account recovery</span></div></div>
+    <div class="login-brand"><span class="brand-mark" aria-hidden="true"><img src="icons/bodun-logo.png" alt="" /></span><div><strong>BODUN</strong><span>Account recovery</span></div></div>
     <h1>Recover access</h1>
     <p class="login-intro">Enter your username or Gmail address. Eligible accounts receive a one-time recovery message.</p>
     <label class="login-field">Username or Gmail<input id="recovery-identifier" autocomplete="username" required /></label>
@@ -76,8 +76,9 @@
   <div id="app" hidden>
     <header id="top-bar">
       <div id="top-bar-left">
-        <span class="brand-mark" aria-hidden="true">PF</span>
-        <div class="brand-copy"><h1>PHONE FARM</h1><span>Device operations</span></div>
+        <span class="brand-mark" aria-hidden="true"><img src="icons/bodun-logo.png" alt="" /></span>
+        <div class="brand-copy"><h1>BODUN</h1><span>Device operations</span></div>
+        <span id="app-version" class="app-version" aria-label="Application version">Version…</span>
       </div>
       <div id="top-bar-right">
         <p id="connection-status" class="connection-state loading" role="status">Connecting</p>
@@ -358,7 +359,7 @@
         <div class="admin-panel-heading">
           <div>
             <h3 id="sites-heading">Sites</h3>
-            <span>Other locations link their phones to this hub. Add a site, then run the Phone Farm site app there with the values shown once.</span>
+            <span>Other locations link their phones to this hub. Add a site, then run the Bodun site app there with the values shown once.</span>
           </div>
           <button type="button" id="sites-refresh-button">Refresh</button>
         </div>

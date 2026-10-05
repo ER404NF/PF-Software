@@ -6,7 +6,7 @@
 const CACHE = "phone-farm-shell-v1";
 const SHELL = [
   "/", "/style.css", "/app.js", "/phoneStage.js", "/liveViewController.js", "/research.js",
-  "/manifest.webmanifest", "/icons/icon-192.png", "/icons/icon-512.png", "/icons/icon.svg",
+  "/manifest.webmanifest", "/icons/bodun-logo.png", "/icons/icon-192.png", "/icons/icon-512.png", "/icons/icon-maskable-512.png",
 ];
 
 self.addEventListener("install", event => {

@@ -28,6 +28,21 @@ const recoveryMessageEl = document.getElementById("recovery-message");
 const logoutButtonEl = document.getElementById("logout-button");
 const whoamiEl = document.getElementById("whoami");
 const roleBadgeEl = document.getElementById("role-badge");
+const appVersionEl = document.getElementById("app-version");
+
+async function loadAppIdentity() {
+  try {
+    const response = await fetch("/api/app-info", { headers: { Accept: "application/json" } });
+    if (!response.ok) throw new Error("version unavailable");
+    const body = await response.json();
+    appVersionEl.textContent = `v${body.version}`;
+    appVersionEl.title = `${body.name} ${body.version}`;
+  } catch {
+    appVersionEl.textContent = "Version unavailable";
+  }
+}
+
+void loadAppIdentity();
 const adminNavEl = document.getElementById("admin-nav");
 const fleetNavButtonEl = document.getElementById("fleet-nav-button");
 const assignmentsNavButtonEl = document.getElementById("assignments-nav-button");
@@ -232,10 +247,10 @@ async function requestJson(url, options = {}, {
     } catch (error) {
       const timedOut = error?.name === "AbortError";
       const message = timedOut
-        ? "Phone Farm did not respond in time. Your change was not confirmed. Try again."
+        ? "Bodun did not respond in time. Your change was not confirmed. Try again."
         : uncertain
           ? "Connection was lost while sending the action. It may have reached the phone. Wait for the screen to refresh before trying again."
-          : "Phone Farm could not be reached. Your change was not confirmed. Check the connection and try again.";
+          : "Bodun could not be reached. Your change was not confirmed. Check the connection and try again.";
       throw new RequestFailure(message, { kind: timedOut ? "timeout" : "network", cause: error });
     }
 
@@ -245,7 +260,7 @@ async function requestJson(url, options = {}, {
         body = await response.json();
       } catch (error) {
         if (response.ok) {
-          throw new RequestFailure("Phone Farm returned an invalid response. Your change was not confirmed. Refresh and try again.", {
+          throw new RequestFailure("Bodun returned an invalid response. Your change was not confirmed. Refresh and try again.", {
             kind: "invalid-response", status: response.status, cause: error,
           });
         }
@@ -254,7 +269,7 @@ async function requestJson(url, options = {}, {
     }
     if (!response.ok) {
       const action = typeof body?.diagnostic?.operatorAction === "string" ? body.diagnostic.operatorAction : "";
-      const base = body?.error || `Phone Farm rejected the request (HTTP ${response.status}).`;
+      const base = body?.error || `Bodun rejected the request (HTTP ${response.status}).`;
       throw new RequestFailure(action ? `${base}. ${action}` : base, {
         kind: "http", status: response.status,
       });
@@ -701,7 +716,7 @@ function safeSend(msg, { uncertain = false, statusEl = null } = {}) {
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     showSurfaceMessage(messageEl, uncertain
       ? "Connection was lost while sending the action. It may have reached the phone. Wait for the screen to refresh before trying again."
-      : "Phone Farm is reconnecting. The action was not sent. Wait until the connection is online and try again.");
+      : "Bodun is reconnecting. The action was not sent. Wait until the connection is online and try again.");
     return false;
   }
   try {
@@ -710,7 +725,7 @@ function safeSend(msg, { uncertain = false, statusEl = null } = {}) {
   } catch {
     showSurfaceMessage(messageEl, uncertain
       ? "Connection was lost while sending the action. It may have reached the phone. Wait for the screen to refresh before trying again."
-      : "Phone Farm could not send the action. Wait until the connection is online and try again.");
+      : "Bodun could not send the action. Wait until the connection is online and try again.");
     return false;
   }
 }
@@ -775,7 +790,7 @@ async function confirmServerLogout() {
   } catch {
     rememberPendingLogout(true);
     logoutRetryButtonEl.hidden = false;
-    loginErrorEl.textContent = "You are signed out on this screen, but the server could not confirm session revocation. Close this browser and try again when Phone Farm is online.";
+    loginErrorEl.textContent = "You are signed out on this screen, but the server could not confirm session revocation. Close this browser and try again when Bodun is online.";
     return false;
   } finally {
     logoutRetryButtonEl.disabled = false;
@@ -1662,7 +1677,7 @@ function buildNetworkCheckButton(device, statusEl = selectErrorEl) {
   const button = document.createElement("button");
   button.type = "button";
   button.className = "network-check-button";
-  button.textContent = "Run network check";
+  button.textContent = "Check network";
   button.addEventListener("click", async () => {
     button.disabled = true;
     statusEl.textContent = `Checking ${device.label} network…`;
@@ -1688,7 +1703,7 @@ function buildRetryProvisioningButton(device) {
   const button = document.createElement("button");
   button.type = "button";
   button.className = "network-check-button";
-  button.textContent = "Retry automatic setup";
+  button.textContent = "Retry setup";
   button.title = "Restarts WebDriverAgent and USB forwarding for this phone. Keeps its proxy, user assignment, identity, and audit history.";
   button.addEventListener("click", async () => {
     button.disabled = true;
@@ -1721,7 +1736,9 @@ function buildRetryProvisioningButton(device) {
 function buildProxyPoolPicker(device) {
   const wrap = document.createElement("label");
   wrap.className = "proxy-pool-picker";
-  wrap.textContent = "Proxy: ";
+  const label = document.createElement("span");
+  label.className = "proxy-pool-picker-label";
+  label.textContent = "Proxy route";
 
   const select = document.createElement("select");
   select.setAttribute("aria-label", `Assign a pool proxy to ${device.label}`);
@@ -1758,7 +1775,7 @@ function buildProxyPoolPicker(device) {
     }
   });
 
-  wrap.appendChild(select);
+  wrap.append(label, select);
   return wrap;
 }
 
@@ -2292,22 +2309,23 @@ function renderDeviceCard(d, task, lastAction) {
   const errorCard = buildDeviceErrorCard(d);
   if (errorCard) card.appendChild(errorCard);
 
-  if (can(UI_CAPABILITIES.MANAGE_PROXY) && isProxyEgress(d.network?.egress)) {
-    card.appendChild(buildProxySwitch(d));
-  }
+  const tools = document.createElement("div");
+  tools.className = "device-card-tools";
+  if (can(UI_CAPABILITIES.MANAGE_PROXY) && isProxyEgress(d.network?.egress)) tools.appendChild(buildProxySwitch(d));
   if (can(UI_CAPABILITIES.RUN_NETWORK_CHECK) && d.assignedToViewer) {
-    card.appendChild(buildNetworkCheckButton(d));
+    tools.appendChild(buildNetworkCheckButton(d));
   }
   if (can(UI_CAPABILITIES.MANAGE_DEVICES)
     && (d.accessState === "wda_user_action_required" || d.accessState === "wda_provisioning_error")) {
-    card.appendChild(buildRetryProvisioningButton(d));
+    tools.appendChild(buildRetryProvisioningButton(d));
   }
   if (can(UI_CAPABILITIES.ASSIGN_PROXY)) {
-    card.appendChild(buildProxyPoolPicker(d));
+    tools.appendChild(buildProxyPoolPicker(d));
   }
   if (can(UI_CAPABILITIES.MANAGE_ROUTING)) {
-    card.appendChild(buildNetworkRoutingPanel(d));
+    tools.appendChild(buildNetworkRoutingPanel(d));
   }
+  if (tools.children.length) card.appendChild(tools);
 
   if (d.currentOperator || d.assignment) {
     const context = document.createElement("div");
@@ -3435,7 +3453,7 @@ function renderPendingUsers(users) {
       decline.className = "danger";
       decline.textContent = "Decline";
       decline.addEventListener("click", () => reviewAccountStatus(user, "rejected", decline, {
-        confirmMessage: `Decline ${user.username}'s application? They will not be granted Phone Farm access.`,
+        confirmMessage: `Decline ${user.username}'s application? They will not be granted Bodun access.`,
       }));
       const ban = document.createElement("button");
       ban.type = "button";
@@ -3677,7 +3695,7 @@ function renderUsers(users) {
       reject.className = "danger";
       reject.textContent = "Reject";
       reject.addEventListener("click", () => reviewAccountStatus(user, "rejected", reject, {
-        confirmMessage: `Decline ${user.username}'s application? They will not be granted Phone Farm access.`,
+        confirmMessage: `Decline ${user.username}'s application? They will not be granted Bodun access.`,
       }));
       accountActions.append(reject);
     }

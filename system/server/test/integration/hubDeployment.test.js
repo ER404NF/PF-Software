@@ -55,7 +55,7 @@ function startHub(extraEnv = {}) {
 }
 
 test("the hub boots in the production configuration the container uses and answers its health probe", async () => {
-  const hub = startHub();
+  const hub = startHub({ PHONE_FARM_APP_VERSION: "9.8.7" });
   try {
     const port = await hub.ready;
     const health = await fetch(`http://127.0.0.1:${port}/healthz`);
@@ -64,6 +64,9 @@ test("the hub boots in the production configuration the container uses and answe
     // Nothing else is reachable without signing in.
     assert.equal((await fetch(`http://127.0.0.1:${port}/api/me`)).status, 401);
     assert.equal((await fetch(`http://127.0.0.1:${port}/api/admin/sites`)).status, 401);
+    const appInfo = await fetch(`http://127.0.0.1:${port}/api/app-info`);
+    assert.equal(appInfo.status, 200);
+    assert.deepEqual(await appInfo.json(), { name: "Bodun", version: "9.8.7" });
     // The login page and PWA files are public.
     assert.equal((await fetch(`http://127.0.0.1:${port}/`)).status, 200);
     const manifest = await fetch(`http://127.0.0.1:${port}/manifest.webmanifest`);

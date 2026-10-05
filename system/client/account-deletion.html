@@ -3,32 +3,67 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Request account deletion — Phone Farm</title>
+  <meta name="theme-color" content="#071a2f" />
+  <link rel="icon" href="/icons/bodun-logo.png" type="image/png" />
+  <title>Privacy center — Bodun</title>
   <link rel="stylesheet" href="/style.css" />
 </head>
-<body>
-  <main id="login-shell">
-    <form id="deletion-request-form">
-      <div class="login-brand"><span class="brand-mark" aria-hidden="true">PF</span><div><strong>PHONE FARM</strong><span>Privacy request</span></div></div>
-      <h1>Request account deletion</h1>
-      <p class="login-intro">Enter the username or Gmail address used for your Phone Farm account. We will record the request and verify your identity before any personal data is removed.</p>
-      <label class="login-field">Username or Gmail address<input id="deletion-identifier" autocomplete="username" maxlength="320" required /></label>
-      <button type="submit">Submit deletion request</button>
-      <a class="secondary-auth-button" href="/">Back to sign in</a>
-      <p id="deletion-request-message" role="status" aria-live="polite"></p>
-    </form>
-    <form id="self-deletion-form" hidden>
-      <div class="login-brand"><span class="brand-mark" aria-hidden="true">PF</span><div><strong>PHONE FARM</strong><span>Signed-in privacy request</span></div></div>
-      <h1>Delete your account</h1>
-      <p class="login-intro">This immediately signs out every session and locks the account while the deletion request awaits the configured retention and cleanup process.</p>
-      <p>Signed in as <strong id="self-deletion-username"></strong>.</p>
-      <a class="secondary-auth-button" href="/api/me/data-export" download>Download available account data</a>
-      <label class="login-field">Current password<input id="self-deletion-password" type="password" autocomplete="current-password" maxlength="512" required /></label>
-      <label class="login-field">Type DELETE MY ACCOUNT<input id="self-deletion-confirmation" autocomplete="off" required /></label>
-      <button type="submit">Lock account and request deletion</button>
-      <a class="secondary-auth-button" href="/">Cancel</a>
-      <p id="self-deletion-message" role="alert" aria-live="assertive"></p>
-    </form>
+<body class="privacy-page">
+  <main class="privacy-shell">
+    <header class="privacy-hero">
+      <a class="privacy-brand" href="/" aria-label="Back to Bodun">
+        <span class="brand-mark" aria-hidden="true"><img src="/icons/bodun-logo.png" alt="" /></span>
+        <span><strong>BODUN</strong><small>Privacy center</small></span>
+      </a>
+      <div class="privacy-hero-copy">
+        <p class="privacy-eyebrow">Your account · your choice</p>
+        <h1>Privacy controls without the fine print maze.</h1>
+        <p class="privacy-intro">Export the information available to you, or request account deletion. Destructive work starts only after identity verification and immediately revokes active sessions.</p>
+      </div>
+      <div class="privacy-promises" aria-label="Privacy process summary">
+        <span class="privacy-promise"><span class="privacy-promise-mark">1</span><span>Verify identity before any destructive work.</span></span>
+        <span class="privacy-promise"><span class="privacy-promise-mark">2</span><span>Lock sessions and tokens before cleanup.</span></span>
+        <span class="privacy-promise"><span class="privacy-promise-mark">3</span><span>Apply the configured retention policy.</span></span>
+      </div>
+    </header>
+
+    <div class="privacy-card-wrap">
+    <section class="privacy-card" aria-labelledby="deletion-heading">
+      <div class="privacy-card-header">
+        <p class="privacy-card-kicker">Privacy center</p>
+        <h2 id="deletion-heading">Control your account data</h2>
+        <p>Choose the action that fits your situation. Bodun keeps sensitive operations explicit and auditable.</p>
+      </div>
+      <form id="deletion-request-form" class="privacy-form">
+        <p class="privacy-card-kicker">Not signed in</p>
+        <h3>Request account deletion</h3>
+        <p class="privacy-card-copy">Enter the username or Gmail address used for your Bodun account. We record the request, then verify identity before personal data is removed.</p>
+        <label class="privacy-field">Username or Gmail address<input id="deletion-identifier" autocomplete="username" maxlength="320" required /></label>
+        <div class="privacy-actions">
+          <button class="privacy-button" type="submit">Submit request</button>
+          <a class="privacy-button secondary" href="/">Back to sign in</a>
+        </div>
+        <p id="deletion-request-message" class="privacy-message" role="status" aria-live="polite"></p>
+      </form>
+
+      <form id="self-deletion-form" class="privacy-form" hidden>
+        <p class="privacy-card-kicker">Signed-in request</p>
+        <h2>Delete your account</h2>
+        <p class="privacy-card-copy">This immediately signs out every session and locks the account while the configured retention and cleanup process runs.</p>
+        <p class="privacy-account">Signed in as <strong id="self-deletion-username"></strong></p>
+        <a class="privacy-export" href="/api/me/data-export" download><span aria-hidden="true">↓</span><span><strong>Download account data</strong><small>Save the information currently available to you first.</small></span></a>
+        <div class="privacy-danger-zone">
+          <strong>Permanent action</strong>
+          <p>Confirm your password and type the phrase exactly. Your access is revoked immediately.</p>
+          <label class="privacy-field">Current password<input id="self-deletion-password" type="password" autocomplete="current-password" maxlength="512" required /></label>
+          <label class="privacy-field">Type <span>DELETE MY ACCOUNT</span><input id="self-deletion-confirmation" autocomplete="off" required /></label>
+          <button type="submit" class="privacy-danger-button">Lock account and request deletion</button>
+        </div>
+        <a class="privacy-button secondary privacy-cancel" href="/">Cancel and return to Bodun</a>
+        <p id="self-deletion-message" class="privacy-message" role="alert" aria-live="assertive"></p>
+      </form>
+    </section>
+    </div>
   </main>
   <script type="module" src="/account-deletion.js"></script>
 </body>

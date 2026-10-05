@@ -14,12 +14,20 @@ test("account deletion is reachable signed out and signed in with labelled confi
   assert.match(shell, /href="\/account-deletion\.html">Request deletion</);
   assert.match(shell, /href="\/account-deletion\.html">Privacy</);
   assert.match(page, /id="deletion-request-form"/);
-  assert.match(page, /id="self-deletion-form" hidden/);
-  assert.match(page, /Type DELETE MY ACCOUNT/);
+  assert.match(page, /id="self-deletion-form"[^>]*hidden/);
+  assert.match(page, /Type <span>DELETE MY ACCOUNT<\/span>/);
   assert.match(page, /href="\/api\/me\/data-export"/);
   assert.match(page, /role="status" aria-live="polite"/);
   assert.match(page, /role="alert" aria-live="assertive"/);
   assert.match(page, /src="\/account-deletion\.js"/);
+});
+
+test("privacy UI uses the Bodun identity and an explicit responsive privacy layout", () => {
+  assert.match(page, /<title>Privacy center — Bodun<\/title>/);
+  assert.match(page, /class="privacy-shell"/);
+  assert.match(page, /icons\/bodun-logo\.png/);
+  assert.match(page, /Verify identity before any destructive work/);
+  assert.match(page, /Apply the configured retention policy/);
 });
 
 test("privacy UI uses the public and authenticated APIs without rendering server text as markup", () => {

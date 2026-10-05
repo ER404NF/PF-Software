@@ -144,6 +144,11 @@ import {
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const clientDir = path.join(__dirname, "../../client");
+const packageVersion = JSON.parse(fs.readFileSync(path.join(__dirname, "../../package.json"), "utf8")).version;
+const requestedApplicationVersion = String(process.env.PHONE_FARM_APP_VERSION || packageVersion).trim();
+const applicationVersion = /^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$/.test(requestedApplicationVersion)
+  ? requestedApplicationVersion
+  : packageVersion;
 const configPath = process.env.DEVICE_CONFIG_PATH || path.join(__dirname, "../../devices.config.json");
 const rawDeviceConfig = loadDeviceConfig({ env: process.env, defaultPath: configPath });
 const discoveredIosDevices = process.env.AUTO_DISCOVER_IOS_DEVICES === "false" ? [] : discoverIosDevices();
@@ -209,6 +214,7 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
   crossOriginResourcePolicy: false,
 }));
+app.get("/api/app-info", (_req, res) => res.json({ name: "Bodun", version: applicationVersion }));
 app.use(express.static(clientDir));
 registerHealthRoutes({ app, databasePool: applicationDatabasePool, checkDatabaseHealth });
 registerMetricsRoutes({ app, httpMetrics, bearerToken: process.env.METRICS_BEARER_TOKEN || null });
