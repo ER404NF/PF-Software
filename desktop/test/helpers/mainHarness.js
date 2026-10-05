@@ -79,6 +79,13 @@ function loadMain(options = {}) {
   Module._load = function patched(request, ...rest) {
     if (request === "electron") return fakeElectron;
     if (request === "./autoUpdate" && options.autoUpdate) return options.autoUpdate;
+    if (request === "./hostEnvironment" && options.internetSharingBridges) {
+      const hostEnvironment = originalLoad.call(this, request, ...rest);
+      return {
+        ...hostEnvironment,
+        detectInternetSharingBridges: () => [...options.internetSharingBridges],
+      };
+    }
     return originalLoad.call(this, request, ...rest);
   };
   require("../../main.js");

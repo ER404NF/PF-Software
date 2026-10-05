@@ -9,7 +9,9 @@ const path = require("node:path");
 const { loadMain } = require("./helpers/mainHarness.js");
 const desktopVersion = require("../package.json").version.replaceAll(".", "\\.");
 
-const app = loadMain();
+// The menu test must not depend on whether a clean CI Mac happens to have
+// Internet Sharing enabled. Production still discovers and validates the real bridge.
+const app = loadMain({ internetSharingBridges: ["bridge100"] });
 const { handlers, appEvents, windows, clipboardWrites, blockers, menus, shown, loginItems, spawned, trusted, stranger, wait, until, responds, readLog } = app;
 const configFile = app.configPath();
 
