@@ -35,9 +35,11 @@ test("nothing is built until the full server suite, the desktop suite and the au
   for (const step of [server, desktop, audit, productionAudit, buildStep]) assert.ok(step >= 0);
   assert.ok(Math.max(server, desktop, audit, productionAudit) < buildStep, "gates must precede the build");
   const serverStep = build.steps[server];
+  const desktopStep = build.steps[desktop];
   assert.match(serverStep.run, /npm test/);
   assert.equal(serverStep["working-directory"], "system");
   assert.match(String(serverStep.env.TZ), /Asia\/Tokyo/, "the suite must run under a zone that is neither the California default nor UTC");
+  assert.match(desktopStep.run, /::error title=Desktop test failure/, "desktop failures must be visible as a workflow annotation");
 });
 
 test("dependencies are installed from the lockfiles", () => {
