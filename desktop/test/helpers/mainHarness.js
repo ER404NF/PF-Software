@@ -53,6 +53,7 @@ function loadMain(options = {}) {
     app: {
       isPackaged: options.isPackaged === true,
       getPath: name => (name === "logs" ? logsDir : name === "temp" ? os.tmpdir() : userData),
+      setPath: () => {},
       getVersion: () => options.version || desktopVersion,
       requestSingleInstanceLock: () => true,
       whenReady: () => Promise.resolve(),

@@ -31,6 +31,10 @@ const { createRestartPolicy, findFreePort } = require("./serverSupervisor");
 const { buildDiagnosticsReport, createLogger } = require("./diagnostics");
 const { enforceReleaseVersion } = require("./autoUpdate");
 
+// The public product name is Bodun. Keep the legacy user-data directory so an
+// in-place upgrade retains host settings, tokens, assignments and WDA state.
+app.setPath("userData", path.join(app.getPath("appData"), "Phone Farm"));
+
 // The app is opened from Finder, so console output is invisible. Everything worth knowing goes to a rotating
 // log file (~/Library/Logs/Phone Farm on a Mac) that "Help > Copy Diagnostics" can hand to whoever is helping.
 const logger = createLogger({ dir: app.getPath("logs") });
@@ -99,13 +103,13 @@ function waitForServerReady(port, timeoutMs = 20_000) {
   const deadline = Date.now() + timeoutMs;
   return new Promise((resolve, reject) => {
     (function poll() {
-      if (!serverProcess) return reject(new Error("Phone Farm server exited during startup"));
+      if (!serverProcess) return reject(new Error("Bodun server exited during startup"));
       const req = http.get({ host: "127.0.0.1", port, path: "/api/me", timeout: 1500 }, res => {
         res.resume();
         resolve(true);
       });
       req.on("error", () => {
-        if (Date.now() > deadline) return reject(new Error("Phone Farm server did not start in time"));
+        if (Date.now() > deadline) return reject(new Error("Bodun server did not start in time"));
         setTimeout(poll, 400);
       });
       req.on("timeout", () => req.destroy());
@@ -201,7 +205,7 @@ function syncKeepAwake() {
   const needed = Boolean(serverProcess || agentProcess || hostServerRestartTimer || agentRestartTimer);
   if (needed && keepAwakeId === null) {
     keepAwakeId = powerSaveBlocker.start("prevent-app-suspension");
-    logger.info("keeping this Mac awake while Phone Farm is running phones");
+    logger.info("keeping this Mac awake while Bodun is running phones");
   } else if (!needed && keepAwakeId !== null) {
     powerSaveBlocker.stop(keepAwakeId);
     keepAwakeId = null;
@@ -247,7 +251,7 @@ async function setProxyRoutingEnabled(enabled) {
     if (candidates.length === 1) {
       const confirmation = await dialog.showMessageBox({
         type: "question", message: `Use ${candidates[0]} for phone proxy routing?`,
-        detail: "Phone Farm verified that this bridge is active and has a connected member.",
+        detail: "Bodun verified that this bridge is active and has a connected member.",
         buttons: ["Enable routing", "Cancel"], defaultId: 0, cancelId: 1, noLink: true,
       });
       if (confirmation.response !== 0) { buildMenu(); return false; }
@@ -255,7 +259,7 @@ async function setProxyRoutingEnabled(enabled) {
     } else {
       const selection = await dialog.showMessageBox({
         type: "question", message: "Select the Internet Sharing bridge",
-        detail: "Several active bridges were found. Select the bridge used by the connected iPhone. Phone Farm will not guess.",
+        detail: "Several active bridges were found. Select the bridge used by the connected iPhone. Bodun will not guess.",
         buttons: [...candidates, "Cancel"], cancelId: candidates.length, noLink: true,
       });
       if (selection.response < 0 || selection.response >= candidates.length) { buildMenu(); return false; }
@@ -269,7 +273,7 @@ async function setProxyRoutingEnabled(enabled) {
     await dialog.showMessageBox({
       type: "error",
       message: "Proxy routing setting was not saved",
-      detail: "Phone Farm could not save this setting. Check that the app settings folder is writable and that the disk has free space, then try again.",
+      detail: "Bodun could not save this setting. Check that the app settings folder is writable and that the disk has free space, then try again.",
       buttons: ["OK"],
       noLink: true,
     });
@@ -279,7 +283,7 @@ async function setProxyRoutingEnabled(enabled) {
   await dialog.showMessageBox({
     type: "info",
     message: enabled ? "Proxy routing enabled" : "Proxy routing disabled",
-    detail: "Quit and reopen Phone Farm to apply this host setting.",
+    detail: "Quit and reopen Bodun to apply this host setting.",
     buttons: ["OK"],
     noLink: true,
   });
@@ -329,7 +333,7 @@ function scheduleHostServerRestart() {
   const delay = hostServerRestarts.next();
   if (delay === null) {
     logger.error("[server] keeps stopping; not restarting it again");
-    startupState = { ...startupState, error: "The Phone Farm server keeps stopping. Choose Help > Copy Diagnostics and send the result to whoever supports you." };
+    startupState = { ...startupState, error: "The Bodun server keeps stopping. Choose Help > Copy Diagnostics and send the result to whoever supports you." };
     syncKeepAwake();
     return;
   }
@@ -790,7 +794,7 @@ function buildMenu() {
         { label: "Show Log Folder", click: () => shell.showItemInFolder(logger.file) },
         { type: "separator" },
         {
-          label: "Start Phone Farm When This Mac Starts",
+          label: "Start Bodun When This Mac Starts",
           type: "checkbox",
           checked: launchAtLoginEnabled(),
           enabled: app.isPackaged,
@@ -825,7 +829,7 @@ if (!gotSingleInstanceLock) {
     }
   });
   app.whenReady().then(async () => {
-    logger.info(`Phone Farm ${app.getVersion()} starting (Electron ${process.versions.electron}, ${process.platform} ${process.arch})`);
+    logger.info(`Bodun ${app.getVersion()} starting (Electron ${process.versions.electron}, ${process.platform} ${process.arch})`);
     const update = await enforceReleaseVersion({ app, dialog, shell, logger });
     if (!update.allowed) return;
     startupUnlocked = true;
@@ -840,7 +844,7 @@ app.on("before-quit", () => {
   hostServerWanted = false;
   stopHostServer();
   stopSiteAgent();
-  logger.info("Phone Farm quitting");
+  logger.info("Bodun quitting");
 });
 app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(); });
 app.on("activate", () => { if (startupUnlocked && BrowserWindow.getAllWindows().length === 0) void launch(); });

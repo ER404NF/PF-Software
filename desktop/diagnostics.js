@@ -88,7 +88,7 @@ function buildDiagnosticsReport({
   platform = process.platform, arch = process.arch, osRelease = os.release(), now = new Date(),
 } = {}) {
   const lines = [
-    "Phone Farm diagnostics",
+    "Bodun diagnostics",
     `Created: ${now.toISOString()}`,
     `App version: ${appVersion ?? "unknown"} (Electron ${electronVersion ?? "?"}, Node ${nodeVersion ?? "?"})`,
     `System: ${platform} ${arch}, release ${osRelease}`,

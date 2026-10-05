@@ -80,14 +80,14 @@ function stageNotices({
     else log(`warning: ${source} not found in the installed electron package; run npm ci in desktop/ first`);
   }
   fs.writeFileSync(path.join(stageRoot, "THIRD_PARTY_NOTICES.txt"), [
-    "Phone Farm third-party notices",
+    "Bodun third-party notices",
     "==============================",
     "",
-    "Phone Farm.app bundles the following third-party software. Each keeps its own license.",
+    "Bodun.app bundles the following third-party software. Each keeps its own license.",
     "",
     "- Electron and Chromium ... licenses/Electron-LICENSE.txt, licenses/Chromium-LICENSES.html",
     "- WebDriverAgent (unmodified source, BSD-3-Clause / Apache-2.0) ... licenses/WebDriverAgent-LICENSE.txt",
-    "- Node.js packages used by the Phone Farm server (express, express-session, multer, nodemailer, ws",
+    "- Node.js packages used by the Bodun server (express, express-session, multer, nodemailer, ws",
     "  and their dependencies) ... the LICENSE file inside each system/node_modules/<package>/ directory",
     "",
   ].join("\n"));
@@ -106,7 +106,7 @@ function stageRuntime({
   install(stageSystemDir);
   stageNotices({ stageRoot, log });
   verifyRuntime(stageRoot);
-  log(`Phone Farm server runtime staged at ${stageSystemDir}`);
+  log(`Bodun server runtime staged at ${stageSystemDir}`);
   return stageSystemDir;
 }
 

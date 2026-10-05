@@ -133,7 +133,8 @@ test("the macOS build produces a .pkg installer, signs with the hardened runtime
   assert.equal(build.mac.target.some(target => /dmg|pkg/.test(target.target ?? target)), false, "electron-builder only makes the .app; build-mac-pkg.cjs makes the installer");
   assert.ok(fs.existsSync(path.join(desktopDir, build.mac.sign.entitlements)));
   assert.match(fs.readFileSync(path.join(desktopDir, build.mac.sign.entitlements), "utf8"), /allow-jit/);
-  assert.equal(packageJson.productName, "Phone Farm");
+  assert.equal(packageJson.productName, "Bodun");
+  assert.match(fs.readFileSync(path.join(desktopDir, "main.js"), "utf8"), /setPath\("userData"[\s\S]*"Phone Farm"/, "the rebrand preserves the legacy user-data directory for upgrades");
   assert.match(packageJson.version, /^\d+\.\d+\.\d+$/);
 });
 
@@ -143,7 +144,7 @@ test("the installer wizard resources and component definition exist", () => {
   }
   const plist = fs.readFileSync(path.join(desktopDir, "build/pkg/components.plist"), "utf8");
   assert.match(plist, /<key>BundleIsRelocatable<\/key>\s*<false\/>/);
-  assert.match(plist, /Phone Farm\.app/);
+  assert.match(plist, /Bodun\.app/);
 });
 
 test("WebDriverAgent is pinned to an exact commit, and its license is recorded", () => {

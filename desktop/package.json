@@ -1,10 +1,10 @@
 {
   "name": "phone-farm-desktop",
-  "productName": "Phone Farm",
+  "productName": "Bodun",
   "version": "0.2.6",
   "private": true,
-  "author": "Phone Farm",
-  "description": "Desktop app for Phone Farm: one download, three first-run modes (set up a new host, connect to an existing hub as an operator, or run a remote site's Mac mini).",
+  "author": "Bodun",
+  "description": "Desktop app for Bodun: one download, three first-run modes (set up a new host, connect to an existing hub as an operator, or run a remote site's Mac mini).",
   "main": "main.js",
   "engines": {
     "node": ">=20"
@@ -31,8 +31,8 @@
   },
   "build": {
     "appId": "com.phonefarm.desktop",
-    "productName": "Phone Farm",
-    "copyright": "Copyright (c) Phone Farm",
+    "productName": "Bodun",
+    "copyright": "Copyright (c) Bodun",
     "directories": {
       "output": "dist",
       "buildResources": "build"

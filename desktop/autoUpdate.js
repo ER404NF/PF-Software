@@ -85,7 +85,7 @@ async function fetchReleases({ fetchImpl = fetch, apiUrl = RELEASES_API, timeout
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetchImpl(trusted, {
-      headers: { Accept: "application/vnd.github+json", "User-Agent": "Phone-Farm-Desktop" },
+      headers: { Accept: "application/vnd.github+json", "User-Agent": "Bodun-Desktop" },
       signal: controller.signal,
     });
     if (!response.ok) throw new Error(`The release service returned HTTP ${response.status}.`);
@@ -111,7 +111,7 @@ async function fetchReleaseAssets(release, { fetchImpl = fetch, timeoutMs = 15_0
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetchImpl(trusted, {
-      headers: { Accept: "application/vnd.github+json", "User-Agent": "Phone-Farm-Desktop" },
+      headers: { Accept: "application/vnd.github+json", "User-Agent": "Bodun-Desktop" },
       signal: controller.signal,
     });
     if (!response.ok) throw new Error(`The release asset service returned HTTP ${response.status}.`);
@@ -145,7 +145,7 @@ async function downloadInstaller(asset, destinationDir, { fetchImpl = fetch, max
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetchImpl(url, {
-      headers: { Accept: "application/octet-stream", "User-Agent": "Phone-Farm-Desktop" },
+      headers: { Accept: "application/octet-stream", "User-Agent": "Bodun-Desktop" },
       redirect: "follow",
       signal: controller.signal,
     });
@@ -196,9 +196,9 @@ async function downloadInstaller(asset, destinationDir, { fetchImpl = fetch, max
 async function retryOrExit(dialog, error) {
   const result = await dialog.showMessageBox({
     type: "error",
-    title: "Phone Farm update required",
-    message: "Phone Farm could not verify or install the required version.",
-    detail: `${error.message}\n\nPhone Farm will remain closed until the update succeeds.`,
+    title: "Bodun update required",
+    message: "Bodun could not verify or install the required version.",
+    detail: `${error.message}\n\nBodun will remain closed until the update succeeds.`,
     buttons: ["Retry", "Exit"],
     defaultId: 0,
     cancelId: 1,
@@ -223,7 +223,7 @@ async function enforceReleaseVersion({
       const current = normalizedVersion(app.getVersion());
       if (!current) throw new Error("This installation has an invalid application version.");
       const release = selectRelease(await fetchReleases({ fetchImpl, apiUrl }));
-      if (!release) throw new Error("No published Phone Farm release is available.");
+      if (!release) throw new Error("No published Bodun release is available.");
       const available = normalizedVersion(release.tag_name);
       const comparison = compareVersions(current, available);
       if (comparison === 0) return { allowed: true, status: "current", version: current.text };
@@ -243,12 +243,12 @@ async function enforceReleaseVersion({
         const assets = await fetchReleaseAssets(release, { fetchImpl });
         asset = selectInstallerAsset({ ...release, assets }, platform, arch);
       }
-      if (!asset) throw new Error(`Phone Farm ${available.text} has no installer for this computer yet.`);
+      if (!asset) throw new Error(`Bodun ${available.text} has no installer for this computer yet.`);
       const answer = await dialog.showMessageBox({
         type: "warning",
-        title: "Phone Farm update required",
-        message: `Phone Farm ${available.text} is required`,
-        detail: `This computer has Phone Farm ${current.text}. It must update before it can continue.`,
+        title: "Bodun update required",
+        message: `Bodun ${available.text} is required`,
+        detail: `This computer has Bodun ${current.text}. It must update before it can continue.`,
         buttons: ["Update now", "No — exit"],
         defaultId: 0,
         cancelId: 1,
@@ -264,7 +264,7 @@ async function enforceReleaseVersion({
       const installerPath = await downloadInstaller(asset, updateDir, { fetchImpl });
       const openError = await shell.openPath(installerPath);
       if (openError) throw new Error(`The installer could not be opened: ${openError}`);
-      logger.info(`verified Phone Farm ${available.text} installer and opened it`);
+      logger.info(`verified Bodun ${available.text} installer and opened it`);
       app.quit();
       return { allowed: false, status: "installer-opened", installerPath };
     } catch (error) {

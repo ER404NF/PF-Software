@@ -60,7 +60,7 @@ function buildXcodeAdminScript(developerDir) {
 function friendlyAdminError(error) {
   const text = `${error?.stderr ?? ""} ${error?.message ?? ""}`;
   if (/-128|User canceled|user cancelled/i.test(text)) return "The password prompt was cancelled. Click Fix it again when you are ready.";
-  if (/-60007|-1743|not allowed/i.test(text)) return "macOS did not allow the request. Open System Settings > Privacy & Security and allow Phone Farm to control this Mac, then try again.";
+  if (/-60007|-1743|not allowed/i.test(text)) return "macOS did not allow the request. Open System Settings > Privacy & Security and allow Bodun to control this Mac, then try again.";
   const last = String(error?.stderr || error?.message || "").trim().split(/\r?\n/).filter(Boolean).pop();
   return last ? `macOS reported: ${last}` : "macOS could not finish the change.";
 }

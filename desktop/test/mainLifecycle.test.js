@@ -28,7 +28,7 @@ async function freePort() {
 test("the setup window opens on a fresh install and the log records the start", () => {
   assert.equal(windows.length, 1);
   assert.match(windows[0].file, /first-run\.html$/);
-  assert.match(readLog(), new RegExp(`Phone Farm ${desktopVersion} starting`));
+  assert.match(readLog(), new RegExp(`Bodun ${desktopVersion} starting`));
 });
 
 test("every desktop channel the page can call is handled, and none answers anyone but the setup page", async () => {
@@ -51,20 +51,20 @@ test("diagnostics are copied to the clipboard and hold no secret", async () => {
   fs.writeFileSync(configFile, JSON.stringify({ sessionSecret: "MUST-NOT-LEAK-1234567", siteToken: "pfs_MUSTNOTLEAKTOKEN", launchAtLogin: true }));
   assert.deepEqual(await handlers.get("desktop:copy-diagnostics")(trusted()), { ok: true });
   const report = clipboardWrites.at(-1);
-  assert.match(report, /^Phone Farm diagnostics/);
+  assert.match(report, /^Bodun diagnostics/);
   assert.match(report, /Saved settings: launchAtLogin, sessionSecret, siteToken/);
   assert.doesNotMatch(report, /MUST-NOT-LEAK|MUSTNOTLEAK/);
-  assert.match(report, new RegExp(`Phone Farm ${desktopVersion} starting`), "the recent log is included");
+  assert.match(report, new RegExp(`Bodun ${desktopVersion} starting`), "the recent log is included");
   fs.rmSync(configFile);
 });
 
 test("the Help menu offers diagnostics, host startup and explicit proxy routing", async () => {
   const help = menus.at(-1).find(item => item.label === "Help");
   assert.deepEqual(help.submenu.filter(item => item.label).map(item => item.label),
-    ["Copy Diagnostics", "Show Log Folder", "Start Phone Farm When This Mac Starts", "Enable Proxy Routing on This Mac"]);
+    ["Copy Diagnostics", "Show Log Folder", "Start Bodun When This Mac Starts", "Enable Proxy Routing on This Mac"]);
   assert.equal(help.submenu.at(-1).type, "checkbox");
   help.submenu[0].click();
-  assert.match(clipboardWrites.at(-1), /^Phone Farm diagnostics/);
+  assert.match(clipboardWrites.at(-1), /^Bodun diagnostics/);
   assert.equal(shown.at(-1).message, "Diagnostics copied");
 
   fs.writeFileSync(configFile, JSON.stringify({ mode: "host" }));

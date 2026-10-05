@@ -1,16 +1,16 @@
-# Phone Farm desktop app
+# Bodun desktop app
 
 Users get this as a ready-made installer — `Phone-Farm-macOS.pkg` or `Phone-Farm-Windows.exe` from
 [GitHub Releases](https://github.com/ER404NF/PF-Software/releases/latest) — and never
 build anything. This directory is the source of that app and of the pipeline that
 builds and verifies the installer.
 
-## What ships inside `Phone Farm.app`
+## What ships inside `Bodun.app`
 
 | In the app | Where (`Contents/Resources/…`) | Notes |
 |---|---|---|
 | Electron app + desktop host code | `app.asar` | `main.js`, `preload.js`, `first-run.html`, `hostEnvironment.js`, `windowSecurity.js`, `wdaSource.js` |
-| Phone Farm server | `system/server/src/` | run with the app's own Electron binary as Node (`ELECTRON_RUN_AS_NODE=1`) — **no system Node.js needed** |
+| Bodun server | `system/server/src/` | run with the app's own Electron binary as Node (`ELECTRON_RUN_AS_NODE=1`) — **no system Node.js needed** |
 | Production dependencies | `system/node_modules/` | installed from the lockfile with `npm ci --omit=dev` |
 | Web client | `system/client/` | |
 | WebDriverAgent (unmodified, pinned) | `wda/WebDriverAgent/` | see below |
@@ -31,7 +31,7 @@ Finder's `PATH`. No Terminal is needed to operate the app after installation.
 
 `AUTO_ROUTE_PROXY_TUNNELS`, `AUTO_NETWORK_ENROLLMENT` and `AUTO_ENABLE_INTERNET_SHARING` are not
 enabled by default. A configured host can explicitly enable the routing orchestrator from
-**Help > Enable Proxy Routing on This Mac**, then quit and reopen Phone Farm. This setting requires
+**Help > Enable Proxy Routing on This Mac**, then quit and reopen Bodun. This setting requires
 `tun2proxy`; the app verifies the active macOS Internet Sharing bridge and asks the operator to choose
 when several candidates exist. It persists only the selected interface name and refuses to enable routing
 when no active bridge can be verified. Routing exposes the per-phone enrollment/start/stop controls; Internet Sharing and automatic
@@ -47,7 +47,7 @@ network enrollment remain manual unless separately configured.
   bundle anything that does not resolve to that commit.
 - **Never built inside the signed app.** On first launch the source is copied to
   `~/Library/Application Support/Phone Farm/wda-source/<version>-<commit>/` (`wdaSource.js`), and
-  derived data lives under `…/host-storage/wda-derived-data/`. Nothing inside `Phone Farm.app` is
+  derived data lives under `…/host-storage/wda-derived-data/`. Nothing inside `Bodun.app` is
   modified at runtime — the verifier checks this.
 - **Signing.** An unsigned WDA project cannot run on a physical iPhone. Host setup detects an Apple
   development team from your keychain when there is exactly one; otherwise it asks for your 10-character
@@ -95,7 +95,7 @@ npm ci
 npm test                 # desktop tests
 npm run dist:mac         # = dist:mac:pkg  -> dist/Phone-Farm-<version>-arm64[-UNSIGNED].pkg
 npm run dist:mac:pkg:universal   # Apple silicon + Intel
-npm run dist:mac:app     # just the .app (dist/mac-arm64/Phone Farm.app)
+npm run dist:mac:app     # just the .app (dist/mac-arm64/Bodun.app)
 npm run verify:pkg -- path/to/Phone-Farm-<version>-arm64.pkg
 ```
 
@@ -137,7 +137,7 @@ Hardware validation (real iPhones) is separate: [docs/MAC_INSTALLER_ACCEPTANCE.m
 
 ## Isolation and security notes
 
-- Only the packaged first-run window receives `preload.js`; the Phone Farm web window has no preload and
+- Only the packaged first-run window receives `preload.js`; the Bodun web window has no preload and
   is confined to its configured HTTP(S) origin.
 - The server sidecar depends on Electron's `runAsNode` fuse staying enabled; it is not disabled.
 - Electron is pinned to a patched release (44.x). `npm run audit:gate` fails the build on a high/critical

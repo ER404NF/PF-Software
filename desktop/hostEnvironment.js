@@ -204,7 +204,7 @@ function resolveMacHostDependencies({
       ok: xcodeReady,
       ...(xcodeFixable ? { fixable: "xcode" } : {}),
       message: xcodeReady ? "Ready"
-        : xcodeFixable ? "Xcode is installed but not set up for Phone Farm yet. Click Fix it; macOS will ask for your Mac password once."
+        : xcodeFixable ? "Xcode is installed but not set up for Bodun yet. Click Fix it; macOS will ask for your Mac password once."
           : !xcodeSelection.ok ? xcodeSelection.message : xcodebuild.message,
       detail: xcodeSelection.detail,
     },
@@ -232,7 +232,7 @@ function resolveMacHostDependencies({
       ok: Boolean(wdaRepoPath),
       message: wdaRepoPath
         ? "Ready"
-        : "WebDriverAgent was not found. Reinstall Phone Farm (it bundles WebDriverAgent), or place a configured checkout at ~/WebDriverAgent / set WDA_REPO_PATH.",
+        : "WebDriverAgent was not found. Reinstall Bodun (it bundles WebDriverAgent), or place a configured checkout at ~/WebDriverAgent / set WDA_REPO_PATH.",
     },
   ];
   // Phone Farm's bundled WebDriverAgent ships unsigned, so it needs the
@@ -249,7 +249,7 @@ function resolveMacHostDependencies({
         ? `Apple development team ${developmentTeam}`
         : signingCandidates.length > 1
           ? `Several Apple development teams were found (${detectedList}). Enter the Team ID to use for signing WebDriverAgent.`
-          : "Enter your Apple Developer Team ID (10 characters, shown at developer.apple.com under Membership) so Phone Farm can sign its bundled WebDriverAgent. Xcode must be signed in to the same Apple ID.",
+          : "Enter your Apple Developer Team ID (10 characters, shown at developer.apple.com under Membership) so Bodun can sign its bundled WebDriverAgent. Xcode must be signed in to the same Apple ID.",
     });
   }
   if (routingEnabled) {

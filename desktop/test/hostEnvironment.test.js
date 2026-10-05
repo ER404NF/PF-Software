@@ -167,7 +167,7 @@ test("the operator's own ~/WebDriverAgent (already signed) outranks the bundled 
   assert.deepEqual(bundledOnly, { path: MANAGED, source: "managed" });
 });
 
-test("Phone Farm's bundled WebDriverAgent is used when the operator supplied none", () => {
+test("Bodun's bundled WebDriverAgent is used when the operator supplied none", () => {
   const result = resolveMacHostDependencies({ ...managedMac(), managedWdaPath: MANAGED });
   assert.equal(result.wdaRepoPath, MANAGED);
   assert.equal(result.wdaSource, "managed");
@@ -219,7 +219,7 @@ test("an operator's own WDA checkout never receives signing overrides", () => {
 
 test("a missing WDA message points at reinstalling the app, which bundles it", () => {
   const result = resolveMacHostDependencies(fakeMac({ prefix: "/opt/homebrew/bin", wdaPath: "/missing", omit: ["WebDriverAgent.xcodeproj"] }));
-  assert.match(result.checks.find(check => check.id === "wda-repo").message, /Reinstall Phone Farm/);
+  assert.match(result.checks.find(check => check.id === "wda-repo").message, /Reinstall Bodun/);
 });
 
 // ---- one-click fixes are offered only when they can work ----------------------------------------

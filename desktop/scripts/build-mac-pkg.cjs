@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 // Builds the macOS installer users actually download:
 //
-//     Phone-Farm-<version>-<arch>.pkg      (double-click -> Installer.app -> /Applications/Phone Farm.app)
+//     Phone-Farm-<version>-<arch>.pkg      (double-click -> Installer.app -> /Applications/Bodun.app)
 //
 // Pipeline: stage the runtime + pinned WebDriverAgent -> electron-builder makes
-// Phone Farm.app -> (sign, notarize, staple the app) -> pkgbuild/productbuild make
+// Bodun.app -> (sign, notarize, staple the app) -> pkgbuild/productbuild make
 // the installer package -> (sign, notarize, staple the package) -> verify.
 // Nothing runs on the END USER's machine except Apple's Installer: no npm, no
 // Node, no tests, no build.
@@ -35,8 +35,8 @@ const { spawnSync } = require("child_process");
 const { verifyPackagedRuntime } = require("./verify-packaged-runtime.cjs");
 
 const desktopDir = path.resolve(__dirname, "..");
-const PRODUCT_NAME = "Phone Farm";
-const APP_BUNDLE = "Phone Farm.app";
+const PRODUCT_NAME = "Bodun";
+const APP_BUNDLE = "Bodun.app";
 const COMPONENT_ID = "com.phonefarm.desktop";
 const MIN_MACOS = "12.0";
 const ARCHES = {
@@ -418,7 +418,7 @@ async function main(argv = process.argv.slice(2), env = process.env) {
     const release = options.release || env.PHONE_FARM_RELEASE === "true";
     const level = resolveBuildLevel({ signing, release, allowUnsigned: env.PHONE_FARM_ALLOW_UNSIGNED === "true" });
     const paths = computePaths({ arch: options.arch, version, level, workDir });
-    console.log(`Phone Farm ${version} (${options.arch}) - signing level: ${level.toUpperCase()}`);
+    console.log(`Bodun ${version} (${options.arch}) - signing level: ${level.toUpperCase()}`);
     if (level !== "notarized") {
       console.log("WARNING: this package is NOT signed and notarized. macOS Gatekeeper will warn (or refuse) when it is opened. It is a development artifact, not the seamless public installer.");
     }

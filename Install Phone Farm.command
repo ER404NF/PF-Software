@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install Phone Farm.command - double-click this in Finder to install Phone Farm on this Mac.
+# Install Phone Farm.command - legacy filename; double-click this in Finder to install Bodun on this Mac.
 #
 # It does NOT build anything. It downloads the newest published macOS installer (.pkg) from
 # this repository's GitHub Releases, checks its SHA-256 checksum, and only then opens it in
@@ -35,7 +35,7 @@ pf_cleanup() {
 
 # Prints a plain-language error, removes anything partially downloaded and exits non-zero.
 pf_fail() {
-  printf '\nPhone Farm was NOT installed.\n%s\n' "$*" >&2
+  printf '\nBodun was NOT installed.\n%s\n' "$*" >&2
   PF_KEEP_WORK_DIR=0
   pf_cleanup
   # A Finder-launched Terminal window may be set to close on exit; keep the error readable.
@@ -81,7 +81,7 @@ pf_check_macos() {
     ''|*[!0-9]*) pf_fail "Could not read the macOS version (got \"${version}\")." ;;
   esac
   if [ "$major" -lt "$PF_MIN_MACOS_MAJOR" ]; then
-    pf_fail "Phone Farm needs macOS ${PF_MIN_MACOS_MAJOR} (Monterey) or newer. This Mac has macOS ${version}."
+    pf_fail "Bodun needs macOS ${PF_MIN_MACOS_MAJOR} (Monterey) or newer. This Mac has macOS ${version}."
   fi
 }
 
@@ -188,11 +188,11 @@ pf_resolve_latest_tag() {
   effective="$(pf_curl --max-time 60 --output /dev/null --write-out '%{url_effective}' "${PF_GITHUB}/${PF_REPO}/releases/latest" 2>/dev/null)"
   status=$?
   if [ "$status" -eq 22 ]; then
-    pf_fail "No Phone Farm release has been published yet at ${PF_GITHUB}/${PF_REPO}/releases"
+    pf_fail "No Bodun release has been published yet at ${PF_GITHUB}/${PF_REPO}/releases"
   elif [ "$status" -ne 0 ]; then
     pf_fail "$(pf_network_message "$status")"
   fi
-  PF_TAG="$(pf_tag_from_url "$effective")" || pf_fail "Could not work out the latest Phone Farm version from GitHub (${effective:-no answer})."
+  PF_TAG="$(pf_tag_from_url "$effective")" || pf_fail "Could not work out the latest Bodun version from GitHub (${effective:-no answer})."
 }
 
 # Downloads URL to DEST through a .part file, so a failed or interrupted transfer never
@@ -254,9 +254,9 @@ pf_select_asset() {
     pf_fail "Release ${tag} contains ${missing_sum} but no SHA-256 checksum for it, so its integrity cannot be verified. The installer was not opened. Ask the maintainer to re-publish the release with its .sha256 file."
   fi
   if [ "$arch" = "x86_64" ]; then
-    pf_fail "Phone Farm ${version} has no installer for Intel Macs. Intel Macs need the universal package, which this release does not include. Apple-silicon Macs are supported."
+    pf_fail "Bodun ${version} has no installer for Intel Macs. Intel Macs need the universal package, which this release does not include. Apple-silicon Macs are supported."
   fi
-  pf_fail "Phone Farm ${version} (the latest release) does not include a macOS installer yet. See ${PF_GITHUB}/${PF_REPO}/releases/tag/${tag}"
+  pf_fail "Bodun ${version} (the latest release) does not include a macOS installer yet. See ${PF_GITHUB}/${PF_REPO}/releases/tag/${tag}"
 }
 
 # ---------------------------------------------------------------------------- main
@@ -264,11 +264,11 @@ pf_select_asset() {
 pf_main() {
   local arch tag version pkg actual status level
 
-  pf_say "Phone Farm Installer"
+  pf_say "Bodun Installer"
   pf_say "--------------------"
   pf_say "Checking your Mac..."
   pf_check_macos
-  arch="$(pf_detect_arch)" || pf_fail "This Mac's processor ($(uname -m 2>/dev/null)) is not supported. Phone Farm runs on Apple-silicon and Intel Macs."
+  arch="$(pf_detect_arch)" || pf_fail "This Mac's processor ($(uname -m 2>/dev/null)) is not supported. Bodun runs on Apple-silicon and Intel Macs."
   pf_say "  $(pf_arch_label "$arch"), macOS $(sw_vers -productVersion 2>/dev/null)"
 
   PF_WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/phone-farm-installer.XXXXXX")" || pf_fail "Could not create a temporary folder for the download."
@@ -283,9 +283,9 @@ pf_main() {
   tag="$PF_TAG"
   version="$(pf_version_from_tag "$tag")"
   pf_select_asset "$tag" "$arch"
-  pf_say "  Phone Farm ${version}: ${PF_ASSET}"
+  pf_say "  Bodun ${version}: ${PF_ASSET}"
 
-  pf_say "Downloading Phone Farm..."
+  pf_say "Downloading Bodun..."
   pkg="$PF_WORK_DIR/$PF_ASSET"
   pf_download "${PF_GITHUB}/${PF_REPO}/releases/download/${tag}/${PF_ASSET}" "$pkg"
   status=$?
@@ -304,7 +304,7 @@ The file was deleted and the installer was not opened. Try again; if this keeps 
   pf_say "  SHA-256 OK"
 
   # Mark the file the way a web browser would, so Gatekeeper performs its normal checks.
-  xattr -w com.apple.quarantine "0081;$(printf '%x' "$(date +%s)");Phone Farm Installer;" "$pkg" 2>/dev/null ||
+  xattr -w com.apple.quarantine "0081;$(printf '%x' "$(date +%s)");Bodun Installer;" "$pkg" 2>/dev/null ||
     pf_fail "Could not mark the download for Gatekeeper checking. The installer was not opened."
 
   pf_say "Opening installer..."
@@ -312,7 +312,7 @@ The file was deleted and the installer was not opened. Try again; if this keeps 
   open "$pkg" || { PF_KEEP_WORK_DIR=0; pf_fail "macOS could not open the installer package."; }
 
   pf_say ""
-  pf_say "Phone Farm installer opened successfully. Follow the macOS Installer steps."
+  pf_say "Bodun installer opened successfully. Follow the macOS Installer steps."
   level="$(pf_signing_note "$PF_ASSET")"
   if [ "$level" != "notarized" ]; then
     pf_say ""

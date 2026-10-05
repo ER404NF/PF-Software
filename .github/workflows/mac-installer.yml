@@ -217,11 +217,11 @@ jobs:
         run: |
           set -euo pipefail
           sudo installer -pkg "${{ steps.build.outputs.pkg_path }}" -target / -verboseR
-          test -d "/Applications/Phone Farm.app"
+          test -d "/Applications/Bodun.app"
           node desktop/scripts/verify-packaged-runtime.cjs \
-            "/Applications/Phone Farm.app/Contents/Resources" \
-            "/Applications/Phone Farm.app/Contents/MacOS/Phone Farm" --require-wda
-          sudo rm -rf "/Applications/Phone Farm.app"
+            "/Applications/Bodun.app/Contents/Resources" \
+            "/Applications/Bodun.app/Contents/MacOS/Bodun" --require-wda
+          sudo rm -rf "/Applications/Bodun.app"
 
       - name: Summary
         run: |

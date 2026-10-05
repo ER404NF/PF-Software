@@ -4,7 +4,7 @@
 <array>
   <dict>
     <key>RootRelativeBundlePath</key>
-    <string>Phone Farm.app</string>
+    <string>Bodun.app</string>
     <!-- Never "relocate" to a stray copy elsewhere (Downloads, a build folder): always install to /Applications. -->
     <key>BundleIsRelocatable</key>
     <false/>

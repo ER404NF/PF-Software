@@ -164,8 +164,8 @@ test("the package installs to /Applications, is never relocatable, and runs no s
 });
 
 test("the installer is built from the app produced by electron-builder for the requested architecture", () => {
-  assert.match(build("unsigned", { arch: "arm64" }).paths.appPath.replaceAll("\\", "/"), /dist\/mac-arm64\/Phone Farm\.app$/);
-  assert.match(build("unsigned", { arch: "universal" }).paths.appPath.replaceAll("\\", "/"), /dist\/mac-universal\/Phone Farm\.app$/);
+  assert.match(build("unsigned", { arch: "arm64" }).paths.appPath.replaceAll("\\", "/"), /dist\/mac-arm64\/Bodun\.app$/);
+  assert.match(build("unsigned", { arch: "universal" }).paths.appPath.replaceAll("\\", "/"), /dist\/mac-universal\/Bodun\.app$/);
   assert.ok(find(build("unsigned", { arch: "universal" }).steps, "build-app").args.includes("--universal"));
   assert.ok(find(build("unsigned", { arch: "arm64" }).steps, "build-app").args.includes("--arm64"));
 });
@@ -202,7 +202,7 @@ function expandedPkg(root, { version = "1.2.3", installLocation = "/Applications
   };
   write("Distribution", `<installer-gui-script><options hostArchitectures="${hostArchitectures}"/><welcome file="w.html"/><readme file="r.html"/><conclusion file="c.html"/></installer-gui-script>`);
   write("component.pkg/PackageInfo", `<pkg-info install-location="${installLocation}" identifier="${COMPONENT_ID}"/>`);
-  const app = "component.pkg/Payload/Phone Farm.app/Contents";
+  const app = "component.pkg/Payload/Bodun.app/Contents";
   write(`${app}/Info.plist`, `<plist><dict><key>CFBundleShortVersionString</key><string>${version}</string><key>CFBundleIdentifier</key><string>${bundleId}</string></dict></plist>`);
   write(`${app}/Resources/system/package.json`, JSON.stringify({ name: "fake", dependencies: { express: "1" } }));
   write(`${app}/Resources/system/package-lock.json`, "{}");
@@ -246,7 +246,7 @@ test("inspection of a package with no app reports it", async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pf-expanded-empty-"));
   try {
     const failures = await inspectExpandedPkg({ expandedDir: root, version: "1.2.3", arch: "arm64", level: "unsigned", boot: false });
-    assert.match(failures[0], /does not contain Phone Farm\.app/);
+    assert.match(failures[0], /does not contain Bodun\.app/);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

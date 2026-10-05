@@ -1,4 +1,4 @@
-# Phone Farm — Human VA Control System
+# Bodun — Human VA Control System
 
 This directory contains the active prototype for the current product: a relay server and browser client that let a **human VA** select an authorized phone, view its screen, and manually operate it.
 

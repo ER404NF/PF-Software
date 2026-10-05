@@ -234,8 +234,8 @@ test("checksum files: sidecar, SHA256SUMS list, and malformed content", { skip }
 test("success: downloads the latest arm64 release, verifies SHA-256, then opens the macOS Installer", { skip }, () => {
   const r = run(release("0.2.3", { "Phone-Farm-0.2.3-arm64.pkg": {} }));
   assert.equal(r.status, 0, r.output);
-  for (const line of ["Phone Farm Installer", "Checking your Mac...", "Checking for latest release...", "Downloading Phone Farm...",
-    "Verifying package...", "Opening installer...", "Phone Farm installer opened successfully. Follow the macOS Installer steps."]) {
+  for (const line of ["Bodun Installer", "Checking your Mac...", "Checking for latest release...", "Downloading Bodun...",
+    "Verifying package...", "Opening installer...", "Bodun installer opened successfully. Follow the macOS Installer steps."]) {
     assert.ok(r.stdout.includes(line), `missing "${line}" in:\n${r.stdout}`);
   }
   assert.doesNotMatch(r.output, /DEVELOPMENT build/);
@@ -254,7 +254,7 @@ test("success: downloads the latest arm64 release, verifies SHA-256, then opens 
 test("the release is resolved dynamically: a 1.0.0 release is installed without any script change", { skip }, () => {
   const r = run(release("1.0.0", { "Phone-Farm-1.0.0-arm64.pkg": {} }));
   assert.equal(r.status, 0, r.output);
-  assert.match(r.stdout, /Phone Farm 1\.0\.0: Phone-Farm-1\.0\.0-arm64\.pkg/);
+  assert.match(r.stdout, /Bodun 1\.0\.0: Phone-Farm-1\.0\.0-arm64\.pkg/);
   assert.ok(r.log.includes(`curl ${GH}/releases/download/v1.0.0/Phone-Farm-1.0.0-arm64.pkg`));
 });
 
@@ -283,7 +283,7 @@ test("checksum mismatch: the package is deleted, the Installer is NOT opened, ex
   const r = run(release("0.2.3", { "Phone-Farm-0.2.3-arm64.pkg": { corrupt: true } }));
   assert.notEqual(r.status, 0);
   assert.match(r.stderr, /INTEGRITY CHECK FAILED/);
-  assert.match(r.stderr, /Phone Farm was NOT installed/);
+  assert.match(r.stderr, /Bodun was NOT installed/);
   assert.equal(openCalls(r.log).length, 0);
   assert.equal(indexOfCall(r.log, "xattr"), -1);
   assert.deepEqual(r.tmpEntries, [], "the bad package and its folder must be removed");
@@ -308,14 +308,14 @@ test("missing checksum: a package without any published SHA-256 is never opened"
 test("missing package: a release without a macOS installer says so plainly", { skip }, () => {
   const r = run(release("0.2.2", {}, { sums: true }));
   assert.notEqual(r.status, 0);
-  assert.match(r.stderr, /Phone Farm 0\.2\.2 \(the latest release\) does not include a macOS installer yet/);
+  assert.match(r.stderr, /Bodun 0\.2\.2 \(the latest release\) does not include a macOS installer yet/);
   assert.equal(openCalls(r.log).length, 0);
 });
 
 test("no published release at all", { skip }, () => {
   const r = run({ routes: { "https://github.com/": "ok" } });
   assert.notEqual(r.status, 0);
-  assert.match(r.stderr, /No Phone Farm release has been published yet/);
+  assert.match(r.stderr, /No Bodun release has been published yet/);
 });
 
 test("GitHub unreachable (DNS / no connection / timeout) gives a human message and downloads nothing", { skip }, () => {

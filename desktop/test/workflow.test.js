@@ -62,7 +62,7 @@ test("build, verify, install-with-Installer and upload happen in that order", ()
   assert.deepEqual([...order].sort((a, b) => a - b), order);
   const install = build.steps.find(step => /sudo installer -pkg/.test(step.run || ""));
   assert.match(install.run, /verify-packaged-runtime\.cjs/);
-  assert.match(install.run, /\/Applications\/Phone Farm\.app/);
+  assert.match(install.run, /\/Applications\/Bodun\.app/);
 });
 
 test("the .pkg is uploaded as a workflow artifact and a missing file is an error", () => {
