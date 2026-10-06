@@ -246,6 +246,11 @@ body {
 .wda-diagnostic-check p { margin: 3px 0 0; color: var(--muted); font-size: 11px; line-height: 1.4; }
 .wda-diagnostic-timeline { margin: 4px 0 0; padding-left: 20px; color: var(--muted); font-size: 11px; }
 .wda-copy-diagnostic-button { justify-self: start; min-height: 32px; }
+.network-routing-panel { display: grid; gap: 8px; width: 100%; padding: 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
+.network-routing-status-grid { display: grid; grid-template-columns: minmax(90px, auto) 1fr; gap: 4px 12px; margin: 0; }
+.network-routing-status-grid dt { color: var(--muted); font-size: 11px; }
+.network-routing-status-grid dd { margin: 0; color: var(--ink); font-size: 11px; font-weight: 700; }
+.network-routing-inline-error { margin: 0; color: var(--offline); font-size: 11px; line-height: 1.4; }
 .wda-lifecycle-result:empty { display: none; }
 .proxy-pool-picker {
   display: grid;

@@ -1735,7 +1735,11 @@ function buildWdaLifecyclePanel(device) {
   const title = document.createElement("strong");
   title.textContent = "Device control service";
   const state = document.createElement("span");
-  state.textContent = device.wdaLifecycle?.enabled === false ? "Stopped" : "Running";
+  const lifecycleLabels = {
+    stopped: "Stopped", starting: "Starting", restarting: "Restarting",
+    failed: "Failed", ready: "Ready", enabled: "Enabled",
+  };
+  state.textContent = lifecycleLabels[device.wdaLifecycle?.state] || "Starting";
   copy.append(title, state);
 
   const actions = document.createElement("div");
@@ -1753,6 +1757,12 @@ function buildWdaLifecyclePanel(device) {
   diagnose.type = "button";
   diagnose.textContent = "Check control";
   diagnose.className = "wda-diagnostic-button";
+  const restart = document.createElement("button");
+  restart.type = "button";
+  restart.textContent = "Restart WDA";
+  restart.className = "wda-restart-button";
+  restart.hidden = starting;
+  restart.title = "Stop the managed WDA and USB tunnel, wait for confirmed exit, then start one fresh isolated pair and recheck control.";
   const result = document.createElement("span");
   result.className = "wda-lifecycle-result";
   result.setAttribute("role", "status");
@@ -1852,6 +1862,31 @@ function buildWdaLifecyclePanel(device) {
     }
   });
 
+  restart.addEventListener("click", async () => {
+    const generation = operatorProfileGeneration;
+    restart.disabled = true;
+    toggle.disabled = true;
+    diagnose.disabled = true;
+    result.textContent = "Restarting WDA and its USB tunnel…";
+    try {
+      const { body } = await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/wda/restart`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      }, { timeoutMs: 30_000, uncertain: true });
+      if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) return;
+      result.textContent = body?.lifecycle?.controlReady
+        ? "WDA restarted and control is ready."
+        : "WDA restarted. Control is still being verified; use Check control for details.";
+    } catch (error) {
+      if (profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) result.textContent = error.message;
+    } finally {
+      if (profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) {
+        restart.disabled = false;
+        toggle.disabled = false;
+        diagnose.disabled = false;
+      }
+    }
+  });
+
   diagnose.addEventListener("click", async () => {
     const generation = operatorProfileGeneration;
     diagnose.disabled = true;
@@ -1879,7 +1914,7 @@ function buildWdaLifecyclePanel(device) {
     }
   });
 
-  actions.append(toggle, diagnose);
+  actions.append(toggle, restart, diagnose);
   panel.append(copy, actions, result, report);
   return panel;
 }
@@ -1940,13 +1975,6 @@ function buildProxyPoolPicker(device) {
 }
 
 // Phase B part 2: network enrollment -> IP discovery -> start/stop routing.
-// Tracks which devices this browser tab has started (but not yet
-// confirmed) enrollment for — the server's own before-snapshot is
-// similarly ephemeral (in-memory, not persisted; see index.js's comment),
-// so losing this on reload just means clicking "Start" again, which is
-// safe and idempotent.
-const enrollmentPendingDeviceIds = new Set();
-
 // One state machine, one primary button — matches the server's own
 // sequencing (enrollment -> discovery -> routing) instead of showing up to
 // four buttons at once. `device.usbNetwork`/`device.routing` are both
@@ -1970,7 +1998,7 @@ function networkRoutingNextAction(device) {
   }
   if (device.usbNetwork?.usbIp) return { label: "Start routing", action: "start-routing" };
   if (device.usbNetwork?.usbIface) return { label: "Discover IP", action: "discover-ip" };
-  if (enrollmentPendingDeviceIds.has(device.id)) return { label: "Confirm enrollment", action: "network-enrollment/confirm" };
+  if (device.networkEnrollment?.state === "pending") return { label: "Confirm enrollment", action: "network-enrollment/confirm" };
   return { label: "Start network enrollment", action: "network-enrollment/start" };
 }
 
@@ -1991,7 +2019,10 @@ function networkRoutingStatusText(device) {
 }
 
 async function triggerRoutingAction(device, action, button) {
+  const originalLabel = button.textContent;
   button.disabled = true;
+  button.textContent = action === "network-enrollment/confirm" ? "Confirming…"
+    : action === "network-enrollment/start" ? "Preparing…" : "Working…";
   selectErrorEl.textContent = "";
   try {
     const { body } = await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/${action}`, {
@@ -2000,10 +2031,8 @@ async function triggerRoutingAction(device, action, button) {
       body: "{}",
     });
     if (action === "network-enrollment/start") {
-      enrollmentPendingDeviceIds.add(device.id);
       selectErrorEl.textContent = `Now enable Internet Sharing for ${device.label} in System Preferences, then click Confirm enrollment.`;
     } else {
-      if (action === "network-enrollment/confirm") enrollmentPendingDeviceIds.delete(device.id);
       selectErrorEl.textContent = body?.network?.usbIp
         ? `${device.label}: IP discovered (${body.network.usbIp}).`
         : body?.network?.usbIface
@@ -2016,17 +2045,41 @@ async function triggerRoutingAction(device, action, button) {
   } catch (error) {
     selectErrorEl.textContent = error.message;
     button.disabled = false;
+    button.textContent = originalLabel;
   }
 }
 
 function buildNetworkRoutingPanel(device) {
   const wrap = document.createElement("div");
   wrap.className = "network-routing-panel";
-
-  const status = document.createElement("span");
-  status.className = "network-routing-status";
-  status.textContent = networkRoutingStatusText(device);
-  wrap.appendChild(status);
+  const statusGrid = document.createElement("dl");
+  statusGrid.className = "network-routing-status-grid";
+  const rows = [
+    ["Proxy routing", device.routingFeature?.state === "enabled" ? "Enabled" : "Disabled"],
+    ["Bridge", device.routingFeature?.state === "bridge_missing" ? "Missing"
+      : device.routingFeature?.state === "enabled" ? "Configured" : "Unavailable"],
+    ["Enrollment", device.usbNetwork?.usbIface ? "Confirmed"
+      : device.networkEnrollment?.state === "pending" ? "Pending"
+        : device.networkEnrollment?.state === "owned_by_other_session" ? "In progress elsewhere" : "Required"],
+    ["Route", device.routing?.state === "routed" && device.routing?.protected === true ? "Protected"
+      : device.routing?.state === "route_lost" ? "Lost"
+        : device.routing?.state ? device.routing.state.replaceAll("_", " ") : "Unverified"],
+  ];
+  for (const [term, value] of rows) {
+    const dt = document.createElement("dt");
+    const dd = document.createElement("dd");
+    dt.textContent = term;
+    dd.textContent = value;
+    statusGrid.append(dt, dd);
+  }
+  wrap.appendChild(statusGrid);
+  const inlineError = device.routing?.lastError || device.autoEnrollment?.note;
+  if (inlineError) {
+    const error = document.createElement("p");
+    error.className = "network-routing-inline-error";
+    error.textContent = inlineError;
+    wrap.appendChild(error);
+  }
 
   const next = networkRoutingNextAction(device);
   const button = document.createElement("button");
@@ -2059,15 +2112,10 @@ function buildNetworkRoutingPanel(device) {
   return wrap;
 }
 
-// network-enrollment/start has no persisted, summary()-visible side effect
-// (only the ephemeral before-snapshot, tracked purely client-side via
-// enrollmentPendingDeviceIds), so it never triggers a server broadcast —
-// this local re-render is the only thing that updates its button label.
-// confirm/discover-ip/start-routing/stop-routing all DO call
-// broadcastDeviceList() server-side; calling this here too for those is
-// harmless (renderFleetSafely is idempotent) and keeps this browser's own
-// panel responsive immediately, without waiting on the real broadcast that
-// follows shortly after.
+// The server broadcasts its session-bound pending state after enrollment
+// starts and broadcasts durable routing changes after later steps. This
+// local refresh keeps the initiating panel responsive while that authoritative
+// device summary is in flight.
 function broadcastLocalFleetRefresh() {
   if (lastDevices.length) void renderFleetSafely(lastDevices);
 }

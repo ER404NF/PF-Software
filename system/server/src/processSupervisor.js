@@ -41,6 +41,11 @@ export class SupervisedProcessGroup extends EventEmitter {
     return { state: entry.state, restartCount: entry.restartCount };
   }
 
+  getDefinition(key) {
+    const entry = this.entries.get(key);
+    return entry ? { bin: entry.bin, args: [...entry.args] } : null;
+  }
+
   // `bin`/`args` describe the OS process; `key` is this group's identity
   // for the device (a UDID). Restarts reuse the same bin/args/env every
   // time. `env` is optional extra environment merged over process.env (e.g.

@@ -116,6 +116,10 @@ class FakeProcessManager {
   stop(udid) { this.stops.push(udid); this.running.delete(udid); }
   stopAll() { for (const udid of [...this.running]) this.stop(udid); }
   getStatus(udid) { return { state: this.running.has(udid) ? "running" : "stopped", restartCount: 0 }; }
+  ownsMapping(udid, { localPort, mjpegLocalPort }) {
+    const last = [...this.starts].reverse().find(start => start.udid === udid);
+    return this.running.has(udid) && last?.localPort === localPort && last?.mjpegLocalPort === mjpegLocalPort;
+  }
   emitExit(udid, log = []) { this.emitter.emit("exit", { key: udid, code: 1, signal: null, log }); }
   emitRestartLimitExceeded(udid, log = []) { this.emitter.emit("restart-limit-exceeded", { key: udid, restartCount: 99, log }); }
   emitPersistentFailure(udid, log = []) { this.emitter.emit("persistent-failure", { key: udid, restartCount: 99, log }); }
@@ -126,7 +130,8 @@ function tempStorePath() {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pf-provisioner-")), "device-provisioning.json");
 }
 
-function makeProvisioner({ manualUdids = new Set(), recoveryCooldownMs, now, provisioningStorePath = tempStorePath() } = {}) {
+function makeProvisioner({ manualUdids = new Set(), recoveryCooldownMs, now, provisioningStorePath = tempStorePath(),
+  isPortAvailable = async () => true } = {}) {
   const state = { attached: [] };
   const devices = new Map();
   const wdaProcessManager = new FakeProcessManager();
@@ -143,6 +148,7 @@ function makeProvisioner({ manualUdids = new Set(), recoveryCooldownMs, now, pro
     portRange: { start: 9000, end: 9010 },
     ...(recoveryCooldownMs === undefined ? {} : { recoveryCooldownMs }),
     ...(now ? { now } : {}),
+    isPortAvailable,
     onDeviceListChanged: () => changes.push(true),
   });
   return { provisioner, wdaProcessManager, iproxyManager, devices, changes, state };
@@ -167,6 +173,119 @@ test("a newly discovered, unconfigured UDID is provisioned automatically", async
   assert.ok(changes.length > 0);
 });
 
+test("automatic provisioning skips occupied control and MJPEG listeners before starting iproxy", async () => {
+  const occupied = new Set([9000, 9100]);
+  const { provisioner, iproxyManager, state } = makeProvisioner({
+    isPortAvailable: async port => !occupied.has(port),
+  });
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  assert.equal(iproxyManager.starts[0].localPort, 9001);
+  assert.equal(iproxyManager.starts[0].mjpegLocalPort, 9101);
+});
+
+test("I205 stops retrying and blocks rather than launching a duplicate pipeline on different ports", async () => {
+  const occupied = new Set();
+  const { provisioner, iproxyManager, state } = makeProvisioner({
+    isPortAvailable: async port => !occupied.has(port),
+  });
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  occupied.add(9000);
+  occupied.add(9100);
+  iproxyManager.emitExit("UDID-00000001", ["bind: Address already in use"]);
+  await new Promise(resolve => setImmediate(resolve));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(iproxyManager.starts.length, 1);
+  assert.equal(iproxyManager.stops.filter(id => id === "UDID-00000001").length, 1);
+  const device = provisioner.runtime.get("UDID-00000001").wdaDevice;
+  assert.equal(device.componentHealth.recovery, "BLOCKED_PORT");
+  assert.equal(device.componentErrors.iproxy.code, "I205");
+});
+
+test("persisted ports owned by an unproven process block attach without launching a duplicate", async () => {
+  const store = tempStorePath();
+  const first = makeProvisioner({ provisioningStorePath: store });
+  first.state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await first.provisioner.pollOnce();
+
+  const restarted = makeProvisioner({ provisioningStorePath: store, isPortAvailable: async () => false });
+  restarted.state.attached = first.state.attached;
+  await restarted.provisioner.pollOnce();
+  const device = restarted.devices.get(discoveredDeviceId("UDID-00000001"));
+  assert.equal(restarted.wdaProcessManager.starts.length, 0);
+  assert.equal(restarted.iproxyManager.starts.length, 0);
+  assert.equal(device.componentHealth.recovery, "BLOCKED_PORT");
+  assert.equal(device.componentErrors.iproxy.code, "I205");
+  assert.doesNotMatch(JSON.stringify(device.componentErrors.iproxy), /UDID-00000001/);
+});
+
+test("retrying a persisted I205 device remains blocked while its foreign listener is present", async () => {
+  const store = tempStorePath();
+  const first = makeProvisioner({ provisioningStorePath: store });
+  first.state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await first.provisioner.pollOnce();
+
+  const restarted = makeProvisioner({ provisioningStorePath: store, isPortAvailable: async () => false });
+  restarted.state.attached = first.state.attached;
+  await restarted.provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  const result = await restarted.provisioner.retryDevice(logicalId);
+  const device = restarted.devices.get(logicalId);
+  assert.equal(result, false);
+  assert.equal(restarted.wdaProcessManager.starts.length, 0);
+  assert.equal(restarted.iproxyManager.starts.length, 0);
+  assert.equal(device.componentErrors.iproxy.code, "I205");
+  assert.equal(device.componentHealth.recovery, "BLOCKED_PORT");
+});
+
+test("starting an intentionally stopped device refuses an occupied foreign port pair", async () => {
+  const occupied = new Set();
+  const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner({
+    isPortAvailable: async port => !occupied.has(port),
+  });
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  await provisioner.stopDevice(logicalId);
+  wdaProcessManager.starts.length = 0;
+  iproxyManager.starts.length = 0;
+  occupied.add(9000);
+  occupied.add(9100);
+
+  const lifecycle = await provisioner.startDevice(logicalId);
+  const device = devices.get(logicalId);
+  assert.equal(lifecycle.enabled, false);
+  assert.equal(wdaProcessManager.starts.length, 0);
+  assert.equal(iproxyManager.starts.length, 0);
+  assert.equal(device.componentErrors.iproxy.code, "I205");
+  assert.equal(device.componentHealth.recovery, "BLOCKED_PORT");
+});
+
+test("an occupied mapping already owned by this runtime is adopted without a second iproxy launch", async () => {
+  const { provisioner, iproxyManager, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const entry = provisioner.runtime.get("UDID-00000001");
+  provisioner.runtime.delete("UDID-00000001");
+  provisioner.isPortAvailable = async port => ![entry.port, entry.mjpegPort].includes(port);
+  await provisioner.pollOnce();
+  assert.equal(iproxyManager.starts.length, 1, "the runtime-owned mapping is adopted");
+});
+
+test("I205 recovery reports a stop failure distinctly and never launches a replacement", async () => {
+  const { provisioner, iproxyManager, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  iproxyManager.stop = async () => { throw Object.assign(new Error("permission denied while stopping"), { code: "EPERM" }); };
+  iproxyManager.emitExit("UDID-00000001", ["bind: Address already in use"]);
+  await new Promise(resolve => setImmediate(resolve));
+  const device = provisioner.runtime.get("UDID-00000001").wdaDevice;
+  assert.equal(device.componentErrors.iproxy.code, "I210");
+  assert.equal(device.componentHealth.recovery, "STOP_FAILED");
+  assert.equal(iproxyManager.starts.length, 1);
+});
+
 test("a discovery command failure retains attached runtimes instead of treating every phone as unplugged", async () => {
   const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner();
   state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
@@ -189,6 +308,19 @@ test("polling again for the same attached UDID does not start a second process",
   await provisioner.pollOnce();
   await provisioner.pollOnce();
   assert.equal(wdaProcessManager.starts.length, 1);
+  assert.equal(iproxyManager.starts.length, 1);
+});
+
+test("overlapping discovery polls share allocation and cannot launch duplicate tunnels", async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const { provisioner, iproxyManager, state } = makeProvisioner({ isPortAvailable: async () => { await gate; return true; } });
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  const first = provisioner.pollOnce();
+  const second = provisioner.pollOnce();
+  assert.equal(first, second);
+  release();
+  await Promise.all([first, second]);
   assert.equal(iproxyManager.starts.length, 1);
 });
 
@@ -437,7 +569,7 @@ test("retry() restarts both processes with the persisted port/derivedDataPath an
   wdaProcessManager.starts.length = 0;
   iproxyManager.starts.length = 0;
 
-  const ok = provisioner.retry("UDID-00000001");
+  const ok = await provisioner.retry("UDID-00000001");
   assert.equal(ok, true);
   const device = devices.get(discoveredDeviceId("UDID-00000001"));
   assert.equal(device.discoveryState, "provisioning");
@@ -447,9 +579,9 @@ test("retry() restarts both processes with the persisted port/derivedDataPath an
   assert.equal(iproxyManager.starts[0].localPort, 9000);
 });
 
-test("retry() on an unmanaged UDID returns false", () => {
+test("retry() on an unmanaged UDID returns false", async () => {
   const { provisioner } = makeProvisioner();
-  assert.equal(provisioner.retry("NEVER-SEEN"), false);
+  assert.equal(await provisioner.retry("NEVER-SEEN"), false);
 });
 
 test("retryDevice() resolves a logical device id to its UDID — routes never need the raw UDID", async () => {
@@ -460,15 +592,15 @@ test("retryDevice() resolves a logical device id to its UDID — routes never ne
   wdaProcessManager.starts.length = 0;
 
   const logicalId = discoveredDeviceId("UDID-00000001");
-  const ok = provisioner.retryDevice(logicalId);
+  const ok = await provisioner.retryDevice(logicalId);
   assert.equal(ok, true);
   assert.equal(devices.get(logicalId).discoveryState, "provisioning");
   assert.equal(wdaProcessManager.starts[0].udid, "UDID-00000001");
 });
 
-test("retryDevice() on an unknown logical id returns false", () => {
+test("retryDevice() on an unknown logical id returns false", async () => {
   const { provisioner } = makeProvisioner();
-  assert.equal(provisioner.retryDevice("ios-does-not-exist"), false);
+  assert.equal(await provisioner.retryDevice("ios-does-not-exist"), false);
 });
 
 test("an iproxy stable event immediately verifies and restores end-to-end control", async () => {
@@ -504,7 +636,8 @@ test("manual WDA stop is idempotent, stops both processes, and persists across p
   await first.provisioner.pollOnce();
   const logicalId = discoveredDeviceId("UDID-00000001");
   assert.deepEqual(await first.provisioner.stopDevice(logicalId), {
-    enabled: false, state: "stopped", controlReady: false,
+    enabled: false, state: "stopped", wdaProcess: "stopped", iproxyProcess: "stopped",
+    endpointReady: false, controlReady: false,
   });
   await first.provisioner.stopDevice(logicalId);
   assert.equal(first.wdaProcessManager.stops.filter(id => id === "UDID-00000001").length, 1);
@@ -585,9 +718,63 @@ test("stop() tears down every managed process", async () => {
   const { provisioner, wdaProcessManager, iproxyManager, state } = makeProvisioner();
   state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
   await provisioner.pollOnce();
-  provisioner.stop();
+  await provisioner.stop();
   assert.ok(wdaProcessManager.stops.includes("UDID-00000001"));
   assert.ok(iproxyManager.stops.includes("UDID-00000001"));
+});
+
+test("stop fences an in-flight attach before it can start WDA or iproxy", async () => {
+  let release;
+  const allocationGate = new Promise(resolve => { release = resolve; });
+  const { provisioner, wdaProcessManager, iproxyManager, state } = makeProvisioner({
+    isPortAvailable: async () => { await allocationGate; return true; },
+  });
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  const poll = provisioner.pollOnce();
+  await new Promise(resolve => setImmediate(resolve));
+  const stopping = provisioner.stop();
+  release();
+  await Promise.all([poll, stopping]);
+  assert.equal(wdaProcessManager.starts.length, 0);
+  assert.equal(iproxyManager.starts.length, 0);
+  await provisioner.stop();
+  assert.equal(wdaProcessManager.starts.length, 0, "idempotent stop must not reopen provisioning");
+});
+
+test("restart waits for both stops, starts one pair, and reports readiness truthfully", async () => {
+  const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  const device = devices.get(logicalId);
+  device.checkReadiness = async () => {
+    device.readiness = { ...device.readiness, ready: true, state: "HEALTHY" };
+    device.setComponentHealth({ wdaEndpoint: "HEALTHY", control: "READY" });
+    return true;
+  };
+  wdaProcessManager.starts.length = 0;
+  iproxyManager.starts.length = 0;
+  let authorizations = 0;
+  const lifecycle = await provisioner.restartDevice(logicalId, { authorize: async () => { authorizations += 1; } });
+  assert.equal(authorizations, 2);
+  assert.equal(wdaProcessManager.starts.length, 1);
+  assert.equal(iproxyManager.starts.length, 1);
+  assert.equal(lifecycle.state, "ready");
+  assert.equal(lifecycle.controlReady, true);
+});
+
+test("restart failure stops partial replacements and reports a failed, disabled lifecycle", async () => {
+  const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  iproxyManager.start = () => { throw new Error("spawn failed"); };
+  await assert.rejects(provisioner.restartDevice(logicalId), /spawn failed/);
+  const lifecycle = provisioner.getLifecycleState(logicalId);
+  assert.equal(lifecycle.enabled, false);
+  assert.equal(lifecycle.controlReady, false);
+  assert.equal(devices.get(logicalId).componentHealth.recovery, "FAILED");
+  assert.ok(wdaProcessManager.stops.length >= 2, "the partially restarted WDA is stopped again");
 });
 
 test("each phone gets its own video port, forwarded next to the control port and given to WdaDevice", async () => {

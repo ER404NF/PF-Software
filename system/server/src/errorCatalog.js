@@ -109,6 +109,22 @@ const DEFINITIONS = {
     operatorAction: "Install or repair libusbmuxd/iproxy and ensure the application can execute it.",
     safeState: "Device control remains unavailable.", publicMessage: "The iproxy executable is missing or cannot be executed.",
   },
+  I209: {
+    name: "iproxy port update could not be saved", component: "iproxy",
+    sourceFile: "system/server/src/deviceProvisioner.js", sourceFunction: "_recoverOccupiedIproxyPorts",
+    severity: "error", retryable: true, automaticRecovery: "No replacement tunnel is started with an undurable mapping.",
+    operatorAction: "Check that Bodun can write its host configuration, then retry automatic setup.",
+    safeState: "Device control remains unavailable and the previous persisted mapping is retained.",
+    publicMessage: "The replacement forwarding ports could not be saved.",
+  },
+  I210: {
+    name: "iproxy process did not stop", component: "iproxy",
+    sourceFile: "system/server/src/deviceProvisioner.js", sourceFunction: "_recoverOccupiedIproxyPorts",
+    severity: "error", retryable: true, automaticRecovery: "A replacement is blocked until process exit is confirmed.",
+    operatorAction: "Quit Bodun completely, reopen it, and run Check control before retrying.",
+    safeState: "No replacement tunnel is started while the old process may still own its ports.",
+    publicMessage: "The previous USB forwarding process did not confirm that it exited.",
+  },
   R201: {
     name: "Automatic device recovery exhausted", component: "device-reconciler",
     sourceFile: "system/server/src/deviceProvisioner.js", sourceFunction: "_recoverEndpoint",

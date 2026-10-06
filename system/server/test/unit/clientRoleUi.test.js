@@ -223,12 +223,20 @@ test("WDA lifecycle and end-to-end control diagnostics are capability-gated", ()
   assert.match(app, /can\(UI_CAPABILITIES\.MANAGE_WDA_LIFECYCLE\) && d\.wdaLifecycle/);
   assert.match(app, /\/wda\/\$\{starting \? "start" : "stop"\}/);
   assert.match(app, /\/control-diagnostic/);
+  assert.match(app, /Restart WDA/);
+  assert.match(app, /\/wda\/restart/);
+  assert.match(app, /lifecycleLabels/);
   assert.match(app, /profileRequestActive\(generation, UI_CAPABILITIES\.MANAGE_WDA_LIFECYCLE\)/);
   assert.match(app, /function renderControlDiagnostic\(diagnostic\)/);
   assert.match(app, /Observed: \$\{check\.observed\}\. Expected: \$\{check\.expected\}\./);
   assert.match(app, /report\.open = true/);
   assert.match(app, /Copy sanitized report/);
   assert.match(app, /navigator\.clipboard\.writeText\(copyableReport\)/);
+});
+
+test("manual network enrollment is restored from the session-bound server summary, not browser-local memory", () => {
+  assert.match(app, /device\.networkEnrollment\?\.state === "pending"/);
+  assert.doesNotMatch(app, /enrollmentPendingDeviceIds/);
 });
 
 test("proxy tunnel routing controls are visible only through the server-issued routing:manage capability", () => {

@@ -52,3 +52,11 @@ test("start() rejects an MJPEG port that is invalid or equal to the control port
   assert.throws(() => manager.start({ udid: "udid-1", localPort: 8101, mjpegLocalPort: 8101 }), /mjpegLocalPort/);
   assert.throws(() => manager.start({ udid: "udid-1", localPort: 8101, mjpegLocalPort: 70000 }), /mjpegLocalPort/);
 });
+
+test("ownsMapping proves only this runtime's exact scoped control and video mapping", () => {
+  const manager = new IProxyManager({ spawn: () => fakeChild(), bin: "iproxy" });
+  manager.start({ udid: "udid-1", localPort: 8101, mjpegLocalPort: 9101 });
+  assert.equal(manager.ownsMapping("udid-1", { localPort: 8101, mjpegLocalPort: 9101 }), true);
+  assert.equal(manager.ownsMapping("udid-1", { localPort: 8102, mjpegLocalPort: 9101 }), false);
+  assert.equal(manager.ownsMapping("other", { localPort: 8101, mjpegLocalPort: 9101 }), false);
+});

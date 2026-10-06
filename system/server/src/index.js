@@ -418,7 +418,24 @@ const usbNetworkStorePath = process.env.USB_NETWORK_STORE_PATH || path.join(__di
 // in between) — a relay restart mid-enrollment just means starting over,
 // which is fine and matches the guide's own "stop for a human, never
 // guess" philosophy for this inherently manual step.
-const networkEnrollmentSnapshots = new Map(); // deviceId -> string[] (bridge members before)
+const networkEnrollmentSnapshots = new Map(); // deviceId -> session-bound pending enrollment
+const NETWORK_ENROLLMENT_TTL_MS = 5 * 60_000;
+function enrollmentFailure(res, code, error, extra = {}) {
+  return res.status(409).json({ error, code, state: "enrollment_failed", ...extra });
+}
+function enrollmentStateFor(deviceId, operator, sessionId) {
+  const pending = networkEnrollmentSnapshots.get(deviceId);
+  if (!pending) return { state: "required" };
+  const remainingMs = NETWORK_ENROLLMENT_TTL_MS - (Date.now() - pending.createdAt);
+  if (remainingMs <= 0) {
+    networkEnrollmentSnapshots.delete(deviceId);
+    return { state: "stale" };
+  }
+  if (!operator || pending.operatorUsername !== operator.username || pending.sessionId !== sessionId) {
+    return { state: "owned_by_other_session" };
+  }
+  return { state: "pending", expiresInMs: remainingMs };
+}
 // Same "cache in memory, refresh explicitly after mutation" convention as
 // proxyPoolCache above — summary() would otherwise do a synchronous disk
 // read per device per connected client on every device_list broadcast.
@@ -2239,6 +2256,8 @@ const summary = (d, viewer = null, viewerSocket = null) => {
     })(),
     usbNetwork: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? usbNetworkForDevice(d.id) : null,
     autoEnrollment: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? (autoNetworkEnrollment?.getStatus(d.id) ?? null) : null,
+    networkEnrollment: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING)
+      ? enrollmentStateFor(d.id, viewer, viewerSocket?.sessionId) : null,
     ...safeNetworkDetails,
   };
 };
@@ -2299,13 +2318,13 @@ app.post("/api/admin/devices/:deviceId/control-diagnostic",
 app.post("/api/admin/devices/:deviceId/wda/:action",
   requireCapability(CAPABILITIES.MANAGE_WDA_LIFECYCLE), async (req, res, next) => {
     try {
-      if (!new Set(["start", "stop"]).has(req.params.action)) return res.status(404).json({ error: "unknown WDA action" });
+      if (!new Set(["start", "stop", "restart"]).has(req.params.action)) return res.status(404).json({ error: "unknown WDA action" });
       if (!deviceProvisioner) return res.status(409).json({ error: "automatic device provisioning is not enabled on this relay" });
       if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
       let currentAtCommit = null;
       const authorizeMutation = async () => {
         const current = await authorizeWdaLifecycle(req);
-        if (req.params.action === "stop" && devices.get(req.params.deviceId)?.status === "in-use") {
+        if (["stop", "restart"].includes(req.params.action) && devices.get(req.params.deviceId)?.status === "in-use") {
           throw httpAuthorizationError("release this phone before stopping WDA control", 409);
         }
         currentAtCommit = current;
@@ -2313,7 +2332,9 @@ app.post("/api/admin/devices/:deviceId/wda/:action",
       };
       const lifecycle = req.params.action === "start"
         ? await deviceProvisioner.startDevice(req.params.deviceId, { authorize: authorizeMutation })
-        : await deviceProvisioner.stopDevice(req.params.deviceId, { authorize: authorizeMutation });
+        : req.params.action === "restart"
+          ? await deviceProvisioner.restartDevice(req.params.deviceId, { authorize: authorizeMutation })
+          : await deviceProvisioner.stopDevice(req.params.deviceId, { authorize: authorizeMutation });
       if (!lifecycle) return res.status(409).json({ error: "this device is not managed by automatic provisioning" });
       if (!currentAtCommit) throw new Error("WDA lifecycle mutation completed without commit authorization");
       logAuditBestEffort({ operator: currentAtCommit.username, type: `wda_${req.params.action}`,
@@ -2434,20 +2455,22 @@ registerNetworkCheckRoutes({
 // trust/developer-certificate prompt was just resolved on the phone) or
 // `provisioning_error` (WDA/iproxy exhausted its restart budget). No-op
 // route (409) when automatic provisioning isn't enabled on this relay.
-app.post("/api/admin/devices/:deviceId/retry-provisioning", requireCapability(CAPABILITIES.MANAGE_DEVICES), (req, res) => {
+app.post("/api/admin/devices/:deviceId/retry-provisioning", requireCapability(CAPABILITIES.MANAGE_DEVICES), async (req, res, next) => {
   if (!deviceProvisioner) return res.status(409).json({ error: "automatic device provisioning is not enabled on this relay" });
   if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
   if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
     return res.status(403).json({ error: "not authorized for this device" });
   }
-  const ok = deviceProvisioner.retryDevice(req.params.deviceId);
-  if (!ok) return res.status(409).json({ error: "this device is not currently managed by automatic provisioning" });
-  logAuditBestEffort({
-    operator: req.currentOperator.username,
-    type: "provisioning_retry",
-    deviceId: req.params.deviceId,
-  }, "Provisioning retry audit write");
-  res.json({ ok: true });
+  try {
+    const ok = await deviceProvisioner.retryDevice(req.params.deviceId);
+    if (!ok) return res.status(409).json({ error: "this device is not currently managed by automatic provisioning" });
+    logAuditBestEffort({
+      operator: req.currentOperator.username,
+      type: "provisioning_retry",
+      deviceId: req.params.deviceId,
+    }, "Provisioning retry audit write");
+    res.json({ ok: true });
+  } catch (error) { next(error); }
 });
 
 // Shared proxy pool (Phase B, Phone_Farm_Automation_Architecture.md §4.6):
@@ -2527,10 +2550,19 @@ app.post("/api/admin/devices/:deviceId/network-enrollment/start", requireCapabil
     return res.status(403).json({ error: "not authorized for this device" });
   }
   try {
+    const active = [...networkEnrollmentSnapshots.entries()].find(([, pending]) => Date.now() - pending.createdAt < NETWORK_ENROLLMENT_TTL_MS);
+    if (active && (active[0] !== req.params.deviceId
+      || active[1].sessionId !== req.sessionID
+      || active[1].operatorUsername !== req.currentOperator.username)) {
+      return enrollmentFailure(res, "ENROLLMENT_CONCURRENT", "Finish or wait for the pending phone enrollment before starting another one.");
+    }
     const before = await listBridgeMembers({ bridgeIface: networkRoutingOrchestrator.bridgeIface });
-    await authorizeRoutingMutation(req, req.params.deviceId);
-    networkEnrollmentSnapshots.set(req.params.deviceId, before);
-    res.json({ ok: true, before });
+    const current = await authorizeRoutingMutation(req, req.params.deviceId);
+    networkEnrollmentSnapshots.set(req.params.deviceId, {
+      before, operatorUsername: current.username, sessionId: req.sessionID, createdAt: Date.now(),
+    });
+    broadcastDeviceList();
+    res.json({ ok: true, enrollment: { state: "pending", expiresInMs: NETWORK_ENROLLMENT_TTL_MS } });
   } catch (error) {
     sendRoutingHttpFailure(res, error, { code: "N201" });
   }
@@ -2545,12 +2577,31 @@ app.post("/api/admin/devices/:deviceId/network-enrollment/confirm", requireCapab
   if (networkRoutingOrchestrator.getRoute(req.params.deviceId)) {
     return res.status(409).json({ error: "stop routing for this device before changing its network identity" });
   }
-  const before = networkEnrollmentSnapshots.get(req.params.deviceId);
-  if (!before) return res.status(409).json({ error: "call network-enrollment/start first, then enable Internet Sharing for this phone" });
+  const pending = networkEnrollmentSnapshots.get(req.params.deviceId);
+  if (!pending) {
+    const other = [...networkEnrollmentSnapshots.entries()].find(([, value]) => value.sessionId === req.sessionID
+      && value.operatorUsername === req.currentOperator.username && Date.now() - value.createdAt < NETWORK_ENROLLMENT_TTL_MS);
+    return other
+      ? enrollmentFailure(res, "ENROLLMENT_WRONG_DEVICE", "This session started enrollment for a different phone.")
+      : enrollmentFailure(res, "ENROLLMENT_MISSING", "Start network enrollment for this phone first.");
+  }
+  if (Date.now() - pending.createdAt >= NETWORK_ENROLLMENT_TTL_MS) {
+    networkEnrollmentSnapshots.delete(req.params.deviceId);
+    return enrollmentFailure(res, "ENROLLMENT_STALE", "The enrollment snapshot expired. Start enrollment again.");
+  }
+  if (pending.operatorUsername !== req.currentOperator.username) {
+    return enrollmentFailure(res, "ENROLLMENT_OWNER_MISMATCH", "Only the operator that started this enrollment can confirm it.");
+  }
+  if (pending.sessionId !== req.sessionID) {
+    return enrollmentFailure(res, "ENROLLMENT_WRONG_SESSION", "Confirm enrollment from the same signed-in session that started it.");
+  }
   try {
     const after = await listBridgeMembers({ bridgeIface: networkRoutingOrchestrator.bridgeIface });
-    const diff = diffBridgeMembers(before, after);
-    if (diff.state !== "assigned") return res.status(409).json({ error: diff.reason, newMembers: diff.newMembers });
+    const diff = diffBridgeMembers(pending.before, after);
+    if (diff.state !== "assigned") {
+      const code = diff.newMembers?.length > 1 ? "ENROLLMENT_MULTIPLE_CHANGES" : "ENROLLMENT_NO_CHANGE";
+      return enrollmentFailure(res, code, diff.reason, { newMemberCount: diff.newMembers?.length ?? 0 });
+    }
     const currentAtCommit = await authorizeRoutingMutation(req, req.params.deviceId);
     const record = setUsbIface(usbNetworkStorePath, req.params.deviceId, diff.iface);
     refreshUsbNetworkCache(req.params.deviceId);
@@ -4587,13 +4638,15 @@ if (isMain) {
   }
 }
 
-server.on("close", () => {
+let runtimeCleanupPromise = null;
+function cleanupRuntime() {
+  if (runtimeCleanupPromise) return runtimeCleanupPromise;
   streamHub.closeAll();
   siteLinkHub.closeAll();
   clearInterval(heartbeatTimer);
   if (queueTickTimer) clearInterval(queueTickTimer);
   if (wdaReadinessTimer) clearInterval(wdaReadinessTimer);
-  void (async () => {
+  runtimeCleanupPromise = (async () => {
     autoNetworkEnrollment?.stop();
     networkRoutingOrchestrator?.stopHealthChecks();
     await researchTaskRunner.stop();
@@ -4604,7 +4657,30 @@ server.on("close", () => {
     await deviceProvisioner?.stop();
     await applicationDatabasePool?.end();
   })().catch(error => logOperationalFailure("Server shutdown cleanup failed", error));
+  return runtimeCleanupPromise;
+}
+
+server.on("close", () => {
+  void cleanupRuntime();
 });
+
+if (isMain) {
+  let signalShutdownStarted = false;
+  const handleSignal = () => {
+    if (signalShutdownStarted) return;
+    signalShutdownStarted = true;
+    const forceExit = setTimeout(() => process.exit(1), 12_000);
+    forceExit.unref?.();
+    server.close(() => {
+      void cleanupRuntime().finally(() => {
+        clearTimeout(forceExit);
+        process.exit(0);
+      });
+    });
+  };
+  process.once("SIGTERM", handleSignal);
+  process.once("SIGINT", handleSignal);
+}
 
 export {
   app,
