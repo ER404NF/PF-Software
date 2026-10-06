@@ -33,7 +33,7 @@ Implemented now:
   and for the WebSocket connection itself;
 - per-operator device authorization (an operator only reaches the devices
   they're allowed to — enforced server-side, not just hidden in the UI);
-- five explicit operator roles mapped to server-side capabilities, layered on
+- seven explicit operator roles mapped to server-side capabilities, layered on
   top of separate device and workspace authorization;
 - authenticated live staff presence and a persistent People roster, with
   multi-tab/session aggregation and safe current-phone activity only;
@@ -132,7 +132,7 @@ node server/scripts/create-operator.js admin1 <password> --role=admin
 `role` and `allowedDevices` answer different questions and are enforced
 separately:
 
-- `role` accepts `admin`, `manager`, `va`, `content_creator`, or `editor`.
+- `role` accepts `host`, `admin`, `special_manager`, `manager`, `va`, `content_creator`, or `editor`.
   Each maps to explicit capabilities documented in
   `../docs/ROLE_CAPABILITY_MATRIX.md`; missing or unknown roles safely
   normalize to `va`.
@@ -151,6 +151,11 @@ separately:
   server-filtered to the same team and to VA, Content Creator, and Editor
   roles. Managers can review applications and rename those members. Admin
   remains the authority for assigning teams, roles, and grants.
+- A Special Manager has the ordinary Manager surface plus the narrowly scoped
+  `wda:lifecycle` capability. Only a Host can assign this rank. Host and Special
+  Manager can stop/start an automatically managed phone's WDA plus its scoped
+  iproxy tunnel and run an end-to-end control readiness check. Admin and ordinary
+  Manager deliberately cannot perform that disruptive lifecycle action.
 
 ### Signup, approval, 2FA, and recovery
 
@@ -358,7 +363,9 @@ UDID:
   bounded restart/backoff;
 - registers the device into the live fleet immediately, in the existing
   `offline` state, with `discoveryState: "provisioning"` — the **existing**
-  10-second WDA-readiness loop above is what actually flips it to `idle`
+  readiness verification flips it to `idle`. The periodic 10-second sweep remains
+  a safety net; an iproxy recovery now triggers an immediate coalesced check so a
+  healthy phone does not remain stuck behind a stale recovery banner.
   once `/status` reports ready; provisioning never polls `/status` itself.
 
 A device whose WDA process exits with a recognized manual-prerequisite

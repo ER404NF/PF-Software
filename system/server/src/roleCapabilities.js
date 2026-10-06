@@ -4,6 +4,7 @@
 export const OPERATOR_ROLES = Object.freeze({
   HOST: "host",
   ADMIN: "admin",
+  SPECIAL_MANAGER: "special_manager",
   MANAGER: "manager",
   VA: "va",
   CONTENT_CREATOR: "content_creator",
@@ -34,6 +35,7 @@ export const CAPABILITIES = Object.freeze({
   VIEW_PROXY_POOL: "proxy:view-pool",
   ASSIGN_PROXY: "proxy:assign",
   MANAGE_DEVICES: "device:provision",
+  MANAGE_WDA_LIFECYCLE: "wda:lifecycle",
   MANAGE_ROUTING: "routing:manage",
   MANAGE_SECURITY: "security:manage",
   MONITOR_DEVICE: "device:monitor",
@@ -55,7 +57,28 @@ export const ROLE_CAPABILITIES = Object.freeze({
   // as admin — the distinction between them is about role-assignment ceilings
   // and multi-hub ownership, not which app features are reachable.
   [OPERATOR_ROLES.HOST]: Object.freeze(Object.values(CAPABILITIES)),
-  [OPERATOR_ROLES.ADMIN]: Object.freeze(Object.values(CAPABILITIES)),
+  // WDA lifecycle control can interrupt a physical phone. It is deliberately
+  // narrower than ordinary administration: only the host and the explicitly
+  // promoted special-manager rank receive it.
+  [OPERATOR_ROLES.ADMIN]: Object.freeze(Object.values(CAPABILITIES)
+    .filter(capability => capability !== CAPABILITIES.MANAGE_WDA_LIFECYCLE)),
+  [OPERATOR_ROLES.SPECIAL_MANAGER]: Object.freeze([
+    ...lowerOperational,
+    CAPABILITIES.CONTROL_DEVICE,
+    CAPABILITIES.ACCESS_MEDIA,
+    CAPABILITIES.VIEW_RESEARCH,
+    CAPABILITIES.OPERATE_RESEARCH,
+    CAPABILITIES.REVIEW_RESEARCH,
+    CAPABILITIES.MANAGE_ASSIGNMENTS,
+    CAPABILITIES.MANAGE_QUEUE,
+    CAPABILITIES.RUN_NETWORK_CHECK,
+    CAPABILITIES.MONITOR_DEVICE,
+    CAPABILITIES.APPROVE_ACTIONS,
+    CAPABILITIES.MANAGE_TEAM_MEMBERS,
+    CAPABILITIES.VIEW_PROXY_POOL,
+    CAPABILITIES.ASSIGN_PROXY,
+    CAPABILITIES.MANAGE_WDA_LIFECYCLE,
+  ]),
   [OPERATOR_ROLES.MANAGER]: Object.freeze([
     ...lowerOperational,
     CAPABILITIES.CONTROL_DEVICE,

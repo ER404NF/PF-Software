@@ -149,6 +149,7 @@ const requestedApplicationVersion = String(process.env.PHONE_FARM_APP_VERSION ||
 const applicationVersion = /^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$/.test(requestedApplicationVersion)
   ? requestedApplicationVersion
   : packageVersion;
+const applicationChannel = process.env.PHONE_FARM_APP_CHANNEL === "demo" ? "demo" : null;
 const configPath = process.env.DEVICE_CONFIG_PATH || path.join(__dirname, "../../devices.config.json");
 const rawDeviceConfig = loadDeviceConfig({ env: process.env, defaultPath: configPath });
 const discoveredIosDevices = process.env.AUTO_DISCOVER_IOS_DEVICES === "false" ? [] : discoverIosDevices();
@@ -214,7 +215,12 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
   crossOriginResourcePolicy: false,
 }));
-app.get("/api/app-info", (_req, res) => res.json({ name: "Bodun", version: applicationVersion }));
+app.get("/api/app-info", (_req, res) => res.json({
+  name: "Bodun",
+  version: applicationVersion,
+  channel: applicationChannel,
+  displayVersion: `${applicationVersion}${applicationChannel ? ` (${applicationChannel})` : ""}`,
+}));
 app.use(express.static(clientDir));
 registerHealthRoutes({ app, databasePool: applicationDatabasePool, checkDatabaseHealth });
 registerMetricsRoutes({ app, httpMetrics, bearerToken: process.env.METRICS_BEARER_TOKEN || null });
@@ -1415,7 +1421,7 @@ app.get("/api/admin/users", requireAnyCapability(CAPABILITIES.MANAGE_USERS, CAPA
         && !(user.role === OPERATOR_ROLES.ADMIN && user.active !== false
           && (user.accountStatus ?? "approved") === "approved" && activeAdminCount === 1),
       actionReason: user.username === current.username
-        ? current.role === OPERATOR_ROLES.MANAGER
+        ? [OPERATOR_ROLES.MANAGER, OPERATOR_ROLES.SPECIAL_MANAGER].includes(current.role)
           ? "You cannot rename or review the account you are currently using."
           : "You cannot reject the account you are currently using."
         : user.role === OPERATOR_ROLES.ADMIN && user.active !== false
@@ -1437,7 +1443,8 @@ app.patch("/api/admin/users/:username/status", requireAnyCapability(CAPABILITIES
     if (!canManagePerson(req.currentOperator, req.params.username)) {
       return res.status(403).json({ error: "not authorized to review this account" });
     }
-    if (req.currentOperator.role === OPERATOR_ROLES.MANAGER && req.params.username === req.currentOperator.username) {
+    if ([OPERATOR_ROLES.MANAGER, OPERATOR_ROLES.SPECIAL_MANAGER].includes(req.currentOperator.role)
+      && req.params.username === req.currentOperator.username) {
       return res.status(403).json({ error: "a manager cannot review their own account" });
     }
     if ((req.body?.status === "rejected" || req.body?.status === "banned")
@@ -1564,7 +1571,8 @@ app.patch("/api/admin/users/:username/rename", requireAnyCapability(CAPABILITIES
     if (!canManagePerson(req.currentOperator, previousUsername)) {
       return res.status(403).json({ error: "not authorized to rename this account" });
     }
-    if (req.currentOperator.role === OPERATOR_ROLES.MANAGER && previousUsername === req.currentOperator.username) {
+    if ([OPERATOR_ROLES.MANAGER, OPERATOR_ROLES.SPECIAL_MANAGER].includes(req.currentOperator.role)
+      && previousUsername === req.currentOperator.username) {
       return res.status(403).json({ error: "a manager cannot rename their own account" });
     }
     assertValidUsername(nextUsername);
@@ -1572,7 +1580,8 @@ app.patch("/api/admin/users/:username/rename", requireAnyCapability(CAPABILITIES
     const authorizeRenameCommit = async () => {
       const current = await authorizeCurrentPersonManager(req, previousUsername,
         [CAPABILITIES.MANAGE_USERS, CAPABILITIES.MANAGE_TEAM_MEMBERS]);
-      if (current.role === OPERATOR_ROLES.MANAGER && previousUsername === current.username) {
+      if ([OPERATOR_ROLES.MANAGER, OPERATOR_ROLES.SPECIAL_MANAGER].includes(current.role)
+        && previousUsername === current.username) {
         throw httpAuthorizationError("a manager cannot rename their own account");
       }
       return current;
@@ -1883,7 +1892,7 @@ function canManagePerson(operator, username) {
   // everyone except a host account, mirroring how an admin can never be
   // demoted/removed by anyone but another admin-or-higher today.
   if (operator.role === OPERATOR_ROLES.ADMIN) return target.role !== OPERATOR_ROLES.HOST;
-  return operator.role === OPERATOR_ROLES.MANAGER
+  return [OPERATOR_ROLES.MANAGER, OPERATOR_ROLES.SPECIAL_MANAGER].includes(operator.role)
     && Boolean(operator.teamId)
     && target.teamId === operator.teamId
     && (username === operator.username || MANAGER_ASSIGNABLE_ROLES.has(target.role));
@@ -1899,7 +1908,9 @@ function canManagePerson(operator, username) {
 const ADMIN_ASSIGNABLE_ROLES = new Set([
   OPERATOR_ROLES.VA, OPERATOR_ROLES.CONTENT_CREATOR, OPERATOR_ROLES.EDITOR, OPERATOR_ROLES.MANAGER,
 ]);
-const HOST_ASSIGNABLE_ROLES = new Set([...ADMIN_ASSIGNABLE_ROLES, OPERATOR_ROLES.ADMIN]);
+const HOST_ASSIGNABLE_ROLES = new Set([
+  ...ADMIN_ASSIGNABLE_ROLES, OPERATOR_ROLES.SPECIAL_MANAGER, OPERATOR_ROLES.ADMIN,
+]);
 const MAIN_HOST_ASSIGNABLE_ROLES = new Set([...HOST_ASSIGNABLE_ROLES, OPERATOR_ROLES.HOST]);
 function maxAssignableRoles(operator) {
   if (operator.role === OPERATOR_ROLES.HOST) {
@@ -2056,6 +2067,10 @@ function deviceOpenDecision(d, viewer, viewerSocket = null) {
   if (d.discoveryState === "provisioning") {
     return { assignedToViewer: true, canOpen: false, accessState: "wda_provisioning", openReason: d.discoveryStateMessage || "Setting up WDA and the device tunnel automatically." };
   }
+  if (d.discoveryState === "wda_stopped") {
+    return { assignedToViewer: true, canOpen: false, accessState: "wda_stopped",
+      openReason: d.discoveryStateMessage || "WDA control is stopped by an authorized operator." };
+  }
   if (d.discoveryState === "user_action_required") {
     return { assignedToViewer: true, canOpen: false, accessState: "wda_user_action_required", openReason: d.discoveryStateMessage || "This phone needs a manual action before it can come online." };
   }
@@ -2133,7 +2148,8 @@ function deviceWatchDecision(d, viewer, viewerSocket = null) {
   if (owner.role !== OPERATOR_ROLES.VA) {
     return { canWatch: false, watchState: "operator_not_va", watchReason: "The active operator is not a VA." };
   }
-  if (viewer.role === OPERATOR_ROLES.MANAGER && !canManagePerson(viewer, owner.username)) {
+  if ([OPERATOR_ROLES.MANAGER, OPERATOR_ROLES.SPECIAL_MANAGER].includes(viewer.role)
+    && !canManagePerson(viewer, owner.username)) {
     return { canWatch: false, watchState: "outside_team", watchReason: "This VA is outside your team." };
   }
   return { canWatch: true, watchState: "va_active", watchReason: `Watch ${owner.username}'s read-only live screen.` };
@@ -2145,7 +2161,8 @@ const summary = (d, viewer = null, viewerSocket = null) => {
   const mayManageAccess = hasCapability(viewer, CAPABILITIES.MANAGE_ACCESS);
   const mayAccessMedia = Boolean(viewer && hasCapability(viewer, CAPABILITIES.ACCESS_MEDIA)
     && canAccessDevice(viewer, d.id));
-  const mayViewDiagnostics = hasCapability(viewer, CAPABILITIES.MANAGE_DEVICES);
+  const mayViewDiagnostics = hasCapability(viewer, CAPABILITIES.MANAGE_DEVICES)
+    || hasCapability(viewer, CAPABILITIES.MANAGE_WDA_LIFECYCLE);
   const healthDetails = typeof d.healthSnapshot === "function" ? d.healthSnapshot() : null;
   const networkDetails = networkVerifier.getStatus(d.id);
   const safeNetworkDetails = mayViewDiagnostics ? networkDetails : {
@@ -2181,6 +2198,8 @@ const summary = (d, viewer = null, viewerSocket = null) => {
       latestError: null,
       recentEvents: [],
     } : null,
+    wdaLifecycle: hasCapability(viewer, CAPABILITIES.MANAGE_WDA_LIFECYCLE)
+      ? deviceProvisioner?.getLifecycleState(d.id) ?? null : null,
     controllerMode: deviceLease.getMode(d.id),
     currentOperator: humanOwners.get(d.id)?.operatorUsername ?? null,
     ...deviceOpenDecision(d, viewer, viewerSocket),
@@ -2250,6 +2269,59 @@ app.get("/api/admin/devices/:deviceId/diagnostics", requireCapability(CAPABILITI
     network: networkVerifier.getStatus(device.id),
   });
 });
+
+async function authorizeWdaLifecycle(req) {
+  const current = await authorizeCurrentOperator(req, [CAPABILITIES.MANAGE_WDA_LIFECYCLE]);
+  if (!canAccessDevice(current, req.params.deviceId)) {
+    throw httpAuthorizationError("not authorized for this device");
+  }
+  return current;
+}
+
+app.post("/api/admin/devices/:deviceId/control-diagnostic",
+  requireCapability(CAPABILITIES.MANAGE_WDA_LIFECYCLE), async (req, res, next) => {
+    try {
+      if (!deviceProvisioner) return res.status(409).json({ error: "automatic device provisioning is not enabled on this relay" });
+      if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
+      await authorizeWdaLifecycle(req);
+      const diagnostic = await deviceProvisioner.diagnoseDevice(req.params.deviceId, {
+        authorize: () => authorizeWdaLifecycle(req),
+      });
+      const current = await authorizeWdaLifecycle(req);
+      if (!diagnostic) return res.status(409).json({ error: "this device is not managed by automatic provisioning" });
+      logAuditBestEffort({ operator: current.username, type: "wda_control_diagnostic", deviceId: req.params.deviceId,
+        detail: { readinessPassed: diagnostic.readinessPassed, readinessChecked: diagnostic.readinessChecked } },
+      "WDA control diagnostic audit write");
+      res.json({ diagnostic });
+    } catch (error) { next(error); }
+  });
+
+app.post("/api/admin/devices/:deviceId/wda/:action",
+  requireCapability(CAPABILITIES.MANAGE_WDA_LIFECYCLE), async (req, res, next) => {
+    try {
+      if (!new Set(["start", "stop"]).has(req.params.action)) return res.status(404).json({ error: "unknown WDA action" });
+      if (!deviceProvisioner) return res.status(409).json({ error: "automatic device provisioning is not enabled on this relay" });
+      if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
+      let currentAtCommit = null;
+      const authorizeMutation = async () => {
+        const current = await authorizeWdaLifecycle(req);
+        if (req.params.action === "stop" && devices.get(req.params.deviceId)?.status === "in-use") {
+          throw httpAuthorizationError("release this phone before stopping WDA control", 409);
+        }
+        currentAtCommit = current;
+        return current;
+      };
+      const lifecycle = req.params.action === "start"
+        ? await deviceProvisioner.startDevice(req.params.deviceId, { authorize: authorizeMutation })
+        : await deviceProvisioner.stopDevice(req.params.deviceId, { authorize: authorizeMutation });
+      if (!lifecycle) return res.status(409).json({ error: "this device is not managed by automatic provisioning" });
+      if (!currentAtCommit) throw new Error("WDA lifecycle mutation completed without commit authorization");
+      logAuditBestEffort({ operator: currentAtCommit.username, type: `wda_${req.params.action}`,
+        deviceId: req.params.deviceId }, `WDA ${req.params.action} audit write`);
+      broadcastDeviceList();
+      res.json({ ok: true, lifecycle });
+    } catch (error) { next(error); }
+  });
 
 // Stamps a device-scoped audit event's detail with which network egress the
 // device was assigned to at the time — CLAUDE.md §8's "account/device
@@ -2853,7 +2925,7 @@ function taskAccessError(taskId, operator) {
   if (!task) return "unknown task";
   if (operator.role !== OPERATOR_ROLES.ADMIN && task.createdBy !== operator.username) {
     const creator = backgroundAuthorization.operatorForUsername(task.createdBy);
-    if (operator.role !== OPERATOR_ROLES.MANAGER || !operator.teamId
+    if (![OPERATOR_ROLES.MANAGER, OPERATOR_ROLES.SPECIAL_MANAGER].includes(operator.role) || !operator.teamId
       || !creator?.teamId || creator.teamId !== operator.teamId) {
       return "not authorized for that task's team";
     }

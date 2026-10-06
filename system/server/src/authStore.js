@@ -464,7 +464,9 @@ export function createOperatorAccount(input) {
   const fullName = input?.fullName == null ? null : validateFullName(input.fullName);
   const email = input?.email == null ? null : normalizeGmail(input.email);
   const teamId = validateTeamId(input?.teamId);
-  if (role === OPERATOR_ROLES.MANAGER && !teamId) throw accountError("manager accounts require a teamId");
+  if ([OPERATOR_ROLES.MANAGER, OPERATOR_ROLES.SPECIAL_MANAGER].includes(role) && !teamId) {
+    throw accountError("manager accounts require a teamId");
+  }
 
   const raw = readConfig();
   if (raw.operators.some(operator => operator?.username === username)) throw accountError("username already exists", 409);
@@ -523,7 +525,7 @@ export function updateOperatorAccount(username, patch) {
   }
   if (Object.hasOwn(patch, "teamId")) next.teamId = validateTeamId(patch.teamId);
 
-  if (normalizeRole(next.role) === OPERATOR_ROLES.MANAGER && !next.teamId) {
+  if ([OPERATOR_ROLES.MANAGER, OPERATOR_ROLES.SPECIAL_MANAGER].includes(normalizeRole(next.role)) && !next.teamId) {
     throw accountError("manager accounts require a teamId");
   }
 

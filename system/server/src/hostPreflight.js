@@ -72,7 +72,11 @@ export function runHostPreflight({
   record("ideviceinfo", binaryAvailable(execFile, ideviceInfoBin, ["--version"]),
     "ideviceinfo not found. Install libimobiledevice: brew install libimobiledevice");
 
-  record("iproxy", binaryAvailable(execFile, iproxyBin, []),
+  // `iproxy` exits with a usage error when invoked without a mapping. That
+  // probe is harmless, but it produces the same message as a malformed tunnel
+  // launch and makes the host log look like provisioning failed. Ask for the
+  // version instead so the availability check is quiet and unambiguous.
+  record("iproxy", binaryAvailable(execFile, iproxyBin, ["--version"]),
     `${iproxyBin} not found. Install libusbmuxd: brew install libusbmuxd`);
 
   if (typeof wdaRepoPath !== "string" || !wdaRepoPath) {

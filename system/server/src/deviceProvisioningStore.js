@@ -53,6 +53,7 @@ export function upsertProvisioningRecord(storePath, udid, patch = {}) {
     wdaLocalPort: patch.wdaLocalPort ?? existing?.wdaLocalPort ?? null,
     mjpegLocalPort: patch.mjpegLocalPort ?? existing?.mjpegLocalPort ?? null,
     derivedDataPath: patch.derivedDataPath ?? existing?.derivedDataPath ?? null,
+    wdaEnabled: typeof patch.wdaEnabled === "boolean" ? patch.wdaEnabled : existing?.wdaEnabled ?? true,
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   };

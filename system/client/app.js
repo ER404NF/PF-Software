@@ -35,8 +35,9 @@ async function loadAppIdentity() {
     const response = await fetch("/api/app-info", { headers: { Accept: "application/json" } });
     if (!response.ok) throw new Error("version unavailable");
     const body = await response.json();
-    appVersionEl.textContent = `v${body.version}`;
-    appVersionEl.title = `${body.name} ${body.version}`;
+    const displayVersion = body.displayVersion || body.version;
+    appVersionEl.textContent = `v${displayVersion}`;
+    appVersionEl.title = `${body.name} ${displayVersion}`;
   } catch {
     appVersionEl.textContent = "Version unavailable";
   }
@@ -213,6 +214,7 @@ let operatorProfileGeneration = 0;
 const ROLE_LABELS = Object.freeze({
   host: "Host",
   admin: "Admin",
+  special_manager: "Special Manager",
   manager: "Manager",
   va: "VA",
   content_creator: "Content Creator",
@@ -327,6 +329,7 @@ const UI_CAPABILITIES = Object.freeze({
   VIEW_PROXY_POOL: "proxy:view-pool",
   ASSIGN_PROXY: "proxy:assign",
   MANAGE_DEVICES: "device:provision",
+  MANAGE_WDA_LIFECYCLE: "wda:lifecycle",
   MANAGE_ROUTING: "routing:manage",
   RUN_NETWORK_CHECK: "network-health:verify",
   MONITOR_DEVICE: "device:monitor",
@@ -1724,6 +1727,163 @@ function buildRetryProvisioningButton(device) {
   return button;
 }
 
+function buildWdaLifecyclePanel(device) {
+  const panel = document.createElement("div");
+  panel.className = "wda-lifecycle-panel";
+  const copy = document.createElement("div");
+  copy.className = "wda-lifecycle-copy";
+  const title = document.createElement("strong");
+  title.textContent = "Device control service";
+  const state = document.createElement("span");
+  state.textContent = device.wdaLifecycle?.enabled === false ? "Stopped" : "Running";
+  copy.append(title, state);
+
+  const actions = document.createElement("div");
+  actions.className = "wda-lifecycle-actions";
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  const starting = device.wdaLifecycle?.enabled === false;
+  toggle.textContent = starting ? "Start WDA" : "Stop WDA";
+  toggle.className = starting ? "wda-start-button" : "wda-stop-button";
+  toggle.title = starting
+    ? "Start WebDriverAgent and its device-scoped USB tunnel, then verify control readiness."
+    : "Stop WebDriverAgent and its device-scoped USB tunnel. Release the phone first if it is in use.";
+
+  const diagnose = document.createElement("button");
+  diagnose.type = "button";
+  diagnose.textContent = "Check control";
+  diagnose.className = "wda-diagnostic-button";
+  const result = document.createElement("span");
+  result.className = "wda-lifecycle-result";
+  result.setAttribute("role", "status");
+  result.setAttribute("aria-live", "polite");
+  const report = document.createElement("details");
+  report.className = "wda-diagnostic-report";
+  report.hidden = true;
+  const reportSummary = document.createElement("summary");
+  reportSummary.textContent = "Control diagnostic report";
+  const reportBody = document.createElement("div");
+  reportBody.className = "wda-diagnostic-report-body";
+  report.append(reportSummary, reportBody);
+  let copyableReport = "";
+
+  function renderControlDiagnostic(diagnostic) {
+    reportBody.replaceChildren();
+    const headline = document.createElement("p");
+    headline.className = "wda-diagnostic-headline";
+    headline.textContent = diagnostic?.report?.summary || "The control diagnostic did not return a report.";
+    reportBody.appendChild(headline);
+    for (const check of diagnostic?.report?.checks || []) {
+      const row = document.createElement("section");
+      row.className = `wda-diagnostic-check ${check.status}`;
+      const heading = document.createElement("strong");
+      heading.textContent = `${check.status === "pass" ? "Pass" : check.status === "wait" ? "Waiting" : check.status === "blocked" ? "Blocked" : "Failed"}: ${check.label}`;
+      const values = document.createElement("p");
+      values.textContent = `Observed: ${check.observed}. Expected: ${check.expected}.`;
+      const meaning = document.createElement("p");
+      meaning.textContent = check.meaning;
+      const action = document.createElement("p");
+      action.textContent = `Next action: ${check.action}`;
+      row.append(heading, values, meaning, action);
+      reportBody.appendChild(row);
+    }
+    const parameters = diagnostic?.report?.parameters;
+    if (parameters) {
+      const parameterText = document.createElement("p");
+      parameterText.className = "wda-diagnostic-parameters";
+      parameterText.textContent = `Parameters: local forwarding port ${parameters.localForwardingPort}; readiness timeout ${parameters.readinessTimeoutMs} ms; consecutive failures ${parameters.consecutiveReadinessFailures}; recovery ${parameters.recoveryState}.`;
+      reportBody.appendChild(parameterText);
+    }
+    const timeline = diagnostic?.report?.timeline || [];
+    if (timeline.length) {
+      const timelineTitle = document.createElement("strong");
+      timelineTitle.textContent = "Recent control timeline";
+      const timelineList = document.createElement("ol");
+      timelineList.className = "wda-diagnostic-timeline";
+      for (const event of timeline) {
+        const item = document.createElement("li");
+        item.textContent = `${event.at || "Unknown time"}: ${String(event.type || "UNKNOWN").replaceAll("_", " ")}`;
+        timelineList.appendChild(item);
+      }
+      reportBody.append(timelineTitle, timelineList);
+    }
+    copyableReport = [diagnostic?.report?.summary,
+      ...(diagnostic?.report?.checks || []).map(check => `${check.status.toUpperCase()} | ${check.label} | observed: ${check.observed} | expected: ${check.expected} | ${check.meaning} | next: ${check.action}`),
+      parameters ? `PARAMETERS | port ${parameters.localForwardingPort} | timeout ${parameters.readinessTimeoutMs} ms | failures ${parameters.consecutiveReadinessFailures} | recovery ${parameters.recoveryState}` : "",
+      ...timeline.map(event => `EVENT | ${event.at || "unknown"} | ${event.type || "UNKNOWN"}`),
+    ].filter(Boolean).join("\n");
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "wda-copy-diagnostic-button";
+    copy.textContent = "Copy sanitized report";
+    copy.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(copyableReport);
+        result.textContent = "Sanitized control report copied.";
+      } catch {
+        result.textContent = "The report could not be copied. Clipboard access is unavailable.";
+      }
+    });
+    reportBody.appendChild(copy);
+    report.hidden = false;
+    report.open = true;
+  }
+
+  toggle.addEventListener("click", async () => {
+    const generation = operatorProfileGeneration;
+    toggle.disabled = true;
+    diagnose.disabled = true;
+    result.textContent = `${starting ? "Starting" : "Stopping"} WDA…`;
+    try {
+      await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/wda/${starting ? "start" : "stop"}`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      }, { timeoutMs: 20_000, uncertain: true });
+      if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) return;
+      result.textContent = starting
+        ? "WDA is starting. Control will unlock after the readiness check passes."
+        : "WDA control stopped.";
+    } catch (error) {
+      if (profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) result.textContent = error.message;
+    } finally {
+      if (profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) {
+        toggle.disabled = false;
+        diagnose.disabled = false;
+      }
+    }
+  });
+
+  diagnose.addEventListener("click", async () => {
+    const generation = operatorProfileGeneration;
+    diagnose.disabled = true;
+    toggle.disabled = true;
+    result.textContent = "Checking WDA, USB tunnel, and control endpoint…";
+    try {
+      const { body } = await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/control-diagnostic`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      }, { timeoutMs: 20_000 });
+      if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) return;
+      const diagnostic = body?.diagnostic;
+      renderControlDiagnostic(diagnostic);
+      result.textContent = diagnostic?.readinessPassed
+        ? "Control path ready: WDA and iproxy responded end to end."
+        : diagnostic?.lifecycle?.enabled === false
+          ? "Control is intentionally stopped. Start WDA to continue."
+          : "Control is not ready. Open device diagnostics for the failing layer.";
+    } catch (error) {
+      if (profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) result.textContent = error.message;
+    } finally {
+      if (profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) {
+        diagnose.disabled = false;
+        toggle.disabled = false;
+      }
+    }
+  });
+
+  actions.append(toggle, diagnose);
+  panel.append(copy, actions, result, report);
+  return panel;
+}
+
 // Phase B assignment control on the fleet card ("the hover button on each
 // phone should let admins/managers choose the proxies"). A <select> rather
 // than a literal CSS-hover popover — same information, keyboard-accessible,
@@ -2034,6 +2194,12 @@ function phoneStatePresentation(device) {
       ? "This phone is being set up automatically. Try again shortly."
       : device.discoveryStateMessage || "Setting up WDA and the device tunnel automatically.",
   };
+  if (device.accessState === "wda_stopped") return {
+    label: "WDA stopped",
+    message: can(UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)
+      ? "WDA control is stopped. Use Start WDA below when you are ready."
+      : "WDA control was stopped by an authorized operator.",
+  };
   if (device.accessState === "wda_user_action_required") return {
     label: "Needs action on phone",
     message: role === "va"
@@ -2318,6 +2484,9 @@ function renderDeviceCard(d, task, lastAction) {
   if (can(UI_CAPABILITIES.MANAGE_DEVICES)
     && (d.accessState === "wda_user_action_required" || d.accessState === "wda_provisioning_error")) {
     tools.appendChild(buildRetryProvisioningButton(d));
+  }
+  if (can(UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE) && d.wdaLifecycle) {
+    tools.appendChild(buildWdaLifecyclePanel(d));
   }
   if (can(UI_CAPABILITIES.ASSIGN_PROXY)) {
     tools.appendChild(buildProxyPoolPicker(d));
@@ -3186,13 +3355,23 @@ const BASE_USER_ROLES = Object.freeze([
 // maxAssignableRoles. Every other viewer, including a non-main host or a
 // plain admin, never sees it as an assignable option at all.
 function assignableUserRoles() {
-  return currentOperator?.isMainHost ? [...BASE_USER_ROLES, ["host", "Host"]] : BASE_USER_ROLES;
+  const roles = currentOperator?.role === "host"
+    ? [...BASE_USER_ROLES.slice(0, -1), ["special_manager", "Special Manager"], BASE_USER_ROLES.at(-1)]
+    : BASE_USER_ROLES;
+  return currentOperator?.isMainHost ? [...roles, ["host", "Host"]] : roles;
 }
 
 // The create-user form's role <select> is static HTML (index.html), unlike
 // roleSelect() below which builds a fresh one per user row — keep its
 // "Host" option in sync with the signed-in operator on every profile change.
 function syncCreateUserRoleOptions() {
+  const hasSpecialManagerOption = [...userCreateRoleEl.options].some(option => option.value === "special_manager");
+  if (currentOperator?.role === "host" && !hasSpecialManagerOption) {
+    const adminIndex = [...userCreateRoleEl.options].findIndex(option => option.value === "admin");
+    userCreateRoleEl.add(new Option("Special Manager", "special_manager"), adminIndex);
+  } else if (currentOperator?.role !== "host" && hasSpecialManagerOption) {
+    userCreateRoleEl.remove([...userCreateRoleEl.options].findIndex(option => option.value === "special_manager"));
+  }
   const hasHostOption = [...userCreateRoleEl.options].some(option => option.value === "host");
   if (currentOperator?.isMainHost && !hasHostOption) {
     userCreateRoleEl.append(new Option("Host", "host"));

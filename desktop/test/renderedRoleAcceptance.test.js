@@ -66,7 +66,8 @@ test("rendered role surfaces preserve permissions, keyboard focus, responsive ph
     "the rendered matrix must contain every real operator role exactly once");
   assert.equal(new Set(profiles.map(profile => profile.role)).size, Object.values(OPERATOR_ROLES).length);
   for (const profile of profiles) auth.createOperatorAccount({ username: profile.username, password: profile.password,
-    role: profile.role, teamId: profile.role === "manager" ? "render-team" : null, allowedDevices: ["mock-a"] });
+    role: profile.role, teamId: ["manager", "special_manager"].includes(profile.role) ? "render-team" : null,
+    allowedDevices: ["mock-a"] });
   const app = await import(pathToFileURL(path.join(repoRoot, "system/server/src/index.js")).href);
   await new Promise(resolve => app.server.listen(0, "127.0.0.1", resolve));
   t.after(async () => { await new Promise(resolve => app.wss.close(resolve)); await new Promise(resolve => app.server.close(resolve)); });

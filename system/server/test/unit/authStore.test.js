@@ -3,6 +3,15 @@ import assert from "node:assert/strict";
 import { hashPassword, verifyPassword, authenticate, canAccessDevice, operators, normalizeRole, publicOperator, hasRole, filterValidResearchGrants, capabilitiesForRole, hasCapability, validateOperatorConfig } from "../../src/authStore.js";
 import { CAPABILITIES, OPERATOR_ROLES, ROLE_CAPABILITIES } from "../../src/roleCapabilities.js";
 
+test("only host and special manager receive physical WDA lifecycle control", () => {
+  assert.equal(hasCapability({ role: OPERATOR_ROLES.HOST }, CAPABILITIES.MANAGE_WDA_LIFECYCLE), true);
+  assert.equal(hasCapability({ role: OPERATOR_ROLES.SPECIAL_MANAGER }, CAPABILITIES.MANAGE_WDA_LIFECYCLE), true);
+  for (const role of [OPERATOR_ROLES.ADMIN, OPERATOR_ROLES.MANAGER, OPERATOR_ROLES.VA,
+    OPERATOR_ROLES.CONTENT_CREATOR, OPERATOR_ROLES.EDITOR]) {
+    assert.equal(hasCapability({ role }, CAPABILITIES.MANAGE_WDA_LIFECYCLE), false, role);
+  }
+});
+
 test("hashPassword + verifyPassword round-trip correctly", () => {
   const hash = hashPassword("correct horse battery staple");
   assert.equal(verifyPassword("correct horse battery staple", hash), true);
@@ -145,7 +154,7 @@ test("operator config rejects more than one main host", () => {
   ] }), /more than one main host/);
 });
 
-test("six roles use explicit capabilities without a numeric rank", () => {
+test("seven roles use explicit capabilities without a numeric rank", () => {
   assert.deepEqual(Object.keys(ROLE_CAPABILITIES).sort(), Object.values(OPERATOR_ROLES).sort());
   assert.equal(hasCapability({ role: "host" }, CAPABILITIES.MANAGE_SECURITY), true);
   assert.equal(hasCapability({ role: "host" }, CAPABILITIES.MANAGE_USERS), true);

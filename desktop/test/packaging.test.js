@@ -138,6 +138,14 @@ test("the macOS build produces a .pkg installer, signs with the hardened runtime
   assert.match(packageJson.version, /^\d+\.\d+\.\d+$/);
 });
 
+test("the packaged shortcut icon uses the transparent Bodun artwork", () => {
+  const desktopIcon = fs.readFileSync(path.join(desktopDir, "build/icon.png"));
+  const webIcon = fs.readFileSync(path.resolve(desktopDir, "../system/client/icons/icon-512.png"));
+  assert.deepEqual(desktopIcon, webIcon, "desktop shortcuts and the web app must use the same Bodun mark");
+  assert.equal(desktopIcon.subarray(1, 4).toString("ascii"), "PNG");
+  assert.equal(desktopIcon[25], 6, "PNG color type must be RGBA so the shortcut has transparency");
+});
+
 test("the installer wizard resources and component definition exist", () => {
   for (const file of ["build/pkg/components.plist", "build/pkg/resources/welcome.html", "build/pkg/resources/readme.html", "build/pkg/resources/conclusion.html"]) {
     assert.ok(fs.existsSync(path.join(desktopDir, file)), file);

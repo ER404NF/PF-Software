@@ -14,7 +14,7 @@ export class IProxyManager {
   isRunning(udid) { return this.group.isRunning(udid); }
   getStatus(udid) { return this.group.getStatus(udid); }
   getLog(udid) { return this.group.getLog(udid); }
-  stop(udid) { this.group.stop(udid); }
+  stop(udid) { return this.group.stop(udid); }
   stopAll() { return this.group.stopAll(); }
 
   // One iproxy process forwards both WDA's control port (8100) and, when

@@ -74,3 +74,12 @@ test("the MJPEG video port is stored and survives a later partial update", () =>
   const updated = upsertProvisioningRecord(storePath, "00008110-ABCDEF1234567890", { displayName: "Renamed" });
   assert.equal(updated.mjpegLocalPort, 9101);
 });
+
+test("the operator WDA enablement choice persists through partial updates", () => {
+  const storePath = tempStorePath();
+  upsertProvisioningRecord(storePath, "00008110-ABCDEF1234567890", {
+    logicalId: "ios-abc123", wdaEnabled: false,
+  });
+  const updated = upsertProvisioningRecord(storePath, "00008110-ABCDEF1234567890", { displayName: "Renamed" });
+  assert.equal(updated.wdaEnabled, false);
+});

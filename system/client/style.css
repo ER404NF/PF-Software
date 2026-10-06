@@ -204,9 +204,49 @@ body {
 .device-card-tools .proxy-switch,
 .device-card-tools .proxy-pool-picker,
 .device-card-tools .network-check-panel,
+.device-card-tools .wda-lifecycle-panel,
 .device-card-tools .routing-panel {
   grid-column: 1 / -1;
 }
+.wda-lifecycle-panel {
+  display: grid;
+  gap: 8px;
+  padding: 9px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface) 88%, var(--canvas));
+}
+.wda-lifecycle-copy {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.wda-lifecycle-copy strong { font-size: 12px; }
+.wda-lifecycle-copy span,
+.wda-lifecycle-result { color: var(--muted); font-size: 11px; }
+.wda-lifecycle-actions {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+.device-card-tools .wda-lifecycle-actions button { min-height: 32px; }
+.device-card-tools .wda-stop-button { color: var(--offline); }
+.device-card-tools .wda-start-button { color: var(--online); }
+.wda-diagnostic-report { width: 100%; border-top: 1px solid var(--line); padding-top: 8px; }
+.wda-diagnostic-report summary { cursor: pointer; color: var(--ink); font-size: 12px; font-weight: 700; }
+.wda-diagnostic-report-body { display: grid; gap: 8px; margin-top: 8px; }
+.wda-diagnostic-headline,
+.wda-diagnostic-parameters { margin: 0; color: var(--ink); font-size: 12px; line-height: 1.45; }
+.wda-diagnostic-check { padding: 8px 10px; border: 1px solid var(--line); border-left-width: 3px; border-radius: 6px; background: var(--surface); }
+.wda-diagnostic-check.pass { border-left-color: var(--online); }
+.wda-diagnostic-check.wait,
+.wda-diagnostic-check.blocked { border-left-color: var(--loading); }
+.wda-diagnostic-check.fail { border-left-color: var(--offline); }
+.wda-diagnostic-check p { margin: 3px 0 0; color: var(--muted); font-size: 11px; line-height: 1.4; }
+.wda-diagnostic-timeline { margin: 4px 0 0; padding-left: 20px; color: var(--muted); font-size: 11px; }
+.wda-copy-diagnostic-button { justify-self: start; min-height: 32px; }
+.wda-lifecycle-result:empty { display: none; }
 .proxy-pool-picker {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);

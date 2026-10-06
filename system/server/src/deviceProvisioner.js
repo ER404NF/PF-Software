@@ -42,6 +42,94 @@ export function classifyIproxyFailure(logText) {
   return match ? diagnosticError(match.code, { technical: { category: match.code } }) : null;
 }
 
+function diagnosticCheck(id, label, observed, expected, status, meaning, action) {
+  return { id, label, observed: String(observed ?? "unknown"), expected, status, meaning, action };
+}
+
+function processDiagnostic(id, label, status) {
+  const state = status?.state ?? "stopped";
+  const restartCount = Number.isSafeInteger(status?.restartCount) ? status.restartCount : 0;
+  const observed = `${state}; restart attempts: ${restartCount}`;
+  if (state === "running") return diagnosticCheck(id, label, observed, "running", "pass",
+    `${label} is running for this phone.`, "No process action is required.");
+  if (state === "starting" || state === "restarting") return diagnosticCheck(id, label, observed, "running", "wait",
+    `${label} is still ${state}; control remains unavailable until it stabilizes.`, "Keep the phone connected and unlocked while the bounded supervisor finishes.");
+  if (state === "stop_failed") return diagnosticCheck(id, label, observed, "running", "fail",
+    `${label} could not be stopped cleanly, so Bodun will not launch a conflicting replacement.`, "Quit Bodun completely, reopen it, then run this check again.");
+  return diagnosticCheck(id, label, observed, "running", "fail",
+    `${label} is not running, so the control path is incomplete.`, "Use Retry setup after reviewing the reported device prerequisite.");
+}
+
+export function buildControlDiagnosticReport({ enabled, attachment, wdaStatus, iproxyStatus,
+  readinessChecked, readinessPassed, readiness, control, localPort, timeoutMs, recovery,
+  sessionProbe = null, windowProbe = null, screenshotProbe = null, recentEvents = [] } = {}) {
+  const checks = [];
+  checks.push(diagnosticCheck("lifecycle", "WDA lifecycle", enabled ? "enabled" : "stopped", "enabled",
+    enabled ? "pass" : "fail",
+    enabled ? "Bodun is permitted to run WDA for this phone." : "WDA was intentionally stopped in Bodun.",
+    enabled ? "No lifecycle action is required." : "Select Start WDA when you want control available again."));
+  checks.push(diagnosticCheck("attachment", "Physical attachment", attachment, "CONNECTED",
+    attachment === "CONNECTED" ? "pass" : attachment === "UNKNOWN" ? "wait" : "fail",
+    attachment === "CONNECTED" ? "The iPhone is present in the latest discovery result."
+      : attachment === "UNKNOWN" ? "Bodun could not complete the latest attachment scan."
+        : "The iPhone is not present in physical-device discovery.",
+    attachment === "CONNECTED" ? "No attachment action is required."
+      : "Reconnect and unlock the iPhone, accept Trust if shown, then run the check again."));
+  checks.push(processDiagnostic("wda_process", "WDA process", wdaStatus));
+  checks.push(processDiagnostic("iproxy_process", "USB tunnel (iproxy)", iproxyStatus));
+
+  const endpointObserved = !enabled ? "not checked: lifecycle stopped"
+    : !readinessChecked ? "not checked: prerequisite process unavailable"
+      : readinessPassed ? `ready on local forwarding port ${localPort}`
+        : `${readiness?.state ?? "unavailable"}; failures: ${readiness?.consecutiveFailures ?? 0}`;
+  checks.push(diagnosticCheck("wda_endpoint", "WDA /status endpoint", endpointObserved,
+    `ready within ${timeoutMs} ms`, readinessPassed ? "pass" : readinessChecked ? "fail" : "blocked",
+    readinessPassed ? "The forwarded WDA endpoint returned a valid ready response."
+      : readinessChecked ? (readiness?.lastError?.why || "The endpoint did not return a valid ready response.")
+        : "The endpoint probe cannot run until lifecycle, attachment, WDA, and iproxy prerequisites are available.",
+    readinessPassed ? "No endpoint action is required."
+      : readiness?.lastError?.operatorAction || "Resolve the first failed prerequisite above, then run Check control again."));
+  for (const probe of [sessionProbe, windowProbe, screenshotProbe].filter(Boolean)) {
+    checks.push(diagnosticCheck(probe.id, probe.label, probe.observed, probe.expected,
+      probe.status, probe.meaning, probe.action));
+  }
+  const probeFailure = checks.find(check => ["wda_session", "window_geometry", "screenshot"].includes(check.id) && check.status !== "pass");
+  const effectiveReady = control === "READY" && !probeFailure;
+  checks.push(diagnosticCheck("control", "Control result", effectiveReady ? "READY" : "UNAVAILABLE", "READY", effectiveReady ? "pass" : "fail",
+    effectiveReady ? "Status, session, input geometry, and screenshot capture all succeeded."
+      : "Bodun fails closed and will not describe control as ready while a required layer or functional probe fails.",
+    effectiveReady ? "The phone can be opened and controlled." : "Follow the first failed or waiting check above."));
+
+  const blocker = checks.find(check => check.id !== "control" && check.status !== "pass") || checks.at(-1);
+  return {
+    outcome: effectiveReady ? "ready" : "unavailable",
+    summary: effectiveReady ? "Control is ready end to end."
+      : `Control is unavailable because: ${blocker.meaning}`,
+    checkedAt: readiness?.checkedAt ?? new Date().toISOString(),
+    parameters: {
+      localForwardingPort: localPort,
+      readinessTimeoutMs: timeoutMs,
+      consecutiveReadinessFailures: readiness?.consecutiveFailures ?? 0,
+      recoveryState: recovery ?? "IDLE",
+    },
+    checks,
+    timeline: recentEvents.slice(-8).map(event => ({ type: event.type, at: event.at })),
+  };
+}
+
+function successfulProbe(id, label, observed, elapsedMs) {
+  return { id, label, observed: `${observed}; ${elapsedMs} ms`, expected: "successful within readiness timeout",
+    status: "pass", meaning: `${label} completed successfully.`, action: "No action is required." };
+}
+
+function failedProbe(id, label, error) {
+  const reason = error?.name === "TimeoutError" || error?.name === "AbortError" ? "timed out"
+    : /HTTP (\d{3})/.exec(String(error?.message))?.[0] || "request failed";
+  return { id, label, observed: reason, expected: "successful within readiness timeout", status: "fail",
+    meaning: `${label} failed even though the basic WDA readiness endpoint was available.`,
+    action: "Keep the phone unlocked. Retry once; if it persists, stop and start WDA from Bodun." };
+}
+
 // Drives "plug in a phone, it comes online with no manual xcodebuild/iproxy
 // typing" (Automation Architecture guide §5-6, trimmed to what Phase A
 // covers — no proxy/TUN/PF yet; "online" here just means "controllable via
@@ -87,6 +175,8 @@ export class DeviceProvisioner {
     this.onDeviceListChanged = onDeviceListChanged;
     this.runtime = new Map(); // udid -> device runtime and bounded recovery bookkeeping
     this.udidByLogicalId = new Map(); // logicalId -> udid, so routes/clients only ever handle the logical id (never the raw UDID — CLAUDE.md §14.8)
+    this.controlChecks = new Map(); // udid -> one coalesced end-to-end readiness probe
+    this.lifecycleOperations = new Map(); // logicalId -> serialized start/stop mutation
     this.timer = null;
 
     this.wdaProcessManager.on("exit", ({ key, log }) => this._onProcessExit("WDA", key, log));
@@ -172,15 +262,18 @@ export class DeviceProvisioner {
     } else {
       wdaDevice.mjpegPort = mjpegPort;
     }
-    wdaDevice.discoveryState = "provisioning";
-    wdaDevice.discoveryStateMessage = "Starting WDA. Starting the USB tunnel. Waiting for device readiness. This can take a minute.";
+    const wdaEnabled = existingRecord?.wdaEnabled !== false;
+    wdaDevice.discoveryState = wdaEnabled ? "provisioning" : "wda_stopped";
+    wdaDevice.discoveryStateMessage = wdaEnabled
+      ? "Starting WDA. Starting the USB tunnel. Waiting for device readiness. This can take a minute."
+      : "WDA control is stopped by an authorized operator.";
     wdaDevice.status = "offline";
     wdaDevice.setComponentError("wdaProcess", null);
     wdaDevice.setComponentError("iproxy", null);
     wdaDevice.setComponentHealth({
       deviceAttachment: "CONNECTED",
-      wdaProcess: "STARTING",
-      iproxy: "STARTING",
+      wdaProcess: wdaEnabled ? "STARTING" : "STOPPED",
+      iproxy: wdaEnabled ? "STARTING" : "STOPPED",
       wdaEndpoint: "UNKNOWN",
       control: "UNAVAILABLE",
       recovery: "IDLE",
@@ -188,13 +281,16 @@ export class DeviceProvisioner {
     wdaDevice.recordDiagnosticEvent("DEVICE_DISCOVERED", { deviceId: logicalId });
     this.runtime.set(udid, {
       logicalId, wdaDevice, port, mjpegPort, derivedDataPath,
+      wdaEnabled,
       recovery: { stage: null, attempts: 0, lastAttemptAt: 0 },
     });
     this.udidByLogicalId.set(logicalId, udid);
 
     try {
-      this.wdaProcessManager.start({ udid, derivedDataPath });
-      this.iproxyManager.start({ udid, localPort: port, mjpegLocalPort: mjpegPort });
+      if (wdaEnabled) {
+        this.wdaProcessManager.start({ udid, derivedDataPath });
+        this.iproxyManager.start({ udid, localPort: port, mjpegLocalPort: mjpegPort });
+      }
     } catch (error) {
       wdaDevice.discoveryState = "provisioning_error";
       wdaDevice.discoveryStateMessage = "Automatic WDA setup could not start. An admin can review the host logs and retry.";
@@ -241,6 +337,7 @@ export class DeviceProvisioner {
     let changed = false;
     for (const [udid, entry] of this.runtime) {
       const { wdaDevice } = entry;
+      if (!entry.wdaEnabled) continue;
       const wdaState = this._managerState(this.wdaProcessManager, udid);
       const iproxyState = this._managerState(this.iproxyManager, udid);
       const currentIproxyHealth = wdaDevice.componentHealth.iproxy;
@@ -347,6 +444,14 @@ export class DeviceProvisioner {
     entry.wdaDevice.refreshControlHealth();
     entry.wdaDevice.recordDiagnosticEvent(`${kind === "WDA" ? "WDA" : "IPROXY"}_STABLE`);
     this.onDeviceListChanged();
+    // A recovered tunnel used to remain unavailable until the unrelated
+    // ten-second global readiness sweep happened to run. Probe immediately
+    // once both supervised processes are running; coalescing prevents a
+    // simultaneous global/diagnostic probe from overlapping this request.
+    if (this._managerState(this.wdaProcessManager, udid) === "running"
+      && this._managerState(this.iproxyManager, udid) === "running") {
+      void this._checkControlReadiness(udid, entry);
+    }
   }
 
   _onProcessExit(kind, udid, log) {
@@ -459,6 +564,8 @@ export class DeviceProvisioner {
   retry(udid) {
     const entry = this.runtime.get(udid);
     if (!entry) return false;
+    entry.wdaEnabled = true;
+    this._saveRecord(udid, { wdaEnabled: true });
     this.wdaProcessManager.stop(udid);
     this.iproxyManager.stop(udid);
     entry.wdaDevice.discoveryState = "provisioning";
@@ -478,6 +585,168 @@ export class DeviceProvisioner {
     return true;
   }
 
+  getLifecycleState(logicalId) {
+    const udid = this.udidByLogicalId.get(logicalId);
+    const entry = udid ? this.runtime.get(udid) : null;
+    if (!entry) return null;
+    return {
+      enabled: entry.wdaEnabled,
+      state: entry.wdaEnabled ? "running" : "stopped",
+      controlReady: entry.wdaDevice.componentHealth.control === "READY",
+    };
+  }
+
+  stopDevice(logicalId, { authorize = null } = {}) {
+    return this._serializeLifecycle(logicalId, async () => {
+      const udid = this.udidByLogicalId.get(logicalId);
+      const entry = udid ? this.runtime.get(udid) : null;
+      if (!entry) return null;
+      if (authorize) await authorize();
+      if (!entry.wdaEnabled) return this.getLifecycleState(logicalId);
+      entry.wdaEnabled = false;
+      this._saveRecord(udid, { wdaEnabled: false });
+      entry.wdaDevice.invalidateReadiness("OPERATOR_STOP");
+      const results = await Promise.allSettled([
+        this.wdaProcessManager.stop(udid),
+        this.iproxyManager.stop(udid),
+      ]);
+      if (results.some(result => result.status === "rejected" || result.value?.ok === false)) {
+        entry.wdaDevice.discoveryState = "provisioning_error";
+        entry.wdaDevice.discoveryStateMessage = "WDA control could not be stopped cleanly. Restart the host before trying to start it again.";
+        entry.wdaDevice.setComponentHealth({ control: "UNAVAILABLE", recovery: "FAILED" });
+        this.onDeviceListChanged();
+        throw new Error("WDA control processes did not stop cleanly");
+      }
+      entry.wdaDevice.discoveryState = "wda_stopped";
+      entry.wdaDevice.discoveryStateMessage = "WDA control is stopped by an authorized operator.";
+      if (entry.wdaDevice.status !== "in-use") entry.wdaDevice.status = "offline";
+      entry.wdaDevice.setComponentHealth({
+        wdaProcess: "STOPPED", iproxy: "STOPPED", wdaEndpoint: "UNKNOWN",
+        control: "UNAVAILABLE", recovery: "OPERATOR_STOPPED",
+      });
+      entry.wdaDevice.recordDiagnosticEvent("WDA_OPERATOR_STOPPED");
+      this.onDeviceListChanged();
+      return this.getLifecycleState(logicalId);
+    });
+  }
+
+  startDevice(logicalId, { authorize = null } = {}) {
+    return this._serializeLifecycle(logicalId, async () => {
+      const udid = this.udidByLogicalId.get(logicalId);
+      const entry = udid ? this.runtime.get(udid) : null;
+      if (!entry) return null;
+      if (authorize) await authorize();
+      if (entry.wdaEnabled) return this.getLifecycleState(logicalId);
+      entry.wdaEnabled = true;
+      this._saveRecord(udid, { wdaEnabled: true });
+      entry.wdaDevice.discoveryState = "provisioning";
+      entry.wdaDevice.discoveryStateMessage = "Starting WDA and the USB tunnel. Verifying end-to-end control.";
+      entry.wdaDevice.setComponentError("wdaProcess", null);
+      entry.wdaDevice.setComponentError("iproxy", null);
+      entry.wdaDevice.invalidateReadiness("OPERATOR_START");
+      try {
+        this.wdaProcessManager.start({ udid, derivedDataPath: entry.derivedDataPath });
+        this.iproxyManager.start({ udid, localPort: entry.port, mjpegLocalPort: entry.mjpegPort });
+      } catch (error) {
+        entry.wdaDevice.discoveryState = "provisioning_error";
+        entry.wdaDevice.discoveryStateMessage = "WDA control could not start. Review diagnostics and retry.";
+        entry.wdaDevice.setComponentHealth({ control: "UNAVAILABLE", recovery: "FAILED" });
+        this.onDeviceListChanged();
+        throw error;
+      }
+      this.onDeviceListChanged();
+      return this.getLifecycleState(logicalId);
+    });
+  }
+
+  async diagnoseDevice(logicalId, { authorize = null } = {}) {
+    const udid = this.udidByLogicalId.get(logicalId);
+    const entry = udid ? this.runtime.get(udid) : null;
+    if (!entry) return null;
+    const wdaStatus = this.wdaProcessManager.getStatus?.(udid) ?? { state: this._managerState(this.wdaProcessManager, udid) };
+    const iproxyStatus = this.iproxyManager.getStatus?.(udid) ?? { state: this._managerState(this.iproxyManager, udid) };
+    const before = { wdaProcess: wdaStatus.state, iproxy: iproxyStatus.state };
+    const readinessChecked = entry.wdaEnabled && before.wdaProcess === "running" && before.iproxy === "running";
+    const checked = readinessChecked
+      ? await this._checkControlReadiness(udid, entry)
+      : false;
+    const probes = { sessionProbe: null, windowProbe: null, screenshotProbe: null };
+    if (checked) {
+      const runProbe = async (key, id, label, work, describe) => {
+        if (authorize) await authorize();
+        const startedAt = this.now();
+        try {
+          const value = await work();
+          if (authorize) await authorize();
+          probes[key] = successfulProbe(id, label, describe(value), Math.max(0, this.now() - startedAt));
+          return true;
+        } catch (error) {
+          probes[key] = failedProbe(id, label, error);
+          return false;
+        }
+      };
+      const sessionReady = await runProbe("sessionProbe", "wda_session", "WDA automation session",
+        () => entry.wdaDevice.ensureSession(), () => "session created or reused");
+      const windowReady = sessionReady && await runProbe("windowProbe", "window_geometry", "Input geometry",
+        () => entry.wdaDevice.ensureWindowSize(), size => `${size.width} x ${size.height} points`);
+      if (windowReady) await runProbe("screenshotProbe", "screenshot", "Screenshot capture",
+        () => entry.wdaDevice.render(), frame => `${Math.ceil((frame.data?.length ?? 0) * 0.75 / 1024)} KiB image received and discarded`);
+    }
+    const health = entry.wdaDevice.healthSnapshot();
+    return {
+      lifecycle: this.getLifecycleState(logicalId),
+      processes: before,
+      readinessChecked,
+      readinessPassed: checked,
+      health,
+      report: buildControlDiagnosticReport({
+        enabled: entry.wdaEnabled,
+        attachment: health.deviceAttachment,
+        wdaStatus,
+        iproxyStatus,
+        readinessChecked,
+        readinessPassed: checked,
+        readiness: health.readiness,
+        control: health.control,
+        localPort: entry.port,
+        timeoutMs: entry.wdaDevice.timeoutMs,
+        recovery: health.recovery,
+        ...probes,
+        recentEvents: health.recentEvents,
+      }),
+    };
+  }
+
+  _checkControlReadiness(udid, entry) {
+    if (this.controlChecks.has(udid)) return this.controlChecks.get(udid);
+    const operation = (async () => {
+      const healthy = await entry.wdaDevice.checkReadiness();
+      if (this.runtime.get(udid) !== entry || !entry.wdaEnabled) return false;
+      if (healthy) {
+        entry.wdaDevice.discoveryState = null;
+        entry.wdaDevice.discoveryStateMessage = null;
+        entry.recovery = { stage: null, attempts: 0, lastAttemptAt: 0 };
+        entry.wdaDevice.setComponentHealth({ recovery: "IDLE" });
+        entry.wdaDevice.recordDiagnosticEvent("CONTROL_PATH_VERIFIED");
+        this.onDeviceListChanged();
+      }
+      return healthy;
+    })().finally(() => {
+      if (this.controlChecks.get(udid) === operation) this.controlChecks.delete(udid);
+    });
+    this.controlChecks.set(udid, operation);
+    return operation;
+  }
+
+  _serializeLifecycle(logicalId, action) {
+    const previous = this.lifecycleOperations.get(logicalId) ?? Promise.resolve();
+    const operation = previous.catch(() => {}).then(action);
+    this.lifecycleOperations.set(logicalId, operation);
+    return operation.finally(() => {
+      if (this.lifecycleOperations.get(logicalId) === operation) this.lifecycleOperations.delete(logicalId);
+    });
+  }
+
   _loadRecord(udid) {
     return loadProvisioningRecords(this.provisioningStorePath)[udid] ?? null;
   }
@@ -492,5 +761,6 @@ function processHealthState(state) {
   if (state === "starting") return "STARTING";
   if (state === "restarting") return "RESTARTING";
   if (state === "failed") return "FAILED";
+  if (state === "stopped") return "STOPPED";
   return "UNKNOWN";
 }

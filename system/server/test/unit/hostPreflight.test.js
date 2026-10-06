@@ -29,7 +29,7 @@ test("preflight passes when every check succeeds", () => {
     execFile: fakeExecFile({
       "xcode-select -p": "/Applications/Xcode.app/Contents/Developer\n",
       "idevice_id -l": "",
-      "iproxy": "usage: iproxy ...",
+      "iproxy --version": "iproxy 2.0.0\n",
     }),
     existsSync: () => true,
     wdaRepoPath: "/Users/va/WebDriverAgent",
@@ -46,7 +46,7 @@ test("preflight flags CommandLineTools as not full Xcode", () => {
     execFile: fakeExecFile({
       "xcode-select -p": "/Library/Developer/CommandLineTools\n",
       "idevice_id -l": "",
-      "iproxy": "",
+      "iproxy --version": "iproxy 2.0.0\n",
     }),
     existsSync: () => true,
     wdaRepoPath: "/Users/va/WebDriverAgent",
@@ -64,7 +64,7 @@ test("preflight distinguishes a missing binary (ENOENT) from one that just exite
     execFile: fakeExecFile({
       "xcode-select -p": "/Applications/Xcode.app/Contents/Developer\n",
       // idevice_id -l intentionally not stubbed -> ENOENT via fakeExecFile's default throw
-      "iproxy": new Error("usage error"), // present, but exits non-zero — still "available"
+      "iproxy --version": new Error("version error"), // present, but exits non-zero — still "available"
     }),
     existsSync: () => true,
     wdaRepoPath: "/Users/va/WebDriverAgent",
@@ -81,7 +81,7 @@ test("preflight requires WDA_REPO_PATH to point at an actual WebDriverAgent chec
     execFile: fakeExecFile({
       "xcode-select -p": "/Applications/Xcode.app/Contents/Developer\n",
       "idevice_id -l": "",
-      "iproxy": "",
+      "iproxy --version": "iproxy 2.0.0\n",
     }),
     existsSync: () => false,
     wdaRepoPath: "/Users/va/WebDriverAgent",
@@ -97,7 +97,7 @@ test("preflight reports a clear message when WDA_REPO_PATH is unset", () => {
     execFile: fakeExecFile({
       "xcode-select -p": "/Applications/Xcode.app/Contents/Developer\n",
       "idevice_id -l": "",
-      "iproxy": "",
+      "iproxy --version": "iproxy 2.0.0\n",
     }),
     existsSync: () => true,
     wdaRepoPath: undefined,
@@ -129,7 +129,7 @@ test("preflight uses resolved absolute binary paths supplied by the desktop host
   assert.ok(calls.includes("/usr/bin/xcodebuild -version"));
   assert.ok(calls.includes("/opt/homebrew/bin/idevice_id -l"));
   assert.ok(calls.includes("/opt/homebrew/bin/ideviceinfo --version"));
-  assert.ok(calls.includes("/opt/homebrew/bin/iproxy "));
+  assert.ok(calls.includes("/opt/homebrew/bin/iproxy --version"));
 });
 
 test("preflight fails when ideviceinfo or xcodebuild is missing", () => {
@@ -141,7 +141,7 @@ test("preflight fails when ideviceinfo or xcodebuild is missing", () => {
       "xcodebuild -version": missing,
       "idevice_id -l": "",
       "ideviceinfo --version": missing,
-      "iproxy": "",
+      "iproxy --version": "iproxy 2.0.0\n",
     }),
     existsSync: () => true,
     wdaRepoPath: "/Users/va/WebDriverAgent",

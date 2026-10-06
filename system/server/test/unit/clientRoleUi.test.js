@@ -215,6 +215,22 @@ test("network verification is visible only through the server-issued capability"
   assert.match(app, /\/api\/devices\/\$\{encodeURIComponent\(device\.id\)\}\/network-check/);
 });
 
+test("WDA lifecycle and end-to-end control diagnostics are capability-gated", () => {
+  assert.match(app, /MANAGE_WDA_LIFECYCLE:\s*"wda:lifecycle"/);
+  assert.match(app, /function buildWdaLifecyclePanel\(device\)/);
+  assert.match(app, /Stop WDA/);
+  assert.match(app, /\/wda\/\$\{starting \? "start" : "stop"\}/);
+  assert.match(app, /can\(UI_CAPABILITIES\.MANAGE_WDA_LIFECYCLE\) && d\.wdaLifecycle/);
+  assert.match(app, /\/wda\/\$\{starting \? "start" : "stop"\}/);
+  assert.match(app, /\/control-diagnostic/);
+  assert.match(app, /profileRequestActive\(generation, UI_CAPABILITIES\.MANAGE_WDA_LIFECYCLE\)/);
+  assert.match(app, /function renderControlDiagnostic\(diagnostic\)/);
+  assert.match(app, /Observed: \$\{check\.observed\}\. Expected: \$\{check\.expected\}\./);
+  assert.match(app, /report\.open = true/);
+  assert.match(app, /Copy sanitized report/);
+  assert.match(app, /navigator\.clipboard\.writeText\(copyableReport\)/);
+});
+
 test("proxy tunnel routing controls are visible only through the server-issued routing:manage capability", () => {
   assert.match(app, /MANAGE_ROUTING:\s*"routing:manage"/);
   assert.match(app, /function buildNetworkRoutingPanel\(device\)/);

@@ -112,6 +112,8 @@ start("server", [path.join(serverRoot, "src/index.js")], {
   COMMENT_TEMPLATES_PATH: path.join(root, "comment-templates.json"),
   ACTION_POLICY_OVERRIDES_PATH: path.join(root, "action-policy.json"),
   PHONE_FARM_LOCAL_DEV: "true",
+  PHONE_FARM_APP_VERSION: "0.3.0",
+  PHONE_FARM_APP_CHANNEL: "demo",
   // Without this the proxy pool silently 503s on every add (see index.js: proxyCredentialEncryptionKey
   // falls back to this, and proxy creation requires one or the other) — the real packaged desktop app
   // always generates a real one per install (main.js's hostSecrets()), so this was invisible there; the
@@ -125,4 +127,4 @@ start("site-b", [path.join(serverRoot, "src/agentMain.js")], {
   DEVICE_CONFIG_PATH: siteDevicesPath,
   AUTO_DISCOVER_IOS_DEVICES: "false",
 });
-console.log(`\nPhone Farm demo: http://127.0.0.1:${PORT}   sign in as demo-admin / ${PASSWORD}\n`);
+console.log(`\nBodun 0.3.0 (demo): http://127.0.0.1:${PORT}   sign in as demo-admin / ${PASSWORD}\n`);

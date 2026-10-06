@@ -6,7 +6,7 @@ import os from "os";
 import path from "path";
 import { WdaDevice } from "../../src/wdaDevice.js";
 import { discoveredDeviceId } from "../../src/deviceDiscovery.js";
-import { DeviceProvisioner, classifyIproxyFailure, classifyWdaFailure } from "../../src/deviceProvisioner.js";
+import { DeviceProvisioner, buildControlDiagnosticReport, classifyIproxyFailure, classifyWdaFailure } from "../../src/deviceProvisioner.js";
 
 test("classifyWdaFailure recognizes known manual-prerequisite failures", () => {
   assert.match(classifyWdaFailure("please Trust This Computer on the device"), /Trust this computer/);
@@ -36,6 +36,72 @@ test("classifyIproxyFailure exposes safe root-cause categories without returning
   }
 });
 
+test("control diagnostics identify a restarting iproxy as the immediate blocker with bounded parameters", () => {
+  const report = buildControlDiagnosticReport({
+    enabled: true,
+    attachment: "CONNECTED",
+    wdaStatus: { state: "running", restartCount: 0 },
+    iproxyStatus: { state: "restarting", restartCount: 2 },
+    readinessChecked: false,
+    readinessPassed: false,
+    readiness: { state: "RECOVERING", consecutiveFailures: 0, checkedAt: null },
+    control: "UNAVAILABLE",
+    localPort: 8102,
+    timeoutMs: 8000,
+    recovery: "IPROXY_RESTART",
+  });
+  assert.equal(report.outcome, "unavailable");
+  assert.match(report.summary, /USB tunnel.*is still restarting/);
+  assert.deepEqual(report.parameters, {
+    localForwardingPort: 8102,
+    readinessTimeoutMs: 8000,
+    consecutiveReadinessFailures: 0,
+    recoveryState: "IPROXY_RESTART",
+  });
+  assert.equal(report.checks.find(check => check.id === "iproxy_process").status, "wait");
+  assert.equal(report.checks.find(check => check.id === "wda_endpoint").status, "blocked");
+});
+
+test("control diagnostics explain an endpoint timeout without leaking arbitrary process output", () => {
+  const report = buildControlDiagnosticReport({
+    enabled: true, attachment: "CONNECTED",
+    wdaStatus: { state: "running", restartCount: 0 },
+    iproxyStatus: { state: "running", restartCount: 0 },
+    readinessChecked: true, readinessPassed: false,
+    readiness: {
+      state: "SUSPECT", consecutiveFailures: 1,
+      lastError: { why: "The endpoint timed out.", operatorAction: "Keep the phone unlocked." },
+    },
+    control: "DEGRADED", localPort: 8100, timeoutMs: 8000, recovery: "IDLE",
+  });
+  const endpoint = report.checks.find(check => check.id === "wda_endpoint");
+  assert.equal(endpoint.status, "fail");
+  assert.equal(endpoint.meaning, "The endpoint timed out.");
+  assert.equal(endpoint.action, "Keep the phone unlocked.");
+  assert.doesNotMatch(JSON.stringify(report), /password|token|udid/i);
+});
+
+test("control diagnostics include read-only session, geometry, screenshot, and sanitized timeline checks", () => {
+  const report = buildControlDiagnosticReport({
+    enabled: true, attachment: "CONNECTED",
+    wdaStatus: { state: "running", restartCount: 0 }, iproxyStatus: { state: "running", restartCount: 0 },
+    readinessChecked: true, readinessPassed: true,
+    readiness: { state: "HEALTHY", consecutiveFailures: 0 }, control: "READY",
+    localPort: 8100, timeoutMs: 8000, recovery: "IDLE",
+    sessionProbe: successfulProbeForTest("wda_session", "WDA automation session"),
+    windowProbe: successfulProbeForTest("window_geometry", "Input geometry"),
+    screenshotProbe: successfulProbeForTest("screenshot", "Screenshot capture"),
+    recentEvents: [{ type: "WDA_READY", at: "2026-10-06T10:00:00.000Z", udid: "SECRET" }],
+  });
+  assert.equal(report.checks.filter(check => ["wda_session", "window_geometry", "screenshot"].includes(check.id)).length, 3);
+  assert.deepEqual(report.timeline, [{ type: "WDA_READY", at: "2026-10-06T10:00:00.000Z" }]);
+  assert.doesNotMatch(JSON.stringify(report), /SECRET|udid/i);
+});
+
+function successfulProbeForTest(id, label) {
+  return { id, label, observed: "ok; 4 ms", expected: "successful", status: "pass", meaning: "Ready.", action: "None." };
+}
+
 // Stands in for WdaProcessManager/IProxyManager — same on/start/stop/stopAll
 // shape, fully test-controlled (no real OS process ever spawned).
 class FakeProcessManager {
@@ -53,13 +119,14 @@ class FakeProcessManager {
   emitExit(udid, log = []) { this.emitter.emit("exit", { key: udid, code: 1, signal: null, log }); }
   emitRestartLimitExceeded(udid, log = []) { this.emitter.emit("restart-limit-exceeded", { key: udid, restartCount: 99, log }); }
   emitPersistentFailure(udid, log = []) { this.emitter.emit("persistent-failure", { key: udid, restartCount: 99, log }); }
+  emitStable(udid) { this.emitter.emit("stable", { key: udid }); }
 }
 
 function tempStorePath() {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), "pf-provisioner-")), "device-provisioning.json");
 }
 
-function makeProvisioner({ manualUdids = new Set(), recoveryCooldownMs, now } = {}) {
+function makeProvisioner({ manualUdids = new Set(), recoveryCooldownMs, now, provisioningStorePath = tempStorePath() } = {}) {
   const state = { attached: [] };
   const devices = new Map();
   const wdaProcessManager = new FakeProcessManager();
@@ -71,7 +138,7 @@ function makeProvisioner({ manualUdids = new Set(), recoveryCooldownMs, now } = 
     manualUdids,
     wdaProcessManager,
     iproxyManager,
-    provisioningStorePath: tempStorePath(),
+    provisioningStorePath,
     derivedDataRoot: "/tmp/derived-root",
     portRange: { start: 9000, end: 9010 },
     ...(recoveryCooldownMs === undefined ? {} : { recoveryCooldownMs }),
@@ -402,6 +469,116 @@ test("retryDevice() resolves a logical device id to its UDID — routes never ne
 test("retryDevice() on an unknown logical id returns false", () => {
   const { provisioner } = makeProvisioner();
   assert.equal(provisioner.retryDevice("ios-does-not-exist"), false);
+});
+
+test("an iproxy stable event immediately verifies and restores end-to-end control", async () => {
+  const { provisioner, iproxyManager, devices, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  const device = devices.get(logicalId);
+  let checks = 0;
+  device.checkReadiness = async () => {
+    checks += 1;
+    device.readiness = { ...device.readiness, ready: true, state: "HEALTHY" };
+    device.setComponentHealth({ wdaEndpoint: "HEALTHY", control: "READY" });
+    device.status = "idle";
+    return true;
+  };
+
+  device.discoveryState = "provisioning";
+  device.discoveryStateMessage = "Recovering the device tunnel. The phone will be available after a fresh readiness check.";
+  iproxyManager.emitStable("UDID-00000001");
+  await new Promise(resolve => setImmediate(resolve));
+
+  assert.equal(checks, 1);
+  assert.equal(device.componentHealth.control, "READY");
+  assert.equal(device.discoveryState, null);
+  assert.equal(device.discoveryStateMessage, null);
+});
+
+test("manual WDA stop is idempotent, stops both processes, and persists across provisioner restart", async () => {
+  const store = tempStorePath();
+  const first = makeProvisioner({ provisioningStorePath: store });
+  first.state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await first.provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  assert.deepEqual(await first.provisioner.stopDevice(logicalId), {
+    enabled: false, state: "stopped", controlReady: false,
+  });
+  await first.provisioner.stopDevice(logicalId);
+  assert.equal(first.wdaProcessManager.stops.filter(id => id === "UDID-00000001").length, 1);
+  assert.equal(first.iproxyManager.stops.filter(id => id === "UDID-00000001").length, 1);
+
+  const second = makeProvisioner({ provisioningStorePath: store });
+  second.state.attached = first.state.attached;
+  await second.provisioner.pollOnce();
+  assert.equal(second.wdaProcessManager.starts.length, 0);
+  assert.equal(second.iproxyManager.starts.length, 0);
+  assert.equal(second.devices.get(logicalId).discoveryState, "wda_stopped");
+});
+
+test("manual WDA start restores the isolated WDA and iproxy pipeline", async () => {
+  const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  await provisioner.stopDevice(logicalId);
+  wdaProcessManager.starts.length = 0;
+  iproxyManager.starts.length = 0;
+
+  const lifecycle = await provisioner.startDevice(logicalId);
+  assert.equal(lifecycle.enabled, true);
+  assert.equal(wdaProcessManager.starts.length, 1);
+  assert.equal(iproxyManager.starts.length, 1);
+  assert.equal(devices.get(logicalId).discoveryState, "provisioning");
+});
+
+test("manual WDA lifecycle denial is checked inside the mutation boundary and leaves processes running", async () => {
+  const { provisioner, wdaProcessManager, iproxyManager, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  const expected = new Error("authorization revoked");
+
+  await assert.rejects(
+    provisioner.stopDevice(logicalId, { authorize: async () => { throw expected; } }),
+    error => error === expected,
+  );
+
+  assert.equal(wdaProcessManager.stops.length, 0);
+  assert.equal(iproxyManager.stops.length, 0);
+  assert.equal(provisioner.getLifecycleState(logicalId).enabled, true);
+});
+
+test("full control diagnostics coalesce overlapping readiness probes", async () => {
+  const { provisioner, devices, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  const device = devices.get(logicalId);
+  let release;
+  let checks = 0;
+  device.checkReadiness = () => {
+    checks += 1;
+    return new Promise(resolve => { release = () => {
+      device.readiness = { ...device.readiness, ready: true, state: "HEALTHY", consecutiveFailures: 0 };
+      device.setComponentHealth({ wdaEndpoint: "HEALTHY", control: "READY" });
+      resolve(true);
+    }; });
+  };
+  device.ensureSession = async () => "session";
+  device.ensureWindowSize = async () => ({ width: 390, height: 844 });
+  device.render = async () => ({ kind: "image", mime: "image/png", data: "cG5n" });
+  const first = provisioner.diagnoseDevice(logicalId);
+  const second = provisioner.diagnoseDevice(logicalId);
+  await new Promise(resolve => setImmediate(resolve));
+  release();
+  const results = await Promise.all([first, second]);
+  assert.equal(checks, 1);
+  assert.equal(results.every(result => result.readinessPassed), true);
+  assert.equal(results.every(result => result.report.outcome === "ready"), true);
+  assert.equal(results.every(result => result.report.checks.find(check => check.id === "window_geometry")?.observed.includes("390 x 844")), true);
 });
 
 test("stop() tears down every managed process", async () => {

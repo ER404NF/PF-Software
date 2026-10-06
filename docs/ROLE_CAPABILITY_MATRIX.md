@@ -2,29 +2,23 @@
 
 Implemented 2026-09-10 in `system/server/src/roleCapabilities.js`. Capabilities are explicit strings rather than an ordinal role rank. Server checks use the current operator record on every HTTP request and WebSocket action. Device grants and research-workspace grants are separate checks and remain mandatory for every role, including Admin.
 
-| Capability | Admin | Manager | VA | Content Creator | Editor |
-|---|:---:|:---:|:---:|:---:|:---:|
-| View fleet and people | Yes | Yes | Yes | Yes | Yes |
-| View assignments and safe network health | Yes | Yes | Yes | Yes | Yes |
-| Control an authorized phone | Yes | Yes | Yes | No | No |
-| Access authorized media | Yes | Yes | Yes | Yes | Yes |
-| View authorized research | Yes | Yes | Yes | Yes | Yes |
-| Run authorized research | Yes | Yes | Yes | Yes | No |
-| Review authorized research | Yes | Yes | Yes | Yes | Yes |
-| Manage routine assignments | Yes | Yes | No | No | No |
-| Review and rename members of the same assigned team | Yes | Yes | No | No | No |
-| Manage scoped queue work | Yes | Yes | No | No | No |
-| Manage AI controller and handoffs (switch to AI, takeover, pause/resume/stop, emergency stop) | Yes | No | No | No | No |
-| Run an approved network check | Yes | Yes | No | No | No |
-| Monitor an authorized phone (including read-only inspection of an AI-controlled phone) | Yes | Yes | No | No | No |
-| Pause or resume the entire queue | Yes | No | No | No | No |
-| Read sensitive global audit history | Yes | No | No | No | No |
-| Configure model selection | Yes | No | No | No | No |
-| Manage roles, grants, passwords, 2FA, proxies, or security | Yes | No | No | No | No |
-| Retry automatic device provisioning (WDA/iproxy) | Yes | No | No | No | No |
-| View the shared proxy pool | Yes | Yes | No | No | No |
-| Assign/release a pool proxy on an authorized phone | Yes | Yes | No | No | No |
-| Start/stop proxy tunnel routing (TUN/PF) on an authorized phone | Yes | No | No | No | No |
+| Capability | Host | Admin | Special Manager | Manager | VA | Content Creator | Editor |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| View fleet and people | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| View assignments and safe network health | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Control an authorized phone | Yes | Yes | Yes | Yes | Yes | No | No |
+| Access authorized media | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| View/run/review authorized research | Yes | Yes | Yes | Yes | Yes | Yes | Review only |
+| Manage routine assignments and scoped queue work | Yes | Yes | Yes | Yes | No | No | No |
+| Review and rename members of the same assigned team | Yes | Yes | Yes | Yes | No | No | No |
+| Manage AI controller and handoffs | Yes | Yes | No | No | No | No | No |
+| Run an approved network check | Yes | Yes | Yes | Yes | No | No | No |
+| Monitor an authorized phone | Yes | Yes | Yes | Yes | No | No | No |
+| Stop/start WDA and run a full control-path check | Yes | No | Yes | No | No | No | No |
+| Retry failed automatic device provisioning | Yes | Yes | No | No | No | No | No |
+| Read sensitive audit/configure models/manage security | Yes | Yes | No | No | No | No | No |
+| View and assign the shared proxy pool | Yes | Yes | Yes | Yes | No | No | No |
+| Start/stop privileged proxy tunnel routing | Yes | Yes | No | No | No | No | No |
 
 Assignment, user-management, presence, and monitor capabilities are explicit boundaries for their routes. Proxy management now controls the persisted `network.enabled` assignment through an Admin-only endpoint and fleet-card switch; the external gateway/provider still applies the real phone traffic route. The shared proxy pool (credential storage/exclusive leasing, `proxy:view-pool`/`proxy:assign`) is a separate, newer mechanism from that older `network.enabled` toggle — see `system/README.md`'s "Shared proxy pool" section. Adding or deleting pool credentials themselves stays under `proxy:manage` (Admin-only); only assigning an existing pool entry to a device is open to Manager too.
 
@@ -45,5 +39,5 @@ Current server enforcement:
   Content Creator, or Editor accounts with the exact same non-empty `teamId`.
   It does not expose sensitive audit records and cannot mutate grants, roles,
   passwords, 2FA, or the Manager's own account.
-- Global queue state, model configuration, sensitive audit history, user/access administration, proxy mutation, security configuration, device-provisioning retries, and proxy tunnel routing (`routing:manage`) remain Admin-only — routing starts privileged processes and changes firewall rules, a higher bar than assigning a pool proxy (which Manager can do).
+- Global queue state, model configuration, sensitive audit history, user/access administration, proxy mutation, security configuration, device-provisioning retries, and proxy tunnel routing (`routing:manage`) remain Admin/Host operations. WDA lifecycle control is intentionally different: only Host and the explicitly promoted Special Manager receive `wda:lifecycle`. An ordinary Admin or Manager cannot stop a physical phone's control process.
 - Unknown or missing roles normalize to VA for backward compatibility and do not acquire management capabilities.

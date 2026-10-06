@@ -1,7 +1,8 @@
 {
   "name": "phone-farm-desktop",
   "productName": "Bodun",
-  "version": "0.2.6",
+  "version": "0.3.0",
+  "releaseChannel": "demo",
   "private": true,
   "author": "Bodun",
   "description": "Desktop app for Bodun: one download, three first-run modes (set up a new host, connect to an existing hub as an operator, or run a remote site's Mac mini).",
