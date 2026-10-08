@@ -1280,7 +1280,7 @@ const proxyPoolController = window.createProxyPoolController({
   formatDate,
   deviceLabel: id => lastDevices.find(device => device.id === id)?.label || id,
   onPoolChanged: () => {
-    if (lastDevices.length) void renderFleetSafely(lastDevices);
+    if (lastDevices.length) void renderFleetSafely(lastDevices, { preserveViewport: true });
   },
 });
 
@@ -2322,7 +2322,7 @@ function buildNetworkRoutingPanel(device) {
 // local refresh keeps the initiating panel responsive while that authoritative
 // device summary is in flight.
 function broadcastLocalFleetRefresh() {
-  if (lastDevices.length) void renderFleetSafely(lastDevices);
+  if (lastDevices.length) void renderFleetSafely(lastDevices, { preserveViewport: true });
 }
 
 function renderDeviceFacts(device) {

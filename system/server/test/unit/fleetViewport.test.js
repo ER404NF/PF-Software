@@ -68,3 +68,8 @@ test("background device lists preserve the viewport, while filter and resize red
   assert.match(app, /deviceCardModel\.captureViewportAnchor\(fleetGroupsEl, window\)/);
   assert.match(app, /deviceCardModel\.restoreViewportAnchor\(fleetGroupsEl, savedViewport, window\)/);
 });
+
+test("button-triggered in-place fleet redraws preserve the viewport", () => {
+  assert.match(app, /onPoolChanged: \(\) => \{\s*if \(lastDevices\.length\) void renderFleetSafely\(lastDevices, \{ preserveViewport: true \}\);/);
+  assert.match(app, /function broadcastLocalFleetRefresh\(\) \{\s*if \(lastDevices\.length\) void renderFleetSafely\(lastDevices, \{ preserveViewport: true \}\);/);
+});
