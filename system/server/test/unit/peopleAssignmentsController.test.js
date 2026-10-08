@@ -110,3 +110,77 @@ test("assignment mutation failures preserve the failure, expose retry, and relea
   assert.match(message.children[0].textContent, /Write failed.*not changed/);
   assert.equal(message.children[1].textContent, "Retry");
 });
+
+// Found by the real-click sweep: the live connection pushes the phone list about every ten seconds, and each push
+// rebuilt the whole Assignments list, closing "Manage assignment" and wiping any time the person was typing.
+const sampleAssignment = overrides => ({ id: "a1", instructions: "Check posts", status: "assigned", assignee: "demo-admin",
+  createdBy: "demo-admin", recurrence: "once", history: [{ at: "2026-10-07T10:00:00Z", actor: "demo-admin", action: "created" }], ...overrides });
+
+test("drawing the same assignments again keeps the cards the person is working in", () => {
+  const f = fixture({ requestJson: async () => ({ body: {} }) });
+  f.controller.renderAssignments([sampleAssignment()]);
+  const first = f.elements.assignmentsList.children[0];
+  assert.ok(first, "a card was drawn");
+  f.controller.renderAssignments([sampleAssignment()]);
+  assert.equal(f.elements.assignmentsList.children[0], first, "the very same card, not a rebuilt copy");
+});
+
+test("when an assignment really changes the list is drawn again", () => {
+  const f = fixture({ requestJson: async () => ({ body: {} }) });
+  f.controller.renderAssignments([sampleAssignment()]);
+  const first = f.elements.assignmentsList.children[0];
+  f.controller.renderAssignments([sampleAssignment({ status: "in_progress" })]);
+  assert.notEqual(f.elements.assignmentsList.children[0], first);
+  f.controller.renderAssignments([]);
+  assert.equal(f.elements.assignmentsList.children.length, 0, "an empty list clears the page");
+  assert.equal(f.elements.assignmentsEmpty.hidden, false);
+});
+
+test("a change to who can be chosen as assignee draws the list again", () => {
+  const f = fixture({ requestJson: async () => ({ body: {} }) });
+  f.controller.renderAssignments([sampleAssignment()]);
+  const first = f.elements.assignmentsList.children[0];
+  f.elements.assignmentAssignee.append(new FakeOption("New person", "new-person"));
+  f.controller.renderAssignments([sampleAssignment()]);
+  assert.notEqual(f.elements.assignmentsList.children[0], first);
+});
+
+// Found by the real-click sweep: pressing Update schedule, Save assignee, Start or Complete gave no confirmation at all
+// (the card is redrawn and the only trace was a changed badge). Each success now says what happened, on that card.
+test("a successful change says what happened on the assignment's card, and the words survive the redraw", async () => {
+  const f = fixture({ requestJson: async () => ({ body: { assignments: [] } }) });
+  f.controller.renderAssignments([sampleAssignment()]);
+  const card = f.elements.assignmentsList.children[0];
+  const cardMessage = card.children[2];
+  await f.controller.updateAssignment("a1", { status: "in_progress" }, { card, messageEl: cardMessage });
+  assert.equal(cardMessage.textContent, "Started.", "said on the card the person pressed");
+  f.controller.renderAssignments([sampleAssignment({ status: "in_progress" })]); // the redraw that follows a real change
+  const redrawn = f.elements.assignmentsList.children[0];
+  assert.notEqual(redrawn, card);
+  assert.equal(redrawn.children[2].textContent, "Started.", "and on the redrawn card");
+});
+
+test("each kind of change has its own plain confirmation", async () => {
+  const cases = [
+    [{ status: "completed" }, "Marked complete."],
+    [{ status: "cancelled" }, "Cancelled."],
+    [{ assignee: "sam" }, "Assignee changed to sam."],
+    [{ startAt: null, endAt: null, exclusive: true }, "Schedule saved."],
+  ];
+  for (const [change, expected] of cases) {
+    const f = fixture({ requestJson: async () => ({ body: { assignments: [] } }) });
+    f.controller.renderAssignments([sampleAssignment()]);
+    const card = f.elements.assignmentsList.children[0];
+    await f.controller.updateAssignment("a1", change, { card, messageEl: card.children[2] });
+    assert.equal(card.children[2].textContent, expected, JSON.stringify(change));
+  }
+});
+
+test("a failed change still shows its error, and no false confirmation", async () => {
+  const f = fixture({ requestJson: async () => { throw new Error("That assignment no longer exists."); } });
+  f.controller.renderAssignments([sampleAssignment()]);
+  const card = f.elements.assignmentsList.children[0];
+  await f.controller.updateAssignment("a1", { status: "in_progress" }, { card, messageEl: card.children[2] });
+  assert.equal(card.children[2].children[0].textContent, "That assignment no longer exists. The assignment was not changed. ");
+  assert.notEqual(card.children[2].textContent, "Started.");
+});

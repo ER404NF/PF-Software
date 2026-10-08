@@ -252,6 +252,25 @@ body {
 .network-routing-status-grid dd { margin: 0; color: var(--ink); font-size: 11px; font-weight: 700; }
 .network-routing-inline-error { margin: 0; color: var(--offline); font-size: 11px; line-height: 1.4; }
 .wda-lifecycle-result:empty { display: none; }
+.wda-lifecycle-copy span[data-tone="healthy"] { color: var(--online); }
+.wda-lifecycle-copy span[data-tone="warning"] { color: var(--loading); }
+.wda-lifecycle-copy span[data-tone="error"] { color: var(--offline); }
+.wda-lifecycle-actions button:disabled { cursor: not-allowed; }
+/* Why a button is unavailable, written out under the buttons (a tooltip alone is invisible on a touch screen). */
+.wda-lifecycle-reasons { margin: 0; padding-left: 16px; color: var(--muted); font-size: 12px; line-height: 1.4; }
+.wda-lifecycle-reasons[hidden] { display: none; }
+/* The result of an action on this card, announced politely to screen readers. */
+.card-message { margin: 0; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+.card-message[hidden] { display: none; }
+.card-message[data-tone="error"] { color: var(--offline); }
+.card-message[data-tone="success"] { color: var(--online); }
+.card-message[data-tone="info"] { color: var(--muted); }
+/* Network enrollment: the manual step, the time left, and why a button is unavailable. */
+.routing-enrollment-steps { display: grid; gap: 4px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; background: color-mix(in srgb, var(--surface) 90%, var(--canvas)); }
+.routing-enrollment-steps strong { font-size: 12px; }
+.routing-enrollment-steps ol { margin: 0; padding-left: 18px; color: var(--ink); font-size: 12px; line-height: 1.45; }
+.routing-countdown { margin: 0; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.routing-reason { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
 .proxy-pool-picker {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
@@ -344,13 +363,12 @@ body {
   text-transform: uppercase;
 }
 .privacy-hero h1 {
-  max-width: 12ch;
+  max-width: 14ch;
   margin: 0;
-  font-family: Georgia, "Times New Roman", serif;
-  font-size: clamp(42px, 6vw, 78px);
-  font-weight: 500;
-  line-height: 0.98;
-  letter-spacing: -0.045em;
+  font-size: clamp(38px, 5.2vw, 68px);
+  font-weight: 600;
+  line-height: 1.02;
+  letter-spacing: -0.02em;
 }
 .privacy-intro { max-width: 48ch; margin: 24px 0 0; color: #c8d1dc; font-size: 16px; line-height: 1.65; }
 .privacy-promises { display: grid; gap: 12px; position: relative; z-index: 1; }
@@ -369,10 +387,10 @@ body {
 .privacy-card-wrap { display: grid; align-items: center; padding: clamp(24px, 6vw, 76px); }
 .privacy-card { width: min(100%, 650px); margin: 0 auto; }
 .privacy-card-header { margin-bottom: 28px; }
-.privacy-card-header h2 { margin: 0 0 9px; font-family: Georgia, "Times New Roman", serif; font-size: clamp(28px, 4vw, 42px); font-weight: 500; letter-spacing: -0.035em; }
+.privacy-card-header h2 { margin: 0 0 9px; font-size: clamp(28px, 4vw, 42px); font-weight: 500; letter-spacing: -0.035em; }
 .privacy-card-header p { margin: 0; color: #637084; line-height: 1.6; }
 .privacy-card-kicker { margin: 0; color: #238b8e; font-size: 11px; font-weight: 850; letter-spacing: 0.12em; text-transform: uppercase; }
-.privacy-card h3 { margin: -5px 0 0; color: #17263a; font-family: Georgia, "Times New Roman", serif; font-size: 25px; font-weight: 500; }
+.privacy-card h3 { margin: -5px 0 0; color: #17263a; font-size: 25px; font-weight: 500; }
 .privacy-card-copy { margin: 0; color: #637084; font-size: 13px; line-height: 1.6; }
 .privacy-form {
   display: grid;
@@ -620,7 +638,9 @@ body {
 .component-health.compact { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 .component-health-row { display: flex; justify-content: space-between; gap: 6px; padding: 5px 7px; border: 1px solid #3a3a3c; border-radius: 6px; font-size: 10px; }
 .component-health-row span { color: #8e8e93; }
-.component-health-row strong { overflow-wrap: anywhere; text-align: right; }
+.component-health-row strong { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; }
+.component-health-row span { white-space: nowrap; }
+.component-health-row strong[data-state="neutral"] { color: #aeaeb2; }
 .component-health-row strong[data-state="healthy"] { color: #30d158; }
 .component-health-row strong[data-state="warning"] { color: #ffcc00; }
 .component-health-row strong[data-state="error"] { color: #ff6961; }
@@ -2451,7 +2471,7 @@ button:not(:disabled):active { transform: translateY(1px); }
 }
 
 #fleet-intro {
-  max-width: 1180px;
+  max-width: var(--content-max);
   padding-bottom: 20px;
   border-color: var(--line);
 }
@@ -2459,7 +2479,7 @@ button:not(:disabled):active { transform: translateY(1px); }
 #fleet-toolbar,
 #fleet-groups,
 #select-error,
-#fleet-empty { max-width: 1180px; }
+#fleet-empty { max-width: var(--content-max); }
 
 #fleet-summary > span {
   min-width: 0;
@@ -2622,7 +2642,7 @@ button:not(:disabled):active { transform: translateY(1px); }
 #assignments-empty,
 #admin-view > .admin-panel,
 #detail-view > :not(#detail-body),
-#detail-body { max-width: 1120px; }
+#detail-body { max-width: var(--content-max); }
 
 .admin-heading { margin-bottom: 24px; }
 .admin-heading h2,
@@ -2631,7 +2651,7 @@ button:not(:disabled):active { transform: translateY(1px); }
 
 #operations-nav {
   display: flex;
-  max-width: 1120px;
+  max-width: var(--content-max);
   align-items: center;
   gap: 8px;
   margin: -8px 0 20px;
@@ -2859,7 +2879,7 @@ button:not(:disabled):active { transform: translateY(1px); }
 /* Role audit fixes: keep critical device controls visible and errors local. */
 #detail-heading {
   display: flex;
-  max-width: 1120px;
+  max-width: var(--content-max);
   align-items: center;
   justify-content: space-between;
   gap: 18px;
@@ -3206,3 +3226,243 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
   /* With a phone open, the phone comes first: no sidebar above it. */
   #app:has(#detail-view:not([hidden])) #people-sidebar { display: none; }
 }
+
+/* Account protection: why a control is locked, and the account actions menu note. */
+.user-lock-reason,
+.user-actions-note { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; }
+.user-lock-reason { grid-column: 1 / -1; }
+.user-actions-note[hidden] { display: none; }
+.user-edit-form input:disabled,
+.user-edit-form select:disabled { opacity: 0.6; cursor: not-allowed; }
+
+/* One state per phone: the attention block says what is wrong, in plain words, under the access box. */
+.device-attention { display: flex; flex-direction: column; gap: 3px; margin-top: 8px; padding: 8px 10px; border: 1px solid #5a3a37; border-left: 3px solid #ff6961; border-radius: 7px; background: #2a1c1b; font-size: 12px; line-height: 1.4; }
+.device-attention[data-tone="warning"] { border-color: #5a4a1d; border-left-color: #ffcc00; background: #2a2412; }
+.device-attention strong { color: #ff8a80; }
+.device-attention[data-tone="warning"] strong { color: #ffd60a; }
+.device-attention span { color: #e5e5ea; overflow-wrap: anywhere; }
+.open-files-button { background: transparent; border: 1px solid #48484a; color: #d1d1d6; }
+
+/* Retry / Diagnostics under a phone's error use the same buttons as the rest of the card. */
+.device-error-actions button { border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; min-height: 32px; background: var(--surface); color: var(--ink); font-size: 12px; font-weight: 650; }
+.device-error-actions button:hover:not(:disabled) { border-color: #2a9d9f; background: var(--canvas); }
+.device-error-actions pre { width: 100%; max-height: 260px; padding: 10px; background: var(--canvas); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; white-space: pre-wrap; overflow-wrap: break-word; word-break: normal; }
+.device-error-card { font-size: 12px; }
+
+/* Fleet cards: operational text is never smaller than 12px, cards line up at the top, and nothing spills out of a card. */
+#fleet-summary > span,
+.wda-lifecycle-copy span, .wda-lifecycle-result,
+.wda-diagnostic-check p, .wda-diagnostic-timeline,
+.network-routing-status-grid dt, .network-routing-status-grid dd, .network-routing-inline-error,
+.proxy-pool-picker-label,
+.mode-pill, .mine-badge,
+.device-access, .device-safe-status,
+.component-health-row,
+.device-error-card,
+.device-card-context, .device-card-meta,
+.proxy-switch-row strong, .proxy-switch-row > div span, .proxy-switch,
+.controller-mode-copy strong, .controller-mode-copy span, .controller-mode-switch,
+.ai-control-button, .ai-locked-note,
+.device-fact > span, #detail-device-facts span { font-size: 12px; }
+.fleet-grid { align-items: start; }
+.device-card { min-width: 0; }
+.device-card-tools > *, .network-routing-panel, .wda-lifecycle-panel, .proxy-pool-picker, .proxy-switch { min-width: 0; max-width: 100%; box-sizing: border-box; }
+.network-routing-panel button, .wda-lifecycle-panel button, .proxy-pool-picker button { max-width: 100%; white-space: normal; overflow-wrap: anywhere; }
+.device-card-meta { overflow-wrap: anywhere; }
+
+/* Ten summary tiles fill two even rows; the filter sits under them on the left instead of floating off to the right. */
+#fleet-toolbar { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+#fleet-toolbar > label { justify-self: start; }
+@media (max-width: 520px) {
+  #fleet-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* The proxy dropdown gets the whole card width (label above it) so a provider name is never cut off. */
+.proxy-pool-picker { grid-template-columns: minmax(0, 1fr); gap: 5px; }
+.proxy-pool-picker select { text-overflow: ellipsis; }
+
+/* The Privacy link in the header looks like the other header buttons. */
+#top-bar-right .header-pill {
+  display: inline-flex; align-items: center; justify-content: center; min-height: 34px; padding: 6px 11px;
+  border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); color: var(--ink);
+  font-size: 12px; font-weight: 600; text-decoration: none;
+}
+#top-bar-right .header-pill:hover { background: var(--soft-strong); color: var(--ink); }
+
+/* The Privacy Center follows the app's light/dark theme instead of always being light. */
+.privacy-page { color: var(--ink); background: var(--canvas); }
+.privacy-hero { color: var(--ink); background: var(--soft); }
+.privacy-hero::after { border-color: var(--line-strong); box-shadow: none; }
+.privacy-brand, .privacy-brand strong { color: var(--ink); }
+.privacy-brand small { color: var(--muted); font-size: 12px; }
+.privacy-eyebrow { color: #2a9d9f; }
+.privacy-intro, .privacy-promise { color: var(--muted); }
+.privacy-card-header p, .privacy-card-copy, .privacy-note, .privacy-danger-zone p, .privacy-export small { color: var(--muted); }
+.privacy-card h3, .privacy-danger-zone h3 { color: var(--ink); }
+.privacy-form { border-color: var(--line-strong); background: var(--surface-solid); box-shadow: var(--shadow-soft); }
+.privacy-form label, .privacy-field-label { color: var(--ink); }
+.privacy-form input { border-color: var(--line-strong); background: var(--canvas); color: var(--ink); }
+.privacy-form input:focus { outline: 3px solid rgba(42, 157, 159, 0.28); border-color: #2a9d9f; }
+.privacy-button { border-color: var(--button-bg); background: var(--button-bg); color: var(--button-ink); }
+.privacy-button:hover:not(:disabled) { background: var(--button-hover); color: var(--button-ink); }
+.privacy-button.secondary { border-color: var(--line-strong); background: var(--surface-solid); color: var(--ink); }
+.privacy-button.secondary:hover:not(:disabled) { border-color: #2a9d9f; background: var(--soft-strong); color: var(--ink); }
+.privacy-account { background: var(--soft); color: var(--ink); }
+.privacy-export { border-color: var(--line-strong); background: var(--soft); color: var(--ink); }
+.privacy-danger-zone { border-color: color-mix(in srgb, var(--offline) 40%, var(--line-strong)); background: color-mix(in srgb, var(--offline) 7%, var(--surface-solid)); }
+.privacy-message { color: var(--ink); }
+.privacy-field-label { display: block; }
+
+/* One content width for every page. The scrollbar space is always reserved, so the header and the page do not
+   shift sideways when a long page gets a scrollbar; on wide screens the content is centred, not pushed left. */
+:root { --content-max: 1360px; }
+html { scrollbar-gutter: stable; }
+#fleet-view, #detail-view, #assignments-view, #admin-view { padding-left: 30px; padding-right: 30px; }
+#fleet-view > *, #detail-view > *, #assignments-view > *, #admin-view > * {
+  max-width: var(--content-max);
+  margin-left: auto;
+  margin-right: auto;
+}
+
+/* Used for the instant the theme changes, so everything switches together. */
+html.theme-switching *, html.theme-switching *::before, html.theme-switching *::after { transition: none !important; animation: none !important; }
+
+/* The three navigation icons are drawn the same way (same size, same line weight). */
+.top-nav-button .nav-icon { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; }
+.top-nav-button .nav-icon svg { display: block; }
+
+/* Users form: the note is a small line across the top, the last row holds the checkbox and the button side by side,
+   and a text box only shows a ring while it is being used from the keyboard. */
+.user-form .user-form-note { grid-column: 1 / -1; margin: 0; color: var(--muted); font-size: 12px; font-weight: 400; line-height: 1.45; }
+.user-form .user-form-footer { grid-column: 1 / -1; display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.user-form .user-form-footer .user-checkbox { align-self: center; }
+.user-form input:focus:not(:focus-visible), body.keyboard-navigation .user-form input:focus:not(:focus-visible) { outline: none; box-shadow: none; }
+.user-form input:focus-visible, body.keyboard-navigation .user-form input:focus-visible { outline: 2px solid #2a9d9f; outline-offset: 1px; box-shadow: none; }
+
+/* Account buttons: one primary action (Save), one plain secondary one, and red outlines for anything destructive. */
+.user-form button.secondary-action { border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink); }
+.user-form button.secondary-action:hover:not(:disabled) { background: var(--soft-strong); color: var(--ink); }
+.user-form button.destructive-action, .user-form button.danger, .user-actions-menu button.danger {
+  border: 1px solid var(--offline); background: transparent; color: var(--offline);
+}
+.user-form button.destructive-action:hover:not(:disabled), .user-form button.danger:hover:not(:disabled), .user-actions-menu button.danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--offline) 12%, transparent); color: var(--offline);
+}
+
+/* Proxies tab: buttons sit together with a clear gap, a disabled Delete says why, and the result line keeps its height. */
+.proxy-action-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.proxy-action-row button { border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface); color: var(--ink); font-size: 12px; font-weight: 600; min-height: 32px; padding: 6px 12px; }
+.proxy-action-row button:hover:not(:disabled) { background: var(--soft-strong); }
+.proxy-reason { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.4; }
+#proxy-pool-message { min-height: 22px; margin: 8px 0; font-size: 13px; }
+#proxy-pool-message[data-tone="success"] { color: color-mix(in srgb, var(--online) 55%, var(--ink)); }
+#proxy-pool-message[data-tone="error"] { color: var(--offline); }
+#proxy-pool-create-form .user-form-footer { justify-content: flex-start; }
+.user-state.neutral { background: var(--surface); color: var(--muted); }
+.user-state.neutral::before { background: var(--quiet); }
+.component-health-row { padding: 5px 6px; gap: 4px; }
+.component-health { gap: 4px; }
+.component-health-row { padding: 5px 5px; }
+
+/* Chip colours that stay readable on a light background (the bright ones above are for dark mode). */
+:root:not([data-theme="dark"]) .component-health-row strong[data-state="healthy"] { color: #17803d; }
+:root:not([data-theme="dark"]) .component-health-row strong[data-state="warning"] { color: #8a5a00; }
+:root:not([data-theme="dark"]) .component-health-row strong[data-state="error"] { color: #c4202f; }
+:root:not([data-theme="dark"]) .component-health-row strong[data-state="neutral"] { color: #5f6368; }
+
+/* The network enrollment panel spans the whole width of the card (it used to sit in one narrow half column, which
+   pushed its button out past the border), and its single column can shrink so long button text wraps instead. */
+.device-card-tools .network-routing-panel { grid-column: 1 / -1; grid-template-columns: minmax(0, 1fr); }
+.network-routing-panel button { width: 100%; }
+.device-card-tools > button { grid-column: 1 / -1; }
+#fleet-toolbar label, .user-state { font-size: 12px; }
+
+/* Page chrome: nothing the person has to read is smaller than 12px. */
+.brand-copy span, .app-version, #connection-status.connection-state, #theme-toggle, #theme-toggle-label,
+#logout-button, #research-toggle, #review-toggle, #role-badge, .sidebar-label, #people-summary,
+.person-details span, .person-details .person-activity, .person-details .person-assignment, #whoami { font-size: 12px; }
+#top-bar-right { gap: 8px; }
+/* The version badge sits with the other header items (the brand column is too narrow for it) and is never squeezed. */
+.app-version { flex: none; white-space: nowrap; }
+#top-bar-right > *, #top-bar-left > * { white-space: nowrap; }
+
+/* The attention block and the error panel were drawn for the dark theme only; on the light theme they use a light tint. */
+:root:not([data-theme="dark"]) .device-attention { border-color: #e7b8b3; border-left-color: #c4202f; background: #fdf1f0; }
+:root:not([data-theme="dark"]) .device-attention strong { color: #a3151f; }
+:root:not([data-theme="dark"]) .device-attention span { color: var(--ink); }
+:root:not([data-theme="dark"]) .device-attention[data-tone="warning"] { border-color: #e8d49a; border-left-color: #b8860b; background: #fdf8e8; }
+:root:not([data-theme="dark"]) .device-attention[data-tone="warning"] strong { color: #7a5600; }
+:root:not([data-theme="dark"]) .device-error-card { border-color: #e7b8b3; background: #fdf6f5; }
+:root:not([data-theme="dark"]) .device-error-card summary { color: #a3151f; }
+:root:not([data-theme="dark"]) .device-error-card p { color: var(--ink); }
+
+/* The Operations panels (hint lines, tables, presence and audit lines, the command output) read at 12px or more. */
+/* The hidden table captions are for screen readers only and are not drawn. */
+.admin-panel-heading span, .admin-table th, .admin-table td, .user-presence, .user-card details summary,
+.user-card details li, #command-output, #stream-status { font-size: 12px; }
+
+/* Privacy page: the small section labels and the line under Download are at least 12px, and the teal label has enough */
+/* contrast on both themes (it was 3.9 to 1 on dark, under the 4.5 to 1 that small text needs). */
+.privacy-card-kicker, .privacy-export small { font-size: 12px; }
+.privacy-form .privacy-card-kicker { color: #1a7073; }
+:root[data-theme="dark"] .privacy-form .privacy-card-kicker { color: #7fd3d5; }
+
+/* Sign-in, application and recovery screens: the brand sub-label and the field labels are at least 12px. */
+.login-brand span:not(.brand-mark), .login-field, .recovery-complete-fields legend { font-size: 12px; }
+
+/* Light theme: the bright status colours (made for the dark page) are too pale on white; these read at 4.5 to 1 or more. */
+:root:not([data-theme="dark"]) .component-health-row span { color: #4b5560; }
+:root:not([data-theme="dark"]) .open-files-button { border-color: var(--line); color: var(--ink); }
+:root:not([data-theme="dark"]) .device-card-tools .wda-stop-button { color: #a3151f; }
+:root:not([data-theme="dark"]) .device-card-tools .wda-start-button { color: #17803d; }
+:root:not([data-theme="dark"]) .wda-lifecycle-copy span[data-tone="healthy"] { color: #17803d; }
+:root:not([data-theme="dark"]) .wda-lifecycle-copy span[data-tone="warning"] { color: #8a5a00; }
+:root:not([data-theme="dark"]) .wda-lifecycle-copy span[data-tone="error"] { color: #a3151f; }
+:root:not([data-theme="dark"]) .card-message[data-tone="error"] { color: #a3151f; }
+:root:not([data-theme="dark"]) .card-message[data-tone="success"] { color: #17803d; }
+
+/* Light theme: destructive buttons and the proxy result line use a red that reads on white. */
+:root:not([data-theme="dark"]) .user-form button.destructive-action { border-color: #a3151f; color: #a3151f; }
+:root:not([data-theme="dark"]) .user-form button.danger { border-color: #a3151f; color: #a3151f; }
+:root:not([data-theme="dark"]) .user-actions-menu button.danger { border-color: #a3151f; color: #a3151f; }
+:root:not([data-theme="dark"]) #proxy-pool-message[data-tone="error"] { color: #a3151f; }
+
+/* Privacy page, light theme: the teal eyebrow and the numbered marks read at 4.5 to 1 or more (they were 3.1 and 2.3). */
+:root:not([data-theme="dark"]) .privacy-eyebrow { color: #1a7073; }
+:root:not([data-theme="dark"]) .privacy-promise-mark { color: #1a7073; border-color: rgba(26, 112, 115, 0.55); }
+
+/* A confirmation note under an assignment ("Started.", "Schedule saved.") is green, not the error red. */
+.assignment-card-message[data-tone="success"] { color: var(--online); }
+/* Light theme: message lines use a red (and green) that reads on white. */
+:root:not([data-theme="dark"]) #select-error { color: #a3151f; }
+:root:not([data-theme="dark"]) #people-error { color: #a3151f; }
+:root:not([data-theme="dark"]) #login-error { color: #a3151f; }
+:root:not([data-theme="dark"]) #signup-message { color: #a3151f; }
+:root:not([data-theme="dark"]) #two-factor-message { color: #a3151f; }
+:root:not([data-theme="dark"]) #recovery-message { color: #a3151f; }
+:root:not([data-theme="dark"]) #assignments-message { color: #a3151f; }
+:root:not([data-theme="dark"]) #users-message { color: #a3151f; }
+:root:not([data-theme="dark"]) #detail-message { color: #a3151f; }
+:root:not([data-theme="dark"]) .assignment-card-message { color: #a3151f; }
+:root:not([data-theme="dark"]) .network-routing-inline-error { color: #a3151f; }
+:root:not([data-theme="dark"]) #file-list button { color: #a3151f; }
+:root:not([data-theme="dark"]) .assignment-card-message[data-tone="success"] { color: #17803d; }
+
+/* Assignment cards: the status and repeat pills, the Manage assignment labels and buttons, and the History lines are 12px or more. */
+.assignment-status, .assignment-recurrence, .assignment-manage-grid > label, .assignment-manage-grid > button, .assignment-manage button,
+.assignment-card details, .assignment-card details li { font-size: 12px; }
+
+/* The notice about automatic phone setup (paused, or checking its earlier phone connections) at the top of the Fleet page. */
+#automatic-setup-banner { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; margin: 0 0 14px; padding: 12px 16px; border: 1px solid #5a4a1d; border-left: 4px solid #ffcc00; border-radius: 10px; background: #2a2412; color: #f5e9c0; }
+#automatic-setup-banner[hidden] { display: none; }
+#automatic-setup-banner p { margin: 0; font-size: 13px; line-height: 1.45; }
+#automatic-setup-text { flex: 1 1 320px; }
+#automatic-setup-result { flex: 1 1 100%; font-size: 12px; }
+#automatic-setup-result:empty { display: none; }
+#automatic-setup-check { flex: none; min-height: 32px; padding: 6px 14px; border: 1px solid currentColor; border-radius: 8px; background: transparent; color: inherit; font: inherit; font-size: 12px; font-weight: 650; cursor: pointer; }
+#automatic-setup-check[hidden] { display: none; }
+#automatic-setup-check:hover:not([aria-disabled="true"]) { background: rgba(255, 255, 255, 0.12); }
+#automatic-setup-check[aria-disabled="true"] { opacity: 0.7; cursor: default; }
+#automatic-setup-banner:focus-visible, #automatic-setup-check:focus-visible { outline: 2px solid #2a9d9f; outline-offset: 2px; }
+:root:not([data-theme="dark"]) #automatic-setup-banner { border-color: #e8d49a; border-left-color: #b8860b; background: #fdf8e8; color: #3d3000; }
+:root:not([data-theme="dark"]) #automatic-setup-check:hover:not([aria-disabled="true"]) { background: rgba(0, 0, 0, 0.06); }

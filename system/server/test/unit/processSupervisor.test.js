@@ -40,7 +40,8 @@ test("an optional env is merged over process.env for the spawned process, and re
   const group = new SupervisedProcessGroup({ spawn, restartBackoffMs: [10] });
   group.start("udid-1", "xcodebuild", ["test"], { CUSTOM_VAR: "tuned" });
   assert.equal(calls[0].env.CUSTOM_VAR, "tuned");
-  assert.equal(calls[0].env.PATH, process.env.PATH, "must still inherit the rest of the real environment");
+  const inheritedPath = Object.entries(calls[0].env).find(([key]) => key.toLowerCase() === "path")?.[1];
+  assert.equal(inheritedPath, process.env.PATH, "must still inherit the rest of the real environment");
 });
 
 test("stdout/stderr are captured into a bounded log ring", () => {

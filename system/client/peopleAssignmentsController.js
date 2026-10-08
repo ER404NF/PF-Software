@@ -157,7 +157,45 @@
       }
     }
 
+    // What the list was last drawn from. A push from the server that changes nothing must not rebuild the cards:
+    // that would close "Manage assignment", clear a message and wipe times the person is typing.
+    let lastDrawn = null;
+    // What each assignment last confirmed ("Started.", "Schedule saved.") so it shows on the card even though the
+    // list is drawn again straight after the change.
+    const assignmentNotes = new Map();
+    const noteElements = new Map();
+    function confirmationFor(change) {
+      if (change.status === "in_progress") return "Started.";
+      if (change.status === "completed") return "Marked complete.";
+      if (change.status === "cancelled") return "Cancelled.";
+      if (change.assignee) return `Assignee changed to ${change.assignee}.`;
+      return "Schedule saved.";
+    }
+    function paintNote(element, text) {
+      element.textContent = text ?? "";
+      if (element.dataset) element.dataset.tone = text ? "success" : "";
+    }
+    function rememberNote(id, text) {
+      assignmentNotes.set(id, text);
+      const element = noteElements.get(id);
+      if (element) paintNote(element, text);
+      const timer = setTimeout(() => {
+        if (assignmentNotes.get(id) !== text) return;
+        assignmentNotes.delete(id);
+        const live = noteElements.get(id);
+        if (live && live.textContent === text) paintNote(live, "");
+      }, 8000);
+      timer?.unref?.();
+    }
+    function drawnFingerprint(assignments) {
+      const assignees = Array.from(assignmentAssignee.options ?? [], option => `${option.value}:${option.textContent}`);
+      return JSON.stringify([assignments, assignees, can(capabilities.MANAGE_ASSIGNMENTS)]);
+    }
+
     function renderAssignments(assignments) {
+      const fingerprint = drawnFingerprint(assignments);
+      if (fingerprint === lastDrawn && (assignments.length === 0 || assignmentsList.children.length > 0)) return;
+      lastDrawn = fingerprint;
       assignmentsList.replaceChildren();
       assignmentsEmpty.hidden = assignments.length > 0;
       for (const assignment of assignments) {
@@ -188,6 +226,8 @@
         cardMessage.setAttribute("role", "alert");
         cardMessage.setAttribute("aria-live", "assertive");
         card.append(heading, meta, cardMessage);
+        noteElements.set(assignment.id, cardMessage);
+        if (assignmentNotes.has(assignment.id)) paintNote(cardMessage, assignmentNotes.get(assignment.id));
         const controls = documentRef.createElement("div");
         controls.className = "assignment-controls";
         const actions = documentRef.createElement("div");
@@ -308,6 +348,7 @@
         await requestJson(`/api/assignments/${encodeURIComponent(id)}`, {
           method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(change),
         });
+        rememberNote(id, confirmationFor(change));
         await refreshAssignments();
         return true;
       } catch (error) {

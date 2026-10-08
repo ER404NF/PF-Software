@@ -3,12 +3,13 @@
 // privileged preload API. The normal Phone Farm window has no preload.
 
 const { app, BrowserWindow, Menu, clipboard, dialog, ipcMain, powerSaveBlocker, shell } = require("electron");
+const { buildMenuTemplate } = require("./menu");
 const { spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
 const http = require("http");
-const { buildHostEnvironment, detectInternetSharingBridges, resolveMacHostDependencies } = require("./hostEnvironment");
+const { buildHostEnvironment, detectInternetSharingBridges, resolveMacHostDependencies, smtpChildEnvironment } = require("./hostEnvironment");
 const {
   agentEntryPath, parseAgentStatus, siteAgentEnvironment, validateSiteSettings,
 } = require("./siteAgentConfig");
@@ -28,8 +29,15 @@ const {
 } = require("./windowSecurity");
 const { applyFix } = require("./hostFixes");
 const { createRestartPolicy, findFreePort } = require("./serverSupervisor");
-const { buildDiagnosticsReport, createLogger } = require("./diagnostics");
+const { buildDiagnosticsReport, createLogger, readBuildRecord, readSetupStatusFile } = require("./diagnostics");
 const { enforceReleaseVersion } = require("./autoUpdate");
+const { shutdownChildren } = require("./shutdown");
+const { createProcessInfo } = require("./processInfo");
+const { createChildrenStore } = require("./childrenStore");
+const { recoverOrphans } = require("./orphanRecovery");
+const {
+  checkRecordsAtLaunch, findDamagedRecords, moveAsideDamagedRecords, confirmationDialog, refusalDialog, nothingFoundDialog, failedDialog, doneDialog,
+} = require("./damagedRecords");
 
 // The public product name is Bodun. Keep the legacy user-data directory so an
 // in-place upgrade retains host settings, tokens, assignments and WDA state.
@@ -159,6 +167,9 @@ function resolveHostSetup(config) {
   // the same on a clean CI Mac as on any other machine.
   if (process.env.PHONE_FARM_SKIP_HOST_PREFLIGHT === "1") return resolveMacHostDependencies({ platform: "linux" });
   const routingEnabled = config?.autoRouteProxyTunnels === true || process.env.AUTO_ROUTE_PROXY_TUNNELS === "true";
+  // Off unless the operator turned them on in the Bodun menu (or the environment says so).
+  const autoNetworkEnrollment = config?.autoNetworkEnrollment === true || process.env.AUTO_NETWORK_ENROLLMENT === "true";
+  const autoInternetSharing = config?.autoInternetSharing === true || process.env.AUTO_ENABLE_INTERNET_SHARING === "true";
   const managedWda = prepareManagedWda();
   // Keychain inspection only when neither the environment nor a saved value names a team.
   let team = { teamId: null, candidates: [] };
@@ -172,6 +183,8 @@ function resolveHostSetup(config) {
     developmentTeam: team.teamId,
     signingCandidates: team.candidates,
     routingEnabled,
+    autoNetworkEnrollment,
+    autoInternetSharing,
     sharedBridgeIface: config?.sharedBridgeIface || process.env.SHARED_BRIDGE_IFACE || null,
   });
 }
@@ -194,9 +207,11 @@ function hostStorageEnvironment(secrets) {
     FILE_STORE_DIR: path.join(storageRoot, "files"),
     ACCOUNT_NOTIFICATION_STORE_PATH: path.join(storageRoot, "notifications.json"),
     DEVICE_PROVISIONING_STORE_PATH: path.join(storageRoot, "device-provisioning.json"),
+    PROCESS_OWNERSHIP_PATH: path.join(storageRoot, "process-ownership.json"),
     WDA_DERIVED_DATA_ROOT: path.join(storageRoot, "wda-derived-data"),
     PROXY_POOL_STORE_PATH: path.join(storageRoot, "proxy-pool.json"),
     USB_NETWORK_STORE_PATH: path.join(storageRoot, "usb-network.json"),
+    ...smtpChildEnvironment(process.env),
   };
 }
 
@@ -280,13 +295,51 @@ async function setProxyRoutingEnabled(enabled) {
     return false;
   }
   buildMenu();
-  await dialog.showMessageBox({
+  await offerRestart(enabled ? "Proxy routing enabled" : "Proxy routing disabled");
+  return true;
+}
+
+// Settings that only take effect when Bodun starts: say so, and offer to restart straight away.
+async function offerRestart(message) {
+  const answer = await dialog.showMessageBox({
     type: "info",
-    message: enabled ? "Proxy routing enabled" : "Proxy routing disabled",
-    detail: "Quit and reopen Bodun to apply this host setting.",
-    buttons: ["OK"],
+    message,
+    detail: "This change applies the next time Bodun starts. Restart now, or choose Later and restart when it suits you.",
+    buttons: ["Restart now", "Later"],
+    defaultId: 0,
+    cancelId: 1,
     noLink: true,
   });
+  if (answer.response === 0) {
+    app.relaunch();
+    app.quit();
+  }
+}
+
+// The two automation switches: automatic network enrollment and automatic Internet Sharing. Off by default.
+const AUTOMATION_SETTINGS = Object.freeze({
+  autoNetworkEnrollment: "Automatic network enrollment",
+  autoInternetSharing: "Automatic Internet Sharing",
+});
+
+async function setAutomationSetting(key, enabled) {
+  const label = AUTOMATION_SETTINGS[key];
+  if (!label) return false;
+  try {
+    writeConfig({ ...(readConfig() ?? {}), [key]: Boolean(enabled) });
+  } catch {
+    buildMenu();
+    await dialog.showMessageBox({
+      type: "error",
+      message: `${label} was not saved`,
+      detail: "Bodun could not save this setting. Check that the app settings folder is writable and that the disk has free space, then try again.",
+      buttons: ["OK"],
+      noLink: true,
+    });
+    return false;
+  }
+  buildMenu();
+  await offerRestart(`${label} ${enabled ? "turned on" : "turned off"}`);
   return true;
 }
 
@@ -304,8 +357,94 @@ function startupFailureDetail() {
   return informative ?? recentServerOutput.at(-1) ?? "";
 }
 
+// How long quitting (or switching mode) waits for a child to finish its own cleanup before it is forced.
+const SHUTDOWN_WAIT_MS = 10_000;
+// On a Mac/Linux each child leads its own process group, so the forced stop can reach its whole tree
+// (the server's iproxy and xcodebuild children inherit the group).
+const CHILDREN_LEAD_GROUPS = process.platform !== "win32";
+
+// What this app has started, remembered on disk so a crash or force-quit that leaves a child running
+// is cleaned up on the next launch (see orphanRecovery.js) instead of leaving two servers side by side.
+const processInfo = createProcessInfo();
+const childrenStore = createChildrenStore({
+  filePath: path.join(storageRoot, "desktop-children.json"),
+  describe: pid => processInfo.describe(pid),
+  log: line => logger.info(`[recovery] ${line}`),
+});
+
+function spawnChild(command, args, options, kind) {
+  const child = spawn(command, args, { ...options, detached: CHILDREN_LEAD_GROUPS });
+  child.isGroupLeader = CHILDREN_LEAD_GROUPS;
+  if (processInfo.supported && Number.isSafeInteger(child.pid)) {
+    void childrenStore.record({ kind, pid: child.pid, port: activeHostSecrets?.port ?? null });
+    child.once("exit", () => childrenStore.remove({ kind, pid: child.pid }));
+  }
+  return child;
+}
+
+// The two records of "which processes did Bodun start": this app's own children and the server's phone processes.
+function recordFiles() {
+  return [
+    { id: "children", label: "the record of Bodun's own server and site agent", filePath: childrenStore.filePath, key: "children" },
+    { id: "ownership", label: "the record of Bodun's phone connections", filePath: path.join(storageRoot, "process-ownership.json"), key: "processes" },
+  ];
+}
+
+// A damaged record that is provably older than the Mac's last start is moved aside by itself (never deleted). One that is not is
+// left alone and the person is asked once per launch: it may be from a session that was force-quit moments ago.
+let askedAboutDamagedRecords = false;
+async function checkProcessRecordsAtLaunch() {
+  try { childrenStore.recover(); } catch { /* the check below reports what is still wrong */ } // this app's own record, through its store
+  let outcome;
+  try {
+    outcome = checkRecordsAtLaunch({ files: recordFiles(), log: line => logger.info(`[recovery] ${line}`) });
+  } catch (error) {
+    logger.warn(`[recovery] could not check the process records: ${error?.message || error}`);
+    return;
+  }
+  if (!outcome.needsPerson.length || askedAboutDamagedRecords) return;
+  askedAboutDamagedRecords = true;
+  const answer = await dialog.showMessageBox(confirmationDialog(outcome.needsPerson));
+  if (answer.response !== 1) return;
+  const result = moveAsideDamagedRecords({
+    files: recordFiles(), isServerRunning: () => Boolean(serverProcess), isAgentRunning: () => Boolean(agentProcess), log: line => logger.info(`[recovery] ${line}`),
+  });
+  if (result.ok && result.skipped.length) void dialog.showMessageBox(failedDialog());
+}
+
+// Bodun menu > Move Aside Damaged Process Records: refuses while Bodun's own server or site agent runs, asks first, never deletes.
+async function moveAsideDamagedRecordsFromMenu() {
+  try {
+    if (serverProcess || agentProcess) { await dialog.showMessageBox(refusalDialog()); return; }
+    const damaged = findDamagedRecords({ files: recordFiles() });
+    if (!damaged.length) { await dialog.showMessageBox(nothingFoundDialog()); return; }
+    const answer = await dialog.showMessageBox(confirmationDialog(damaged));
+    if (answer.response !== 1) return;
+    const result = moveAsideDamagedRecords({
+      files: recordFiles(), isServerRunning: () => Boolean(serverProcess), isAgentRunning: () => Boolean(agentProcess), log: line => logger.info(`[recovery] ${line}`),
+    });
+    if (!result.ok) { await dialog.showMessageBox(refusalDialog()); return; }
+    if (!result.moved.length) { await dialog.showMessageBox(failedDialog()); return; }
+    const done = await dialog.showMessageBox(doneDialog());
+    if (done.response === 0) {
+      app.relaunch();
+      app.quit();
+    }
+  } catch (error) {
+    logger.error(`moving the damaged records aside failed: ${error?.message || error}`);
+  }
+}
+
+// Before a new server or site agent starts: stop a leftover of the previous run that is provably ours.
+async function ensureNoOrphans() {
+  await checkProcessRecordsAtLaunch();
+  if (!processInfo.supported) return;
+  const summary = await recoverOrphans({ store: childrenStore, describe: pid => processInfo.describe(pid), log: line => logger.info(`[recovery] ${line}`) });
+  if (summary.terminated || summary.dropped) logger.info(`[recovery] stopped ${summary.terminated} leftover process(es), forgot ${summary.dropped} record(s)`);
+}
+
 function spawnHostServer() {
-  const child = spawn(process.execPath, [resolveServerEntry()], { env: hostServerEnv, stdio: "pipe" });
+  const child = spawnChild(process.execPath, [resolveServerEntry()], { env: hostServerEnv, stdio: "pipe" }, "host-server");
   serverProcess = child;
   recentServerOutput.length = 0;
   child.stdout.on("data", chunk => { rememberServerOutput(chunk); logger.info(`[server] ${String(chunk).trimEnd()}`); });
@@ -358,22 +497,27 @@ function scheduleHostServerRestart() {
   syncKeepAwake();
 }
 
-// Stops the local server on purpose (switching mode, quitting): it must NOT be restarted.
+// Stops the local server on purpose (switching mode, quitting): it must NOT be restarted. The
+// termination signal goes out at once; the returned promise settles when the server has exited
+// (bounded by SHUTDOWN_WAIT_MS, then forced), so callers that must not overlap an old server await it.
 function stopHostServer() {
   hostServerWanted = false;
   clearTimeout(hostServerRestartTimer);
   hostServerRestartTimer = null;
+  let stopped = Promise.resolve();
   if (serverProcess) {
     const child = serverProcess;
     serverProcess = null;
     child.intentionalStop = true;
-    child.kill();
+    stopped = shutdownChildren({ children: [child], timeoutMs: SHUTDOWN_WAIT_MS }).catch(error => logger.warn(`stopping the server: ${error?.message || error}`));
   }
   syncKeepAwake();
+  return stopped;
 }
 
 async function startHostServer() {
   if (serverProcess) return { port: activeHostSecrets.port, preflight: publicPreflight(activeHostResolution) };
+  await ensureNoOrphans();
   const config = readConfig();
   const resolution = resolveHostSetup(config);
   activeHostResolution = resolution;
@@ -447,9 +591,9 @@ function startSiteAgent(settings) {
   };
   delete env.DEVICE_CONFIG_PATH;
   env.AUTO_PROVISION_WDA = "true";
-  const child = spawn(process.execPath, [agentEntryPath({
+  const child = spawnChild(process.execPath, [agentEntryPath({
     packaged: app.isPackaged, resourcesPath: process.resourcesPath, dirname: __dirname, path,
-  })], { env, stdio: "pipe" });
+  })], { env, stdio: "pipe" }, "site-agent");
   agentProcess = child;
   agentWanted = settings;
   syncKeepAwake();
@@ -505,14 +649,16 @@ function stopSiteAgent() {
   agentWanted = null;
   clearTimeout(agentRestartTimer);
   agentRestartTimer = null;
+  let stopped = Promise.resolve();
   if (agentProcess) {
     const child = agentProcess;
     agentProcess = null;
     child.intentionalStop = true;
-    child.kill();
+    stopped = shutdownChildren({ children: [child], timeoutMs: SHUTDOWN_WAIT_MS }).catch(error => logger.warn(`stopping the site agent: ${error?.message || error}`));
   }
   agentStatus = { state: "stopped", detail: "" };
   syncKeepAwake();
+  return stopped;
 }
 
 function protectWindowNavigation(window, isAllowed) {
@@ -674,7 +820,8 @@ ipcMain.handle("desktop:start-site-agent", async (event, input = {}) => {
   const checked = validateSiteSettings(input);
   if (!checked.ok) return { ok: false, error: checked.error };
   try {
-    stopHostServer();
+    await stopHostServer();
+    await ensureNoOrphans();
     const started = startSiteAgent(checked.settings);
     writeConfig({ ...readConfig(), mode: "site", ...checked.settings });
     applyLaunchAtLogin();
@@ -691,9 +838,9 @@ ipcMain.handle("desktop:get-site-status", event => {
   return { ok: true, status: agentStatus };
 });
 
-ipcMain.handle("desktop:stop-site-agent", event => {
+ipcMain.handle("desktop:stop-site-agent", async event => {
   if (!authorizedSetupRequest(event)) return unauthorizedResult();
-  stopSiteAgent();
+  await stopSiteAgent();
   const config = readConfig();
   if (config?.mode === "site") writeConfig({ ...config, mode: undefined, siteToken: undefined });
   return { ok: true };
@@ -704,7 +851,7 @@ ipcMain.handle("desktop:connect-to-host", async (event, { url } = {}) => {
   try {
     const parsed = new URL(url);
     if (!normalizedOrigin(parsed.toString())) throw new Error("host URL must be http or https and must not contain credentials");
-    stopHostServer();
+    await stopHostServer();
     writeConfig({ mode: "client", serverUrl: parsed.toString() });
     applyLaunchAtLogin();
     await openAppWindow(parsed.toString());
@@ -728,6 +875,7 @@ async function launch() {
     const checked = validateSiteSettings(existing);
     if (checked.ok) {
       try {
+        await ensureNoOrphans();
         const started = startSiteAgent(checked.settings);
         applyLaunchAtLogin();
         startupState = { mode: "site", preflight: started.preflight ?? null, error: null };
@@ -758,6 +906,7 @@ function collectDiagnostics() {
   const resolution = activeHostResolution;
   return buildDiagnosticsReport({
     appVersion: app.getVersion(),
+    build: readBuildRecord(path.join(path.dirname(path.dirname(path.dirname(resolveServerEntry()))), "build-info.json")),
     electronVersion: process.versions.electron,
     nodeVersion: process.versions.node,
     mode: config?.mode ?? startupState.mode,
@@ -767,52 +916,39 @@ function collectDiagnostics() {
     tools: resolution?.tools ?? {},
     serverState: serverProcess ? "running" : hostServerRestartTimer ? "restarting" : "stopped",
     agentState: agentProcess || agentWanted ? agentStatus.state : null,
+    automaticSetup: readSetupStatusFile(path.join(storageRoot, "automatic-setup-status.json"), [serverProcess?.pid, agentProcess?.pid].filter(Number.isSafeInteger)),
+    processRecords: childrenStore.health(),
     logLines: logger.tail(250),
     logFile: logger.file,
   });
 }
 
 function buildMenu() {
-  const template = [
-    ...(process.platform === "darwin" ? [{ role: "appMenu" }] : []),
-    { role: "editMenu" },
-    { role: "viewMenu" },
-    { role: "windowMenu" },
-    {
-      label: "Help",
-      submenu: [
-        {
-          label: "Copy Diagnostics",
-          click: () => {
-            clipboard.writeText(collectDiagnostics());
-            void dialog.showMessageBox({
-              type: "info",
-              message: "Diagnostics copied",
-              detail: "Paste them into a message to whoever is helping you. They contain no passwords or keys.",
-            });
-          },
-        },
-        { label: "Show Log Folder", click: () => shell.showItemInFolder(logger.file) },
-        { type: "separator" },
-        {
-          label: "Start Bodun When This Mac Starts",
-          type: "checkbox",
-          checked: launchAtLoginEnabled(),
-          enabled: app.isPackaged,
-          click: item => setLaunchAtLogin(item.checked),
-        },
-        {
-          label: "Enable Proxy Routing on This Mac",
-          type: "checkbox",
-          checked: readConfig()?.autoRouteProxyTunnels === true,
-          enabled: readConfig()?.mode === "host",
-          click: item => { void setProxyRoutingEnabled(item.checked); },
-        },
-      ],
+  const config = readConfig();
+  const template = buildMenuTemplate({
+    isMac: process.platform === "darwin",
+    isPackaged: app.isPackaged,
+    config,
+    launchAtLogin: launchAtLoginEnabled(config),
+    handlers: {
+      setLaunchAtLogin,
+      setProxyRouting: enabled => { void setProxyRoutingEnabled(enabled); },
+      setAutomation: (key, enabled) => { void setAutomationSetting(key, enabled); },
+      copyDiagnostics: () => {
+        clipboard.writeText(collectDiagnostics());
+        void dialog.showMessageBox({
+          type: "info",
+          message: "Diagnostics copied",
+          detail: "Paste them into a message to whoever is helping you. They contain no passwords or keys.",
+        });
+      },
+      showLogFolder: () => shell.showItemInFolder(logger.file),
+      moveAsideDamagedRecords: () => { void moveAsideDamagedRecordsFromMenu(); },
     },
-  ];
+  });
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
 }
+
 
 // One Phone Farm per Mac: a second copy (a double-click, or the login item firing while the app is already open)
 // would fight the first one for the server's port and the phones.
@@ -821,6 +957,8 @@ if (!gotSingleInstanceLock) {
   app.quit();
 } else {
   app.on("second-instance", () => {
+    // A relaunch while the old server is still cleaning up must not start a second one.
+    if (shuttingDown) return;
     const window = [appWindow, setupWindow].find(candidate => candidate && !candidate.isDestroyed());
     if (window) {
       if (window.isMinimized()) window.restore();
@@ -841,11 +979,28 @@ if (!gotSingleInstanceLock) {
     app.quit();
   });
 }
-app.on("before-quit", () => {
+// Quitting waits (up to SHUTDOWN_WAIT_MS) for the server and site agent to finish stopping every phone
+// process they run, then forces what is left. The single-instance lock is held until the app really
+// exits, so a relaunch cannot start a new server next to one that is still cleaning up.
+let shuttingDown = false;
+let shutdownComplete = false;
+app.on("before-quit", event => {
+  if (shutdownComplete) return;
+  event?.preventDefault?.();
+  if (shuttingDown) return;
+  shuttingDown = true;
   hostServerWanted = false;
-  stopHostServer();
-  stopSiteAgent();
   logger.info("Bodun quitting");
+  Promise.all([stopHostServer(), stopSiteAgent()])
+    .catch(error => logger.warn(`shutdown: ${error?.message || error}`))
+    .finally(() => {
+      shutdownComplete = true;
+      // exit() ends the process at once and does not raise before-quit again. The flags are reset only
+      // for a stand-in Electron that returns from exit() (the tests); the real one never gets here.
+      app.exit(0);
+      shuttingDown = false;
+      shutdownComplete = false;
+    });
 });
 app.on("window-all-closed", () => { if (process.platform !== "darwin") app.quit(); });
-app.on("activate", () => { if (startupUnlocked && BrowserWindow.getAllWindows().length === 0) void launch(); });
+app.on("activate", () => { if (shuttingDown) return; if (startupUnlocked && BrowserWindow.getAllWindows().length === 0) void launch(); });

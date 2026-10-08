@@ -1,0 +1,15 @@
+{
+  "groups": [
+    {
+      "layers": [
+        {
+          "image-name": "logo.png",
+          "name": "logo"
+        }
+      ]
+    }
+  ],
+  "supported-platforms": {
+    "squares": "shared"
+  }
+}

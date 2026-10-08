@@ -55,31 +55,57 @@ export class AutoNetworkEnrollment {
     this.attachedLastTick = new Set();
     this.validatedMappings = new Set();
     this.timer = null;
+    this.generation = 0;
+    this.stopped = false;
+    this.tickOperation = null;
   }
 
   getStatus(deviceId) {
     return this.status.get(deviceId) ?? null;
   }
 
-  _setStatus(deviceId, state, note = null) {
+  _isCurrent(generation) {
+    return !this.stopped && generation === this.generation;
+  }
+
+  _setStatus(deviceId, state, note = null, generation = this.generation) {
+    if (!this._isCurrent(generation)) return false;
     const next = { state, note, updatedAt: new Date().toISOString() };
     this.status.set(deviceId, next);
     this.onStatusChanged(deviceId, next);
+    return true;
   }
 
   start() {
     if (this.timer) return;
+    this.stopped = false;
+    this.generation += 1;
     void this.tick();
     this.timer = setInterval(() => { void this.tick().catch(() => {}); }, this.pollIntervalMs);
     this.timer.unref?.();
   }
 
-  stop() {
+  async stop() {
+    this.stopped = true;
+    this.generation += 1;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    if (this.tickOperation) await this.tickOperation.catch(() => {});
   }
 
-  async tick() {
+  tick() {
+    if (this.stopped) return Promise.resolve();
+    if (this.tickOperation) return this.tickOperation;
+    const generation = this.generation;
+    const operation = this._tick(generation);
+    this.tickOperation = operation;
+    operation.finally(() => {
+      if (this.tickOperation === operation) this.tickOperation = null;
+    }).catch(() => {});
+    return operation;
+  }
+
+  async _tick(generation) {
     let attached;
     try {
       attached = this.discoverIosDevices();
@@ -91,15 +117,18 @@ export class AutoNetworkEnrollment {
       attached = attached.devices;
     }
     if (!Array.isArray(attached)) return;
+    if (!this._isCurrent(generation)) return;
     const candidateDevices = attached.filter(d => !this.manualUdids.has(d.udid));
     const attachedIds = new Set(candidateDevices.map(device => discoveredDeviceId(device.udid)));
     for (const previousId of this.attachedLastTick) {
       if (attachedIds.has(previousId)) continue;
+      if (!this._isCurrent(generation)) return;
       clearUsbNetworkRecord(this.usbNetworkStorePath, previousId);
       this.validatedMappings.delete(previousId);
       this.ipAttempts.delete(previousId);
-      this._setStatus(previousId, "disconnected", "The cached USB interface and IP were cleared; they will be rediscovered after reconnect.");
+      this._setStatus(previousId, "disconnected", "The cached USB interface and IP were cleared; they will be rediscovered after reconnect.", generation);
     }
+    if (!this._isCurrent(generation)) return;
     this.attachedLastTick = attachedIds;
 
     const records = loadUsbNetworkRecords(this.usbNetworkStorePath);
@@ -109,9 +138,10 @@ export class AutoNetworkEnrollment {
       members = await this.listBridgeMembers({ bridgeIface: this.bridgeIface });
     } catch (error) {
       const note = `Waiting to read the shared USB network (${operationalErrorKind(error)}).`;
-      for (const device of candidateDevices) this._setStatus(discoveredDeviceId(device.udid), "pending", note);
+      for (const device of candidateDevices) this._setStatus(discoveredDeviceId(device.udid), "pending", note, generation);
       return;
     }
+    if (!this._isCurrent(generation)) return;
     // Persisted enX/IP values are hints, never proof. On the first sighting
     // in this process, require the interface to still be on the configured
     // bridge and force a fresh traffic-based IP observation. A vanished
@@ -120,13 +150,14 @@ export class AutoNetworkEnrollment {
       const logicalId = discoveredDeviceId(device.udid);
       const record = records[logicalId];
       if (!record?.usbIface || this.validatedMappings.has(logicalId)) continue;
+      if (!this._isCurrent(generation)) return;
       if (!members.includes(record.usbIface)) {
         clearUsbNetworkRecord(this.usbNetworkStorePath, logicalId);
         delete records[logicalId];
-        this._setStatus(logicalId, "stale", "The saved USB interface is no longer on the bridge and will be rediscovered.");
+        this._setStatus(logicalId, "stale", "The saved USB interface is no longer on the bridge and will be rediscovered.", generation);
       } else {
         records[logicalId] = setUsbIface(this.usbNetworkStorePath, logicalId, record.usbIface);
-        this._setStatus(logicalId, "discovering_ip", "Revalidating the phone's USB network address.");
+        this._setStatus(logicalId, "discovering_ip", "Revalidating the phone's USB network address.", generation);
       }
       this.validatedMappings.add(logicalId);
     }
@@ -138,29 +169,30 @@ export class AutoNetworkEnrollment {
     if (pendingDevices.length === 1 && pendingMembers.length === 1) {
       const logicalId = discoveredDeviceId(pendingDevices[0].udid);
       try {
+        if (!this._isCurrent(generation)) return;
         setUsbIface(this.usbNetworkStorePath, logicalId, pendingMembers[0]);
         this.validatedMappings.add(logicalId);
-        this._setStatus(logicalId, "discovering_ip", null);
+        this._setStatus(logicalId, "discovering_ip", null, generation);
       } catch (error) {
-        this._setStatus(logicalId, "pending", `Could not record network enrollment (${operationalErrorKind(error)}).`);
+        this._setStatus(logicalId, "pending", `Could not record network enrollment (${operationalErrorKind(error)}).`, generation);
       }
     } else {
       for (const device of pendingDevices) {
         const logicalId = discoveredDeviceId(device.udid);
         if (pendingDevices.length > 1 || pendingMembers.length > 1) {
           this._setStatus(logicalId, "ambiguous",
-            `${pendingDevices.length} phone(s) and ${pendingMembers.length} new network interface(s) appeared at once — unplug and replug one at a time, or use manual enrollment.`);
+            `${pendingDevices.length} phone(s) and ${pendingMembers.length} new network interface(s) appeared at once — unplug and replug one at a time, or use manual enrollment.`, generation);
         } else {
           // pendingMembers.length === 0: Internet Sharing hasn't picked this phone up on the bridge yet.
-          this._setStatus(logicalId, "pending", "Waiting for this phone to appear on the shared USB network.");
+          this._setStatus(logicalId, "pending", "Waiting for this phone to appear on the shared USB network.", generation);
         }
       }
     }
 
-    await this._discoverPendingIps(candidateDevices, records);
+    await this._discoverPendingIps(candidateDevices, records, generation);
   }
 
-  async _discoverPendingIps(candidateDevices, records) {
+  async _discoverPendingIps(candidateDevices, records, generation = this.generation) {
     const now = Date.now();
     for (const device of candidateDevices) {
       const logicalId = discoveredDeviceId(device.udid);
@@ -169,42 +201,48 @@ export class AutoNetworkEnrollment {
 
       const attempt = this.ipAttempts.get(logicalId) ?? { lastAttemptAt: 0, count: 0 };
       if (now - attempt.lastAttemptAt < IP_DISCOVERY_COOLDOWN_MS) continue;
+      if (!this._isCurrent(generation)) return;
       this.ipAttempts.set(logicalId, { lastAttemptAt: now, count: attempt.count + 1 });
 
       try {
         const ownIp = await this.discoverBridgeOwnIp({ bridgeIface: this.bridgeIface });
+        if (!this._isCurrent(generation)) return;
         const capture = await this.captureDeviceTraffic({ iface: record.usbIface });
+        if (!this._isCurrent(generation)) return;
         const result = discoverDeviceIp(capture, { excludeIps: [ownIp] });
         if (result.state !== "resolved") {
           const struggling = attempt.count + 1 >= IP_DISCOVERY_STRUGGLING_AFTER;
           this._setStatus(logicalId, "discovering_ip",
-            struggling ? `Still waiting for network traffic from this phone (${result.reason}). Try opening an app on it.` : result.reason);
+            struggling ? `Still waiting for network traffic from this phone (${result.reason}). Try opening an app on it.` : result.reason, generation);
           continue;
         }
+        if (!this._isCurrent(generation)) return;
         setUsbIp(this.usbNetworkStorePath, logicalId, result.ip);
         this.ipAttempts.delete(logicalId);
-        await this._maybeAutoRoute(logicalId, result.ip);
+        await this._maybeAutoRoute(logicalId, result.ip, generation);
       } catch (error) {
-        this._setStatus(logicalId, "discovering_ip", `IP discovery failed (${operationalErrorKind(error)}).`);
+        this._setStatus(logicalId, "discovering_ip", `IP discovery failed (${operationalErrorKind(error)}).`, generation);
       }
     }
   }
 
-  async _maybeAutoRoute(deviceId, usbIp) {
+  async _maybeAutoRoute(deviceId, usbIp, generation = this.generation) {
+    if (!this._isCurrent(generation)) return;
     if (!this.startRouting) {
-      this._setStatus(deviceId, "ready", "Network identity resolved. Assign a proxy, then start routing.");
+      this._setStatus(deviceId, "ready", "Network identity resolved. Assign a proxy, then start routing.", generation);
       return;
     }
     const proxy = proxyForDevice(this.proxyPoolStorePath, deviceId);
     if (!proxy) {
-      this._setStatus(deviceId, "ready", "Network identity resolved. Assign a proxy to start routing automatically.");
+      this._setStatus(deviceId, "ready", "Network identity resolved. Assign a proxy to start routing automatically.", generation);
       return;
     }
     try {
+      if (!this._isCurrent(generation)) return;
       await this.startRouting(deviceId, { usbIp });
-      this._setStatus(deviceId, "routing", null);
+      this._setStatus(deviceId, "routing", null, generation);
     } catch (error) {
-      this._setStatus(deviceId, "ready", `Automatic routing failed to start (${operationalErrorKind(error)}).`);
+      this._setStatus(deviceId, "ready", `Automatic routing failed to start (${operationalErrorKind(error)}).`, generation);
     }
   }
 }

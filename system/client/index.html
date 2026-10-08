@@ -78,16 +78,16 @@
       <div id="top-bar-left">
         <span class="brand-mark" aria-hidden="true"><img src="icons/bodun-logo.png" alt="" /></span>
         <div class="brand-copy"><h1>BODUN</h1><span>Device operations</span></div>
-        <span id="app-version" class="app-version" aria-label="Application version">Version…</span>
       </div>
       <div id="top-bar-right">
+        <span id="app-version" class="app-version" aria-label="Application version">Version…</span>
         <p id="connection-status" class="connection-state loading" role="status">Connecting</p>
         <button type="button" id="theme-toggle" aria-label="Use dark mode" aria-pressed="false"><span aria-hidden="true">&#9680;</span><span id="theme-toggle-label">Dark</span></button>
         <span id="role-badge"></span>
         <span id="whoami"></span>
         <button type="button" id="research-toggle" aria-controls="research-panel" aria-expanded="false">Research</button>
         <button type="button" id="review-toggle" aria-controls="review-panel" aria-expanded="false" hidden>Review</button>
-        <a href="/account-deletion.html">Privacy</a>
+        <a id="privacy-link" class="header-pill" href="/account-deletion.html">Privacy</a>
         <button type="button" id="logout-button">Sign out</button>
       </div>
     </header>
@@ -95,9 +95,9 @@
     <aside id="people-sidebar" aria-label="Staff presence">
       <nav id="admin-nav" hidden aria-label="Workspace navigation">
         <span class="sidebar-label">Workspace</span>
-        <button type="button" id="fleet-nav-button" class="top-nav-button active"><span aria-hidden="true">&#9638;</span> Fleet overview</button>
-        <button type="button" id="assignments-nav-button" class="top-nav-button"><span aria-hidden="true">&#10003;</span> Assignments</button>
-        <button type="button" id="admin-nav-button" class="top-nav-button" hidden><span aria-hidden="true">&#9881;</span> Operations</button>
+        <button type="button" id="fleet-nav-button" class="top-nav-button active"><span aria-hidden="true" class="nav-icon"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" focusable="false"><rect x="2" y="2" width="5" height="5" rx="1"/><rect x="9" y="2" width="5" height="5" rx="1"/><rect x="2" y="9" width="5" height="5" rx="1"/><rect x="9" y="9" width="5" height="5" rx="1"/></svg></span> Fleet overview</button>
+        <button type="button" id="assignments-nav-button" class="top-nav-button"><span aria-hidden="true" class="nav-icon"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" focusable="false"><rect x="2.5" y="3" width="11" height="10.5" rx="1.5"/><path d="M2.5 6.5h11M5.5 1.5v3M10.5 1.5v3"/></svg></span> Assignments</button>
+        <button type="button" id="admin-nav-button" class="top-nav-button" hidden><span aria-hidden="true" class="nav-icon"><svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" focusable="false"><path d="M2 4.5h7M12 4.5h2M2 11.5h2M7 11.5h7"/><circle cx="10.5" cy="4.5" r="1.5"/><circle cx="5.5" cy="11.5" r="1.5"/></svg></span> Operations</button>
       </nav>
       <div id="people-heading">
         <div>
@@ -116,6 +116,11 @@
         <p id="fleet-description">View fleet status and open available phones.</p>
         <p id="fleet-access-message" hidden></p>
       </header>
+      <div id="automatic-setup-banner" role="region" aria-label="Automatic phone setup" tabindex="0" hidden>
+        <p id="automatic-setup-text" role="status" aria-live="polite"></p>
+        <button type="button" id="automatic-setup-check" hidden>Check again</button>
+        <p id="automatic-setup-result" role="status" aria-live="polite"></p>
+      </div>
       <div id="fleet-toolbar">
         <div id="fleet-summary" aria-label="Fleet summary"></div>
         <label for="fleet-status-filter">Show
@@ -128,7 +133,7 @@
           </select>
         </label>
       </div>
-      <p id="select-error"></p>
+      <p id="select-error" role="status" aria-live="polite"></p>
       <p id="fleet-empty" hidden>No phones match this filter.</p>
       <div id="fleet-groups"></div>
     </section>
@@ -258,7 +263,7 @@
       </header>
 
       <nav id="operations-nav" aria-label="Operations sections">
-        <span>Jump to</span>
+        <span>Sections</span>
         <a href="#command-console-panel" data-operations-target="command-console-panel">Commands</a>
         <a href="#queue-panel" data-operations-target="queue-panel">Task queue</a>
         <a href="#pending-panel" data-operations-target="pending-panel" hidden>Applications</a>
@@ -331,9 +336,9 @@
         </div>
         <form id="user-create-form" class="user-form">
           <p class="user-form-note">New users must enroll an authenticator and save recovery codes at first sign-in.</p>
+          <label>Username<input id="user-create-username" maxlength="100" autocomplete="off" required /></label>
           <label>Full name<input id="user-create-full-name" maxlength="150" autocomplete="off" required /></label>
           <label>Gmail address<input id="user-create-email" type="email" placeholder="name@gmail.com" autocomplete="off" required /></label>
-          <label>Username<input id="user-create-username" maxlength="100" autocomplete="off" required /></label>
           <label>Initial password<input id="user-create-password" type="password" minlength="12" maxlength="512" autocomplete="new-password" required /></label>
           <label>Role
             <select id="user-create-role">
@@ -347,8 +352,10 @@
           <label>Device IDs<input id="user-create-devices" placeholder="mock-1, phone-2" /></label>
           <label>Research workspaces<input id="user-create-research" placeholder="client-a, client-b" /></label>
           <label>Team ID<input id="user-create-team" placeholder="team-a" pattern="[a-z0-9][a-z0-9_-]{0,99}" /></label>
-          <label class="user-checkbox"><input id="user-create-all-devices" type="checkbox" /> All devices</label>
-          <button type="submit">Create user</button>
+          <div class="user-form-footer">
+            <label class="user-checkbox"><input id="user-create-all-devices" type="checkbox" /> All devices</label>
+            <button type="submit">Create user</button>
+          </div>
         </form>
         <p id="users-message" role="status" aria-live="polite"></p>
         <div id="users-list" class="users-list"></div>
@@ -371,6 +378,7 @@
         </form>
         <div id="site-token-reveal" role="status" hidden>
           <strong>Copy these now. The token is shown only once.</strong>
+          <p id="site-token-help">On the site's Mac, open Bodun, choose "This is a remote site's Mac mini", and enter these three values.</p>
           <pre id="site-token-command"></pre>
           <div>
             <button type="button" id="site-token-copy-button">Copy</button>
@@ -391,7 +399,7 @@
           <button type="button" id="proxy-pool-refresh-button">Refresh</button>
         </div>
         <form id="proxy-pool-create-form" class="user-form" hidden>
-          <label>Provider<input id="proxy-pool-provider" maxlength="100" autocomplete="off" required /></label>
+          <label>Provider<input id="proxy-pool-provider" maxlength="100" autocomplete="off" placeholder="Provider name" required /></label>
           <label>Protocol
             <select id="proxy-pool-protocol">
               <option value="socks5">socks5</option>
@@ -399,14 +407,16 @@
               <option value="https">https</option>
             </select>
           </label>
-          <label>Host<input id="proxy-pool-host" maxlength="255" autocomplete="off" required /></label>
-          <label>Port<input id="proxy-pool-port" type="number" min="1" max="65535" required /></label>
-          <label>Username<input id="proxy-pool-username" maxlength="200" autocomplete="off" required /></label>
-          <label>Password<input id="proxy-pool-password" type="password" maxlength="512" autocomplete="new-password" required /></label>
+          <label>Host<input id="proxy-pool-host" maxlength="255" autocomplete="off" placeholder="Host name" required /></label>
+          <label>Port<input id="proxy-pool-port" type="number" min="1" max="65535" placeholder="Port number" required /></label>
+          <label>Username<input id="proxy-pool-username" maxlength="200" autocomplete="off" placeholder="Username" required /></label>
+          <label>Password<input id="proxy-pool-password" type="password" maxlength="512" autocomplete="new-password" placeholder="Password" required /></label>
           <label>Country (2-letter code)<input id="proxy-pool-country" maxlength="2" pattern="[A-Za-z]{2}" placeholder="US" required /></label>
-          <label>Label (optional)<input id="proxy-pool-label" maxlength="100" placeholder="US pool 1" /></label>
-          <button type="button" id="proxy-pool-test-button">Test Proxy</button>
-          <button type="submit">Add proxy</button>
+          <label>Label (optional)<input id="proxy-pool-label" maxlength="100" placeholder="Optional name, e.g. US pool 1" /></label>
+          <div class="user-form-footer">
+            <button type="button" id="proxy-pool-test-button" class="secondary-action">Test Proxy</button>
+            <button type="submit">Add proxy</button>
+          </div>
         </form>
         <p id="proxy-pool-message" role="status" aria-live="polite"></p>
         <div id="proxy-pool-list" class="users-list"></div>
@@ -418,7 +428,7 @@
           </div>
         </div>
         <div id="proxy-provider-list" class="users-list"></div>
-        <p id="proxy-provider-empty" class="admin-empty" hidden>No proxy provider is configured.</p>
+        <p id="proxy-provider-empty" class="admin-empty" hidden>No separate provider inventory is connected. The proxies above are used directly.</p>
       </section>
 
       <section class="admin-panel" id="audit-panel" tabindex="-1" aria-labelledby="audit-heading">
@@ -478,7 +488,10 @@
   <script src="review.js"></script>
   <script src="operationsController.js"></script>
   <script src="peopleAssignmentsController.js"></script>
+  <script src="deviceCardModel.js"></script>
   <script src="proxyPoolController.js"></script>
+  <script src="cardMessages.js"></script>
+  <script src="automaticSetupBanner.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

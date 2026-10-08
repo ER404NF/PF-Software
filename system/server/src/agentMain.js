@@ -18,6 +18,7 @@ import { loadDeviceConfig } from "./deviceConfigLoader.js";
 import { loadDevices } from "./deviceRegistry.js";
 import { discoverIosDevices } from "./deviceDiscovery.js";
 import { startAutoProvisioning } from "./provisioningBoot.js";
+import { createShutdownHandler } from "./shutdown.js";
 import { SiteAgent } from "./siteAgent.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -48,11 +49,13 @@ export function startAgent(env = process.env) {
   const agent = new SiteAgent({ ...config, devices, log: message => console.log(`[agent] ${message}`) });
   agent.start();
   console.log(`Phone Farm site agent for "${config.siteId}" started, linking to ${config.hubUrl} with ${devices.size} phone(s).`);
-  const shutdown = () => {
-    agent.stop();
-    provisioner?.stop?.();
-    process.exit(0);
-  };
+  // Stopping the phones' processes is awaited (bounded) before the process exits; the old handler
+  // started it and exited immediately, so the iproxy/WebDriverAgent children were never stopped.
+  const shutdown = createShutdownHandler({
+    cleanupRuntime: async () => { agent.stop(); await provisioner?.stop?.(); },
+    hardStopMs: 8000,
+    log: line => console.error(`[agent shutdown] ${line}`),
+  });
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
   return { agent, devices, provisioner };

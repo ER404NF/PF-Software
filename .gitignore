@@ -24,6 +24,8 @@ system/storage/**
 # credential material, not fixture data — generate it locally with
 # server/scripts/create-operator.js, never commit it.
 system/operators.config.json
+# Written into the installer's staged runtime at build time; never part of the source.
+/system/build-info.json
 /system/tmp/
 /tmp/
 /system/test-*.txt

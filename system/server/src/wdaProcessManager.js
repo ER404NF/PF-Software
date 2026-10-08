@@ -1,5 +1,6 @@
 import { spawn as nodeSpawn } from "child_process";
 import { SupervisedProcessGroup } from "./processSupervisor.js";
+import { ownershipHooks } from "./iproxyManager.js";
 
 // One xcodebuild WebDriverAgentRunner per device, launched with an explicit
 // argv array (never a shell string — Automation Architecture guide §11
@@ -46,6 +47,7 @@ export class WdaProcessManager {
     restartBackoffMs,
     developmentTeam = process.env.WDA_DEVELOPMENT_TEAM || null,
     bundleId = process.env.WDA_BUNDLE_ID || null,
+    ownershipStore = null,
   } = {}) {
     if (developmentTeam !== null && !TEAM_ID_PATTERN.test(developmentTeam)) {
       throw new Error("WDA_DEVELOPMENT_TEAM must be a 10-character Apple Developer Team ID (letters and digits)");
@@ -57,7 +59,10 @@ export class WdaProcessManager {
     this.xcodebuildBin = xcodebuildBin;
     this.developmentTeam = developmentTeam;
     this.bundleId = developmentTeam ? (bundleId || `com.phonefarm.wda.${developmentTeam.toLowerCase()}`) : null;
-    this.group = new SupervisedProcessGroup({ spawn, restartBackoffMs, logRingSize: 200, retryIndefinitely: true });
+    this.group = new SupervisedProcessGroup({
+      spawn, restartBackoffMs, logRingSize: 200, retryIndefinitely: true,
+      ownership: ownershipStore ? ownershipHooks(ownershipStore, "wda") : null,
+    });
   }
 
   on(...args) { this.group.on(...args); return this; }
@@ -66,6 +71,7 @@ export class WdaProcessManager {
   getLog(udid) { return this.group.getLog(udid); }
   stop(udid) { return this.group.stop(udid); }
   stopAll() { return this.group.stopAll(); }
+  clearBlockedStop(udid, options) { return this.group.clearBlockedStop(udid, options); }
 
   start({ udid, derivedDataPath }) {
     if (!this.wdaRepoPath) throw new Error("WDA_REPO_PATH is not configured");
@@ -87,6 +93,7 @@ export class WdaProcessManager {
         `PRODUCT_BUNDLE_IDENTIFIER=${this.bundleId}`,
       );
     }
-    this.group.start(udid, this.xcodebuildBin, args, mjpegTuningEnv());
+    // "started" | "queued" | "blocked" | "running" (see SupervisedProcessGroup.start)
+    return this.group.start(udid, this.xcodebuildBin, args, mjpegTuningEnv());
   }
 }

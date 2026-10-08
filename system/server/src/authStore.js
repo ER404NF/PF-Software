@@ -39,11 +39,26 @@ const ACCOUNT_STATUSES = new Set(["pending", "approved", "rejected", "banned"]);
 const MAX_RECENT_LOGIN_IPS = 5;
 const roleSet = new Set(Object.values(OPERATOR_ROLES));
 
-function accountError(message, status = 400) {
+function accountError(message, status = 400, code = null) {
   const error = new Error(message);
   error.status = status;
+  if (code) error.code = code;
   return error;
 }
+
+// Admin and Host are the accounts that can administer everyone else. The system must always keep at least
+// one active one, whichever of the two roles it is.
+const ADMINISTRATOR_ROLES = [OPERATOR_ROLES.ADMIN, OPERATOR_ROLES.HOST];
+const isAdministratorRole = role => ADMINISTRATOR_ROLES.includes(normalizeRole(role));
+export function isActiveAdministrator(operator) {
+  return operator?.active !== false && (operator?.accountStatus ?? "approved") === "approved" && isAdministratorRole(operator?.role);
+}
+// How many active Admin/Host accounts exist, not counting `excludeIndex` (the account about to change).
+function otherActiveAdministrators(raw, excludeIndex) {
+  return raw.operators.filter((operator, operatorIndex) => operatorIndex !== excludeIndex && isActiveAdministrator(operator)).length;
+}
+export const SELF_CHANGE_MESSAGE = "You can't change your own role or turn off your own account. Ask another admin.";
+export const LAST_ADMINISTRATOR_MESSAGE = "This is the last active admin or host account. Make someone else an admin or host first.";
 
 export function hashPassword(password) {
   const salt = crypto.randomBytes(16).toString("hex");
@@ -492,7 +507,7 @@ export function createOperatorAccount(input) {
   return publicOperatorAccount(operators.get(username));
 }
 
-export function updateOperatorAccount(username, patch) {
+export function updateOperatorAccount(username, patch, { actor = null } = {}) {
   validateUsername(username);
   if (!patch || typeof patch !== "object" || Array.isArray(patch)) throw accountError("request body must be an object");
   const allowedKeys = new Set(["password", "role", "active", "allowedDevices", "allowedResearchWorkspaces", "fullName", "email", "teamId"]);
@@ -505,6 +520,14 @@ export function updateOperatorAccount(username, patch) {
   if (index < 0) throw accountError("operator not found", 404);
   const current = internalOperator(raw.operators[index]);
   const next = { ...raw.operators[index], username };
+
+  // Nobody can switch off, demote or re-rank the account they are signed in with (that is how an
+  // administrator locks everyone out by accident). Other changes to their own account are fine.
+  if (actor && actor === username) {
+    const changesRole = Object.hasOwn(patch, "role") && normalizeRole(patch.role) !== normalizeRole(current.role);
+    const turnsOff = Object.hasOwn(patch, "active") && patch.active === false;
+    if (changesRole || turnsOff) throw accountError(SELF_CHANGE_MESSAGE, 409, "SELF_CHANGE_BLOCKED");
+  }
 
   if (Object.hasOwn(patch, "role")) next.role = validateRole(patch.role);
   if (Object.hasOwn(patch, "active")) {
@@ -535,12 +558,10 @@ export function updateOperatorAccount(username, patch) {
     next.allowedDevices = [];
   }
 
-  const removesActiveAdmin = current.active !== false && current.role === OPERATOR_ROLES.ADMIN
-    && (next.active === false || ![OPERATOR_ROLES.ADMIN, OPERATOR_ROLES.HOST].includes(normalizeRole(next.role)));
-  if (removesActiveAdmin) {
-    const hasAnother = raw.operators.some((operator, operatorIndex) => operatorIndex !== index
-      && operator?.active !== false && normalizeRole(operator?.role) === OPERATOR_ROLES.ADMIN);
-    if (!hasAnother) throw accountError("cannot deactivate or demote the last active admin", 409);
+  const removesActiveAdministrator = isActiveAdministrator(current)
+    && (next.active === false || !isAdministratorRole(next.role));
+  if (removesActiveAdministrator && otherActiveAdministrators(raw, index) === 0) {
+    throw accountError(LAST_ADMINISTRATOR_MESSAGE, 409, "LAST_ADMINISTRATOR");
   }
 
   // isMainHost is never itself editable through this generic patch (see
@@ -901,15 +922,47 @@ function deletionCandidate(username, password) {
   if (current.isMainHost) {
     throw accountError("transfer main-host responsibility before requesting account deletion", 409);
   }
-  if (current.active !== false && current.accountStatus === "approved"
-    && current.role === OPERATOR_ROLES.ADMIN) {
-    const hasAnother = raw.operators.some((operator, operatorIndex) => operatorIndex !== index
-      && operator?.active !== false
-      && (operator?.accountStatus ?? "approved") === "approved"
-      && normalizeRole(operator?.role) === OPERATOR_ROLES.ADMIN);
-    if (!hasAnother) throw accountError("create or activate another admin before requesting account deletion", 409);
+  if (isActiveAdministrator(current) && otherActiveAdministrators(raw, index) === 0) {
+    throw accountError("You're the only admin or host. Make someone else an admin or host first, then you can delete your account.", 409, "LAST_ADMINISTRATOR");
   }
   return { raw, index, current };
+}
+
+// Locks an account for deletion exactly as the person's own request does (the account is switched off at once,
+// its sign-in secrets are cleared, and the privacy process removes the data afterwards).
+function lockForDeletion(raw, index, current) {
+  raw.operators[index] = {
+    ...raw.operators[index],
+    active: false,
+    authVersion: current.authVersion + 1,
+    privacyDeletionState: "requested",
+    privacyDeletionRequestedAt: new Date().toISOString(),
+    twoFactorSecret: null,
+    recoveryCodeDigests: [],
+    recoveryTokenHash: null,
+    recoveryTokenExpiresAt: null,
+  };
+  writeConfig(raw);
+  replaceLiveOperators(raw);
+}
+
+// A person with authority over this account (a higher role, checked by the caller) asks for it to be deleted.
+// The same protections apply as for a self-request, and it can never be your own account through this path.
+export function requestOperatorDeletionByAuthority(username, { actor = null } = {}) {
+  validateUsername(username);
+  if (!actor) throw accountError("who is deleting this account must be known", 400);
+  if (actor === username) throw accountError("To delete your own account use Privacy, then Delete my account.", 409, "USE_SELF_DELETION");
+  const raw = readConfig();
+  const index = raw.operators.findIndex(operator => operator?.username === username);
+  if (index < 0) throw accountError("operator not found", 404);
+  const current = internalOperator(raw.operators[index]);
+  if (current.isMainHost) throw accountError("The main host account can't be deleted. Transfer main-host responsibility first.", 409, "MAIN_HOST");
+  if (current.privacyDeletionState) throw accountError("This account is already being deleted.", 409, "ALREADY_DELETING");
+  if (isActiveAdministrator(current) && otherActiveAdministrators(raw, index) === 0) {
+    throw accountError(LAST_ADMINISTRATOR_MESSAGE, 409, "LAST_ADMINISTRATOR");
+  }
+  lockForDeletion(raw, index, current);
+  return publicOperatorAccount(operators.get(username));
 }
 
 export function validateOperatorDeletionRequest(username, password) {
@@ -919,20 +972,7 @@ export function validateOperatorDeletionRequest(username, password) {
 
 export function requestOperatorDeletion(username, password) {
   const { raw, index, current } = deletionCandidate(username, password);
-  const requestedAt = new Date().toISOString();
-  raw.operators[index] = {
-    ...raw.operators[index],
-    active: false,
-    authVersion: current.authVersion + 1,
-    privacyDeletionState: "requested",
-    privacyDeletionRequestedAt: requestedAt,
-    twoFactorSecret: null,
-    recoveryCodeDigests: [],
-    recoveryTokenHash: null,
-    recoveryTokenExpiresAt: null,
-  };
-  writeConfig(raw);
-  replaceLiveOperators(raw);
+  lockForDeletion(raw, index, current);
   return publicOperatorAccount(operators.get(username));
 }
 

@@ -262,7 +262,7 @@ export async function probeProxy(proxy, provider, { timeoutMs = DEFAULT_TIMEOUT_
     if (secureTarget) socket = await secureTargetSocket(socket, target, timeoutMs);
     const authorization = proxy.protocol === "socks5" || secureTarget ? "" : proxyAuthorization(proxy);
     const requestTarget = proxy.protocol === "socks5" || secureTarget ? `${targetUrl.pathname}${targetUrl.search}` : targetUrl.href;
-    socket.write(`GET ${requestTarget} HTTP/1.1\r\nHost: ${targetUrl.host}\r\n${authorization}Accept: application/json,text/plain\r\nUser-Agent: PF-Software-Proxy-Test\r\nConnection: close\r\n\r\n`);
+    socket.write(`GET ${requestTarget} HTTP/1.1\r\nHost: ${targetUrl.host}\r\n${authorization}Accept: application/json,text/plain\r\nUser-Agent: Bodun-Proxy-Test\r\nConnection: close\r\n\r\n`);
     const response = await readHttpResponse(socket);
     if (response.status < 200 || response.status >= 300) throw new ProxyTestError("P109", { technical: { httpStatus: response.status } });
     return parseObservedIdentity(response.body);

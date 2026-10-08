@@ -3,10 +3,11 @@ import assert from "node:assert/strict";
 import { hashPassword, verifyPassword, authenticate, canAccessDevice, operators, normalizeRole, publicOperator, hasRole, filterValidResearchGrants, capabilitiesForRole, hasCapability, validateOperatorConfig } from "../../src/authStore.js";
 import { CAPABILITIES, OPERATOR_ROLES, ROLE_CAPABILITIES } from "../../src/roleCapabilities.js";
 
-test("only host and special manager receive physical WDA lifecycle control", () => {
-  assert.equal(hasCapability({ role: OPERATOR_ROLES.HOST }, CAPABILITIES.MANAGE_WDA_LIFECYCLE), true);
-  assert.equal(hasCapability({ role: OPERATOR_ROLES.SPECIAL_MANAGER }, CAPABILITIES.MANAGE_WDA_LIFECYCLE), true);
-  for (const role of [OPERATOR_ROLES.ADMIN, OPERATOR_ROLES.MANAGER, OPERATOR_ROLES.VA,
+test("only host, admin and special manager receive physical WDA lifecycle control", () => {
+  for (const role of [OPERATOR_ROLES.HOST, OPERATOR_ROLES.ADMIN, OPERATOR_ROLES.SPECIAL_MANAGER]) {
+    assert.equal(hasCapability({ role }, CAPABILITIES.MANAGE_WDA_LIFECYCLE), true, role);
+  }
+  for (const role of [OPERATOR_ROLES.MANAGER, OPERATOR_ROLES.VA,
     OPERATOR_ROLES.CONTENT_CREATOR, OPERATOR_ROLES.EDITOR]) {
     assert.equal(hasCapability({ role }, CAPABILITIES.MANAGE_WDA_LIFECYCLE), false, role);
   }

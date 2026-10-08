@@ -3,7 +3,7 @@
 // deliberately does NOT enable AUTO_ROUTE_PROXY_TUNNELS (it needs a real
 // macOS bridge, pfctl, and tun2proxy — none of which exist in CI), so it
 // covers exactly what's reachable without hardware: authentication, the
-// admin-only capability gate, and the safe "not enabled on this relay"
+// admin-only capability gate, and the safe "turned off on this Mac"
 // fallback — proving a disabled relay never allows a routing action to
 // silently no-op as success. networkRoutingOrchestrator.test.js covers the
 // actual state machine exhaustively against fakes.
@@ -28,6 +28,7 @@ process.env.NODE_ENV = "test";
 
 const { server, wss, networkRoutingOrchestrator, autoNetworkEnrollment } = await import("../../src/index.js");
 const { operators, hashPassword } = await import("../../src/authStore.js");
+const { assertPlainOperatorText } = await import("../helpers/plainText.js");
 
 let httpUrl;
 
@@ -97,13 +98,15 @@ test("an authorized Admin gets a clear 409 rather than a silent no-op when routi
     body: JSON.stringify({ usbIp: "192.168.2.10" }),
   });
   assert.equal(start.status, 409);
-  assert.match((await start.json()).error, /not enabled on this relay/);
+  assert.match((await start.json()).error, /Automatic network setup is turned off on this Mac\./);
 
   const stop = await fetch(`${httpUrl}/api/admin/devices/mock-1/stop-routing`, {
     method: "POST", headers: { Cookie: adminCookie },
   });
   assert.equal(stop.status, 409);
-  assert.match((await stop.json()).error, /not enabled on this relay/);
+  const stopMessage = (await stop.json()).error;
+  assert.match(stopMessage, /Automatic network setup is turned off on this Mac\./);
+  assertPlainOperatorText(stopMessage, "stop routing while routing is off");
 });
 
 test("device_list never exposes a routing field to a viewer without routing:manage", async () => {
@@ -165,6 +168,6 @@ test("network-enrollment and discover-ip all return the same clear 409 while rou
   ]) {
     const res = await fetch(`${httpUrl}${path}`, { method: "POST", headers: { Cookie: adminCookie } });
     assert.equal(res.status, 409, path);
-    assert.match((await res.json()).error, /not enabled on this relay/);
+    assert.match((await res.json()).error, /Automatic network setup is turned off on this Mac\./);
   }
 });

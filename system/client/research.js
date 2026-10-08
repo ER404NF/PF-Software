@@ -142,6 +142,8 @@ async function loadResearchRuns() {
 
 researchToggle.addEventListener("click", async () => {
   if (!researchPanel.hidden) return researchReset();
+  // Research and Review open in the same place: only one is open at a time.
+  if (!document.getElementById("review-panel").hidden) document.getElementById("review-toggle").click();
   researchPanel.hidden = false;
   researchToggle.setAttribute("aria-expanded", "true");
   const epoch = ++researchEpoch;
@@ -155,7 +157,16 @@ researchToggle.addEventListener("click", async () => {
       option.value = account.id;
     }
     if (accounts.length) await loadResearchRuns();
-    else researchMessage.textContent = "No research accounts assigned. Ask an administrator to configure workspace access.";
+    else {
+      // An empty list says so in the list itself, and tells each person what they can do about it.
+      const placeholder = researchText(researchAccount, "option", "No research accounts yet");
+      placeholder.value = "";
+      placeholder.disabled = true;
+      placeholder.selected = true;
+      researchMessage.textContent = window.phoneFarmCan?.("users:manage")
+        ? "No research accounts are set up yet. Add a research workspace to a user under Operations, then open this panel again."
+        : "No research accounts are assigned to you yet. Ask your manager to give you access.";
+    }
   } catch (error) {
     if (epoch === researchEpoch) researchMessage.textContent = error.message;
   }

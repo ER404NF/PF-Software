@@ -152,10 +152,10 @@ separately:
   roles. Managers can review applications and rename those members. Admin
   remains the authority for assigning teams, roles, and grants.
 - A Special Manager has the ordinary Manager surface plus the narrowly scoped
-  `wda:lifecycle` capability. Only a Host can assign this rank. Host and Special
-  Manager can stop/start an automatically managed phone's WDA plus its scoped
-  iproxy tunnel and run an end-to-end control readiness check. Admin and ordinary
-  Manager deliberately cannot perform that disruptive lifecycle action.
+  `wda:lifecycle` capability. Only a Host can assign this rank. Host, Admin and
+  Special Manager can start, stop and restart an automatically managed phone's WDA
+  plus its scoped iproxy tunnel and run an end-to-end control readiness check. An
+  ordinary Manager deliberately cannot perform that disruptive lifecycle action.
 
 ### Signup, approval, 2FA, and recovery
 
@@ -187,10 +187,17 @@ $env:TWO_FACTOR_MASTER_KEY = "use-a-long-random-secret-of-at-least-32-characters
 ```
 
 Approval, rejection, and recovery messages are written to the durable account
-notification outbox. Set `COMPANY_FROM_EMAIL` when the company mailbox is
-known. Until an SMTP/API delivery adapter and its credentials are configured,
+notification outbox. SMTP delivery requires `SMTP_HOST`, `SMTP_PORT`,
+`SMTP_USER`, `SMTP_PASS`, and a verified `COMPANY_FROM_EMAIL`; optional
+`SMTP_SECURE=true` enables implicit TLS. The desktop launcher passes these
+deployment environment values only to its private server child. It never writes
+`SMTP_PASS` to desktop configuration, diagnostics, logs, browser responses, or
+audit events. Until all required settings are configured,
 items remain `awaiting_sender_configuration`; the app does not report them as
-delivered. Recovery message bodies are AES-256-GCM encrypted in the outbox and
+delivered. Eligible queued and failed items are reclaimed after restart and
+retried with bounded exponential backoff; SMTP connection, greeting, socket,
+and overall send deadlines prevent a provider outage from hanging the worker.
+Recovery message bodies are AES-256-GCM encrypted in the outbox and
 are never returned by the administrative notification API. By default the
 existing `TWO_FACTOR_MASTER_KEY` protects them; deployments may instead set a
 separate `ACCOUNT_NOTIFICATION_ENCRYPTION_KEY`. Recovery requests fail closed
@@ -377,6 +384,22 @@ an unresolved prompt. Exhausting the restart budget surfaces
 on the fleet card (Admin-only, `device:provision` capability) that calls
 `POST /api/admin/devices/:deviceId/retry-provisioning`.
 
+**Start-up check and the status of automatic phone setup.** Before the first discovery pass the provisioner
+looks at the process records of earlier sessions (`process-ownership.json`): up to three looks, two seconds
+apart, and only while waiting can help. While it looks the status is `checking`; if it cannot finish, setup is
+**paused** (nothing is discovered or started, so no duplicate of a leftover process can be created) and the
+status says why: `setup_paused_cannot_check` and `setup_paused_earlier_session` clear by themselves (re-checked
+every 30 seconds, and on demand with `POST /api/admin/automatic-setup/check`, device-provisioning capability,
+audited, one check at a time, refused while shutting down); `setup_paused_record_damaged` needs a person (see
+`desktop/README.md`, "Troubleshooting"). A re-check only looks and reclaims under the exact-match rules above,
+at most three reclaim attempts per leftover; it never signals anything new. The status is one object
+(`setupStatus.js`: `state`, `code`, plain `message`) sent to every page in each `device_list` message as
+`automaticSetup` (`canCheckAgain` is true only for holders of the provisioning capability while paused), and
+written, with the record file's name and folder name (never a path), to `automatic-setup-status.json` for the
+desktop app's Copy Diagnostics. A damaged record that is provably older than the Mac's last start is moved aside
+(never deleted) by `damagedRecordRecovery.js`; every other case stays blocked with the bytes untouched. Writes
+are temporary file, flush, rename, folder flush. Demo: `npm run demo -- --paused-setup`.
+
 See "Shared proxy pool" and "Proxy tunnel routing" below for Phase B, which
 this feeds into.
 
@@ -510,7 +533,7 @@ leased pool proxy: `networkRoutingOrchestrator.js` drives
   member (Architecture guide §4.4). Two ways to do this now:
   - **Manual** (always available): `POST .../network-enrollment/start`
     snapshots the bridge's current members; the admin then manually enables
-    USB Internet Sharing for **that one phone** in System Preferences;
+    USB Internet Sharing for **that one phone** in System Settings (General, then Sharing);
     `POST .../network-enrollment/confirm` snapshots again and diffs
     (`usbNetworkMapper.js`) — exactly one new member is recorded as that
     device's `usbIface` (`usbNetworkStore.js`), zero or several is refused
@@ -710,7 +733,9 @@ Server -> client:
   including `id`, `label`, `hostLabel`, status/health, controller mode, safe
   network state, `assignedToViewer`, `canOpen`, `accessState`, and `openReason`.
   Task instructions, credentials, proxy secrets, and access lists are omitted
-  for viewers without the corresponding management capability.
+  for viewers without the corresponding management capability. The message also
+  carries `automaticSetup` (`{ state, code, message, canCheckAgain }`), the one plain
+  status of automatic phone setup that the Fleet page shows to everyone.
 - `frame`: `{ deviceId, kind, data, mime? }`
 - live video: JSON `stream_started` / `stream_state` / `stream_stopped` / `stream_unsupported` plus binary frames (see "Live video, gestures and multi-site")
 - `error`: `{ deviceId?, message }`

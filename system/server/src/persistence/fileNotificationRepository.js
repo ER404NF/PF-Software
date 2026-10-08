@@ -18,6 +18,8 @@ export function createFileNotificationRepository(storeOrOptions) {
     markAborted(id) { return store.markAborted(id); },
     markSent(id) { return store.markSent(id); },
     markFailed(id) { return store.markFailed(id); },
+    claimNext(options) { return store.claimNext(options); },
+    completeClaim(id, claimToken, outcome) { return store.completeClaim(id, claimToken, outcome); },
     canSecureRecovery() { return store.canSecureRecovery(); },
   });
 }

@@ -15,7 +15,7 @@ test("account deletion is reachable signed out and signed in with labelled confi
   assert.match(shell, /href="\/account-deletion\.html">Privacy</);
   assert.match(page, /id="deletion-request-form"/);
   assert.match(page, /id="self-deletion-form"[^>]*hidden/);
-  assert.match(page, /Type <span>DELETE MY ACCOUNT<\/span>/);
+  assert.match(page, /Type <strong>DELETE MY ACCOUNT<\/strong>/);
   assert.match(page, /href="\/api\/me\/data-export"/);
   assert.match(page, /role="status" aria-live="polite"/);
   assert.match(page, /role="alert" aria-live="assertive"/);

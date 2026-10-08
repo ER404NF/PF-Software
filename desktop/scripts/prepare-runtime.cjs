@@ -15,6 +15,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
 const { findForbiddenFiles, findMissingFiles, findUnresolvableImports } = require("./verify-packaged-runtime.cjs");
+const { writeBuildInfo } = require("./write-build-info.cjs");
 
 const desktopDir = path.resolve(__dirname, "..");
 const defaultSystemDir = path.resolve(desktopDir, "..", "system");
@@ -103,6 +104,8 @@ function stageRuntime({
   fs.rmSync(stageSystemDir, { recursive: true, force: true });
   fs.mkdirSync(stageSystemDir, { recursive: true });
   copyAllowlist(systemDir, stageSystemDir);
+  // Which build this is, so the installed app can be told apart from any other with the same version.
+  writeBuildInfo(stageSystemDir, { cwd: path.dirname(systemDir) });
   install(stageSystemDir);
   stageNotices({ stageRoot, log });
   verifyRuntime(stageRoot);

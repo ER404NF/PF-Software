@@ -67,7 +67,7 @@ test("the hub boots in the production configuration the container uses and answe
     const appInfo = await fetch(`http://127.0.0.1:${port}/api/app-info`);
     assert.equal(appInfo.status, 200);
     assert.deepEqual(await appInfo.json(), {
-      name: "Bodun", version: "9.8.7", channel: null, displayVersion: "9.8.7",
+      name: "Bodun", version: "9.8.7", channel: null, displayVersion: "9.8.7", buildId: null, builtAt: null,
     });
     // The login page and PWA files are public.
     assert.equal((await fetch(`http://127.0.0.1:${port}/`)).status, 200);

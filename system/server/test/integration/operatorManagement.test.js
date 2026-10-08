@@ -576,8 +576,12 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
       method: "PATCH",
       body: { role: "manager", teamId: "team-a" },
     });
+    // Demoting the account you are signed in with is refused outright (the last-administrator rule is the
+    // second line of defence, checked below against the store directly).
     assert.equal(lastAdmin.status, 409);
-    assert.match(lastAdmin.body.error, /last active admin/);
+    assert.equal(lastAdmin.body.code, "SELF_CHANGE_BLOCKED");
+    assert.match(lastAdmin.body.error, /You can't change your own role or turn off your own account/);
+    assert.throws(() => auth.updateOperatorAccount("admin-test", { role: "manager", teamId: "team-a" }), /last active admin/);
 
     const selfRejected = await request(baseUrl, "/api/admin/users/admin-test/status", {
       cookie: adminCookie,

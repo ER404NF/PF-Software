@@ -28,6 +28,8 @@ function loadMain(options = {}) {
   const loginItems = [];
   const spawned = [];
   const quitCalls = [];
+  const relaunchCalls = [];
+  const exitCalls = [];
   const openedPaths = [];
   const dialogResponses = [...(options.dialogResponses || [])];
 
@@ -59,6 +61,8 @@ function loadMain(options = {}) {
       whenReady: () => Promise.resolve(),
       on: (name, handler) => { appEvents.set(name, handler); },
       quit: () => quitCalls.push(Date.now()),
+      relaunch: () => relaunchCalls.push(Date.now()),
+      exit: code => exitCalls.push(code),
       setLoginItemSettings: settings => loginItems.push(settings),
     },
     BrowserWindow: FakeWindow,
@@ -80,6 +84,10 @@ function loadMain(options = {}) {
   Module._load = function patched(request, ...rest) {
     if (request === "electron") return fakeElectron;
     if (request === "./autoUpdate" && options.autoUpdate) return options.autoUpdate;
+    if (request === "./processInfo" && options.processInfo) {
+      const processInfoModule = originalLoad.call(this, request, ...rest);
+      return { ...processInfoModule, createProcessInfo: () => options.processInfo };
+    }
     if (request === "./hostEnvironment" && options.internetSharingBridges) {
       const hostEnvironment = originalLoad.call(this, request, ...rest);
       return {
@@ -89,12 +97,14 @@ function loadMain(options = {}) {
     }
     return originalLoad.call(this, request, ...rest);
   };
+  // A test can put files in the app's storage (a saved setting, a damaged record) before main.js reads them.
+  options.prepare?.({ userData, logsDir });
   require("../../main.js");
   Module._load = originalLoad;
 
   const wait = ms => new Promise(resolve => setTimeout(resolve, ms));
   return {
-    desktopDir, userData, logsDir, handlers, appEvents, windows, clipboardWrites, blockers, menus, shown, loginItems, spawned, quitCalls, openedPaths, wait,
+    desktopDir, userData, logsDir, dialogResponses, handlers, appEvents, windows, clipboardWrites, blockers, menus, shown, loginItems, spawned, quitCalls, relaunchCalls, exitCalls, openedPaths, wait,
     // An event as Electron would deliver it from the first-run page / from anywhere else.
     trusted: () => ({ sender: windows[0].webContents, senderFrame: { url: pathToFileURL(path.join(desktopDir, "first-run.html")).toString() } }),
     stranger: { sender: { not: "the setup window" }, senderFrame: { url: "https://example.com/" } },

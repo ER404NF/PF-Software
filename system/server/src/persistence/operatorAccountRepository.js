@@ -17,6 +17,7 @@ export const OPERATOR_ACCOUNT_REPOSITORY_METHODS = Object.freeze([
   "resetSecondFactor",
   "validateDeletion",
   "requestDeletion",
+  "requestDeletionByAuthority",
   "finalizePrivacyDeletion",
 ]);
 

@@ -33,7 +33,7 @@ test("the site token is validated before use, never logged, and stored only in t
 test("stopping site mode forgets the token and the app quits cleanly with it", () => {
   assert.match(main, /siteToken: undefined/);
   assert.match(main, /before-quit[\s\S]*stopSiteAgent\(\)/);
-  assert.match(main, /function stopSiteAgent\(\) \{[\s\S]*agentWanted = null;[\s\S]*child\.kill\(\)/, "stopping is deliberate, so the agent is not restarted");
+  assert.match(main, /function stopSiteAgent\(\) \{[\s\S]*agentWanted = null;[\s\S]*child\.intentionalStop = true;[\s\S]*shutdownChildren\(/, "stopping is deliberate, so the agent is not restarted, and it is stopped with the bounded wait");
 });
 
 test("the setup page offers the third mode without weakening its Content-Security-Policy", () => {

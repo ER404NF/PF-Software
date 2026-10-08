@@ -4,10 +4,17 @@ import { discoveredDeviceId } from "./deviceDiscovery.js";
 import { isLocalPortAvailable, reserveAvailablePortPair, resolveMjpegPortRange, resolvePortRange } from "./portAllocator.js";
 import { upsertProvisioningRecord, loadProvisioningRecords } from "./deviceProvisioningStore.js";
 import { diagnosticError } from "./errorCatalog.js";
+import { LifecycleError, lifecycleSuccess } from "./provisioningResults.js";
+import { ownerStatus } from "./portReclaimer.js";
+import { buildSetupStatus } from "./setupStatus.js";
+import { STORE_UNAVAILABLE } from "./processOwnershipStore.js";
 
 const DEFAULT_POLL_INTERVAL_MS = 5000;
 const DEFAULT_RECOVERY_COOLDOWN_MS = 15_000;
 const MAX_ENDPOINT_RECOVERIES = 2;
+// How many times a tunnel that died because a stale Bodun leftover held its port is brought back
+// automatically before the phone is reported as blocked.
+const MAX_PORT_RECLAIMS = 2;
 
 // Matches the specific, previously-observed failure modes from the
 // Automation Architecture guide §11 that need a human action on the phone
@@ -40,6 +47,12 @@ const IPROXY_FAILURES = [
 export function classifyIproxyFailure(logText) {
   const match = IPROXY_FAILURES.find(candidate => candidate.pattern.test(String(logText)));
   return match ? diagnosticError(match.code, { technical: { category: match.code } }) : null;
+}
+
+function assertStartResult(result) {
+  if (result === "blocked") throw new LifecycleError("old_process_would_not_stop");
+  if (result === "queued") throw new LifecycleError("process_replacement_pending");
+  if (result !== "started" && result !== "running") throw new LifecycleError("process_replacement_pending");
 }
 
 function diagnosticCheck(id, label, observed, expected, status, meaning, action) {
@@ -144,6 +157,22 @@ function failedProbe(id, label, error) {
 // offline -> idle. This loop only observes that side effect (via `status`)
 // to know when to clear the "provisioning" banner — it never duplicates
 // the HTTP polling.
+const defaultTimers = {
+  setTimeout: (fn, ms) => { const handle = setTimeout(fn, ms); handle.unref?.(); return handle; },
+  clearTimeout: handle => clearTimeout(handle),
+};
+
+// Which pause (if any) a sweep's counts call for. Counts a test or an older caller left out count as "could not check".
+function setupCodeForSweep(summary) {
+  const counts = summary ?? {};
+  const skipped = counts.skipped ?? 0;
+  const cannotLook = counts.cannotLook ?? 0;
+  const earlier = (counts.ownerAlive ?? 0) + (counts.reclaimFailed ?? 0) + (counts.unverifiedAlive ?? 0);
+  if (skipped === 0 && cannotLook === 0 && earlier === 0) return null;
+  if (cannotLook > 0 || skipped > cannotLook + earlier) return "setup_paused_cannot_check";
+  return "setup_paused_earlier_session";
+}
+
 export class DeviceProvisioner {
   constructor({
     devices,
@@ -160,6 +189,20 @@ export class DeviceProvisioner {
     isPortAvailable,
     now = () => Date.now(),
     onDeviceListChanged = () => {},
+    // Stale-leftover handling (portReclaimer.js / processOwnershipStore.js). Without them a busy
+    // port is simply reported as held by an unidentified program and nothing is ever signalled.
+    portReclaimer = null,
+    ownershipStore = null,
+    ownerServer = { pid: process.pid, startTime: null },
+    iproxyBin = null,
+    // Start-up check of Bodun's earlier phone connections (see start() and recheckNow()). Injectable so a test can drive
+    // the waits and the re-check timer by hand.
+    timers = defaultTimers,
+    startupTries = 3,
+    startupRetryDelayMs = 2000,
+    recheckIntervalMs = 30_000,
+    maxReclaimAttempts = 3,
+    onSetupStatusChanged = () => {},
   }) {
     this.devices = devices;
     this.discoverIosDevices = discoverIosDevices;
@@ -175,6 +218,10 @@ export class DeviceProvisioner {
     this.isPortAvailable = isPortAvailable;
     this.now = now;
     this.onDeviceListChanged = onDeviceListChanged;
+    this.portReclaimer = portReclaimer;
+    this.ownershipStore = ownershipStore;
+    this.ownerServer = ownerServer;
+    this.iproxyBin = iproxyBin ?? iproxyManager?.bin ?? null;
     this.runtime = new Map(); // udid -> device runtime and bounded recovery bookkeeping
     this.udidByLogicalId = new Map(); // logicalId -> udid, so routes/clients only ever handle the logical id (never the raw UDID — CLAUDE.md §14.8)
     this.controlChecks = new Map(); // udid -> one coalesced end-to-end readiness probe
@@ -184,6 +231,21 @@ export class DeviceProvisioner {
     this.stopping = false;
     this.generation = 0;
     this.stopOperation = null;
+    this.startOperation = null;
+    this.sweepOperation = null;
+    this.startupSweepPending = false;
+    this.startupFailure = false;
+    this.timers = timers;
+    this.startupTries = startupTries;
+    this.startupRetryDelayMs = startupRetryDelayMs;
+    this.recheckIntervalMs = recheckIntervalMs;
+    this.maxReclaimAttempts = maxReclaimAttempts;
+    this.onSetupStatusChanged = onSetupStatusChanged;
+    this.setupStatus = buildSetupStatus("setup_running");
+    this.recheckTimer = null;
+    this.checkOperation = null;
+    this.reclaimAttempts = new Map(); // "kind:udid" -> how many times a leftover was asked to stop this session
+    this.waiters = new Set(); // functions that end a start-up wait early (shutdown)
 
     this.wdaProcessManager.on("exit", ({ key, log }) => this._onProcessExit("WDA", key, log));
     this.wdaProcessManager.on("starting", ({ key }) => this._onProcessStarting("WDA", key));
@@ -200,10 +262,201 @@ export class DeviceProvisioner {
   }
 
   start() {
-    if (this.timer || this.stopping) return;
-    void this.pollOnce();
+    if (this.startOperation) return this.startOperation;
+    if (this.stopping) return Promise.resolve();
+    // Recover from a crash or force-quit first: leftovers recorded by an earlier run are stopped (or
+    // their records dropped) before the first discovery pass looks at any port. The interval is
+    // deliberately installed afterwards: a slow or failed inspection must never overlap discovery.
+    this.startupSweepPending = true;
+    this._setSetupStatus("setup_checking");
+    this.startOperation = (async () => {
+      let outcome;
+      try {
+        outcome = await this._runStartupChecks();
+      } finally {
+        this.startupSweepPending = false;
+      }
+      if (this.stopping) return;
+      // A check that could not be completed means a leftover process might still be running, and starting discovery
+      // could create the duplicate the record exists to prevent. Setup is PAUSED (and says why); a later check can lift it.
+      if (!outcome.ok) { this._pause(outcome); return; }
+      this._setSetupStatus("setup_running");
+      await this._beginPolling();
+    })();
+    return this.startOperation;
+  }
+
+  // The current status of automatic phone setup: { state, code, message, changesByItself }.
+  getSetupStatus() {
+    return { ...this.setupStatus };
+  }
+
+  _setSetupStatus(code) {
+    if (this.setupStatus.code === code) return false;
+    this.setupStatus = buildSetupStatus(code);
+    try { this.onSetupStatusChanged(this.getSetupStatus()); } catch { /* a listener must never break setup */ }
+    try { this.onDeviceListChanged(); } catch { /* same */ }
+    return true;
+  }
+
+  // One look at the earlier connections: re-read the record from disk, then sweep it. → { ok: true } or
+  // { ok: false, code, retryable }. A damaged record needs a person; the other reasons may clear by themselves.
+  async _checkOnce() {
+    const fail = error => (error?.code === STORE_UNAVAILABLE && error.reason === "damaged"
+      ? { ok: false, code: "setup_paused_record_damaged", retryable: false }
+      : { ok: false, code: "setup_paused_cannot_check", retryable: true });
+    let summary;
+    try {
+      await this.ownershipStore?.flush?.(); // nothing older than this look may be written back afterwards
+      this.ownershipStore?.reload?.({ recover: true });
+      this.sweepOperation = Promise.resolve().then(() => this.sweepStaleOwnership());
+      summary = await this.sweepOperation;
+    } catch (error) {
+      return fail(error);
+    }
+    const code = setupCodeForSweep(summary);
+    return code ? { ok: false, code, retryable: buildSetupStatus(code).changesByItself } : { ok: true };
+  }
+
+  // Up to `startupTries` looks, `startupRetryDelayMs` apart, but only while waiting can help.
+  async _runStartupChecks() {
+    let outcome = { ok: false, code: "setup_paused_cannot_check", retryable: true };
+    for (let attempt = 1; attempt <= this.startupTries; attempt += 1) {
+      outcome = await this._checkOnce();
+      if (outcome.ok || this.stopping || !outcome.retryable) return outcome;
+      if (attempt < this.startupTries) await this._wait(this.startupRetryDelayMs);
+      if (this.stopping) return outcome;
+    }
+    return outcome;
+  }
+
+  _pause({ code, retryable }) {
+    this.startupFailure = true;
+    if (this._setSetupStatus(code)) console.error("Automatic device provisioning is blocked because process ownership could not be verified.");
+    if (retryable) this._scheduleRecheck();
+    else this._cancelRecheck();
+  }
+
+  _scheduleRecheck() {
+    if (this.stopping) return;
+    this._cancelRecheck();
+    this.recheckTimer = this.timers.setTimeout(() => {
+      this.recheckTimer = null;
+      if (this.stopping) return;
+      void this.recheckNow().catch(() => {});
+    }, this.recheckIntervalMs);
+  }
+
+  _cancelRecheck() {
+    if (this.recheckTimer) this.timers.clearTimeout(this.recheckTimer);
+    this.recheckTimer = null;
+  }
+
+  // A wait that shutdown can end at once.
+  _wait(ms) {
+    return new Promise(resolve => {
+      let handle = null;
+      const wake = () => {
+        if (handle !== null) this.timers.clearTimeout(handle);
+        this.waiters.delete(wake);
+        resolve();
+      };
+      this.waiters.add(wake);
+      if (this.stopping) { wake(); return; }
+      handle = this.timers.setTimeout(wake, ms);
+    });
+  }
+
+  // Look again at the earlier connections right now (the Check again button; also what the 30 second timer calls).
+  // One check at a time: pressing twice shares the running one. It only looks and reclaims under the same exact-match
+  // rules as at start-up, so it can never signal anything new. Throws "shutting_down" while Bodun is stopping.
+  recheckNow() {
+    if (this.stopping) return Promise.reject(new LifecycleError("shutting_down"));
+    if (this.checkOperation) return this.checkOperation;
+    if (!this.startupFailure) return Promise.resolve(this.getSetupStatus()); // running, or the first check is still going
+    const operation = (async () => {
+      try {
+        const outcome = await this._checkOnce();
+        if (this.stopping) return this.getSetupStatus();
+        if (outcome.ok) {
+          this._cancelRecheck();
+          this.startupFailure = false;
+          this._setSetupStatus("setup_running");
+          await this._beginPolling();
+        } else {
+          this._pause(outcome);
+        }
+        return this.getSetupStatus();
+      } finally {
+        if (this.checkOperation === operation) this.checkOperation = null;
+      }
+    })();
+    this.checkOperation = operation;
+    return operation;
+  }
+
+  // Discovery and the periodic poll begin, exactly once, after the earlier connections have been checked.
+  async _beginPolling() {
+    if (this.stopping || this.startupFailure) return;
+    await this.pollOnce();
+    if (this.stopping || this.startupFailure || this.timer) return;
     this.timer = setInterval(() => { void this.pollOnce(); }, this.pollIntervalMs);
     this.timer.unref?.();
+  }
+
+  // Looks only at Bodun's own ownership records, never at ports by number:
+  //   process gone                         → drop the record
+  //   pid reused (start time/command differ) → drop the record, signal nothing
+  //   record without a start time          → drop the record (never usable to signal)
+  //   same process, owner server dead/reused/this server → stop it (exit confirmed), then drop
+  //   same process, owner server still alive (or unknown) → leave it and its record alone
+  async sweepStaleOwnership() {
+    const store = this.ownershipStore;
+    const reclaimer = this.portReclaimer;
+    const inspector = reclaimer?.inspector;
+    if (!store?.list || !reclaimer || !inspector) return { dropped: 0, reclaimed: 0, skipped: 0 };
+    if (this.ownerServer && !this.ownerServer.startTime) {
+      const own = await inspector.describe(this.ownerServer.pid).catch(() => null);
+      if (own?.startTime) this.ownerServer.startTime = own.startTime;
+    }
+    // The counts say WHY a record was left alone (the status shown to people depends on it): "cannotLook" the operating system
+    // could not be asked, "ownerAlive" the Bodun session that started it is still running, "reclaimFailed" the leftover would
+    // not stop (or was already asked enough times), "unverifiedAlive" a record without a start time whose process is alive.
+    const summary = { dropped: 0, reclaimed: 0, skipped: 0, cannotLook: 0, ownerAlive: 0, reclaimFailed: 0, unverifiedAlive: 0 };
+    for (const record of store.list()) {
+      if (this.stopping) break;
+      const attemptKey = `${record.kind}:${record.udid}`;
+      const forget = async () => { await store.drop(record.kind, record.udid); this.reclaimAttempts.delete(attemptKey); summary.dropped += 1; };
+      if (record.unverified || !record.startTime) {
+        const unverified = await inspector.describe(record.pid).catch(() => undefined);
+        if (unverified === null) await forget();
+        else {
+          summary.skipped += 1;
+          if (unverified === undefined) summary.cannotLook += 1; else summary.unverifiedAlive += 1;
+        }
+        continue;
+      }
+      const description = await inspector.describe(record.pid).catch(() => undefined);
+      if (description === undefined) { summary.skipped += 1; summary.cannotLook += 1; continue; } // could not look: leave it
+      if (description === null || description.startTime !== record.startTime || description.command !== record.command) { await forget(); continue; }
+      const owner = await ownerStatus(record, this.ownerServer, inspector);
+      if (!["dead", "reused", "self"].includes(owner)) {
+        summary.skipped += 1;
+        if (owner === "unknown") summary.cannotLook += 1; else summary.ownerAlive += 1;
+        continue;
+      }
+      // A leftover that did not stop is asked at most `maxReclaimAttempts` times in all; after that it is only looked at.
+      const attempts = this.reclaimAttempts.get(attemptKey) ?? 0;
+      if (attempts >= this.maxReclaimAttempts) { summary.skipped += 1; summary.reclaimFailed += 1; continue; }
+      this.reclaimAttempts.set(attemptKey, attempts + 1);
+      const result = await reclaimer.reclaim({
+        description, classification: { kind: "owned_by_record", record, holder: { program: description.program, pid: description.pid } },
+        deviceId: this.udidByLogicalId ? [...this.udidByLogicalId].find(([, udid]) => udid === record.udid)?.[0] ?? null : null,
+        port: record.ports?.[0] ?? null, isStopping: () => this.stopping,
+      });
+      if (result.ok) { await forget(); summary.reclaimed += 1; } else { summary.skipped += 1; summary.reclaimFailed += 1; }
+    }
+    return summary;
   }
 
   async stop() {
@@ -212,10 +465,19 @@ export class DeviceProvisioner {
     this.generation += 1;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    this._cancelRecheck();
+    for (const wake of [...this.waiters]) wake(); // a start-up wait must not hold shutdown back
     this.stopOperation = (async () => {
+      // Terminate the managed processes straight away: waiting for a slow discovery pass or a restart's
+      // readiness check first (both unbounded) could keep them alive past the shutdown deadline.
+      const immediate = Promise.allSettled([this.wdaProcessManager.stopAll(), this.iproxyManager.stopAll()]);
+      // A start-up check or a Check again that is still looking ends as soon as it notices that Bodun is stopping.
+      await Promise.allSettled([this.startOperation, this.checkOperation].filter(Boolean));
       const activePoll = this.pollOperation;
       if (activePoll) await activePoll.catch(() => {});
       await Promise.allSettled([...this.lifecycleOperations.values()]);
+      await immediate;
+      // Second pass for anything a late operation managed to start in the meantime.
       await Promise.allSettled([this.wdaProcessManager.stopAll(), this.iproxyManager.stopAll()]);
     })();
     return this.stopOperation;
@@ -223,6 +485,8 @@ export class DeviceProvisioner {
 
   pollOnce() {
     if (this.stopping) return Promise.resolve();
+    if (this.startupFailure) return Promise.resolve();
+    if (this.startupSweepPending) return this.startOperation ?? Promise.resolve();
     if (this.pollOperation) return this.pollOperation;
     const operation = this._pollOnce().finally(() => {
       if (this.pollOperation === operation) this.pollOperation = null;
@@ -274,20 +538,26 @@ export class DeviceProvisioner {
     let reservation;
     let adoptOwnedTunnel = false;
     let blockedForeignTunnel = false;
-    let occupiedControlPort = false;
-    let occupiedMjpegPort = false;
+    let portConflict = null;
     const availability = this.isPortAvailable ?? isLocalPortAvailable;
     if (Number.isSafeInteger(existingRecord?.wdaLocalPort) && Number.isSafeInteger(existingRecord?.mjpegLocalPort)) {
       const [controlFree, mjpegFree] = await Promise.all([
         availability(existingRecord.wdaLocalPort), availability(existingRecord.mjpegLocalPort),
       ]);
-      occupiedControlPort = !controlFree;
-      occupiedMjpegPort = !mjpegFree;
       if (!controlFree || !mjpegFree) {
         adoptOwnedTunnel = this.iproxyManager.ownsMapping?.(udid, {
           localPort: existingRecord.wdaLocalPort, mjpegLocalPort: existingRecord.mjpegLocalPort,
         }) === true;
-        blockedForeignTunnel = !adoptOwnedTunnel;
+        if (!adoptOwnedTunnel) {
+          // A leftover from an earlier run is stopped if (and only if) it is provably Bodun's own;
+          // anything else keeps the phone blocked, with a plain message naming who holds the port.
+          const result = await this._serializeLifecycle(logicalId, () => this._resolvePortConflict({
+            logicalId, port: existingRecord.wdaLocalPort, mjpegPort: existingRecord.mjpegLocalPort,
+          }));
+          if (result.status !== "free") portConflict = this._conflictError(result);
+          blockedForeignTunnel = portConflict !== null;
+        }
+        if (this.stopping || generation !== this.generation) return;
       }
     }
     try {
@@ -347,30 +617,45 @@ export class DeviceProvisioner {
     });
     this.udidByLogicalId.set(logicalId, udid);
 
+    let wdaStartAttempted = false;
+    let iproxyStartAttempted = false;
     try {
       if (wdaEnabled && blockedForeignTunnel) {
-        const detail = diagnosticError("I205", {
-          why: "A persisted control or video port is owned by a process Bodun cannot prove it started.",
-          operatorAction: "Stop the manual or stale tunnel, then use Retry setup. Bodun will not kill an unowned process or start a duplicate pipeline.",
-          technical: { ownership: "unproven", controlPortOccupied: occupiedControlPort, videoPortOccupied: occupiedMjpegPort },
-        });
-        wdaDevice.discoveryState = "provisioning_error";
-        wdaDevice.discoveryStateMessage = `${detail.name}. ${detail.operatorAction}`;
-        wdaDevice.setComponentError("iproxy", detail);
-        wdaDevice.setComponentHealth({ wdaProcess: "STOPPED", iproxy: "FAILED", control: "UNAVAILABLE", recovery: "BLOCKED_PORT" });
-        wdaDevice.recordDiagnosticEvent("IPROXY_FOREIGN_OWNER_BLOCKED", { error: detail });
+        this._applyConflictBanner(wdaDevice, portConflict);
       } else if (wdaEnabled) {
         if (this.stopping || generation !== this.generation) return;
-        this.wdaProcessManager.start({ udid, derivedDataPath });
+        wdaStartAttempted = true;
+        assertStartResult(this.wdaProcessManager.start({ udid, derivedDataPath }));
         if (this.stopping || generation !== this.generation) {
           await this.wdaProcessManager.stop(udid);
           return;
         }
-        if (!adoptOwnedTunnel) this.iproxyManager.start({ udid, localPort: port, mjpegLocalPort: mjpegPort });
+        if (!adoptOwnedTunnel) {
+          iproxyStartAttempted = true;
+          assertStartResult(this.iproxyManager.start({ udid, localPort: port, mjpegLocalPort: mjpegPort }));
+        }
       }
     } catch (error) {
-      wdaDevice.discoveryState = "provisioning_error";
-      wdaDevice.discoveryStateMessage = "Automatic WDA setup could not start. An admin can review the host logs and retry.";
+      // A queued start is still future work. Stop invalidates the supervisor's
+      // generation so it cannot launch after this attach has been reported as
+      // failed. If iproxy failed after WDA started, stop both halves of the
+      // control path instead of leaving a partially usable phone behind.
+      await Promise.allSettled([
+        ...(wdaStartAttempted ? [this.wdaProcessManager.stop(udid)] : []),
+        ...(iproxyStartAttempted ? [this.iproxyManager.stop(udid)] : []),
+      ]);
+      if (error instanceof LifecycleError) {
+        this._markStartResultFailure(this.runtime.get(udid), udid, error);
+      } else {
+        wdaDevice.discoveryState = "provisioning_error";
+        wdaDevice.discoveryStateMessage = "Automatic WDA setup could not start. An admin can review the host logs and retry.";
+        wdaDevice.setComponentHealth({
+          wdaProcess: processHealthState(this._managerState(this.wdaProcessManager, udid)),
+          iproxy: processHealthState(this._managerState(this.iproxyManager, udid)),
+          wdaEndpoint: "UNKNOWN", control: "UNAVAILABLE", recovery: "FAILED",
+        });
+        wdaDevice.recordDiagnosticEvent("AUTOMATIC_CONTROL_START_FAILED");
+      }
     }
     finally {
       reservation.release();
@@ -424,11 +709,18 @@ export class DeviceProvisioner {
       const wdaState = this._managerState(this.wdaProcessManager, udid);
       const iproxyState = this._managerState(this.iproxyManager, udid);
       const currentIproxyHealth = wdaDevice.componentHealth.iproxy;
+      // A port conflict or an unconfirmed stop is a latched cause: until a retry/start/restart (or an
+      // unplug) changes something, the process states must not be rewritten from the managers — they
+      // read "stopped" precisely because Bodun refused to start into the conflict, and writing that
+      // back made the chip flip between FAILED and STOPPED for the same underlying problem.
+      const latched = ["BLOCKED_PORT", "STOP_FAILED"].includes(wdaDevice.componentHealth.recovery);
       wdaDevice.setComponentHealth({
         deviceAttachment: "CONNECTED",
-        wdaProcess: processHealthState(wdaState),
-        iproxy: iproxyState === "running" && currentIproxyHealth === "STARTING"
-          ? "STARTING" : processHealthState(iproxyState),
+        ...(latched ? {} : {
+          wdaProcess: processHealthState(wdaState),
+          iproxy: iproxyState === "running" && currentIproxyHealth === "STARTING"
+            ? "STARTING" : processHealthState(iproxyState),
+        }),
       });
       if (wdaDevice.discoveryState === "provisioning"
         && wdaDevice.status !== "offline"
@@ -522,6 +814,7 @@ export class DeviceProvisioner {
     const entry = this.runtime.get(udid);
     if (!entry) return;
     const component = kind === "WDA" ? "wdaProcess" : "iproxy";
+    if (kind !== "WDA") entry.portReclaims = 0;
     entry.wdaDevice.setComponentHealth({ [component]: "RUNNING" });
     entry.wdaDevice.setComponentError(component, null);
     entry.wdaDevice.refreshControlHealth();
@@ -551,7 +844,7 @@ export class DeviceProvisioner {
     entry.wdaDevice.recordDiagnosticEvent(`${kind === "WDA" ? "WDA" : "IPROXY"}_FAILED`, { error: detail });
     this.onDeviceListChanged();
     if (kind === "iproxy" && detail.code === "I205") {
-      void this._recoverOccupiedIproxyPorts(udid, entry);
+      void this._recoverOccupiedIproxyPorts(udid, entry).catch(() => {});
       return;
     }
     // classifyWdaFailure's patterns (untrusted cert, Developer Mode, App ID
@@ -582,41 +875,48 @@ export class DeviceProvisioner {
     this.onDeviceListChanged();
   }
 
-  async _recoverOccupiedIproxyPorts(udid, entry) {
-    if (this.runtime.get(udid) !== entry || !entry.wdaEnabled) return;
-    try {
-      let stopped;
+  // The tunnel died because its port was busy. Stop the supervisor's retry loop, find out who
+  // holds the port, and either bring the tunnel back (the holder was a provable leftover of
+  // Bodun's own and is now gone) or report exactly who is in the way. Serialized per phone so a
+  // Retry/Start/Restart queues behind it instead of racing it.
+  _recoverOccupiedIproxyPorts(udid, entry) {
+    return this._serializeLifecycle(entry.logicalId, async () => {
+      if (this.runtime.get(udid) !== entry || !entry.wdaEnabled || this.stopping) return;
       try {
-        stopped = await this.iproxyManager.stop(udid);
-      } catch (error) {
-        throw Object.assign(new Error("iproxy stop failed"), { code: "IPROXY_STOP_FAILED", cause: error });
+        let stopped;
+        try {
+          stopped = await this.iproxyManager.stop(udid);
+        } catch (error) {
+          throw Object.assign(new Error("iproxy stop failed"), { code: "IPROXY_STOP_FAILED", cause: error });
+        }
+        if (stopped?.ok === false) throw Object.assign(new Error("iproxy did not confirm exit"), { code: "IPROXY_STOP_FAILED" });
+        if (this.stopping || this.runtime.get(udid) !== entry || !entry.wdaEnabled) return;
+        const result = await this._resolvePortConflict(entry);
+        if (this.stopping || this.runtime.get(udid) !== entry || !entry.wdaEnabled) return;
+        if (result.status === "free" && (entry.portReclaims ?? 0) < MAX_PORT_RECLAIMS) {
+          entry.portReclaims = (entry.portReclaims ?? 0) + 1;
+          entry.wdaDevice.recordDiagnosticEvent("IPROXY_STALE_TUNNEL_RECLAIMED");
+          this.iproxyManager.start({ udid, localPort: entry.port, mjpegLocalPort: entry.mjpegPort });
+        } else {
+          // A holder that is not provably Bodun's own, or a port that keeps being taken again.
+          const blocking = result.status === "free" ? { status: "unidentified", port: entry.port } : result;
+          this._markPortConflict(entry, this._conflictError(blocking));
+        }
+      } catch (cause) {
+        const code = cause?.code === "IPROXY_STOP_FAILED" ? "I210"
+          : classifyIproxyFailure(cause?.message || "")?.code ?? "I203";
+        const error = diagnosticError(code);
+        entry.wdaDevice.discoveryState = "provisioning_error";
+        entry.wdaDevice.discoveryStateMessage = `${error.name}. ${error.operatorAction}`;
+        entry.wdaDevice.setComponentError("iproxy", error);
+        entry.wdaDevice.setComponentHealth({
+          iproxy: "FAILED", control: "UNAVAILABLE",
+          recovery: code === "I205" ? "BLOCKED_PORT" : code === "I210" ? "STOP_FAILED" : "FAILED",
+        });
+        entry.wdaDevice.recordDiagnosticEvent("IPROXY_PORT_REALLOCATION_FAILED", { error });
       }
-      if (stopped?.ok === false) throw Object.assign(new Error("iproxy did not confirm exit"), { code: "IPROXY_STOP_FAILED" });
-      if (this.stopping || this.runtime.get(udid) !== entry || !entry.wdaEnabled) return;
-      const error = diagnosticError("I205", {
-        why: "The forwarding process could not bind its assigned control or video port, and ownership of the current listener cannot be proven.",
-        operatorAction: "Stop the manual or stale tunnel, then use Retry setup. Bodun will not launch a second pipeline on different ports.",
-        technical: { ownership: "unproven" },
-      });
-      entry.wdaDevice.discoveryState = "provisioning_error";
-      entry.wdaDevice.discoveryStateMessage = `${error.name}. ${error.operatorAction}`;
-      entry.wdaDevice.setComponentError("iproxy", error);
-      entry.wdaDevice.setComponentHealth({ iproxy: "FAILED", control: "UNAVAILABLE", recovery: "BLOCKED_PORT" });
-      entry.wdaDevice.recordDiagnosticEvent("IPROXY_FOREIGN_OWNER_BLOCKED", { error });
-    } catch (cause) {
-      const code = cause?.code === "IPROXY_STOP_FAILED" ? "I210"
-        : classifyIproxyFailure(cause?.message || "")?.code ?? "I203";
-      const error = diagnosticError(code);
-      entry.wdaDevice.discoveryState = "provisioning_error";
-      entry.wdaDevice.discoveryStateMessage = `${error.name}. ${error.operatorAction}`;
-      entry.wdaDevice.setComponentError("iproxy", error);
-      entry.wdaDevice.setComponentHealth({
-        iproxy: "FAILED", control: "UNAVAILABLE",
-        recovery: code === "I205" ? "BLOCKED_PORT" : code === "I210" ? "STOP_FAILED" : "FAILED",
-      });
-      entry.wdaDevice.recordDiagnosticEvent("IPROXY_PORT_REALLOCATION_FAILED", { error });
-    }
-    this.onDeviceListChanged();
+      this.onDeviceListChanged();
+    });
   }
 
   _ownsIproxyMapping(udid, entry) {
@@ -635,19 +935,80 @@ export class DeviceProvisioner {
     });
   }
 
-  _markForeignIproxyPort(udid, entry) {
-    const error = diagnosticError("I205", {
-      why: "A required control or video port is already occupied by a process Bodun cannot prove it started.",
-      operatorAction: "Stop the manual or stale tunnel, then retry setup. Bodun will not kill an unowned process or launch a duplicate tunnel.",
-      technical: { ownership: "unproven" },
+  // Ports Bodun has persisted for its phones (used to recognise a leftover of Bodun's own).
+  _persistedPortPairs() {
+    try {
+      return Object.entries(loadProvisioningRecords(this.provisioningStorePath))
+        .filter(([, record]) => Number.isSafeInteger(record?.wdaLocalPort))
+        .map(([udid, record]) => ({ udid, wdaPort: record.wdaLocalPort, mjpegPort: Number.isSafeInteger(record.mjpegLocalPort) ? record.mjpegLocalPort : null }));
+    } catch {
+      return [];
+    }
+  }
+
+  _portIsFree(port) {
+    return (this.isPortAvailable ?? isLocalPortAvailable)(port);
+  }
+
+  // Looks at a phone's control and video ports. Free ports cost nothing. A busy port is handed to the
+  // reclaimer, which stops the holder only if it is provably a leftover of this Bodun; the port is then
+  // probed again. Returns { status: "free" } or the blocking result (foreign | unidentified | unknown |
+  // would_not_stop | shutting_down) for _conflictError().
+  async _resolvePortConflict(target) {
+    for (const port of [target.port, target.mjpegPort].filter(Number.isSafeInteger)) {
+      if (this.stopping) return { status: "shutting_down", port };
+      if (await this._portIsFree(port)) continue;
+      if (!this.portReclaimer) return { status: "unidentified", port };
+      const result = await this.portReclaimer.resolvePort({
+        port,
+        deviceId: target.logicalId,
+        records: this.ownershipStore?.list?.() ?? [],
+        persisted: this._persistedPortPairs(),
+        iproxyBin: this.iproxyBin,
+        ownerServer: this.ownerServer,
+        isStopping: () => this.stopping,
+      });
+      if (result.status === "free" || result.status === "reclaimed") {
+        if (await this._portIsFree(port)) continue;
+        return { status: "unidentified", port };
+      }
+      return result;
+    }
+    return { status: "free" };
+  }
+
+  _conflictError(result) {
+    const details = { port: result.port, program: result.holder?.program ?? null, pid: result.holder?.pid ?? null };
+    switch (result.status) {
+      case "foreign": return new LifecycleError("port_held_by_other_program", details);
+      case "would_not_stop": return new LifecycleError("old_process_would_not_stop", details);
+      case "shutting_down": return new LifecycleError("shutting_down", details);
+      default: return new LifecycleError("port_held_by_unidentified_program", details);
+    }
+  }
+
+  // The banner on the phone's card: the plain sentence naming who holds the port (program, process
+  // number, port) — never the holder's command line.
+  _applyConflictBanner(wdaDevice, error) {
+    const stopFailed = error.code === "old_process_would_not_stop";
+    const detail = diagnosticError(stopFailed ? "I210" : "I205", {
+      why: error.message,
+      operatorAction: stopFailed
+        ? "Restart Bodun, then use Retry setup."
+        : "Close that program, then use Retry setup. Bodun will not stop other programs.",
+      technical: error.details?.program ? { program: error.details.program, pid: error.details.pid, port: error.details.port } : { port: error.details?.port ?? null },
     });
-    entry.wdaDevice.discoveryState = "provisioning_error";
-    entry.wdaDevice.discoveryStateMessage = `${error.name}. ${error.operatorAction}`;
-    entry.wdaDevice.setComponentError("iproxy", error);
-    entry.wdaDevice.setComponentHealth({
-      wdaProcess: "STOPPED", iproxy: "FAILED", control: "UNAVAILABLE", recovery: "BLOCKED_PORT",
+    wdaDevice.discoveryState = "provisioning_error";
+    wdaDevice.discoveryStateMessage = error.message;
+    wdaDevice.setComponentError("iproxy", detail);
+    wdaDevice.setComponentHealth({
+      wdaProcess: "STOPPED", iproxy: "FAILED", control: "UNAVAILABLE", recovery: stopFailed ? "STOP_FAILED" : "BLOCKED_PORT",
     });
-    entry.wdaDevice.recordDiagnosticEvent("IPROXY_FOREIGN_OWNER_BLOCKED", { error });
+    wdaDevice.recordDiagnosticEvent(stopFailed ? "IPROXY_STOP_FAILED" : "IPROXY_FOREIGN_OWNER_BLOCKED", { error: detail });
+  }
+
+  _markPortConflict(entry, error) {
+    this._applyConflictBanner(entry.wdaDevice, error);
     this.onDeviceListChanged();
     return error;
   }
@@ -661,6 +1022,24 @@ export class DeviceProvisioner {
       wdaProcess: "STOPPED", iproxy: "FAILED", control: "UNAVAILABLE", recovery: "STOP_FAILED",
     });
     entry.wdaDevice.recordDiagnosticEvent("IPROXY_STOP_FAILED", { error });
+    this.onDeviceListChanged();
+  }
+
+  _markStartResultFailure(entry, udid, error) {
+    if (error?.code === "old_process_would_not_stop") {
+      this._markIproxyStopFailed(entry);
+      return;
+    }
+    if (error?.code !== "process_replacement_pending") return;
+    entry.wdaDevice.discoveryState = "provisioning_error";
+    entry.wdaDevice.discoveryStateMessage = error.message;
+    if (entry.wdaDevice.status !== "in-use") entry.wdaDevice.status = "offline";
+    entry.wdaDevice.setComponentHealth({
+      wdaProcess: processHealthState(this._managerState(this.wdaProcessManager, udid)),
+      iproxy: processHealthState(this._managerState(this.iproxyManager, udid)),
+      wdaEndpoint: "UNKNOWN", control: "UNAVAILABLE", recovery: "FAILED",
+    });
+    entry.wdaDevice.recordDiagnosticEvent("PROCESS_REPLACEMENT_PENDING");
     this.onDeviceListChanged();
   }
 
@@ -724,18 +1103,20 @@ export class DeviceProvisioner {
   // Automation Architecture guide's own "redact UDIDs" logging rule).
   retryDevice(logicalId) {
     return this._serializeLifecycle(logicalId, async () => {
-      if (this.stopping) return false;
+      if (this.stopping) throw new LifecycleError("shutting_down");
       const udid = this.udidByLogicalId.get(logicalId);
-      if (!udid) return false;
+      if (!udid) throw new LifecycleError("device_unknown");
       return this.retry(udid);
     });
   }
 
   // Internal — keyed by UDID because that's what the runtime map and the
-  // process managers use as their identity.
+  // process managers use as their identity. Every failure is a thrown LifecycleError (a distinct,
+  // plain-language reason); only success returns a value: { ok: true, code: "started" }.
   async retry(udid) {
     const entry = this.runtime.get(udid);
-    if (!entry || this.stopping) return false;
+    if (!entry) throw new LifecycleError("device_not_attached");
+    if (this.stopping) throw new LifecycleError("shutting_down");
     const adoptOwnedTunnel = this._ownsIproxyMapping(udid, entry);
     const stopped = await Promise.all([
       this.wdaProcessManager.stop(udid),
@@ -745,21 +1126,23 @@ export class DeviceProvisioner {
       || this.wdaProcessManager.getStatus?.(udid)?.state === "stop_failed"
       || this.iproxyManager.getStatus?.(udid)?.state === "stop_failed") {
       this._markIproxyStopFailed(entry);
-      return false;
+      throw new LifecycleError("old_process_would_not_stop");
     }
-    if (this.stopping || this.runtime.get(udid) !== entry) return false;
+    if (this.stopping) throw new LifecycleError("shutting_down");
+    if (this.runtime.get(udid) !== entry) throw new LifecycleError("device_not_attached");
     let reservation = null;
     if (!adoptOwnedTunnel) {
+      const conflict = await this._resolvePortConflict(entry);
+      if (conflict.status !== "free") throw this._markPortConflict(entry, this._conflictError(conflict));
       try {
         reservation = await this._reserveDevicePorts(entry);
       } catch {
-        this._markForeignIproxyPort(udid, entry);
-        return false;
+        throw this._markPortConflict(entry, this._conflictError({ status: "unidentified", port: entry.port }));
       }
     }
     if (this.stopping || this.runtime.get(udid) !== entry) {
       reservation?.release();
-      return false;
+      throw new LifecycleError(this.stopping ? "shutting_down" : "device_not_attached");
     }
     try {
       entry.wdaEnabled = true;
@@ -776,16 +1159,19 @@ export class DeviceProvisioner {
         wdaEndpoint: "UNKNOWN", control: "UNAVAILABLE", recovery: "MANUAL_RETRY",
       });
       entry.wdaDevice.recordDiagnosticEvent("WDA_RETRY_REQUESTED");
-      this.wdaProcessManager.start({ udid, derivedDataPath: entry.derivedDataPath });
-      if (!adoptOwnedTunnel) this.iproxyManager.start({ udid, localPort: entry.port, mjpegLocalPort: entry.mjpegPort });
+      assertStartResult(this.wdaProcessManager.start({ udid, derivedDataPath: entry.derivedDataPath }));
+      if (!adoptOwnedTunnel) {
+        assertStartResult(this.iproxyManager.start({ udid, localPort: entry.port, mjpegLocalPort: entry.mjpegPort }));
+      }
       this.onDeviceListChanged();
-      return true;
+      return lifecycleSuccess();
     } catch (error) {
       await Promise.allSettled([this.wdaProcessManager.stop(udid), this.iproxyManager.stop(udid)]);
       entry.wdaEnabled = false;
       try { this._saveRecord(udid, { wdaEnabled: false }); } catch { /* keep the start failure */ }
       entry.wdaDevice.discoveryState = "provisioning_error";
-      entry.wdaDevice.discoveryStateMessage = "WDA control could not start safely. Review diagnostics before retrying.";
+      entry.wdaDevice.discoveryStateMessage = error instanceof LifecycleError
+        ? error.message : "WDA control could not start safely. Review diagnostics before retrying.";
       entry.wdaDevice.setComponentHealth({ wdaProcess: "FAILED", control: "UNAVAILABLE", recovery: "FAILED" });
       this.onDeviceListChanged();
       throw error;
@@ -794,10 +1180,24 @@ export class DeviceProvisioner {
     }
   }
 
-  getLifecycleState(logicalId) {
+  getLifecycleState(logicalId, { inUse: authoritativeInUse = null } = {}) {
     const udid = this.udidByLogicalId.get(logicalId);
-    const entry = udid ? this.runtime.get(udid) : null;
-    if (!entry) return null;
+    if (!udid) return null;
+    const entry = this.runtime.get(udid);
+    if (!entry) {
+      // Unplugged within this session: no processes, but the operator's choice (enabled or stopped) is
+      // still on record, and Stop must keep working so it can be changed.
+      let enabled = true;
+      try { enabled = this._loadRecord(udid)?.wdaEnabled !== false; } catch { /* keep the default */ }
+      const inUse = typeof authoritativeInUse === "boolean"
+        ? authoritativeInUse : this.devices.get(logicalId)?.status === "in-use";
+      return {
+        managed: true, attached: false, enabled, state: "detached", wdaProcess: "stopped", iproxyProcess: "stopped",
+        endpointReady: false, controlReady: false, inUse,
+        ...lifecycleGuidance({ state: "detached", attached: false, inUse }),
+        canStop: enabled, stopReason: enabled ? null : "Already stopped.",
+      };
+    }
     const wdaProcess = this._managerState(this.wdaProcessManager, udid);
     const iproxyProcess = this._managerState(this.iproxyManager, udid);
     const endpointReady = entry.wdaDevice.readiness?.ready === true;
@@ -810,22 +1210,85 @@ export class DeviceProvisioner {
         : [wdaProcess, iproxyProcess].includes("restarting") ? "restarting"
           : wdaProcess !== "running" || iproxyProcess !== "running" ? "starting"
             : controlReady ? "ready" : "enabled";
+    const inUse = typeof authoritativeInUse === "boolean"
+      ? authoritativeInUse : entry.wdaDevice.status === "in-use";
     return {
+      managed: true,
+      attached: true,
       enabled: entry.wdaEnabled,
       state,
       wdaProcess,
       iproxyProcess,
       endpointReady,
       controlReady,
+      inUse,
+      ...lifecycleGuidance({
+        state, inUse, attached: true,
+        anyRunning: ["running", "starting", "restarting"].includes(wdaProcess) || ["running", "starting", "restarting"].includes(iproxyProcess),
+        // A short instruction, not a repeat of the explanation that the card already shows above its buttons.
+        blockedMessage: entry.wdaDevice.componentHealth.recovery === "BLOCKED_PORT" ? "Close the other program first, then use Retry setup."
+          : entry.wdaDevice.componentHealth.recovery === "STOP_FAILED" ? "Restart this Mac first, then try again."
+            : null,
+      }),
     };
+  }
+
+  // A process Bodun tried to stop but could not confirm gone leaves its supervisor "blocked" for good.
+  // The block is lifted only on proof that the old process no longer exists: the kept ownership record
+  // shows it (dead pid / different start time), or Bodun just stopped it itself because it is provably
+  // its own leftover. Returns whether every blocked manager was cleared.
+  async _clearStopFailures(udid) {
+    for (const [manager, kind] of [[this.wdaProcessManager, "wda"], [this.iproxyManager, "iproxy"]]) {
+      if (manager.getStatus?.(udid)?.state !== "stop_failed") continue;
+      let cleared = await manager.clearBlockedStop?.(udid);
+      if (!cleared && await this._reclaimOwnProcess(kind, udid)) cleared = await manager.clearBlockedStop?.(udid, { verifiedGone: true });
+      if (!cleared) return false;
+    }
+    return true;
+  }
+
+  async _reclaimOwnProcess(kind, udid) {
+    const record = this.ownershipStore?.get?.(kind, udid);
+    const inspector = this.portReclaimer?.inspector;
+    if (!record || record.unverified || !record.startTime || !inspector) return false;
+    const description = await inspector.describe(record.pid).catch(() => undefined);
+    if (description === undefined) return false;
+    if (description === null || description.startTime !== record.startTime || description.command !== record.command) return true; // already gone (or the pid was reused)
+    const owner = await ownerStatus(record, this.ownerServer, inspector);
+    if (!["self", "dead", "reused"].includes(owner)) return false;
+    const result = await this.portReclaimer.reclaim({
+      description, classification: { kind: "owned_by_record", record, holder: { program: description.program, pid: description.pid } },
+      deviceId: null, port: record.ports?.[0] ?? null, isStopping: () => this.stopping,
+    });
+    return result.ok === true;
+  }
+
+  // The phone a Start/Stop/Restart is about. Unknown or manually configured phones are "not managed";
+  // an unplugged phone has no running processes to act on (Stop for it is handled separately).
+  _lifecycleEntry(logicalId, { allowDetached = false } = {}) {
+    if (this.stopping) throw new LifecycleError("shutting_down");
+    const udid = this.udidByLogicalId.get(logicalId);
+    if (!udid) throw new LifecycleError("device_not_managed");
+    const entry = this.runtime.get(udid) ?? null;
+    if (!entry && !allowDetached) throw new LifecycleError("device_not_attached");
+    return { udid, entry };
+  }
+
+  _assertStillCurrent(udid, entry) {
+    if (this.stopping) throw new LifecycleError("shutting_down");
+    if (this.runtime.get(udid) !== entry) throw new LifecycleError("device_not_attached");
   }
 
   restartDevice(logicalId, { authorize = null } = {}) {
     return this._serializeLifecycle(logicalId, async () => {
-      const udid = this.udidByLogicalId.get(logicalId);
-      const entry = udid ? this.runtime.get(udid) : null;
-      if (!entry || this.stopping) return null;
+      const { udid, entry } = this._lifecycleEntry(logicalId);
       if (authorize) await authorize();
+      if (!entry.wdaEnabled) throw new LifecycleError("wda_not_running");
+      if ([this.wdaProcessManager, this.iproxyManager].some(manager => manager.getStatus?.(udid)?.state === "stop_failed")
+        && !(await this._clearStopFailures(udid))) {
+        this._markIproxyStopFailed(entry);
+        throw new LifecycleError("old_process_would_not_stop");
+      }
       entry.wdaEnabled = true;
       this._saveRecord(udid, { wdaEnabled: true });
       entry.wdaDevice.invalidateReadiness("OPERATOR_RESTART");
@@ -840,19 +1303,21 @@ export class DeviceProvisioner {
         const stopped = await Promise.all([
           this.wdaProcessManager.stop(udid), this.iproxyManager.stop(udid),
         ]);
-        if (stopped.some(result => result?.ok === false)) throw new Error("WDA control processes did not confirm exit");
-        if (this.stopping || this.runtime.get(udid) !== entry) return null;
-        const reservation = await reserveAvailablePortPair({
-          controlRange: { start: entry.port, end: entry.port },
-          mjpegRange: { start: entry.mjpegPort, end: entry.mjpegPort },
-          preferredControl: entry.port, preferredMjpeg: entry.mjpegPort,
-          ...(this.isPortAvailable ? { isAvailable: this.isPortAvailable } : {}),
-        });
+        if (stopped.some(result => result?.ok === false)) throw new LifecycleError("wda_stop_unconfirmed");
+        this._assertStillCurrent(udid, entry);
+        const conflict = await this._resolvePortConflict(entry);
+        if (conflict.status !== "free") throw this._markPortConflict(entry, this._conflictError(conflict));
+        let reservation;
+        try {
+          reservation = await this._reserveDevicePorts(entry);
+        } catch {
+          throw this._markPortConflict(entry, this._conflictError({ status: "unidentified", port: entry.port }));
+        }
         try {
           if (authorize) await authorize();
-          if (this.stopping || this.runtime.get(udid) !== entry) return null;
-          this.wdaProcessManager.start({ udid, derivedDataPath: entry.derivedDataPath });
-          this.iproxyManager.start({ udid, localPort: entry.port, mjpegLocalPort: entry.mjpegPort });
+          this._assertStillCurrent(udid, entry);
+          assertStartResult(this.wdaProcessManager.start({ udid, derivedDataPath: entry.derivedDataPath }));
+          assertStartResult(this.iproxyManager.start({ udid, localPort: entry.port, mjpegLocalPort: entry.mjpegPort }));
         } finally {
           reservation.release();
         }
@@ -866,6 +1331,12 @@ export class DeviceProvisioner {
         return this.getLifecycleState(logicalId);
       } catch (error) {
         await Promise.allSettled([this.wdaProcessManager.stop(udid), this.iproxyManager.stop(udid)]);
+        // A port conflict is not a reason to forget that the operator wants WDA running: the banner
+        // is already set and the phone stays enabled, so Start/Restart can be tried again.
+        if (error instanceof LifecycleError) {
+          this._markStartResultFailure(entry, udid, error);
+          throw error;
+        }
         entry.wdaEnabled = false;
         try { this._saveRecord(udid, { wdaEnabled: false }); } catch { /* preserve the original failure */ }
         entry.wdaDevice.discoveryState = "provisioning_error";
@@ -884,11 +1355,35 @@ export class DeviceProvisioner {
 
   stopDevice(logicalId, { authorize = null } = {}) {
     return this._serializeLifecycle(logicalId, async () => {
-      const udid = this.udidByLogicalId.get(logicalId);
-      const entry = udid ? this.runtime.get(udid) : null;
-      if (!entry || this.stopping) return null;
+      const { udid, entry } = this._lifecycleEntry(logicalId, { allowDetached: true });
       if (authorize) await authorize();
-      if (!entry.wdaEnabled) return this.getLifecycleState(logicalId);
+      if (!entry) {
+        // Unplugged in this session: there is no running process to stop, but the operator's choice
+        // is still recorded, so the phone comes back stopped when it is plugged in again.
+        try { this._saveRecord(udid, { wdaEnabled: false }); } catch { /* the in-memory state below still reports it */ }
+        await Promise.allSettled([this.wdaProcessManager.stop(udid), this.iproxyManager.stop(udid)]);
+        const wdaDevice = this.devices.get(logicalId);
+        if (wdaDevice) {
+          wdaDevice.discoveryStateMessage = "Unplugged. WDA control will stay stopped when the cable is reconnected.";
+          wdaDevice.recordDiagnosticEvent?.("WDA_OPERATOR_STOPPED");
+        }
+        this.onDeviceListChanged();
+        return this.getLifecycleState(logicalId);
+      }
+      if (!entry.wdaEnabled) {
+        // Already off. If an earlier stop was never confirmed, try to settle it now instead of
+        // pretending everything is stopped.
+        if (![this.wdaProcessManager, this.iproxyManager].some(manager => manager.getStatus?.(udid)?.state === "stop_failed")) {
+          return this.getLifecycleState(logicalId);
+        }
+        if (!(await this._clearStopFailures(udid))) throw new LifecycleError("wda_stop_unconfirmed");
+        entry.wdaDevice.setComponentHealth({ wdaProcess: "STOPPED", iproxy: "STOPPED", control: "UNAVAILABLE", recovery: "OPERATOR_STOPPED" });
+        entry.wdaDevice.clearErrors();
+        entry.wdaDevice.discoveryState = "wda_stopped";
+        entry.wdaDevice.discoveryStateMessage = "WDA control is stopped by an authorized operator.";
+        this.onDeviceListChanged();
+        return this.getLifecycleState(logicalId);
+      }
       entry.wdaEnabled = false;
       this._saveRecord(udid, { wdaEnabled: false });
       entry.wdaDevice.invalidateReadiness("OPERATOR_STOP");
@@ -901,7 +1396,7 @@ export class DeviceProvisioner {
         entry.wdaDevice.discoveryStateMessage = "WDA control could not be stopped cleanly. Restart the host before trying to start it again.";
         entry.wdaDevice.setComponentHealth({ control: "UNAVAILABLE", recovery: "FAILED" });
         this.onDeviceListChanged();
-        throw new Error("WDA control processes did not stop cleanly");
+        throw new LifecycleError("wda_stop_unconfirmed");
       }
       entry.wdaDevice.discoveryState = "wda_stopped";
       entry.wdaDevice.discoveryStateMessage = "WDA control is stopped by an authorized operator.";
@@ -910,6 +1405,8 @@ export class DeviceProvisioner {
         wdaProcess: "STOPPED", iproxy: "STOPPED", wdaEndpoint: "UNKNOWN",
         control: "UNAVAILABLE", recovery: "OPERATOR_STOPPED",
       });
+      // Stopped on purpose is not a failure: an old "endpoint unavailable" or "port in use" error must not stay on the card.
+      entry.wdaDevice.clearErrors();
       entry.wdaDevice.recordDiagnosticEvent("WDA_OPERATOR_STOPPED");
       this.onDeviceListChanged();
       return this.getLifecycleState(logicalId);
@@ -918,31 +1415,39 @@ export class DeviceProvisioner {
 
   startDevice(logicalId, { authorize = null } = {}) {
     return this._serializeLifecycle(logicalId, async () => {
-      const udid = this.udidByLogicalId.get(logicalId);
-      const entry = udid ? this.runtime.get(udid) : null;
-      if (!entry || this.stopping) return null;
+      const { udid, entry } = this._lifecycleEntry(logicalId);
       if (authorize) await authorize();
-      if (entry.wdaEnabled) return this.getLifecycleState(logicalId);
-      if ([this.wdaProcessManager, this.iproxyManager]
-        .some(manager => manager.getStatus?.(udid)?.state === "stop_failed")) {
-        this._markIproxyStopFailed(entry);
-        return this.getLifecycleState(logicalId);
+      if (entry.wdaEnabled) {
+        const current = this.getLifecycleState(logicalId);
+        // Already on and working (or still coming up): nothing to do.
+        if (current.state !== "failed") return current;
+        // Failed but still enabled: Start is allowed only when nothing is running any more.
+        if (current.startReason === "Control is running but not responding. Use Restart WDA.") {
+          throw new LifecycleError("running_not_responding");
+        }
+      }
+      if ([this.wdaProcessManager, this.iproxyManager].some(manager => manager.getStatus?.(udid)?.state === "stop_failed")) {
+        if (!(await this._clearStopFailures(udid))) {
+          this._markIproxyStopFailed(entry);
+          throw new LifecycleError("old_process_would_not_stop");
+        }
       }
       const adoptOwnedTunnel = this._ownsIproxyMapping(udid, entry);
       let reservation = null;
       if (!adoptOwnedTunnel) {
+        const conflict = await this._resolvePortConflict(entry);
+        if (conflict.status !== "free") throw this._markPortConflict(entry, this._conflictError(conflict));
         try {
           reservation = await this._reserveDevicePorts(entry);
         } catch {
-          this._markForeignIproxyPort(udid, entry);
-          return this.getLifecycleState(logicalId);
+          throw this._markPortConflict(entry, this._conflictError({ status: "unidentified", port: entry.port }));
         }
       }
       try {
         if (authorize) await authorize();
         if (this.stopping || this.runtime.get(udid) !== entry) {
           reservation?.release();
-          return null;
+          this._assertStillCurrent(udid, entry);
         }
         entry.wdaEnabled = true;
         this._saveRecord(udid, { wdaEnabled: true });
@@ -961,10 +1466,16 @@ export class DeviceProvisioner {
         wdaEndpoint: "UNKNOWN", control: "UNAVAILABLE", recovery: "IDLE",
       });
       try {
-        this.wdaProcessManager.start({ udid, derivedDataPath: entry.derivedDataPath });
-        if (!adoptOwnedTunnel) this.iproxyManager.start({ udid, localPort: entry.port, mjpegLocalPort: entry.mjpegPort });
+        assertStartResult(this.wdaProcessManager.start({ udid, derivedDataPath: entry.derivedDataPath }));
+        if (!adoptOwnedTunnel) {
+          assertStartResult(this.iproxyManager.start({ udid, localPort: entry.port, mjpegLocalPort: entry.mjpegPort }));
+        }
       } catch (error) {
         await Promise.allSettled([this.wdaProcessManager.stop(udid), this.iproxyManager.stop(udid)]);
+        if (error instanceof LifecycleError) {
+          this._markStartResultFailure(entry, udid, error);
+          throw error;
+        }
         entry.wdaEnabled = false;
         try { this._saveRecord(udid, { wdaEnabled: false }); } catch { /* preserve the start error */ }
         entry.wdaDevice.discoveryState = "provisioning_error";
@@ -1075,6 +1586,44 @@ export class DeviceProvisioner {
   _saveRecord(udid, patch) {
     return upsertProvisioningRecord(this.provisioningStorePath, udid, patch);
   }
+}
+
+// Which of Start / Stop / Restart is allowed, and — for each one that is not — the plain sentence
+// that says why. The server decides; the UI only shows it (and the routes enforce the same rules).
+//   state: stopped | starting | restarting | ready | enabled | failed | detached
+// `blockedMessage`: why the phone is blocked (another program holds its port), so a disabled Start says that
+// instead of "running but not responding".
+export function lifecycleGuidance({ state, anyRunning = false, inUse = false, attached = true, managed = true, blockedMessage = null, unmanagedReason = null }) {
+  if (!managed) {
+    const reason = unmanagedReason || "Bodun is not managing this phone's control service.";
+    return { canStart: false, canStop: false, canRestart: false, startReason: reason, stopReason: reason, restartReason: reason };
+  }
+  const busyWithPhone = inUse && attached;
+  const running = ["starting", "restarting", "ready", "enabled"].includes(state);
+
+  let canStart = false;
+  let startReason = null;
+  if (state === "detached") startReason = "Plug the phone in first.";
+  else if (state === "stopped" || (state === "failed" && !anyRunning)) canStart = true;
+  else if (state === "failed") startReason = blockedMessage || "Control is running but not responding. Use Restart WDA.";
+  else startReason = "Already running.";
+
+  let canStop = false;
+  let stopReason = null;
+  if (state === "stopped") stopReason = "Already stopped.";
+  else if (state === "detached") canStop = true;
+  else if (busyWithPhone) stopReason = "Release the phone first.";
+  else canStop = running || state === "failed";
+
+  let canRestart = false;
+  let restartReason = null;
+  if (state === "detached") restartReason = "Plug the phone in first.";
+  else if (state === "stopped") restartReason = "Start it first.";
+  else if (state === "starting" || state === "restarting") restartReason = "Wait for it to finish starting.";
+  else if (busyWithPhone) restartReason = "Release the phone first.";
+  else canRestart = ["ready", "enabled", "failed"].includes(state);
+
+  return { canStart, canStop, canRestart, startReason, stopReason, restartReason };
 }
 
 function processHealthState(state) {

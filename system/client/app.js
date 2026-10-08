@@ -36,8 +36,11 @@ async function loadAppIdentity() {
     if (!response.ok) throw new Error("version unavailable");
     const body = await response.json();
     const displayVersion = body.displayVersion || body.version;
-    appVersionEl.textContent = `v${displayVersion}`;
-    appVersionEl.title = `${body.name} ${displayVersion}`;
+    // The build id (short commit) tells two builds with the same version number apart.
+    appVersionEl.textContent = `v${displayVersion}${body.buildId ? ` · ${body.buildId}` : ""}`;
+    appVersionEl.title = body.buildId
+      ? `${body.name} ${displayVersion}, build ${body.buildId}${body.builtAt ? `, built ${new Date(body.builtAt).toLocaleDateString()}` : ""}`
+      : `${body.name} ${displayVersion} (development build)`;
   } catch {
     appVersionEl.textContent = "Version unavailable";
   }
@@ -66,6 +69,33 @@ const fleetStatusFilterEl = document.getElementById("fleet-status-filter");
 const fleetEmptyEl = document.getElementById("fleet-empty");
 const fleetGroupsEl = document.getElementById("fleet-groups");
 const selectErrorEl = document.getElementById("select-error");
+// The result of every card-level action is shown on that card (cardMessages.js), not in the page-level line above.
+const cardMessages = window.createCardMessages();
+// What the server says about automatic phone setup (checking, paused with a reason, running, off); null from an older hub.
+let automaticSetupStatus = null;
+const automaticSetupBanner = window.createAutomaticSetupBanner({
+  banner: document.getElementById("automatic-setup-banner"),
+  text: document.getElementById("automatic-setup-text"),
+  button: document.getElementById("automatic-setup-check"),
+  result: document.getElementById("automatic-setup-result"),
+  requestJson,
+});
+
+// The line above the fleet is for page-level messages only (a phone you were using became unavailable...).
+// Whatever lands there fades after a few seconds and is cleared when you move to another page, so a stale
+// message never lingers under a different view.
+const PAGE_MESSAGE_TTL_MS = 8000;
+let pageMessageTimer = null;
+function clearPageMessage() {
+  clearTimeout(pageMessageTimer);
+  pageMessageTimer = null;
+  if (selectErrorEl.textContent) selectErrorEl.textContent = "";
+}
+new MutationObserver(() => {
+  clearTimeout(pageMessageTimer);
+  if (!selectErrorEl.textContent) return;
+  pageMessageTimer = setTimeout(() => { if (selectErrorEl.textContent) selectErrorEl.textContent = ""; }, PAGE_MESSAGE_TTL_MS);
+}).observe(selectErrorEl, { childList: true, characterData: true, subtree: true });
 const detailViewEl = document.getElementById("detail-view");
 const assignmentsViewEl = document.getElementById("assignments-view");
 const assignmentsRefreshButtonEl = document.getElementById("assignments-refresh-button");
@@ -271,8 +301,8 @@ async function requestJson(url, options = {}, {
     }
     if (!response.ok) {
       const action = typeof body?.diagnostic?.operatorAction === "string" ? body.diagnostic.operatorAction : "";
-      const base = body?.error || `Bodun rejected the request (HTTP ${response.status}).`;
-      throw new RequestFailure(action ? `${base}. ${action}` : base, {
+      const base = deviceCardModel.asSentence(body?.error || `Bodun rejected the request (HTTP ${response.status}).`);
+      throw new RequestFailure(action ? `${base} ${action}` : base, {
         kind: "http", status: response.status,
       });
     }
@@ -302,7 +332,14 @@ function rememberPendingLogout(value) {
 
 function applyTheme(theme, { persist = true } = {}) {
   const nextTheme = theme === "dark" ? "dark" : "light";
-  document.documentElement.dataset.theme = nextTheme;
+  const root = document.documentElement;
+  const changing = root.dataset.theme !== nextTheme;
+  // Switch every colour in one paint: transitions are turned off for that moment, so no half-light, half-dark frame shows.
+  if (changing && persist) {
+    root.classList.add("theme-switching");
+    requestAnimationFrame(() => requestAnimationFrame(() => root.classList.remove("theme-switching")));
+  }
+  root.dataset.theme = nextTheme;
   themeToggleEl.setAttribute("aria-pressed", String(nextTheme === "dark"));
   themeToggleEl.setAttribute("aria-label", `Use ${nextTheme === "dark" ? "light" : "dark"} mode`);
   themeToggleLabelEl.textContent = nextTheme === "dark" ? "Light" : "Dark";
@@ -550,7 +587,11 @@ function syncLiveViewControls(device = lastDevices.find(candidate => candidate.i
   if (!available && liveViewController.isActiveFor(currentDeviceId)) stopLiveView();
 }
 
+let lastNavView = null;
 function updateTopNav() {
+  // Moving to another page leaves old messages behind.
+  if (lastNavView !== null && lastNavView !== currentView) { clearPageMessage(); cardMessages.clearAll(); }
+  lastNavView = currentView;
   fleetNavButtonEl.classList.toggle("active", currentView === "fleet" || currentView === "detail");
   assignmentsNavButtonEl.classList.toggle("active", currentView === "assignments");
   adminNavButtonEl.classList.toggle("active", currentView === "admin");
@@ -609,6 +650,7 @@ function showFleetView() {
   assignmentsViewEl.hidden = true;
   adminViewEl.hidden = true;
   updateTopNav();
+  refreshFleetLayout();
 }
 
 function showDetailView(deviceId) {
@@ -767,6 +809,8 @@ function clearLocalAuthenticatedState() {
   pendingWatchDeviceId = null;
   pendingAiWorkspaceExitDeviceId = null;
   lastDevices = [];
+  automaticSetupStatus = null; // the next person's page must not show the last person's notice or Check again button
+  automaticSetupBanner.update(null);
   clearTimeout(watchRefreshTimerId);
   watchRefreshTimerId = null;
   clearAiWorkspace();
@@ -887,6 +931,8 @@ function applyLiveOperatorProfile(profile) {
   // demoted operator cannot keep reading stale privileged DOM while the safe
   // viewer-specific responses are in flight.
   lastDevices = [];
+  automaticSetupStatus = null; // the next device list brings the status for the new role, with or without Check again
+  automaticSetupBanner.update(null);
   renderToken++;
   fleetGroupsEl.replaceChildren();
   fleetSummaryEl.textContent = "Refreshing fleet access…";
@@ -1232,6 +1278,7 @@ const proxyPoolController = window.createProxyPoolController({
   can,
   capabilities: UI_CAPABILITIES,
   formatDate,
+  deviceLabel: id => lastDevices.find(device => device.id === id)?.label || id,
   onPoolChanged: () => {
     if (lastDevices.length) void renderFleetSafely(lastDevices);
   },
@@ -1251,6 +1298,9 @@ fleetNavButtonEl.addEventListener("click", () => {
 });
 assignmentsNavButtonEl.addEventListener("click", () => showAssignmentsView());
 adminNavButtonEl.addEventListener("click", () => showAdminView());
+// An address edited by hand, or back/forward, changes which panel is wanted. (replaceState never fires this,
+// so choosing a tab cannot loop back through here.)
+window.addEventListener("hashchange", syncOperationsNavigation);
 operationsNavEl.addEventListener("click", (event) => {
   const link = event.target.closest("[data-operations-target]");
   if (!link || link.hidden) return;
@@ -1279,6 +1329,8 @@ function connect() {
       applyLiveOperatorProfile(msg.operator);
     }
     if (msg.type === "device_list") {
+      automaticSetupStatus = msg.automaticSetup ?? null;
+      automaticSetupBanner.update(automaticSetupStatus);
       renderFleetSafely(msg.devices);
       populateAssignmentForm();
       if (currentView === "assignments" && can(UI_CAPABILITIES.VIEW_ASSIGNMENTS)) void refreshAssignments();
@@ -1504,7 +1556,6 @@ function renderFleetSummary(devices) {
     ["iproxy", `${healthy.iproxy}/${devices.length}`],
     ["Proxy tunnels", `${healthy.tunnels}/${devices.length}`],
     ["Protected routes", `${healthy.protectedRoutes}/${devices.length}`],
-    ["Total", devices.length],
     ["Available to you", devices.filter(device => device.canOpen).length],
     ["In use", devices.filter(device => device.status === "in-use").length],
     ["Offline", devices.filter(device => device.status === "offline").length],
@@ -1592,10 +1643,41 @@ function groupByHost(devices) {
   return groups;
 }
 
+// The most columns that fit the window right now; the fleet is drawn again when this changes (a resize, or coming back
+// to the fleet page after the window changed while it was hidden).
+let fleetColumnLimit = null;
+function currentFleetColumnLimit() { return deviceCardModel.fleetColumnCount(4, fleetGroupsEl.clientWidth); }
+function refreshFleetLayout() {
+  if (currentView !== "fleet" || !lastDevices.length) return;
+  const limit = currentFleetColumnLimit();
+  if (limit === fleetColumnLimit) return;
+  void renderFleetSafely(lastDevices);
+}
+window.addEventListener("resize", refreshFleetLayout);
+
+// Where a keyboard user was inside the fleet; forgotten as soon as focus goes anywhere else or the mouse is used.
+let lastCardFocus = null;
+fleetGroupsEl.addEventListener("focusin", event => {
+  lastCardFocus = deviceCardModel.captureFocus(fleetGroupsEl, event.target);
+});
+document.addEventListener("focusin", event => {
+  if (!fleetGroupsEl.contains(event.target)) lastCardFocus = null;
+});
+document.addEventListener("pointerdown", () => { lastCardFocus = null; });
+
 function renderFleet(devices, tasksByDevice, lastActionByDevice) {
+  fleetColumnLimit = currentFleetColumnLimit();
+  errorCardMemory.prune(new Set(devices.map(device => device.id)));
+  wdaReportMemory.prune(new Set(devices.map(device => device.id)));
+  // The cards are built again below; keep the keyboard user's place. A button that turned itself off while its request ran
+  // has already lost focus to the page: then the last control focused inside the fleet is used.
+  const savedFocus = deviceCardModel.captureFocus(fleetGroupsEl, document.activeElement)
+    ?? (document.activeElement === document.body ? lastCardFocus : null);
   fleetGroupsEl.innerHTML = "";
   const visibleDevices = devices.filter(fleetMatchesFilter);
   fleetEmptyEl.hidden = visibleDevices.length > 0;
+  // Said every time (an earlier "Refreshing fleet access…" must not linger here when a filter matches nothing).
+  fleetEmptyEl.textContent = devices.length === 0 ? "No phones are available to you yet." : "No phones match this filter.";
   for (const [hostLabel, groupDevices] of groupByHost(visibleDevices)) {
     const section = document.createElement("section");
     section.className = "fleet-group";
@@ -1607,7 +1689,7 @@ function renderFleet(devices, tasksByDevice, lastActionByDevice) {
 
     const grid = document.createElement("div");
     grid.className = "fleet-grid";
-    const columnCount = Math.min(groupDevices.length, 4);
+    const columnCount = deviceCardModel.fleetColumnCount(groupDevices.length, fleetGroupsEl.clientWidth);
     grid.style.setProperty("--fleet-columns", String(columnCount));
     grid.style.setProperty("--fleet-width", `${columnCount * 290 + Math.max(0, columnCount - 1) * 18}px`);
     grid.classList.toggle("single-device", groupDevices.length === 1);
@@ -1618,6 +1700,17 @@ function renderFleet(devices, tasksByDevice, lastActionByDevice) {
 
     fleetGroupsEl.appendChild(section);
   }
+  deviceCardModel.restoreFocus(fleetGroupsEl, savedFocus);
+}
+
+// Where the result of an action on a phone's card goes: onto that card (it is rebuilt on every update, so the text is
+// kept per phone by cardMessages), or into an explicit message element when the detail view passes one.
+function sayOnCard(device, statusEl = null) {
+  return (text, tone = "info") => {
+    if (statusEl) { statusEl.textContent = text; return; }
+    if (text) cardMessages.show(device.id, text, tone);
+    else cardMessages.clear(device.id);
+  };
 }
 
 function isProxyEgress(egress) {
@@ -1654,7 +1747,8 @@ function buildProxySwitch(device) {
     const requested = input.checked;
     input.disabled = true;
     state.textContent = "Saving";
-    selectErrorEl.textContent = "";
+    const say = sayOnCard(device);
+    say("");
     try {
       await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/proxy`, {
         method: "PATCH",
@@ -1662,11 +1756,11 @@ function buildProxySwitch(device) {
         body: JSON.stringify({ enabled: requested }),
       });
       state.textContent = requested ? "On" : "Off";
-      selectErrorEl.textContent = `Proxy routing ${requested ? "enabled" : "disabled"} for ${device.label}.`;
+      say(`Proxy routing ${requested ? "enabled" : "disabled"} for ${device.label}.`, "success");
     } catch (error) {
       input.checked = !requested;
       state.textContent = input.checked ? "On" : "Off";
-      selectErrorEl.textContent = error.message;
+      say(error.message, "error");
     } finally {
       input.disabled = false;
     }
@@ -1676,25 +1770,25 @@ function buildProxySwitch(device) {
   return wrap;
 }
 
-function buildNetworkCheckButton(device, statusEl = selectErrorEl) {
+function buildNetworkCheckButton(device, statusEl = null) {
   const button = document.createElement("button");
   button.type = "button";
   button.className = "network-check-button";
   button.textContent = "Check network";
+  const say = sayOnCard(device, statusEl);
   button.addEventListener("click", async () => {
     button.disabled = true;
-    statusEl.textContent = `Checking ${device.label} network…`;
+    say(`Checking ${device.label} network…`, "info");
     try {
       const { body } = await requestJson(`/api/devices/${encodeURIComponent(device.id)}/network-check`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "{}",
       }, { timeoutMs: 30_000, uncertain: true });
-      statusEl.textContent = body?.ok
-        ? `${device.label} network verified.`
-        : `${device.label} network check completed with a warning.`;
+      if (body?.ok) say(`${device.label} network verified.`, "success");
+      else say(`${device.label} network check completed with a warning.`, "error");
     } catch (error) {
-      statusEl.textContent = error.message;
+      say(error.message, "error");
     } finally {
       button.disabled = false;
     }
@@ -1708,18 +1802,19 @@ function buildRetryProvisioningButton(device) {
   button.className = "network-check-button";
   button.textContent = "Retry setup";
   button.title = "Restarts WebDriverAgent and USB forwarding for this phone. Keeps its proxy, user assignment, identity, and audit history.";
+  const say = sayOnCard(device);
   button.addEventListener("click", async () => {
     button.disabled = true;
-    selectErrorEl.textContent = `Retrying setup for ${device.label}…`;
+    say(`Retrying setup for ${device.label}…`, "info");
     try {
       await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/retry-provisioning`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: "{}",
       });
-      selectErrorEl.textContent = `Retrying automatic setup for ${device.label}.`;
+      say(`Retrying automatic setup for ${device.label}.`, "success");
     } catch (error) {
-      selectErrorEl.textContent = error.message;
+      say(error.message, "error");
     } finally {
       button.disabled = false;
     }
@@ -1727,46 +1822,84 @@ function buildRetryProvisioningButton(device) {
   return button;
 }
 
+// What is running on each phone's control service right now (device id -> "start" | "stop" | "restart" | "check").
+// Kept outside the cards because the fleet is rebuilt on every update: a double click, or an update arriving
+// mid-action, must not start a second action or re-enable the buttons.
+const wdaInFlight = new Map();
+// What is open on each phone's card survives the redraws (the fleet is rebuilt about every ten seconds).
+const errorCardMemory = deviceCardModel.createCardMemory();
+const wdaReportMemory = deviceCardModel.createCardMemory();
+
+
+const WDA_ACTIONS = {
+  start: { path: "start", timeoutMs: 20_000, doing: "Starting WDA…", done: () => "WDA is starting. Control will unlock after the readiness check passes." },
+  stop: { path: "stop", timeoutMs: 20_000, doing: "Stopping WDA…", done: () => "WDA control stopped." },
+  restart: {
+    path: "restart", timeoutMs: 30_000, doing: "Restarting WDA and its USB tunnel…",
+    done: body => (body?.lifecycle?.controlReady
+      ? "WDA restarted and control is ready."
+      : "WDA restarted. Control is still being verified; use Check control for details."),
+  },
+};
+
 function buildWdaLifecyclePanel(device) {
+  // The control service has its own message slot (right under its buttons); the card's general one is separate.
+  const wdaMessageKey = `${device.id}::wda`;
+  const model = deviceCardModel.lifecycleButtons(device.wdaLifecycle, wdaInFlight.get(device.id) ?? null, automaticSetupStatus);
   const panel = document.createElement("div");
   panel.className = "wda-lifecycle-panel";
+
   const copy = document.createElement("div");
   copy.className = "wda-lifecycle-copy";
   const title = document.createElement("strong");
   title.textContent = "Device control service";
   const state = document.createElement("span");
-  const lifecycleLabels = {
-    stopped: "Stopped", starting: "Starting", restarting: "Restarting",
-    failed: "Failed", ready: "Ready", enabled: "Enabled",
-  };
-  state.textContent = lifecycleLabels[device.wdaLifecycle?.state] || "Starting";
+  const label = deviceCardModel.describeLifecycle(device.wdaLifecycle, automaticSetupStatus);
+  state.textContent = label.text;
+  state.dataset.tone = label.tone;
   copy.append(title, state);
 
   const actions = document.createElement("div");
   actions.className = "wda-lifecycle-actions";
-  const toggle = document.createElement("button");
-  toggle.type = "button";
-  const starting = device.wdaLifecycle?.enabled === false;
-  toggle.textContent = starting ? "Start WDA" : "Stop WDA";
-  toggle.className = starting ? "wda-start-button" : "wda-stop-button";
-  toggle.title = starting
-    ? "Start WebDriverAgent and its device-scoped USB tunnel, then verify control readiness."
-    : "Stop WebDriverAgent and its device-scoped USB tunnel. Release the phone first if it is in use.";
+  actions.setAttribute("role", "group");
+  actions.setAttribute("aria-label", `Control service actions for ${device.label}`);
+  const buttonsByKey = new Map();
+  const reasonsId = `wda-reasons-${device.id}`;
+  for (const spec of model.buttons) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = spec.label;
+    button.className = `wda-${spec.key}-button`;
+    button.dataset.action = spec.key;
+    button.disabled = spec.disabled;
+    if (spec.disabled && spec.reason) button.setAttribute("aria-describedby", reasonsId);
+    buttonsByKey.set(spec.key, button);
+    actions.appendChild(button);
+  }
 
-  const diagnose = document.createElement("button");
-  diagnose.type = "button";
-  diagnose.textContent = "Check control";
-  diagnose.className = "wda-diagnostic-button";
-  const restart = document.createElement("button");
-  restart.type = "button";
-  restart.textContent = "Restart WDA";
-  restart.className = "wda-restart-button";
-  restart.hidden = starting;
-  restart.title = "Stop the managed WDA and USB tunnel, wait for confirmed exit, then start one fresh isolated pair and recheck control.";
-  const result = document.createElement("span");
-  result.className = "wda-lifecycle-result";
+  // Why a button is disabled is written out under the buttons — a tooltip alone is invisible on a touch screen.
+  const reasons = document.createElement("ul");
+  reasons.className = "wda-lifecycle-reasons";
+  reasons.id = reasonsId;
+  for (const entry of model.reasons) {
+    if (model.note && entry.reason === model.note) continue;
+    const item = document.createElement("li");
+    item.textContent = `${entry.label}: ${entry.reason}`;
+    reasons.appendChild(item);
+  }
+  if (model.note) {
+    const item = document.createElement("li");
+    item.textContent = model.note;
+    reasons.appendChild(item);
+  }
+  reasons.hidden = reasons.children.length === 0;
+
+  const result = document.createElement("p");
+  result.className = "wda-lifecycle-result card-message";
   result.setAttribute("role", "status");
   result.setAttribute("aria-live", "polite");
+  cardMessages.attach(wdaMessageKey, result);
+
   const report = document.createElement("details");
   report.className = "wda-diagnostic-report";
   report.hidden = true;
@@ -1822,100 +1955,70 @@ function buildWdaLifecyclePanel(device) {
       parameters ? `PARAMETERS | port ${parameters.localForwardingPort} | timeout ${parameters.readinessTimeoutMs} ms | failures ${parameters.consecutiveReadinessFailures} | recovery ${parameters.recoveryState}` : "",
       ...timeline.map(event => `EVENT | ${event.at || "unknown"} | ${event.type || "UNKNOWN"}`),
     ].filter(Boolean).join("\n");
-    const copy = document.createElement("button");
-    copy.type = "button";
-    copy.className = "wda-copy-diagnostic-button";
-    copy.textContent = "Copy sanitized report";
-    copy.addEventListener("click", async () => {
+    const copyButton = document.createElement("button");
+    copyButton.type = "button";
+    copyButton.className = "wda-copy-diagnostic-button";
+    copyButton.textContent = "Copy sanitized report";
+    copyButton.addEventListener("click", async () => {
       try {
         await navigator.clipboard.writeText(copyableReport);
-        result.textContent = "Sanitized control report copied.";
+        cardMessages.show(wdaMessageKey, "Sanitized control report copied.", "success");
       } catch {
-        result.textContent = "The report could not be copied. Clipboard access is unavailable.";
+        cardMessages.show(wdaMessageKey, "The report could not be copied. Clipboard access is unavailable.", "error");
       }
     });
-    reportBody.appendChild(copy);
+    reportBody.appendChild(copyButton);
     report.hidden = false;
     report.open = true;
   }
 
-  toggle.addEventListener("click", async () => {
+  // One action at a time per phone. The in-flight marker lives outside this card (the card is rebuilt on every
+  // fleet update), and the fleet is redrawn at the start and the end so the buttons always match.
+  async function run(key) {
+    if (wdaInFlight.has(device.id)) return;
     const generation = operatorProfileGeneration;
-    toggle.disabled = true;
-    diagnose.disabled = true;
-    result.textContent = `${starting ? "Starting" : "Stopping"} WDA…`;
+    wdaInFlight.set(device.id, key);
+    for (const button of buttonsByKey.values()) button.disabled = true;
     try {
-      await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/wda/${starting ? "start" : "stop"}`, {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
-      }, { timeoutMs: 20_000, uncertain: true });
-      if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) return;
-      result.textContent = starting
-        ? "WDA is starting. Control will unlock after the readiness check passes."
-        : "WDA control stopped.";
-    } catch (error) {
-      if (profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) result.textContent = error.message;
-    } finally {
-      if (profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) {
-        toggle.disabled = false;
-        diagnose.disabled = false;
+      if (key === "check") {
+        cardMessages.begin(wdaMessageKey, "Checking WDA, USB tunnel, and control endpoint…", "info");
+        const { body } = await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/control-diagnostic`, {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+        }, { timeoutMs: 20_000 });
+        if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) return;
+        const diagnostic = body?.diagnostic;
+        wdaReportMemory.update(device.id, { diagnostic });
+        renderControlDiagnostic(diagnostic);
+        const passed = diagnostic?.readinessPassed === true;
+        cardMessages.show(wdaMessageKey, passed
+          ? "Control path ready: WDA and iproxy responded end to end."
+          : diagnostic?.lifecycle?.enabled === false
+            ? "Control is intentionally stopped. Start WDA to continue."
+            : "Control is not ready. Open device diagnostics for the failing layer.", passed ? "success" : "error");
+        return;
       }
-    }
-  });
-
-  restart.addEventListener("click", async () => {
-    const generation = operatorProfileGeneration;
-    restart.disabled = true;
-    toggle.disabled = true;
-    diagnose.disabled = true;
-    result.textContent = "Restarting WDA and its USB tunnel…";
-    try {
-      const { body } = await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/wda/restart`, {
+      const action = WDA_ACTIONS[key];
+      cardMessages.begin(wdaMessageKey, action.doing, "info");
+      const { body } = await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/wda/${action.path}`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
-      }, { timeoutMs: 30_000, uncertain: true });
+      }, { timeoutMs: action.timeoutMs, uncertain: true });
       if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) return;
-      result.textContent = body?.lifecycle?.controlReady
-        ? "WDA restarted and control is ready."
-        : "WDA restarted. Control is still being verified; use Check control for details.";
+      cardMessages.show(wdaMessageKey, action.done(body), "success");
     } catch (error) {
-      if (profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) result.textContent = error.message;
+      if (profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) cardMessages.show(wdaMessageKey, error.message, "error");
     } finally {
-      if (profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) {
-        restart.disabled = false;
-        toggle.disabled = false;
-        diagnose.disabled = false;
-      }
+      wdaInFlight.delete(device.id);
+      if (profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) broadcastLocalFleetRefresh();
     }
-  });
+  }
 
-  diagnose.addEventListener("click", async () => {
-    const generation = operatorProfileGeneration;
-    diagnose.disabled = true;
-    toggle.disabled = true;
-    result.textContent = "Checking WDA, USB tunnel, and control endpoint…";
-    try {
-      const { body } = await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/control-diagnostic`, {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
-      }, { timeoutMs: 20_000 });
-      if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) return;
-      const diagnostic = body?.diagnostic;
-      renderControlDiagnostic(diagnostic);
-      result.textContent = diagnostic?.readinessPassed
-        ? "Control path ready: WDA and iproxy responded end to end."
-        : diagnostic?.lifecycle?.enabled === false
-          ? "Control is intentionally stopped. Start WDA to continue."
-          : "Control is not ready. Open device diagnostics for the failing layer.";
-    } catch (error) {
-      if (profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) result.textContent = error.message;
-    } finally {
-      if (profileRequestActive(generation, UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) {
-        diagnose.disabled = false;
-        toggle.disabled = false;
-      }
-    }
-  });
+  for (const [key, button] of buttonsByKey) {
+    button.addEventListener("click", () => { if (!button.disabled) void run(key); });
+  }
 
-  actions.append(toggle, restart, diagnose);
-  panel.append(copy, actions, result, report);
+  panel.append(copy, actions, reasons, result, report);
+  const rememberedReport = wdaReportMemory.get(device.id).diagnostic;
+  if (rememberedReport) renderControlDiagnostic(rememberedReport);
   return panel;
 }
 
@@ -1942,7 +2045,7 @@ function buildProxyPoolPicker(device) {
   select.appendChild(none);
   for (const proxy of proxyPoolController.getPool()) {
     if (proxy.leasedToDeviceId && proxy.leasedToDeviceId !== device.id) continue; // leased elsewhere — not selectable here
-    const option = new Option(`${proxy.flag ? `${proxy.flag} ` : ""}${proxy.country} · ${proxy.provider} · ${proxy.label}`, proxy.id);
+    const option = new Option(`${proxy.flag ? `${proxy.flag} ` : ""}${deviceCardModel.proxyName(proxy)} · ${deviceCardModel.providerName(proxy.provider, proxyPoolController.getProviderLabels())}`, proxy.id);
     option.selected = proxy.id === device.poolProxy?.id;
     select.appendChild(option);
   }
@@ -1951,7 +2054,8 @@ function buildProxyPoolPicker(device) {
     const generation = operatorProfileGeneration;
     const requested = select.value || null;
     select.disabled = true;
-    selectErrorEl.textContent = "";
+    const say = sayOnCard(device);
+    say("");
     try {
       await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/proxy-assignment`, {
         method: "PATCH",
@@ -1959,12 +2063,12 @@ function buildProxyPoolPicker(device) {
         body: JSON.stringify({ proxyId: requested }),
       });
       if (!profileRequestActive(generation, UI_CAPABILITIES.ASSIGN_PROXY)) return;
-      selectErrorEl.textContent = requested ? `Proxy assigned to ${device.label}.` : `Proxy released from ${device.label}.`;
+      say(requested ? `Proxy assigned to ${device.label}.` : `Proxy released from ${device.label}.`, "success");
       await proxyPoolController.refresh(); // re-renders the fleet, restoring select.disabled
       if (!profileRequestActive(generation, UI_CAPABILITIES.ASSIGN_PROXY)) return;
     } catch (error) {
       if (!profileRequestActive(generation, UI_CAPABILITIES.ASSIGN_PROXY)) return;
-      selectErrorEl.textContent = error.message;
+      say(error.message, "error");
       select.disabled = false;
       select.value = device.poolProxy?.id || "";
     }
@@ -1986,19 +2090,42 @@ function buildProxyPoolPicker(device) {
 // rather than showing a stuck disabled button.
 const ROUTING_TERMINAL_ERROR_STATES = new Set(["tun_error", "pf_syntax_error", "route_lost"]);
 
+// How long is left, in words ("4 minutes"); at least one minute while there is any time at all.
+function enrollmentMinutes(ms) {
+  const minutes = Math.max(1, Math.ceil((Number(ms) || 0) / 60_000));
+  return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
+
 function networkRoutingNextAction(device) {
-  if (device.routingFeature?.state === "disabled") return { label: "Routing disabled", action: null, disabled: true };
-  if (device.routingFeature?.state === "bridge_missing") return { label: "Bridge required", action: null, disabled: true };
-  if (device.routingFeature?.state === "setup_failed") return { label: "Setup failed", action: null, disabled: true };
-  if (device.routingFeature?.state === "starting") return { label: "Routing starting…", action: null, disabled: true };
+  const feature = device.routingFeature?.state;
+  if (feature === "disabled") return { label: "Routing disabled", action: null, disabled: true, reason: "Proxy routing is turned off on this Mac. Turn it on from the Bodun menu, then restart Bodun." };
+  if (feature === "bridge_missing") return { label: "Bridge required", action: null, disabled: true, reason: "Internet Sharing is not set up on this Mac yet." };
+  if (feature === "setup_failed") return { label: "Setup failed", action: null, disabled: true, reason: "Proxy routing could not be set up on this Mac. Check Help > Copy Diagnostics." };
+  if (feature === "starting") return { label: "Routing starting…", action: null, disabled: true, reason: "Proxy routing is starting. This takes a moment." };
   const routingState = device.routing?.state;
   if (routingState === "routed") return { label: "Stop routing", action: "stop-routing", kind: "stop" };
   if (routingState && !ROUTING_TERMINAL_ERROR_STATES.has(routingState)) {
-    return { label: "Routing…", action: null, disabled: true };
+    return { label: "Routing…", action: null, disabled: true, reason: "The route is being set up. This takes a moment." };
+  }
+  const enrollment = device.networkEnrollment;
+  // While this session's enrollment is waiting, Confirm is the next step — even for a phone that was enrolled before.
+  if (enrollment?.state === "pending") return { label: "Confirm enrollment", action: "network-enrollment/confirm", pending: true };
+  if (enrollment?.state === "blocked_by_other") {
+    return {
+      label: "Start network enrollment", action: null, disabled: true,
+      reason: `Another phone (${enrollment.otherLabel}) is being set up for networking. Cancel it or wait ${enrollmentMinutes(enrollment.remainingMs)}.`,
+      cancelOther: { deviceId: enrollment.otherDeviceId, label: enrollment.otherLabel },
+    };
+  }
+  if (enrollment?.state === "owned_by_other_session") {
+    return {
+      label: "Start network enrollment", action: null, disabled: true,
+      reason: `This phone is being set up in another window. Cancel it or wait ${enrollmentMinutes(enrollment.remainingMs)}.`,
+      cancelOther: { deviceId: device.id, label: device.label },
+    };
   }
   if (device.usbNetwork?.usbIp) return { label: "Start routing", action: "start-routing" };
   if (device.usbNetwork?.usbIface) return { label: "Discover IP", action: "discover-ip" };
-  if (device.networkEnrollment?.state === "pending") return { label: "Confirm enrollment", action: "network-enrollment/confirm" };
   return { label: "Start network enrollment", action: "network-enrollment/start" };
 }
 
@@ -2020,10 +2147,11 @@ function networkRoutingStatusText(device) {
 
 async function triggerRoutingAction(device, action, button) {
   const originalLabel = button.textContent;
+  const say = sayOnCard(device);
   button.disabled = true;
   button.textContent = action === "network-enrollment/confirm" ? "Confirming…"
     : action === "network-enrollment/start" ? "Preparing…" : "Working…";
-  selectErrorEl.textContent = "";
+  say("");
   try {
     const { body } = await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/${action}`, {
       method: "POST",
@@ -2031,23 +2159,54 @@ async function triggerRoutingAction(device, action, button) {
       body: "{}",
     });
     if (action === "network-enrollment/start") {
-      selectErrorEl.textContent = `Now enable Internet Sharing for ${device.label} in System Preferences, then click Confirm enrollment.`;
+      say("Enrollment started. Follow the steps shown on this card, then press Confirm enrollment.", "success");
     } else {
-      selectErrorEl.textContent = body?.network?.usbIp
+      say(body?.network?.usbIp
         ? `${device.label}: IP discovered (${body.network.usbIp}).`
         : body?.network?.usbIface
           ? `${device.label}: enrolled as ${body.network.usbIface}.`
           : body?.routing?.state
             ? `${device.label}: ${body.routing.state.replaceAll("_", " ")}.`
-            : `${device.label}: done.`;
+            : `${device.label}: done.`, "success");
     }
     broadcastLocalFleetRefresh();
   } catch (error) {
-    selectErrorEl.textContent = error.message;
+    say(error.message, "error");
     button.disabled = false;
     button.textContent = originalLabel;
   }
 }
+
+// Releases a waiting enrollment (this phone's or the one that is blocking it) so another phone can be set up.
+async function cancelEnrollment(device, target, button) {
+  const say = sayOnCard(device);
+  button.disabled = true;
+  say("");
+  try {
+    await requestJson(`/api/admin/devices/${encodeURIComponent(target.deviceId)}/network-enrollment`, { method: "DELETE" });
+    say(`Enrollment for ${target.label} cancelled.`, "success");
+    if (target.deviceId !== device.id) cardMessages.show(target.deviceId, "This enrollment was cancelled.", "info");
+    broadcastLocalFleetRefresh();
+  } catch (error) {
+    say(error.message, "error");
+    button.disabled = false;
+  }
+}
+
+// One timer updates every visible countdown; the cards are not rebuilt each second.
+const enrollmentExpiries = new Map(); // device id -> time (ms) when its enrollment runs out
+function formatCountdown(ms) {
+  if (ms <= 0) return "Expired. Start the enrollment again.";
+  const total = Math.ceil(ms / 1000);
+  return `${Math.floor(total / 60)} min ${String(total % 60).padStart(2, "0")} s left`;
+}
+function tickEnrollmentCountdowns() {
+  for (const element of document.querySelectorAll(".routing-countdown[data-device-id]")) {
+    const expires = enrollmentExpiries.get(element.dataset.deviceId);
+    if (expires) element.textContent = formatCountdown(expires - Date.now());
+  }
+}
+setInterval(tickEnrollmentCountdowns, 1000);
 
 function buildNetworkRoutingPanel(device) {
   const wrap = document.createElement("div");
@@ -2082,15 +2241,57 @@ function buildNetworkRoutingPanel(device) {
   }
 
   const next = networkRoutingNextAction(device);
+  if (next.pending) {
+    // The manual step, in plain words, with the time that is left.
+    const expires = Date.now() + (device.networkEnrollment?.expiresInMs ?? 0);
+    enrollmentExpiries.set(device.id, expires);
+    const steps = document.createElement("div");
+    steps.className = "routing-enrollment-steps";
+    const heading = document.createElement("strong");
+    heading.textContent = "Connect this phone to the network";
+    const list = document.createElement("ol");
+    for (const text of [
+      "Open System Settings, then General, then Sharing.",
+      "Turn on Internet Sharing and tick this phone's USB connection.",
+      "Come back here and press Confirm enrollment.",
+    ]) {
+      const item = document.createElement("li");
+      item.textContent = text;
+      list.appendChild(item);
+    }
+    const countdown = document.createElement("p");
+    countdown.className = "routing-countdown";
+    countdown.dataset.deviceId = device.id;
+    countdown.textContent = formatCountdown(expires - Date.now());
+    steps.append(heading, list, countdown);
+    wrap.appendChild(steps);
+  }
   const button = document.createElement("button");
   button.type = "button";
   button.className = next.kind === "stop" ? "network-check-button stop" : "network-check-button";
   button.textContent = next.label;
   button.disabled = Boolean(next.disabled);
+  if (next.disabled && next.reason) {
+    const reason = document.createElement("p");
+    reason.className = "routing-reason";
+    reason.id = `routing-reason-${device.id}`;
+    reason.textContent = next.reason;
+    button.setAttribute("aria-describedby", reason.id);
+    wrap.appendChild(reason);
+  }
   if (next.action) {
     button.addEventListener("click", () => triggerRoutingAction(device, next.action, button));
   }
   wrap.appendChild(button);
+  const cancelTarget = next.pending ? { deviceId: device.id, label: device.label } : next.cancelOther;
+  if (cancelTarget) {
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "network-check-button secondary";
+    cancel.textContent = cancelTarget.deviceId === device.id ? "Cancel enrollment" : `Cancel enrollment for ${cancelTarget.label}`;
+    cancel.addEventListener("click", () => cancelEnrollment(device, cancelTarget, cancel));
+    wrap.appendChild(cancel);
+  }
 
   // Escape hatch: once enrolled, the primary button progresses on to
   // "Discover IP"/"Start routing"/"Stop routing" and never comes back to
@@ -2311,9 +2512,9 @@ function deviceComponentRows(device) {
     || (device?.networkMismatch ? "FAILED" : device?.networkVerified ? "PROTECTED" : "UNVERIFIED");
   return [
     ["Device", health.deviceAttachment || (device?.status === "offline" ? "OFFLINE" : "ATTACHED")],
-    ["Control", health.control || (device?.status === "offline" ? "UNAVAILABLE" : "READY")],
-    ["WDA", [health.wdaProcess, health.wdaEndpoint].filter(Boolean).join(" / ") || "UNKNOWN"],
-    ["iproxy", health.iproxy || "UNKNOWN"],
+    ["Control", health.control || (device?.status === "offline" ? "UNAVAILABLE" : "READY"), { recovery: health.recovery, endpoint: health.wdaEndpoint }],
+    ["WDA", health.wdaProcess || "UNKNOWN", { endpoint: health.wdaEndpoint }],
+    ["iproxy", health.iproxy || "UNKNOWN", { recovery: health.recovery }],
     ["Network", networkState],
     ["Proxy", proxyHealth === true ? "HEALTHY"
       : proxyHealth === false ? "FAILED"
@@ -2336,23 +2537,24 @@ function diagnosticRetryKind(diagnostic) {
 function buildComponentHealthPanel(device, { compact = false } = {}) {
   const panel = document.createElement("div");
   panel.className = `component-health${compact ? " compact" : ""}`;
-  for (const [label, stateValue] of deviceComponentRows(device)) {
-    const state = String(stateValue || "UNKNOWN").toUpperCase();
+  for (const [label, stateValue, context] of deviceComponentRows(device)) {
+    const chip = deviceCardModel.chipFor(label, stateValue, context);
     const row = document.createElement("div");
     row.className = "component-health-row";
     const name = document.createElement("span");
     name.textContent = label;
     const value = document.createElement("strong");
-    value.textContent = state.replaceAll("_", " ");
-    value.dataset.state = /FAILED|OFFLINE|UNAVAILABLE|MISMATCH|LOST|ERROR/.test(state) ? "error"
-      : /SUSPECT|DEGRADED|RECOVERING|VERIFYING|UNKNOWN|NOT CHECKED|UNVERIFIED/.test(state) ? "warning" : "healthy";
+    value.textContent = chip.text;
+    value.title = chip.title;
+    value.dataset.state = chip.tone;
     row.append(name, value);
     panel.appendChild(row);
   }
   return panel;
 }
 
-async function retryDeviceDiagnostic(device, button, statusEl) {
+async function retryDeviceDiagnostic(device, button, statusEl = null) {
+  const say = sayOnCard(device, statusEl);
   const diagnostic = diagnosticForDevice(device);
   const retryKind = diagnosticRetryKind(diagnostic);
   button.disabled = true;
@@ -2361,41 +2563,41 @@ async function retryDeviceDiagnostic(device, button, statusEl) {
       await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/retry-provisioning`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
       });
-      statusEl.textContent = `Retrying automatic setup for ${device.label}.`;
+      say(`Retrying automatic setup for ${device.label}.`, "success");
       return;
     }
     if (retryKind === "network" && can(UI_CAPABILITIES.RUN_NETWORK_CHECK)) {
       await requestJson(`/api/devices/${encodeURIComponent(device.id)}/network-check`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
       }, { timeoutMs: 30_000, uncertain: true });
-      statusEl.textContent = `Network diagnostics completed for ${device.label}.`;
+      say(`Network diagnostics completed for ${device.label}.`, "success");
       return;
     }
-    statusEl.textContent = diagnostic?.operatorAction || "Contact your manager for help with this phone.";
+    say(diagnostic?.operatorAction || "Contact your manager for help with this phone.", "info");
   } catch (error) {
-    statusEl.textContent = error.message;
+    say(error.message, "error");
   } finally {
     button.disabled = false;
   }
 }
 
-function buildDeviceErrorCard(device, statusEl = selectErrorEl) {
+function buildDeviceErrorCard(device, statusEl = null, shownText = "") {
   const error = diagnosticForDevice(device);
-  if (!error) return null;
+  if (!error) {
+    errorCardMemory.clear(device.id);
+    return null;
+  }
+  const remembered = errorCardMemory.get(device.id);
   const details = document.createElement("details");
   details.className = "device-error-card";
+  details.open = Boolean(errorCardMemory.get(device.id).open);
+  details.addEventListener("toggle", () => errorCardMemory.update(device.id, { open: details.open }));
   const heading = document.createElement("summary");
-  heading.textContent = `${error.name || "Device error"} · ${error.code || "Unknown code"}`;
+  // When the "Needs attention" block already explains the problem, this row is only for the details behind it.
+  heading.textContent = shownText ? "Details" : `${error.name || "Device error"} · ${error.code || "Unknown code"}`;
   details.appendChild(heading);
 
-  const fields = [
-    ["Error name", error.name],
-    ["Location", error.location || [error.sourceFunction, error.sourceFile].filter(Boolean).join(" · ")],
-    ["Why", error.why || error.publicMessage],
-    ["How to fix", error.operatorAction],
-    ["Error code", error.code],
-    ["Safe state", error.safeState],
-  ];
+  const fields = deviceCardModel.errorRows(error, shownText);
   for (const [label, fieldValue] of fields) {
     if (!fieldValue) continue;
     const row = document.createElement("p");
@@ -2423,14 +2625,19 @@ function buildDeviceErrorCard(device, statusEl = selectErrorEl) {
     diagnostics.textContent = "Diagnostics";
     const output = document.createElement("pre");
     output.hidden = true;
+    if (remembered.diagnostics) {
+      output.textContent = remembered.diagnostics;
+      output.hidden = false;
+    }
     diagnostics.addEventListener("click", async () => {
       diagnostics.disabled = true;
       try {
         const { body } = await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/diagnostics`);
-        output.textContent = JSON.stringify(body, null, 2);
+        output.textContent = deviceCardModel.formatDiagnostics(body);
         output.hidden = false;
+        errorCardMemory.update(device.id, { diagnostics: output.textContent });
       } catch (requestError) {
-        statusEl.textContent = requestError.message;
+        sayOnCard(device, statusEl)(requestError.message, "error");
       } finally {
         diagnostics.disabled = false;
       }
@@ -2448,6 +2655,7 @@ function renderDeviceCard(d, task, lastAction) {
   const canManageAi = can(UI_CAPABILITIES.MANAGE_AI_CONTROLLER);
 
   const card = document.createElement("article");
+  card.dataset.deviceId = d.id;
   card.className = `device-card ${cardStatusClass(d)}${isMine ? " mine" : ""}${isWatched ? " watched" : ""}${isAiMode && !canManageAi ? " ai-locked" : ""}${d.canOpen || d.canWatch || d.mediaActions?.list ? " openable" : " restricted"}`;
   if (d.lastSeenAt) card.title = `Last responded: ${new Date(d.lastSeenAt).toLocaleString()}`;
 
@@ -2468,7 +2676,8 @@ function renderDeviceCard(d, task, lastAction) {
 
   const metaRow = document.createElement("div");
   metaRow.className = "device-card-meta";
-  const metaParts = [d.status, d.id, d.hostLabel || "this-mac"];
+  const stateSummary = deviceCardModel.deviceStateSummary(d);
+  const metaParts = [stateSummary.headline, d.id, d.hostLabel || "this-mac"];
   const health = healthSuffix(d);
   if (health) metaParts.push(health.trim());
   metaRow.textContent = metaParts.join(" · ");
@@ -2506,21 +2715,38 @@ function renderDeviceCard(d, task, lastAction) {
   accessLabel.textContent = d.assignedToViewer ? "Assigned to you" : "Not assigned to you";
   const accessReason = document.createElement("span");
   const presentation = phoneStatePresentation(d);
-  accessReason.textContent = d.canOpen ? "Available to open." : presentation.message;
+  // This box says who the phone is for. What is wrong with it (if anything) goes in the attention block below,
+  // never here, so setup errors cannot show up under "Assigned to you".
+  accessReason.textContent = !d.assignedToViewer ? presentation.message
+    : d.canOpen ? (d.assignment ? `Assigned to you · ${assignmentWindow(d.assignment)}` : "Available to open.")
+      : stateSummary.attention ? "Can't be opened until the problem below is fixed."
+        : "Can't be opened right now.";
   access.append(accessLabel, accessReason);
   card.appendChild(access);
+  let attentionText = ""; // what the Needs attention block says, so the collapsed error row does not repeat it
+  if (stateSummary.attention && d.assignedToViewer && presentation.message) {
+    attentionText = presentation.message;
+    const attention = document.createElement("div");
+    attention.className = "device-attention";
+    attention.dataset.tone = stateSummary.tone;
+    const attentionTitle = document.createElement("strong");
+    attentionTitle.textContent = "Needs attention";
+    const attentionDetail = document.createElement("span");
+    attentionDetail.textContent = presentation.message;
+    attention.append(attentionTitle, attentionDetail);
+    card.appendChild(attention);
+  }
 
   const networkState = document.createElement("div");
   networkState.className = "device-safe-status";
   const proxyDisabled = isProxyEgress(d.network?.egress) && d.network?.enabled === false;
-  const egress = proxyDisabled ? "Proxy disabled"
-    : d.network?.providerLabel || d.network?.gatewayLabel || d.network?.egress || "No egress assigned";
+  const egress = deviceCardModel.egressLabel(d, { proxyDisabled, knownProviders: proxyPoolController.getProviderLabels() });
   const verification = d.networkMismatch ? "Network mismatch"
     : d.networkVerified ? "Network verified" : "Network not verified";
   networkState.textContent = `${egress} · ${verification} · ${formatLastSeen(d.lastSeenAt)}`;
   card.appendChild(networkState);
   card.appendChild(buildComponentHealthPanel(d, { compact: true }));
-  const errorCard = buildDeviceErrorCard(d);
+  const errorCard = buildDeviceErrorCard(d, null, attentionText);
   if (errorCard) card.appendChild(errorCard);
 
   const tools = document.createElement("div");
@@ -2533,7 +2759,9 @@ function renderDeviceCard(d, task, lastAction) {
     && (d.accessState === "wda_user_action_required" || d.accessState === "wda_provisioning_error")) {
     tools.appendChild(buildRetryProvisioningButton(d));
   }
-  if (can(UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE) && d.wdaLifecycle) {
+  // Shown for everyone who may manage the control service. When the server has no lifecycle for the phone
+  // (automatic setup is off, or the phone is not managed) the panel is disabled and says why.
+  if (can(UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) {
     tools.appendChild(buildWdaLifecyclePanel(d));
   }
   if (can(UI_CAPABILITIES.ASSIGN_PROXY)) {
@@ -2543,6 +2771,14 @@ function renderDeviceCard(d, task, lastAction) {
     tools.appendChild(buildNetworkRoutingPanel(d));
   }
   if (tools.children.length) card.appendChild(tools);
+
+  // The result of anything the operator does on this card appears here, right under the buttons.
+  const cardMessage = document.createElement("p");
+  cardMessage.className = "card-message";
+  cardMessage.setAttribute("role", "status");
+  cardMessage.setAttribute("aria-live", "polite");
+  cardMessages.attach(d.id, cardMessage);
+  card.appendChild(cardMessage);
 
   if (d.currentOperator || d.assignment) {
     const context = document.createElement("div");
@@ -2563,7 +2799,8 @@ function renderDeviceCard(d, task, lastAction) {
     const open = document.createElement("button");
     open.type = "button";
     open.className = "open-device-button";
-    open.textContent = presentation.label;
+    open.textContent = d.canOpen ? presentation.label : "Can't open yet";
+    if (!d.canOpen) open.title = presentation.message;
     open.disabled = !d.canOpen;
     open.addEventListener("click", () => requestDeviceOpen(d));
     card.appendChild(open);
@@ -2581,7 +2818,7 @@ function renderDeviceCard(d, task, lastAction) {
   if (d.mediaActions?.list) {
     const files = document.createElement("button");
     files.type = "button";
-    files.className = "open-device-button";
+    files.className = "open-device-button open-files-button";
     files.textContent = "Open files";
     files.addEventListener("click", () => openMediaWorkspace(d));
     card.appendChild(files);
@@ -2661,7 +2898,8 @@ function buildControllerModeSwitch(device, statusEl = null) {
   const heading = document.createElement("strong");
   heading.textContent = "Controller";
   const state = document.createElement("span");
-  state.textContent = isAiMode ? "AI mode" : humanBusy ? "Human mode · phone in use" : "Human mode";
+  const humanBusyLabel = () => (device.status === "in-use" ? "phone in use" : "phone not ready");
+  state.textContent = isAiMode ? "AI mode" : humanBusy ? `Human mode · ${humanBusyLabel()}` : "Human mode";
   copy.append(heading, state);
 
   const label = document.createElement("label");
@@ -2674,7 +2912,7 @@ function buildControllerModeSwitch(device, statusEl = null) {
   input.disabled = humanBusy;
   input.setAttribute("role", "switch");
   input.setAttribute("aria-label", `AI controller for ${device.label}`);
-  if (humanBusy) input.title = "Release the phone before switching it to AI mode.";
+  if (humanBusy) input.title = device.status === "in-use" ? "Release the phone before switching it to AI mode." : "The phone is not ready yet, so it cannot be switched to AI mode.";
   const track = document.createElement("span");
   track.className = "controller-mode-track";
   track.setAttribute("aria-hidden", "true");
@@ -2691,7 +2929,7 @@ function buildControllerModeSwitch(device, statusEl = null) {
     const result = await runAdminCommand(`/mode ${requestedAi ? "ai" : "human"} ${device.id}`, { statusEl });
     if (!result?.ok) {
       input.checked = !requestedAi;
-      state.textContent = isAiMode ? "AI mode" : humanBusy ? "Human mode · phone in use" : "Human mode";
+      state.textContent = isAiMode ? "AI mode" : humanBusy ? `Human mode · ${humanBusyLabel()}` : "Human mode";
       input.disabled = humanBusy;
       return;
     }
@@ -2953,7 +3191,9 @@ function openMediaWorkspace(device) {
 
 function requestDeviceOpen(device) {
   if (!device?.canOpen) {
-    selectErrorEl.textContent = device?.openReason || "This phone cannot be opened.";
+    const reason = device?.openReason || "This phone cannot be opened.";
+    if (device?.id) cardMessages.show(device.id, reason, "error");
+    else selectErrorEl.textContent = reason;
     return false;
   }
   selectDevice(device.id);
@@ -2962,7 +3202,9 @@ function requestDeviceOpen(device) {
 
 function requestDeviceWatch(device) {
   if (!device?.canWatch || !can(UI_CAPABILITIES.MONITOR_DEVICE)) {
-    selectErrorEl.textContent = device?.watchReason || "This live screen cannot be watched.";
+    const reason = device?.watchReason || "This live screen cannot be watched.";
+    if (device?.id) cardMessages.show(device.id, reason, "error");
+    else selectErrorEl.textContent = reason;
     return false;
   }
   stopLiveView();
@@ -3488,7 +3730,9 @@ function describeUserChanges(user, change) {
 function buildUserActionsMenu(user) {
   const wrap = document.createElement("div");
   wrap.className = "user-actions-menu";
-  wrap.hidden = !can(UI_CAPABILITIES.MANAGE_USERS);
+  // Admins and hosts manage everyone; a manager may only delete members of their own team.
+  wrap.hidden = !canManagePeople();
+  const protection = user.protection || {};
 
   const trigger = document.createElement("button");
   trigger.type = "button";
@@ -3603,7 +3847,63 @@ function buildUserActionsMenu(user) {
     }
   });
 
-  actionsPanel.append(kickButton, changeRoleButton, rolePanel);
+  // What the signed-in person cannot do to this account is shown, disabled, with the reason written out.
+  const ownAccountNote = "You can't do this to the account you're signed in with.";
+  const lastAdminNote = protection.reason || "This is the last active admin or host account.";
+  const noteLines = [];
+  if (protection.self) {
+    kickButton.disabled = true;
+    changeRoleButton.disabled = true;
+    noteLines.push(ownAccountNote);
+    if (user.actionReason) noteLines.push(user.actionReason);
+  } else if (protection.lastAdministrator) {
+    kickButton.disabled = true;
+    changeRoleButton.disabled = true;
+    noteLines.push(lastAdminNote);
+  }
+
+  const deleteButton = document.createElement("button");
+  deleteButton.type = "button";
+  deleteButton.className = "danger";
+  deleteButton.textContent = "Delete account";
+  deleteButton.disabled = protection.canDelete !== true;
+  if (deleteButton.disabled && protection.deleteReason && !noteLines.includes(protection.deleteReason)) noteLines.push(protection.deleteReason);
+  deleteButton.addEventListener("click", async () => {
+    if (deleteButton.disabled) return;
+    const typed = window.prompt(`Delete ${user.username}? Their account is switched off straight away and their data is removed.\n\nType "${user.username}" to confirm.`);
+    if (typed === null) return;
+    if (typed.trim() !== user.username) {
+      usersMessageEl.textContent = "Nothing was deleted: the username you typed did not match.";
+      return;
+    }
+    deleteButton.disabled = true;
+    usersMessageEl.textContent = "";
+    try {
+      await requestJson(`/api/admin/users/${encodeURIComponent(user.username)}`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ confirmUsername: user.username }),
+      });
+      usersMessageEl.textContent = `${user.username} was deleted. The account is switched off and its data will be removed.`;
+      await refreshUsers();
+    } catch (error) {
+      usersMessageEl.textContent = error.message;
+      deleteButton.disabled = false;
+    }
+  });
+
+  const note = document.createElement("p");
+  note.className = "user-actions-note";
+  note.id = `user-actions-note-${user.username}`;
+  note.textContent = noteLines.join(" ");
+  note.hidden = noteLines.length === 0;
+  if (noteLines.length) {
+    for (const button of [kickButton, changeRoleButton, deleteButton]) if (button.disabled) button.setAttribute("aria-describedby", note.id);
+  }
+
+  // Only people who manage users get Kick / Change role; a manager's menu is just Delete (own team).
+  if (can(UI_CAPABILITIES.MANAGE_USERS)) actionsPanel.append(kickButton, changeRoleButton, rolePanel);
+  actionsPanel.append(deleteButton, note);
 
   trigger.addEventListener("click", () => {
     const opening = actionsPanel.hidden;
@@ -3763,6 +4063,14 @@ function renderUsers(users) {
     active.checked = user.active === true;
     const activeLabel = labeledControl("Active", active);
     activeLabel.className = "user-checkbox";
+    // Your own account, and the last admin/host, cannot be turned off or re-ranked: the controls are
+    // disabled and the reason is written out under them (the server refuses it as well).
+    const userProtection = user.protection || {};
+    const lockReason = userProtection.self || userProtection.lastAdministrator ? userProtection.reason : null;
+    if (lockReason) {
+      active.disabled = true;
+      role.disabled = true;
+    }
 
     const allDevices = document.createElement("input");
     allDevices.type = "checkbox";
@@ -3790,7 +4098,7 @@ function renderUsers(users) {
     save.textContent = "Save";
     const revoke = document.createElement("button");
     revoke.type = "button";
-    revoke.className = "danger";
+    revoke.className = "secondary-action";
     revoke.textContent = "Sign out all sessions";
 
     form.append(
@@ -3803,9 +4111,16 @@ function renderUsers(users) {
       allDevicesLabel,
       labeledControl("Research workspaces", research),
       labeledControl("Reset password", password),
-      save,
-      revoke,
     );
+    if (lockReason) {
+      const reasonLine = document.createElement("p");
+      reasonLine.className = "user-lock-reason";
+      reasonLine.textContent = lockReason;
+      form.append(reasonLine);
+      for (const control of [active, role]) control.setAttribute("aria-describedby", `user-lock-${user.username}`);
+      reasonLine.id = `user-lock-${user.username}`;
+    }
+    form.append(save, revoke);
     form.addEventListener("submit", async event => {
       event.preventDefault();
       usersMessageEl.textContent = "";
@@ -3861,6 +4176,7 @@ function renderUsers(users) {
     });
     const resetTwoFactor = document.createElement("button");
     resetTwoFactor.type = "button";
+    resetTwoFactor.className = "destructive-action";
     resetTwoFactor.textContent = "Reset 2FA";
     resetTwoFactor.addEventListener("click", async () => {
       if (resetTwoFactor.disabled || !window.confirm(`Reset two-factor authentication for ${user.username}? Their current authenticator will stop working.`)) return;
@@ -3888,8 +4204,12 @@ function renderUsers(users) {
     renameButton.type = "button";
     renameButton.textContent = "Change username";
     renameButton.addEventListener("click", async () => {
-      renameButton.disabled = true;
       usersMessageEl.textContent = "";
+      if (renameInput.value.trim() === user.username) {
+        usersMessageEl.textContent = `${user.username} already has this username. Type a different one first.`;
+        return;
+      }
+      renameButton.disabled = true;
       try {
         const { body } = await requestJson(`/api/admin/users/${encodeURIComponent(user.username)}/rename`, {
           method: "PATCH",
@@ -3956,7 +4276,8 @@ function renderUsers(users) {
       ].filter(Boolean).join(" ");
       accountActions.append(banNote);
     }
-    if (user.actionReason) {
+    // For your own account the reason is already written in the account menu, next to the buttons it explains.
+    if (user.actionReason && !user.protection?.self) {
       const actionReason = document.createElement("p");
       actionReason.className = "user-action-note";
       actionReason.textContent = user.actionReason;
@@ -4002,10 +4323,9 @@ function clearSitesView() {
 function showSiteToken(body) {
   const siteId = body.site.id;
   siteTokenCommandEl.textContent = [
-    `HUB_URL=${body.hubUrl}`,
-    `SITE_ID=${siteId}`,
-    `SITE_TOKEN=${body.token}`,
-    "npm run agent",
+    `Hub address: ${body.hubUrl}`,
+    `Site ID: ${siteId}`,
+    `Site token: ${body.token}`,
   ].join("\n");
   siteTokenRevealEl.hidden = false;
 }

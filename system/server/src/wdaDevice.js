@@ -112,6 +112,9 @@ export class WdaDevice {
   }
 
   async checkReadiness() {
+    // A phone an operator stopped on purpose is not asked whether it answers: it would only record a failure for something
+    // that is meant to be off. Starting it again clears this state.
+    if (this.componentHealth.recovery === "OPERATOR_STOPPED") return false;
     const generation = this.readinessGeneration;
     const checkedAt = new Date().toISOString();
     try {
@@ -194,6 +197,12 @@ export class WdaDevice {
     if (!Object.hasOwn(this.componentErrors, component)) throw new Error(`unknown process component: ${component}`);
     this.componentErrors[component] = error ?? null;
     return this.componentErrors[component];
+  }
+
+  // Forgets the errors shown for this phone (used when an operator stops it on purpose).
+  clearErrors() {
+    this.componentErrors = { wdaProcess: null, iproxy: null };
+    this.readiness = { ...this.readiness, lastError: null };
   }
 
   invalidateReadiness(component) {

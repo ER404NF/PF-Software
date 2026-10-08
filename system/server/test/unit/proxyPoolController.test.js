@@ -5,9 +5,11 @@ import path from "node:path";
 import vm from "node:vm";
 import { fileURLToPath } from "node:url";
 
-const context = { window: {}, encodeURIComponent, Promise, JSON, Number };
-vm.runInNewContext(fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)),
-  "../../../client/proxyPoolController.js"), "utf8"), context);
+const context = { window: {}, encodeURIComponent, Promise, JSON, Number, Intl };
+// The controller uses the shared proxy and provider names from deviceCardModel.js, which the page loads first.
+for (const file of ["deviceCardModel.js", "proxyPoolController.js"]) {
+  vm.runInNewContext(fs.readFileSync(path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../../client", file), "utf8"), context);
+}
 const { createProxyPoolController } = context.window;
 
 class Element {
@@ -31,7 +33,7 @@ function deferred() {
 }
 
 function fixture({ requestJson = async url => ({ body: url.includes("providers") ? { providers: [] } : { proxies: [] } }),
-  getGeneration = () => 1, requestActive = () => true, can = () => true, onPoolChanged = () => {} } = {}) {
+  getGeneration = () => 1, requestActive = () => true, can = () => true, onPoolChanged = () => {}, deviceLabel } = {}) {
   const names = ["refreshButton", "createForm", "providerInput", "protocolInput", "hostInput", "portInput",
     "usernameInput", "passwordInput", "countryInput", "labelInput", "testButton", "message", "poolList",
     "poolEmpty", "providerList", "providerEmpty"];
@@ -40,7 +42,7 @@ function fixture({ requestJson = async url => ({ body: url.includes("providers")
   const documentRef = { createElement: tag => new Element(tag) };
   const capabilities = { VIEW_PROXY_POOL: "proxy:view", MANAGE_PROXY: "proxy:manage" };
   const controller = createProxyPoolController({ elements, documentRef, requestJson, getProfileGeneration: getGeneration,
-    requestActive, can, capabilities, formatDate: value => value, onPoolChanged });
+    requestActive, can, capabilities, formatDate: value => value, onPoolChanged, ...(deviceLabel ? { deviceLabel } : {}) });
   return { controller, elements, capabilities };
 }
 
@@ -151,6 +153,27 @@ test("unsaved tests clear passwords, restore the button, and can be retried", as
   assert.equal(f.elements.testButton.disabled, false);
 });
 
+test("testing with an empty required field points at that field and sends nothing", async () => {
+  // Found by the real-click sweep: Test Proxy with an empty form sent the request and answered "Correct the highlighted
+  // proxy fields" although nothing was highlighted. Add proxy already pointed at the field; Test Proxy now does the same.
+  let requests = 0;
+  const f = fixture({ requestJson: async () => { requests += 1; return { body: { result: { publicIpv4: "198.51.100.3", latencyMs: 5 } } }; } });
+  const pointedAt = [];
+  f.elements.providerInput.checkValidity = () => true;
+  f.elements.hostInput.checkValidity = () => false;
+  f.elements.hostInput.reportValidity = () => { pointedAt.push("host"); return false; };
+  f.elements.portInput.checkValidity = () => false;
+  f.elements.portInput.reportValidity = () => { pointedAt.push("port"); return false; };
+  assert.equal(await f.controller.testUnsavedProxy(), false);
+  assert.deepEqual(pointedAt, ["host"]);
+  assert.equal(requests, 0);
+  assert.equal(f.elements.testButton.disabled, false);
+  f.elements.hostInput.checkValidity = () => true;
+  f.elements.portInput.checkValidity = () => true;
+  assert.equal(await f.controller.testUnsavedProxy(), true);
+  assert.equal(requests, 1);
+});
+
 test("capability loss during a mutation suppresses its result", async () => {
   const gate = deferred();
   let mayManage = true;
@@ -173,4 +196,57 @@ test("successful pool refresh notifies fleet pickers without duplicating pool st
   assert.equal(await f.controller.refresh(), true);
   assert.equal(changes, 1);
   assert.equal(f.controller.getPool()[0].id, expected.id);
+});
+
+const textOf = element => [element.textContent, ...element.children.map(textOf)].filter(Boolean).join(" ");
+const findAll = (element, predicate) => [element, ...element.children.flatMap(child => findAll(child, predicate))].filter(predicate);
+
+test("an assigned proxy shows the phone's name and a Delete that explains itself in visible text", () => {
+  const f = fixture({ deviceLabel: id => (id === "udid-1" ? "iPhone 2" : id) });
+  f.controller.renderPool([proxy({ leasedToDeviceId: "udid-1" })]);
+  const card = f.elements.poolList.children[0];
+  assert.match(textOf(card), /Assigned to iPhone 2/);
+  const [row] = findAll(card, el => el.className === "proxy-action-row");
+  assert.deepEqual(row.children.map(button => button.textContent), ["Test Proxy", "Delete"]);
+  assert.equal(row.children[1].disabled, true);
+  const [reason] = findAll(card, el => el.className === "proxy-reason");
+  assert.match(reason.textContent, /Can't delete while it is assigned to iPhone 2\. Release it from that phone first\./);
+  assert.equal(row.children[1].attributes["aria-describedby"], reason.id);
+});
+
+test("an unassigned proxy is Available in a neutral gray, never the red 'inactive' style, and Delete needs no reason", () => {
+  const f = fixture();
+  f.controller.renderPool([proxy()]);
+  const card = f.elements.poolList.children[0];
+  const [state] = findAll(card, el => /user-state/.test(el.className || ""));
+  assert.equal(state.textContent, "Available");
+  assert.match(state.className, / neutral$/);
+  assert.doesNotMatch(state.className, /inactive/);
+  assert.equal(findAll(card, el => el.className === "proxy-reason").length, 0);
+});
+
+test("provider names display the way the provider registry spells them", async () => {
+  const f = fixture({ requestJson: async url => ({ body: url.includes("providers")
+    ? { providers: [{ id: "oxy", label: "Oxylabs", exits: [] }] } : { proxies: [proxy({ provider: "oxylabs" })] } }) });
+  await f.controller.refresh();
+  assert.match(textOf(f.elements.poolList.children[0]), /Oxylabs · socks5 · IT/);
+});
+
+test("the empty provider list no longer contradicts the proxies that are in use", async () => {
+  const f = fixture();
+  await f.controller.refresh();
+  assert.equal(f.elements.providerEmpty.textContent, "No separate provider inventory is connected. The proxies above are used directly.");
+  f.controller.clear();
+  assert.equal(f.elements.providerEmpty.textContent, "No separate provider inventory is connected. The proxies above are used directly.");
+});
+
+test("results carry a success or error tone for the result line", async () => {
+  const f = fixture({ requestJson: async () => ({ body: { result: { publicIpv4: "198.51.100.7", latencyMs: 12 } } }) });
+  f.elements.message.dataset = {};
+  await f.controller.testSavedProxy(proxy(), new Element("button"));
+  assert.equal(f.elements.message.dataset.tone, "success");
+  const failing = fixture({ requestJson: async url => { if (url.endsWith("/test")) throw new Error("Proxy refused the connection."); return { body: url.includes("providers") ? { providers: [] } : { proxies: [] } }; } });
+  failing.elements.message.dataset = {};
+  await failing.controller.testSavedProxy(proxy(), new Element("button"));
+  assert.equal(failing.elements.message.dataset.tone, "error");
 });

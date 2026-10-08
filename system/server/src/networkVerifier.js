@@ -144,7 +144,7 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS,
       if (generation !== (generations.get(deviceId) ?? 0)) return getStatus(deviceId);
       onError(err);
       const diagnostic = diagnosticError("V201", {
-        why: "PF-Software could not complete the device egress request.",
+        why: "Bodun could not complete the device egress request.",
         technical: { reason: err?.code || err?.name, timeoutMs },
       });
       const entry = { ...emptyStatus(), networkCheckedAt: checkedAt(), networkVerified: false,

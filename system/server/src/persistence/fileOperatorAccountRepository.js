@@ -5,6 +5,7 @@ import {
   listOperatorAccounts,
   renameOperatorAccount,
   requestOperatorDeletion,
+  requestOperatorDeletionByAuthority,
   resetOperatorSecondFactor,
   setOperatorAccountStatus,
   updateOperatorAccount,
@@ -20,6 +21,7 @@ export function createFileOperatorAccountRepository(legacyStore = {
   listOperatorAccounts,
   renameOperatorAccount,
   requestOperatorDeletion,
+  requestOperatorDeletionByAuthority,
   resetOperatorSecondFactor,
   setOperatorAccountStatus,
   updateOperatorAccount,
@@ -40,9 +42,9 @@ export function createFileOperatorAccountRepository(legacyStore = {
       await authorize?.();
       return legacyStore.createOperatorAccount(input);
     },
-    async updateAccount(username, patch, { authorize = null } = {}) {
+    async updateAccount(username, patch, { authorize = null, actor = null } = {}) {
       await authorize?.();
-      return legacyStore.updateOperatorAccount(username, patch);
+      return legacyStore.updateOperatorAccount(username, patch, { actor });
     },
     async setAccountStatus(username, status, metadata, { authorize = null } = {}) {
       await authorize?.();
@@ -67,6 +69,10 @@ export function createFileOperatorAccountRepository(legacyStore = {
     async requestDeletion(username, password, { authorize = null } = {}) {
       await authorize?.();
       return legacyStore.requestOperatorDeletion(username, password);
+    },
+    async requestDeletionByAuthority(username, { authorize = null, actor = null } = {}) {
+      await authorize?.();
+      return legacyStore.requestOperatorDeletionByAuthority(username, { actor });
     },
     async finalizePrivacyDeletion(username, tombstone, requestId, { authorize = null } = {}) {
       await authorize?.();

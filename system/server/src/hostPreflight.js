@@ -43,7 +43,7 @@ export function runHostPreflight({
     return {
       ok: false,
       fatal: false,
-      checks: [{ id: "platform", ok: false, message: "automatic WDA provisioning requires macOS; skipped on this host" }],
+      checks: [{ id: "platform", ok: false, message: "Automatic phone setup needs macOS, so it is skipped on this computer." }],
     };
   }
 

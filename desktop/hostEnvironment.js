@@ -164,6 +164,8 @@ function resolveMacHostDependencies({
   readdirSync = fs.readdirSync,
   execFile = execFileSync,
   routingEnabled = false,
+  autoNetworkEnrollment = false,
+  autoInternetSharing = false,
   sharedBridgeIface = null,
   pathImpl = platform === "darwin" ? path.posix : path,
 } = {}) {
@@ -280,6 +282,9 @@ function resolveMacHostDependencies({
     ok: checks.every(check => check.ok || check.optional),
     autoProvision: true,
     routingEnabled: Boolean(routingEnabled),
+    // Only meaningful while routing is on; both are off unless the operator switched them on.
+    autoNetworkEnrollment: Boolean(routingEnabled && autoNetworkEnrollment),
+    autoInternetSharing: Boolean(routingEnabled && autoInternetSharing),
     sharedBridgeIface: routingEnabled ? sharedBridgeIface : null,
     tools,
     wdaRepoPath,
@@ -316,7 +321,21 @@ function buildHostEnvironment(baseEnv, resolved) {
   if (resolved.tools.tun2proxy) env.TUN2PROXY_BIN = resolved.tools.tun2proxy;
   if (resolved.routingEnabled) env.AUTO_ROUTE_PROXY_TUNNELS = "true";
   if (resolved.routingEnabled && resolved.sharedBridgeIface) env.SHARED_BRIDGE_IFACE = resolved.sharedBridgeIface;
+  if (resolved.autoNetworkEnrollment) env.AUTO_NETWORK_ENROLLMENT = "true";
+  if (resolved.autoInternetSharing) env.AUTO_ENABLE_INTERNET_SHARING = "true";
   return env;
+}
+
+// SMTP remains a deployment environment contract. Electron GUI launches do
+// not inherit a shell profile reliably on macOS, so the launcher copies the
+// supported keys explicitly into the private child environment. The password
+// is never returned by diagnostics or written to desktop-config.json.
+function smtpChildEnvironment(env = process.env) {
+  const result = {};
+  for (const key of ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "SMTP_SECURE", "COMPANY_FROM_EMAIL"]) {
+    if (typeof env[key] === "string" && env[key]) result[key] = env[key];
+  }
+  return result;
 }
 
 module.exports = {
@@ -328,4 +347,5 @@ module.exports = {
   resolveBinary,
   resolveMacHostDependencies,
   searchDirectories,
+  smtpChildEnvironment,
 };

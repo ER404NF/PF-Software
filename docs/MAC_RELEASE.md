@@ -118,3 +118,27 @@ runs both suites, builds `desktop/dist/Phone-Farm-<version>-<arch>[-UNSIGNED].pk
 the environment; see `desktop/README.md`. Build commands are intentionally kept inside `desktop/`. The only
 script at repository root is `Install Phone Farm.command`, which downloads a published release and never
 builds anything.
+
+## The desktop icon (and the grey square behind it)
+
+Bodun's artwork (`desktop/build/icon.png`) is fully transparent: there is no grey square in the file. macOS 26 draws
+its own rounded square behind every app icon that was not made for it, so on a Mac running macOS 26 the Dock and the
+desktop shortcut can still show a grey plate. A plate-less icon is not something the system offers. The closest
+option is a **layered icon**, where macOS draws its own glass-style square in Bodun's own colours instead of grey.
+
+A layered-icon candidate is prepared but **not switched on**: `desktop/build/candidates/icon.icon` (an Icon Composer
+folder holding the same logo as one transparent layer). It stays out of the installer until someone has looked at
+it on a Mac with Xcode 26, because a wrong icon file would break the build.
+
+To look at it, on the Mac:
+
+1. Run `sw_vers` and note the macOS version.
+2. Run `node desktop/scripts/check-macos-icon.cjs`. It checks the folder, asks Xcode to compile it into a temporary
+   folder, and prints what happened. It changes nothing.
+3. If it compiles and the result looks right, switch the installer over with one line in `desktop/package.json`,
+   under `build.mac`: change `"icon": "build/icon.png"` to `"icon": "build/candidates/icon.icon"`. The release
+   machine then needs Xcode 26 (the `macos-14` runner in `.github/workflows/mac-installer.yml` may not have it).
+   electron-builder also writes the older `icon.icns` itself, so Macs older than macOS 26 keep an icon.
+4. After installing the new build, check what shipped: `plutil -p /Applications/Bodun.app/Contents/Info.plist`
+   (look for the icon entries) and `ls /Applications/Bodun.app/Contents/Resources`. If the old icon still shows,
+   macOS is holding on to it: log out and back in, or restart the Mac. Nothing in these steps touches any other app.

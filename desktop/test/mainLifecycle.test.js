@@ -12,11 +12,17 @@ const desktopVersion = require("../package.json").version.replaceAll(".", "\\.")
 // The menu test must not depend on whether a clean CI Mac happens to have
 // Internet Sharing enabled. Production still discovers and validates the real bridge.
 const app = loadMain({ internetSharingBridges: ["bridge100"] });
-const { handlers, appEvents, windows, clipboardWrites, blockers, menus, shown, loginItems, spawned, trusted, stranger, wait, until, responds, readLog } = app;
+const { handlers, appEvents, windows, clipboardWrites, blockers, menus, shown, loginItems, relaunchCalls, spawned, trusted, stranger, wait, until, responds, readLog } = app;
 const configFile = app.configPath();
 
 test.before(async () => { await wait(50); }); // whenReady().then(launch) runs in a microtask
 test.after(() => app.cleanup());
+
+// The menu is rebuilt whenever a setting changes; saving the (unchanged) start-at-login choice is the cheapest way to make
+// it read the settings file again.
+async function buildMenuAgain() {
+  await handlers.get("desktop:set-launch-at-login")(trusted(), { enabled: true });
+}
 
 async function freePort() {
   return new Promise(resolve => {
@@ -58,21 +64,63 @@ test("diagnostics are copied to the clipboard and hold no secret", async () => {
   fs.rmSync(configFile);
 });
 
-test("the Help menu offers diagnostics, host startup and explicit proxy routing", async () => {
+test("Help offers diagnostics only; the Mac's settings live in the Bodun menu, and routing asks to restart", async () => {
   const help = menus.at(-1).find(item => item.label === "Help");
-  assert.deepEqual(help.submenu.filter(item => item.label).map(item => item.label),
-    ["Copy Diagnostics", "Show Log Folder", "Start Bodun When This Mac Starts", "Enable Proxy Routing on This Mac"]);
-  assert.equal(help.submenu.at(-1).type, "checkbox");
+  assert.deepEqual(help.submenu.filter(item => item.label).map(item => item.label), ["Copy Diagnostics", "Show Log Folder"]);
   help.submenu[0].click();
   assert.match(clipboardWrites.at(-1), /^Bodun diagnostics/);
   assert.equal(shown.at(-1).message, "Diagnostics copied");
 
+  const appMenu = () => menus.at(-1).find(item => item.label === "Bodun");
+  const labels = () => appMenu().submenu.filter(item => item.label).map(item => item.label);
+  assert.ok(labels().includes("Start Bodun When This Mac Starts"));
+  assert.ok(!labels().some(label => /Proxy Routing/.test(label)), "an operator workstation has no routing switch");
+
   fs.writeFileSync(configFile, JSON.stringify({ mode: "host" }));
-  const hostHelp = menus.at(-1).find(item => item.label === "Help");
-  hostHelp.submenu.at(-1).click({ checked: true });
+  await buildMenuAgain();
+  assert.ok(labels().includes("Enable Proxy Routing on This Mac (restart required)"));
+  const routing = appMenu().submenu.find(item => /Proxy Routing/.test(item.label || ""));
+  const restartsBefore = relaunchCalls.length;
+  routing.click({ checked: true });
   await wait(0);
   assert.equal(JSON.parse(fs.readFileSync(configFile, "utf8")).autoRouteProxyTunnels, true);
   assert.equal(shown.at(-1).message, "Proxy routing enabled");
+  assert.deepEqual(shown.at(-1).buttons, ["Restart now", "Later"]);
+  assert.equal(relaunchCalls.length, restartsBefore + 1, "Restart now relaunches Bodun");
+  fs.rmSync(configFile);
+});
+
+test("automatic network enrollment and automatic Internet Sharing are off by default and can be switched on or off from the menu", async () => {
+  fs.writeFileSync(configFile, JSON.stringify({ mode: "host", autoRouteProxyTunnels: true }));
+  await buildMenuAgain();
+  const find = text => menus.at(-1).find(item => item.label === "Bodun").submenu.find(item => (item.label || "").startsWith(text));
+  assert.equal(find("Automatic Network Enrollment").checked, false);
+  assert.equal(find("Automatic Internet Sharing").checked, false);
+  assert.equal(find("Automatic Network Enrollment").enabled, true);
+
+  find("Automatic Network Enrollment").click({ checked: true });
+  await wait(0);
+  assert.equal(JSON.parse(fs.readFileSync(configFile, "utf8")).autoNetworkEnrollment, true);
+  assert.match(shown.at(-1).message, /Automatic network enrollment turned on/);
+
+  find("Automatic Internet Sharing").click({ checked: true });
+  await wait(0);
+  const saved = JSON.parse(fs.readFileSync(configFile, "utf8"));
+  assert.equal(saved.autoInternetSharing, true);
+  assert.equal(saved.autoNetworkEnrollment, true, "turning one on leaves the other alone");
+
+  await buildMenuAgain();
+  assert.equal(find("Automatic Network Enrollment").checked, true);
+  find("Automatic Network Enrollment").click({ checked: false });
+  await wait(0);
+  assert.equal(JSON.parse(fs.readFileSync(configFile, "utf8")).autoNetworkEnrollment, false);
+  assert.match(shown.at(-1).message, /Automatic network enrollment turned off/);
+
+  // Without routing the two switches are shown but cannot be used.
+  fs.writeFileSync(configFile, JSON.stringify({ mode: "host" }));
+  await buildMenuAgain();
+  assert.equal(find("Automatic Network Enrollment").enabled, false);
+  assert.equal(find("Automatic Internet Sharing").enabled, false);
   fs.rmSync(configFile);
 });
 

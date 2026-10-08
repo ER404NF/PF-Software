@@ -8,7 +8,7 @@ import { EventEmitter } from "events";
 export class SupervisedProcessGroup extends EventEmitter {
   constructor({ spawn, restartBackoffMs, logRingSize = 100, stableRunMs = 5 * 60_000,
     retryIndefinitely = false, stopGraceMs = 2000, killWaitMs = 5000,
-    setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout } = {}) {
+    setTimeoutFn = setTimeout, clearTimeoutFn = clearTimeout, ownership = null } = {}) {
     super();
     if (typeof spawn !== "function") throw new Error("a spawn function is required");
     this.spawn = spawn;
@@ -24,6 +24,20 @@ export class SupervisedProcessGroup extends EventEmitter {
     this.pendingStops = new Map();
     this.generations = new Map();
     this.blockedStops = new Map();
+    // Optional durable ownership hooks (processOwnershipStore.js, wired by the
+    // managers): { onSpawn({key,pid,bin,args}), onRelease({key,pid}), confirmGone(key) }.
+    // They only ever observe — a hook failure must never affect supervision.
+    this.ownership = ownership;
+  }
+
+  _ownershipCall(name, payload) {
+    try {
+      const result = this.ownership?.[name]?.(payload);
+      if (result && typeof result.catch === "function") result.catch(() => {});
+      return result;
+    } catch {
+      return undefined;
+    }
   }
 
   isRunning(key) {
@@ -51,12 +65,17 @@ export class SupervisedProcessGroup extends EventEmitter {
   // time. `env` is optional extra environment merged over process.env (e.g.
   // WDA's MJPEG tuning vars) — omitting it keeps the previous, unchanged
   // behavior of simply inheriting the parent process's environment.
+  //
+  // Returns what actually happened, so callers cannot mistake "nothing was
+  // started" for success: "started", "queued" (a replacement waiting for a
+  // pending stop), "blocked" (an earlier stop never confirmed exit) or
+  // "running" (already running).
   start(key, bin, args, env) {
     if (this.blockedStops.has(key)) {
       this.emit("replacement-blocked", { key, reason: this.blockedStops.get(key) });
-      return false;
+      return "blocked";
     }
-    if (this.isRunning(key)) return;
+    if (this.isRunning(key)) return "running";
     const generation = (this.generations.get(key) ?? 0) + 1;
     this.generations.set(key, generation);
     const launch = () => {
@@ -78,9 +97,10 @@ export class SupervisedProcessGroup extends EventEmitter {
         }
         launch();
       });
-    } else {
-      launch();
+      return "queued";
     }
+    launch();
+    return "started";
   }
 
   _appendLog(entry, line) {
@@ -111,6 +131,7 @@ export class SupervisedProcessGroup extends EventEmitter {
     }
     entry.child = child;
     entry.state = "running";
+    if (Number.isSafeInteger(child.pid)) this._ownershipCall("onSpawn", { key, pid: child.pid, bin, args });
     this.emit("starting", { key });
     // A missing executable emits `error` without `exit`. Some other child
     // failures can emit both, so settle this spawn exactly once.
@@ -143,7 +164,12 @@ export class SupervisedProcessGroup extends EventEmitter {
       this.emit("log", { key, stream: "stderr", line: `spawn error: ${error.message}` });
       fail(null, null);
     });
-    child.on("exit", fail);
+    // An 'exit' event is the confirmation that this process is gone (an 'error'
+    // event is not: a failed kill also raises it), so only 'exit' releases ownership.
+    child.on("exit", (code, signal) => {
+      if (Number.isSafeInteger(child.pid)) this._ownershipCall("onRelease", { key, pid: child.pid });
+      fail(code, signal);
+    });
   }
 
   _processFailed(key, entry, code, signal) {
@@ -190,7 +216,14 @@ export class SupervisedProcessGroup extends EventEmitter {
   stop(key) {
     const entry = this.entries.get(key);
     this.generations.set(key, (this.generations.get(key) ?? 0) + 1);
-    if (!entry) return this.pendingStops.get(key);
+    if (!entry) {
+      const pending = this.pendingStops.get(key);
+      if (pending) return pending;
+      // A second stop after a stop that never confirmed exit must not look like
+      // success: the old process may still be alive.
+      if (this.blockedStops.has(key)) return Promise.resolve({ ok: false, error: this.blockedStops.get(key) });
+      return undefined;
+    }
     entry.stopped = true;
     entry.state = "stopped";
     if (entry.restartTimer) this.clearTimeoutFn(entry.restartTimer);
@@ -210,20 +243,23 @@ export class SupervisedProcessGroup extends EventEmitter {
       done = true;
       if (forceTimer) this.clearTimeoutFn(forceTimer);
       if (killWaitTimer) this.clearTimeoutFn(killWaitTimer);
-      child.off?.("exit", finish);
-      child.off?.("close", finish);
+      child.off?.("exit", onExit);
+      child.off?.("close", onExit);
       child.off?.("error", onKillError);
       if (this.pendingStops.get(key) === stopped) this.pendingStops.delete(key);
+      if (result?.ok !== false && Number.isSafeInteger(child.pid)) this._ownershipCall("onRelease", { key, pid: child.pid });
       settle(result);
     };
+    // 'exit'/'close' pass (code, signal); `finish` takes a result, so adapt.
+    const onExit = () => finish();
     const onKillError = error => {
       // ESRCH proves the old process is already gone. Other kill errors (for
       // example EPERM) do not prove termination, so keep the replacement
       // queued until an exit/close event confirms that its ports are free.
       if (error?.code === "ESRCH") finish();
     };
-    child.once?.("exit", finish);
-    child.once?.("close", finish);
+    child.once?.("exit", onExit);
+    child.once?.("close", onExit);
     child.on?.("error", onKillError);
     try {
       child.kill?.();
@@ -239,7 +275,7 @@ export class SupervisedProcessGroup extends EventEmitter {
       try { child.kill?.("SIGKILL"); } catch (error) { onKillError(error); }
       if (!done) {
         killWaitTimer = this.setTimeoutFn(() => {
-          const reason = "process did not confirm exit after SIGKILL; replacement is blocked until relay restart";
+          const reason = "process did not confirm exit after SIGKILL; replacement is blocked until Bodun restarts";
           this.blockedStops.set(key, reason);
           this.emit("stop-timeout", { key, reason });
           finish({ ok: false, error: reason });
@@ -249,6 +285,19 @@ export class SupervisedProcessGroup extends EventEmitter {
     }, this.stopGraceMs);
     forceTimer.unref?.();
     return stopped;
+  }
+
+  // A blocked stop is otherwise permanent until the server restarts. It may be
+  // cleared only with proof that the old process is gone: either the kept
+  // ownership record shows it (dead pid / different start time), or the caller
+  // just reclaimed it itself (`verifiedGone`). Returns whether it was cleared.
+  async clearBlockedStop(key, { verifiedGone = false } = {}) {
+    if (!this.blockedStops.has(key)) return true;
+    const proven = verifiedGone || (await this.ownership?.confirmGone?.(key)) === true;
+    if (!proven) return false;
+    this.blockedStops.delete(key);
+    this._ownershipCall("onRelease", { key, pid: null });
+    return true;
   }
 
   stopAll() {

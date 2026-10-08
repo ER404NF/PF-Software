@@ -28,8 +28,16 @@ export function diffBridgeMembers(before, after) {
   const beforeSet = new Set(before);
   const newMembers = after.filter(iface => !beforeSet.has(iface));
   if (newMembers.length === 1) return { state: "assigned", iface: newMembers[0], newMembers };
-  if (newMembers.length === 0) return { state: "ambiguous", reason: "no new bridge member appeared after enabling Internet Sharing for this phone", newMembers };
-  return { state: "ambiguous", reason: `multiple new bridge members appeared (${newMembers.join(", ")}) — enroll phones one at a time`, newMembers };
+  if (newMembers.length === 0) {
+    return {
+      state: "ambiguous", newMembers,
+      reason: "Bodun did not see a new network connection appear. Turn on Internet Sharing for this phone's USB connection in System Settings, then press Confirm again.",
+    };
+  }
+  return {
+    state: "ambiguous", newMembers,
+    reason: `More than one new network connection appeared (${newMembers.join(", ")}). Set up one phone at a time: turn off sharing for the others, cancel, and start again.`,
+  };
 }
 
 // The Mac's own address on the shared bridge — needed to exclude it from
@@ -45,11 +53,20 @@ export function parseInterfaceIp(ifconfigOutput) {
   return match ? match[1] : null;
 }
 
+// macOS only creates the shared bridge (bridge100) once Internet Sharing is turned on, so before the first
+// phone is shared `ifconfig bridge100` answers "interface bridge100 does not exist". That is not a failure:
+// it is simply a bridge with no members yet, and the "before" list is empty.
+const MISSING_INTERFACE = /does not exist|no such (?:device|interface)|interface .* not found/i;
+
 async function runIfconfig(iface, execFile) {
   return new Promise((resolve, reject) => {
     execFile("ifconfig", [iface], { timeout: 5000, windowsHide: true, encoding: "utf8" }, (error, stdout, stderr) => {
-      if (error) reject(new Error(`ifconfig ${iface} failed: ${(stderr || error.message || "").trim().slice(0, 300)}`));
-      else resolve(stdout);
+      if (error) {
+        const detail = (stderr || error.message || "").trim().slice(0, 300);
+        reject(Object.assign(new Error(`ifconfig ${iface} failed: ${detail}`), {
+          code: "IFCONFIG_FAILED", missingInterface: MISSING_INTERFACE.test(`${stderr} ${error.message}`),
+        }));
+      } else resolve(stdout);
     });
   });
 }
@@ -59,7 +76,13 @@ async function runIfconfig(iface, execFile) {
 // need a real bridge.
 export async function listBridgeMembers({ bridgeIface, execFile = execFileCb } = {}) {
   if (typeof bridgeIface !== "string" || !bridgeIface) throw new Error("bridgeIface is required");
-  const output = await runIfconfig(bridgeIface, execFile);
+  let output;
+  try {
+    output = await runIfconfig(bridgeIface, execFile);
+  } catch (error) {
+    if (error?.missingInterface) return [];
+    throw error;
+  }
   return parseBridgeMembers(output);
 }
 

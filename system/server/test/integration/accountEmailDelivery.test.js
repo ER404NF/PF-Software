@@ -154,8 +154,8 @@ test("signup/review notifications send when available and post-commit failures n
       },
     });
     assert.equal(failureStateSignup.status, 201);
-    const originalMarkFailed = accountNotificationStore.markFailed;
-    accountNotificationStore.markFailed = () => {
+    const originalCompleteClaim = accountNotificationStore.completeClaim;
+    accountNotificationStore.completeClaim = () => {
       throw new Error("failed to write C:/sensitive/outbox/account-notifications.json");
     };
     nextShouldFail = true;
@@ -165,9 +165,9 @@ test("signup/review notifications send when available and post-commit failures n
       });
       assert.equal(committedWithUnrecordedDeliveryFailure.status, 200);
       assert.equal(committedWithUnrecordedDeliveryFailure.body.operator.accountStatus, "rejected");
-      assert.equal(committedWithUnrecordedDeliveryFailure.body.notification.deliveryState, "pending_reconciliation");
+      assert.equal(committedWithUnrecordedDeliveryFailure.body.notification.deliveryState, "needs_reconciliation");
     } finally {
-      accountNotificationStore.markFailed = originalMarkFailed;
+      accountNotificationStore.completeClaim = originalCompleteClaim;
     }
 
     // Account creation is the authoritative commit. A later outbox write

@@ -41,7 +41,8 @@ test("start() passes WDA's MJPEG tuning env vars to the spawned xcodebuild proce
   assert.equal(calls[0].options.env.MJPEG_SCALING_FACTOR, "50");
   // The spawned process must still inherit the rest of the parent's real
   // environment (PATH, etc.) — these are additions, not a replacement.
-  assert.equal(calls[0].options.env.PATH, process.env.PATH);
+  const inheritedPath = Object.entries(calls[0].options.env).find(([key]) => key.toLowerCase() === "path")?.[1];
+  assert.equal(inheritedPath, process.env.PATH);
 });
 
 test("start() lets each MJPEG tuning value be overridden via this app's own env vars, independently", () => {

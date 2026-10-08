@@ -299,6 +299,8 @@ function renderPolicyRow(list, entry, account, epoch, mayEdit) {
 
 reviewToggle.addEventListener("click", async () => {
   if (!reviewPanel.hidden) return reviewReset();
+  // Research and Review open in the same place: only one is open at a time.
+  if (!document.getElementById("research-panel").hidden) document.getElementById("research-toggle").click();
   reviewPanel.hidden = false;
   reviewToggle.setAttribute("aria-expanded", "true");
   const tabs = visibleTabs();

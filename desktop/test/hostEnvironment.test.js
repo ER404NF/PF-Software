@@ -7,6 +7,7 @@ const {
   discoverWdaSource,
   detectInternetSharingBridges,
   resolveMacHostDependencies,
+  smtpChildEnvironment,
 } = require("../hostEnvironment");
 
 const UDID_TOOLS = ["idevice_id", "ideviceinfo", "iproxy"];
@@ -96,6 +97,23 @@ test("host environment enables automatic WDA with resolved absolute tools and le
   assert.equal(env.XCODEBUILD_BIN, "/usr/bin/xcodebuild");
   assert.equal(env.TUN2PROXY_BIN, "/opt/homebrew/bin/tun2proxy-bin");
   assert.equal(env.AUTO_ROUTE_PROXY_TUNNELS, "false");
+});
+
+test("the packaged child receives explicit SMTP deployment settings without serializing them", () => {
+  const env = smtpChildEnvironment({
+    SMTP_HOST: "smtp.example.com", SMTP_PORT: "587", SMTP_USER: "mailer@example.com",
+    SMTP_PASS: "private-password", SMTP_SECURE: "true", COMPANY_FROM_EMAIL: "noreply@example.com",
+    UNRELATED_SECRET: "do-not-copy",
+  });
+  assert.deepEqual(env, {
+    SMTP_HOST: "smtp.example.com", SMTP_PORT: "587", SMTP_USER: "mailer@example.com",
+    SMTP_PASS: "private-password", SMTP_SECURE: "true", COMPANY_FROM_EMAIL: "noreply@example.com",
+  });
+  assert.equal(Object.hasOwn(env, "UNRELATED_SECRET"), false);
+  const publicStatus = {
+    configured: Boolean(env.SMTP_HOST && env.SMTP_PORT && env.SMTP_USER && env.SMTP_PASS && env.COMPANY_FROM_EMAIL),
+  };
+  assert.doesNotMatch(JSON.stringify(publicStatus), /private-password|mailer@example\.com|smtp\.example\.com/);
 });
 
 test("tun2proxy is required only when routing was explicitly enabled", () => {
@@ -274,4 +292,20 @@ test("missing iPhone tools get a Fix it only when Homebrew is there to install t
 test("a row that is already fine never shows a Fix it", () => {
   const result = resolveMacHostDependencies(fakeMac({ prefix: "/opt/homebrew/bin" }));
   assert.ok(result.checks.every(check => check.fixable === undefined));
+});
+
+test("automatic network enrollment and Internet Sharing reach the server only when the operator turned them on, and only with routing", () => {
+  const base = { ...fakeMac({ prefix: "/opt/homebrew/bin", tunName: "tun2proxy-bin" }), routingEnabled: true, sharedBridgeIface: "bridge100" };
+  const off = buildHostEnvironment({}, resolveMacHostDependencies(base));
+  assert.equal(off.AUTO_NETWORK_ENROLLMENT, undefined);
+  assert.equal(off.AUTO_ENABLE_INTERNET_SHARING, undefined);
+  const on = buildHostEnvironment({}, resolveMacHostDependencies({ ...base, autoNetworkEnrollment: true, autoInternetSharing: true }));
+  assert.equal(on.AUTO_NETWORK_ENROLLMENT, "true");
+  assert.equal(on.AUTO_ENABLE_INTERNET_SHARING, "true");
+  const onlyOne = buildHostEnvironment({}, resolveMacHostDependencies({ ...base, autoInternetSharing: true }));
+  assert.equal(onlyOne.AUTO_NETWORK_ENROLLMENT, undefined);
+  assert.equal(onlyOne.AUTO_ENABLE_INTERNET_SHARING, "true");
+  const noRouting = buildHostEnvironment({}, resolveMacHostDependencies({ ...fakeMac({ prefix: "/opt/homebrew/bin" }), autoNetworkEnrollment: true, autoInternetSharing: true }));
+  assert.equal(noRouting.AUTO_NETWORK_ENROLLMENT, undefined, "without routing there is nothing to enroll");
+  assert.equal(noRouting.AUTO_ENABLE_INTERNET_SHARING, undefined);
 });

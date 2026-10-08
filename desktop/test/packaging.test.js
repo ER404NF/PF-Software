@@ -56,6 +56,7 @@ test("only the allow-listed runtime is staged; credentials, storage, tests and f
     for (const wanted of ["server/src/index.js", "client/index.html", "package.json", "models.config.json", "node_modules/express/package.json"]) {
       assert.ok(fs.existsSync(path.join(staged, wanted)), `${wanted} should be staged`);
     }
+    assert.match(JSON.parse(fs.readFileSync(path.join(staged, "build-info.json"), "utf8")).commit, /^([0-9a-f]{7}|unknown)$/, "the build record is staged");
     for (const forbidden of ["operators.config.json", "devices.config.json", "storage", "tmp", "server/test", "server/fixtures", "test-results-debug.txt", ".env"]) {
       assert.equal(fs.existsSync(path.join(staged, forbidden)), false, `${forbidden} must not be staged`);
     }
@@ -102,7 +103,9 @@ test("electron-builder packages an allow-listed app, not the whole desktop direc
   const files = packageJson.build.files;
   assert.ok(files.includes("main.js"));
   assert.equal(files.some(pattern => /\*\*/.test(pattern)), false, "no wildcard patterns: build/runtime and tests must stay out of app.asar");
-  for (const source of ["main.js", "hostEnvironment.js", "windowSecurity.js", "wdaSource.js"]) {
+  // Every desktop module that ends up in the app is checked, so a module that only another module
+  // requires (not main.js directly) cannot be left out of the package either.
+  for (const source of files.filter(file => file.endsWith(".js"))) {
     const text = fs.readFileSync(path.join(desktopDir, source), "utf8");
     for (const match of text.matchAll(/require\("\.\/([\w-]+)"\)/g)) {
       assert.ok(files.includes(`${match[1]}.js`), `${source} requires ./${match[1]} which is missing from build.files`);

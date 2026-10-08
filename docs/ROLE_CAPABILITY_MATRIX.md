@@ -14,8 +14,10 @@ Implemented 2026-09-10 in `system/server/src/roleCapabilities.js`. Capabilities 
 | Manage AI controller and handoffs | Yes | Yes | No | No | No | No | No |
 | Run an approved network check | Yes | Yes | Yes | Yes | No | No | No |
 | Monitor an authorized phone | Yes | Yes | Yes | Yes | No | No | No |
-| Stop/start WDA and run a full control-path check | Yes | No | Yes | No | No | No | No |
+| Stop/start/restart WDA and run a full control-path check | Yes | Yes | Yes | No | No | No | No |
 | Retry failed automatic device provisioning | Yes | Yes | No | No | No | No | No |
+| See the automatic phone setup notice on Fleet | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
+| Check again on a paused automatic phone setup (`POST /api/admin/automatic-setup/check`, same capability as the retry above) | Yes | Yes | No | No | No | No | No |
 | Read sensitive audit/configure models/manage security | Yes | Yes | No | No | No | No | No |
 | View and assign the shared proxy pool | Yes | Yes | Yes | Yes | No | No | No |
 | Start/stop privileged proxy tunnel routing | Yes | Yes | No | No | No | No | No |
@@ -39,5 +41,13 @@ Current server enforcement:
   Content Creator, or Editor accounts with the exact same non-empty `teamId`.
   It does not expose sensitive audit records and cannot mutate grants, roles,
   passwords, 2FA, or the Manager's own account.
-- Global queue state, model configuration, sensitive audit history, user/access administration, proxy mutation, security configuration, device-provisioning retries, and proxy tunnel routing (`routing:manage`) remain Admin/Host operations. WDA lifecycle control is intentionally different: only Host and the explicitly promoted Special Manager receive `wda:lifecycle`. An ordinary Admin or Manager cannot stop a physical phone's control process.
+- Global queue state, model configuration, sensitive audit history, user/access administration, proxy mutation, security configuration, device-provisioning retries, and proxy tunnel routing (`routing:manage`) remain Admin/Host operations. WDA lifecycle control is the one exception to "Admin is Host-equivalent minus ownership": Host, Admin and the explicitly promoted Special Manager receive `wda:lifecycle` (Admin was added at the customer's request so the Start/Stop/Restart WDA buttons are visible to Admin); an ordinary Manager and every lower role cannot stop a physical phone's control process.
 - Unknown or missing roles normalize to VA for backward compatibility and do not acquire management capabilities.
+
+## Account protection and deletion
+
+- **Your own account.** Nobody can turn off, demote or re-rank the account they are signed in with (server answer: 409, code `SELF_CHANGE_BLOCKED`). Other edits to your own account (for example your name) are unaffected.
+- **The last Admin/Host.** The system always keeps at least one active Admin or Host account. Turning off, demoting or deleting the last one is refused (409, code `LAST_ADMINISTRATOR`), whichever of the two roles it holds. A Host counts as an administrator for this rule; moving an Admin to Host is allowed because it does not remove an administrator.
+- **Deleting your own account** is open to everyone through Privacy, then Delete my account (the existing privacy flow). The last Admin/Host is the one exception and is told to make someone else Admin or Host first.
+- **Deleting someone else's account** (`DELETE /api/admin/users/:username`, typed username confirmation required) is allowed only for someone who outranks the account — Host over Admin, Admin over Manager/Special Manager and below, a Manager/Special Manager over the members of their own team (VA, Content Creator, Editor). Equal ranks cannot delete each other; the main host account and the last Admin/Host cannot be deleted; an account already being deleted cannot be deleted again. The account is locked at once (sessions ended, sign-in secrets cleared) and the privacy process removes its data afterwards. The users list tells the editor, per row, whether deletion is allowed and why not (`protection.canDelete`, `protection.deleteReason`).
+- The Review (approve/reject) decision logic is unchanged.

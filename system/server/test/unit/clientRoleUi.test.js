@@ -47,7 +47,7 @@ test("Operations has keyboard-reachable role-aware section navigation", () => {
     assert.match(html, new RegExp(`id="${target}"[^>]*tabindex="-1"[^>]*aria-labelledby=`));
   }
   const controller = fs.readFileSync(path.join(clientDir, "operationsController.js"), "utf8");
-  assert.match(controller, /function sync\(allowed\)[\s\S]*panel\.hidden = !active/);
+  assert.match(controller, /function render\(allowed\)[\s\S]*panel\.hidden = !active[\s\S]*function sync\(allowed\)[\s\S]*render\(allowed\)/);
   assert.match(controller, /function select\(panelId[\s\S]*historyRef\.replaceState[\s\S]*focus/);
   assert.match(app, /operationsNavEl\.addEventListener\("click"[\s\S]*selectOperationsPanel/);
   assert.match(controller, /activePanelId[\s\S]*aria-current/);
@@ -175,9 +175,10 @@ test("role and error-handling audit controls are explicit and recoverable", () =
   for (const label of ["Device", "Control", "WDA", "iproxy", "Network", "Proxy"]) {
     assert.match(app, new RegExp(`\\["${label}"`));
   }
-  assert.match(app, /\["Error name", error\.name\]/);
-  assert.match(app, /\["Location", error\.location/);
-  assert.match(app, /\["How to fix", error\.operatorAction\]/);
+  const model = fs.readFileSync(path.join(clientDir, "deviceCardModel.js"), "utf8");
+  assert.match(model, /\["Error name", error\?\.name\]/);
+  assert.doesNotMatch(app, /\["Location"/, "file locations and function names are not shown to operators");
+  assert.match(model, /\["How to fix", error\?\.operatorAction\]/);
   assert.match(app, /diagnostics\.textContent = "Diagnostics"/);
   for (const label of ["Physical devices", "Device control", "Proxy tunnels", "Protected routes"]) {
     assert.match(app, new RegExp(`\\["${label}"`));
@@ -216,22 +217,21 @@ test("network verification is visible only through the server-issued capability"
 });
 
 test("WDA lifecycle and end-to-end control diagnostics are capability-gated", () => {
+  const model = fs.readFileSync(path.join(clientDir, "deviceCardModel.js"), "utf8");
   assert.match(app, /MANAGE_WDA_LIFECYCLE:\s*"wda:lifecycle"/);
   assert.match(app, /function buildWdaLifecyclePanel\(device\)/);
-  assert.match(app, /Stop WDA/);
-  assert.match(app, /\/wda\/\$\{starting \? "start" : "stop"\}/);
-  assert.match(app, /can\(UI_CAPABILITIES\.MANAGE_WDA_LIFECYCLE\) && d\.wdaLifecycle/);
-  assert.match(app, /\/wda\/\$\{starting \? "start" : "stop"\}/);
+  // three separate buttons (labels live in the model), each posting to its own route
+  for (const label of ["Start WDA", "Stop WDA", "Restart WDA", "Check control"]) assert.match(model, new RegExp(label));
+  assert.match(app, /\/wda\/\$\{action\.path\}/);
+  assert.match(app, /path: "start"[\s\S]*path: "stop"[\s\S]*path: "restart"/);
+  // shown to every holder of the capability, even when the lifecycle is null (then it is a disabled panel)
+  assert.match(app, /if \(can\(UI_CAPABILITIES\.MANAGE_WDA_LIFECYCLE\)\) \{\s*tools\.appendChild\(buildWdaLifecyclePanel\(d\)\);/);
+  assert.doesNotMatch(app, /can\(UI_CAPABILITIES\.MANAGE_WDA_LIFECYCLE\) && d\.wdaLifecycle/);
   assert.match(app, /\/control-diagnostic/);
-  assert.match(app, /Restart WDA/);
-  assert.match(app, /\/wda\/restart/);
-  assert.match(app, /lifecycleLabels/);
   assert.match(app, /profileRequestActive\(generation, UI_CAPABILITIES\.MANAGE_WDA_LIFECYCLE\)/);
   assert.match(app, /function renderControlDiagnostic\(diagnostic\)/);
   assert.match(app, /Observed: \$\{check\.observed\}\. Expected: \$\{check\.expected\}\./);
   assert.match(app, /report\.open = true/);
-  assert.match(app, /Copy sanitized report/);
-  assert.match(app, /navigator\.clipboard\.writeText\(copyableReport\)/);
 });
 
 test("manual network enrollment is restored from the session-bound server summary, not browser-local memory", () => {
@@ -255,7 +255,7 @@ test("proxy-provider inventory is capability-gated and never claims it changed p
   const controller = fs.readFileSync(path.join(clientDir, "proxyPoolController.js"), "utf8");
   assert.match(html, /id="proxy-provider-list"/);
   assert.match(html, /enabled exit is not proof that phone traffic uses it/);
-  assert.match(html, /<script src="proxyPoolController\.js"><\/script>\s*<script src="app\.js"><\/script>/);
+  assert.match(html, /<script src="deviceCardModel\.js"><\/script>\s*<script src="proxyPoolController\.js"><\/script>\s*<script src="cardMessages\.js"><\/script>\s*<script src="automaticSetupBanner\.js"><\/script>\s*<script src="app\.js"><\/script>/);
   assert.match(controller, /requestJson\("\/api\/admin\/proxy-providers"\)/);
   assert.match(controller, /const mayManage = can\(capabilities\.MANAGE_PROXY\)/);
   assert.match(controller, /\/api\/admin\/proxy-providers\/\$\{encodeURIComponent\(provider\.id\)\}\/exits/);
@@ -283,6 +283,9 @@ test("the Sites panel is admin-only, hidden by default, and never keeps a token 
   assert.match(html, /id="sites-panel"\s+hidden/);
   assert.match(html, /id="site-token-reveal"[^>]*hidden/);
   assert.match(html, /The token is shown only once/);
+  assert.match(html, /On the site's Mac, open Bodun, choose "This is a remote site's Mac mini", and enter these three values\./);
+  assert.match(app, /`Hub address: \$\{body\.hubUrl\}`,\s*`Site ID: \$\{siteId\}`,\s*`Site token: \$\{body\.token\}`,/);
+  assert.doesNotMatch(app, /npm run agent|HUB_URL=|SITE_TOKEN=/, "the one-time box shows plain labels, not developer commands or variables");
   assert.match(app, /MANAGE_SITES: "sites:manage"/);
   assert.match(app, /sitesPanelEl\.hidden = !can\(UI_CAPABILITIES\.MANAGE_SITES\)/);
   assert.match(app, /can\(UI_CAPABILITIES\.MANAGE_SITES\) \? refreshSites\(\)/);

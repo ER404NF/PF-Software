@@ -19,6 +19,30 @@
       ],
       "port": 4173,
       "cwd": "system"
+    },
+    {
+      "name": "phone-farm-demo-broken",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "demo",
+        "--",
+        "--broken-phones"
+      ],
+      "port": 4173,
+      "cwd": "system"
+    },
+    {
+      "name": "phone-farm-demo-paused",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "demo",
+        "--",
+        "--paused-setup"
+      ],
+      "port": 4173,
+      "cwd": "system"
     }
   ]
 }

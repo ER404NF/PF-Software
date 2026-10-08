@@ -71,7 +71,9 @@ test("failed server logout clears local state and leaves a persistent retry warn
   let streamResets = 0;
   let sitesCleared = 0;
   let proxyClears = 0;
+  const noticeUpdates = [];
   const context = vm.createContext({
+    automaticSetupStatus: { state: "paused", canCheckAgain: true }, automaticSetupBanner: { update(value) { noticeUpdates.push(value); } },
     signedOut: false, fileRequestGeneration: 0, currentDeviceId: "a", pendingDeviceId: "a",
     watchedDeviceId: "a", pendingWatchDeviceId: "a", pendingAiWorkspaceExitDeviceId: "a",
     lastDevices: [{ id: "a" }], watchRefreshTimerId: 1,
@@ -96,6 +98,8 @@ test("failed server logout clears local state and leaves a persistent retry warn
   assert.equal(streamResets, 1, "sign-out must stop the live video and clear the picture immediately");
   assert.equal(sitesCleared, 1, "sign-out must remove any site token still on screen");
   assert.equal(proxyClears, 1, "sign-out must remove proxy inventory and any typed password");
+  assert.equal(context.automaticSetupStatus, null, "the next person must not see the last person's Check again button");
+  assert.deepEqual(noticeUpdates, [null]);
   assert.equal(pending, true);
   assert.equal(context.logoutRetryButtonEl.hidden, false);
   assert.match(context.loginErrorEl.textContent, /server could not confirm session revocation/);
@@ -324,18 +328,23 @@ test("transient device error keeps selection and Release available", () => {
 
 test("an unopenable fleet summary cannot send select_device", () => {
   const selected = [];
-  const context = vm.createContext({ selectErrorEl: {}, selectDevice: id => selected.push(id) });
+  const shown = [];
+  const context = vm.createContext({ selectErrorEl: {}, cardMessages: { show: (id, text, tone) => shown.push([id, text, tone]) }, selectDevice: id => selected.push(id) });
   vm.runInContext(section("function requestDeviceOpen(device)", "// Stops whatever AI control"), context);
   assert.equal(vm.runInContext("requestDeviceOpen({ id: 'mock-2', canOpen: false, openReason: 'Not assigned.' })", context), false);
   assert.deepEqual(selected, []);
-  assert.equal(context.selectErrorEl.textContent, "Not assigned.");
+  // the reason appears on that phone's card (not in the page-level line)
+  assert.deepEqual(shown, [["mock-2", "Not assigned.", "error"]]);
+  assert.equal(context.selectErrorEl.textContent, undefined);
   assert.equal(vm.runInContext("requestDeviceOpen({ id: 'mock-1', canOpen: true })", context), true);
   assert.deepEqual(selected, ["mock-1"]);
 });
 
 test("an unwatchable fleet summary cannot request a live screen", () => {
   const sent = [];
+  const shown = [];
   const context = vm.createContext({
+    cardMessages: { show: (id, text, tone) => shown.push([id, text, tone]) },
     pendingWatchDeviceId: null, watchedDeviceId: null,
     UI_CAPABILITIES: { MONITOR_DEVICE: "device:monitor" }, can: () => true,
     selectErrorEl: {}, detailMessageEl: {}, hintEl: {}, filesPanelEl: {}, showDetailView() {}, clearAiWorkspace() {}, stopLiveView() {},
@@ -344,7 +353,8 @@ test("an unwatchable fleet summary cannot request a live screen", () => {
   vm.runInContext(section("function requestDeviceOpen(device)", "// Stops whatever AI control"), context);
   assert.equal(vm.runInContext("requestDeviceWatch({ id: 'mock-1', canWatch: false, watchReason: 'Outside team.' })", context), false);
   assert.deepEqual(sent, []);
-  assert.equal(context.selectErrorEl.textContent, "Outside team.");
+  assert.deepEqual(shown, [["mock-1", "Outside team.", "error"]]);
+  assert.equal(context.selectErrorEl.textContent, undefined);
   assert.equal(vm.runInContext("requestDeviceWatch({ id: 'mock-1', canWatch: true })", context), true);
   assert.equal(sent.length, 1);
   assert.equal(sent[0].type, "watch_device");
@@ -371,7 +381,9 @@ test("live role updates clear privileged DOM before safe data is reloaded", () =
   let assignmentRefreshes = 0;
   let sitesCleared = 0;
   let proxyClearOptions = null;
+  const noticeUpdates = [];
   const context = vm.createContext({
+    automaticSetupStatus: { state: "paused", canCheckAgain: true }, automaticSetupBanner: { update(value) { noticeUpdates.push(value); } },
     currentOperator: { username: "operator", role: "admin", capabilities: ["queue:manage", "users:manage"] },
     lastDevices: [{ authorizedOperators: ["private"] }], renderToken: 4,
     UI_CAPABILITIES: {
@@ -417,6 +429,8 @@ test("live role updates clear privileged DOM before safe data is reloaded", () =
   assert.equal(context.renderToken, 5);
   assert.equal(renderedAssignments.length, 0);
   assert.equal(sitesCleared, 1, "a demoted operator loses any site token on screen");
+  assert.equal(context.automaticSetupStatus, null, "a demoted operator loses the Check again button until the next device list");
+  assert.deepEqual(noticeUpdates, [null]);
   assert.equal(assignmentRefreshes, 1);
   assert.equal(context.commandOutputEl.textContent, "");
   assert.deepEqual(context.queueBodyEl.children, []);

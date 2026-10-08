@@ -63,8 +63,14 @@ export function createAccountNotificationStore({ storePath, companyEmail = null,
   }
 
   function safeItem(item) {
-    const { securePayload: omittedSecurePayload, ...safe } = item;
+    const { securePayload: omittedSecurePayload, body: omittedBody, claimToken: omittedClaimToken, ...safe } = item;
     return { ...safe };
+  }
+
+  function contentFor(item) {
+    const body = item.kind === "account_recovery" ? decryptBody(item.securePayload) : item.body;
+    const { securePayload, claimToken, ...metadata } = item;
+    return { ...metadata, body };
   }
 
   function queue({ to, fullName, username, status, recoveryToken = null, holdForCommit = false }) {
@@ -95,6 +101,8 @@ export function createAccountNotificationStore({ storePath, companyEmail = null,
       kind: recovery ? "account_recovery" : `account_${status}`,
       deliveryState: holdForCommit ? "pending_account_commit"
         : companyEmail ? "queued" : "awaiting_sender_configuration",
+      attemptCount: 0,
+      nextAttemptAt: null,
       createdAt: new Date().toISOString(),
     };
     write([...notifications, item]);
@@ -102,15 +110,13 @@ export function createAccountNotificationStore({ storePath, companyEmail = null,
   }
 
   function list() {
-    return read().map(item => ({ ...item })).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    return read().map(safeItem).sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
   function deliveryContent(id) {
     const item = read().find(candidate => candidate?.id === id);
     if (!item) return null;
-    const body = item.kind === "account_recovery" ? decryptBody(item.securePayload) : item.body;
-    const { securePayload, ...metadata } = item;
-    return { ...metadata, body };
+    return contentFor(item);
   }
 
   function setCommitState(id, committed) {
@@ -133,8 +139,69 @@ export function createAccountNotificationStore({ storePath, companyEmail = null,
     const notifications = read();
     const index = notifications.findIndex(item => item?.id === id);
     if (index < 0) return null;
-    if (notifications[index].deliveryState !== "queued") return safeItem(notifications[index]);
-    const next = { ...notifications[index], deliveryState: state };
+    if (!["queued", "retrying"].includes(notifications[index].deliveryState)) return safeItem(notifications[index]);
+    const { claimToken, leaseUntil, ...current } = notifications[index];
+    const next = { ...current, deliveryState: state };
+    notifications[index] = next;
+    write(notifications);
+    return safeItem(next);
+  }
+
+  // Synchronous read/claim/write makes claims atomic inside the single relay
+  // process. The lease lets a later process recover a notification after a
+  // crash, while the random token prevents a stale worker from completing a
+  // newer attempt.
+  function claimNext({ now = new Date(), maxAttempts = 5, leaseMs = 60_000, id = null } = {}) {
+    const nowMs = now instanceof Date ? now.getTime() : Number(now);
+    const notifications = read();
+    const index = notifications.findIndex(item => {
+      if (id && item?.id !== id) return false;
+      const attempts = Number.isSafeInteger(item.attemptCount) ? item.attemptCount : 0;
+      if (attempts >= maxAttempts || ["sent", "aborted_account_change", "pending_account_commit"].includes(item.deliveryState)) return false;
+      if (item.deliveryState === "queued") return true;
+      if (item.deliveryState === "awaiting_sender_configuration") return Boolean(companyEmail);
+      if (item.deliveryState === "failed") {
+        if (item.retryExhaustedAt) return false;
+        // Records written by the previous implementation have neither an
+        // attempt count nor a deadline. Reconcile them immediately after the
+        // upgrade instead of stranding them forever.
+        return !item.nextAttemptAt || Date.parse(item.nextAttemptAt) <= nowMs;
+      }
+      return item.deliveryState === "retrying" && Date.parse(item.leaseUntil || "") <= nowMs;
+    });
+    if (index < 0) return null;
+    const claimToken = crypto.randomUUID();
+    const current = notifications[index];
+    const next = {
+      ...current,
+      from: current.from || companyEmail,
+      deliveryState: "retrying",
+      attemptCount: (Number.isSafeInteger(current.attemptCount) ? current.attemptCount : 0) + 1,
+      lastAttemptAt: new Date(nowMs).toISOString(),
+      leaseUntil: new Date(nowMs + leaseMs).toISOString(),
+      nextAttemptAt: null,
+      claimToken,
+    };
+    notifications[index] = next;
+    write(notifications);
+    return { ...contentFor(next), claimToken };
+  }
+
+  function completeClaim(id, claimToken, { sent, nextAttemptAt = null, permanent = false } = {}) {
+    const notifications = read();
+    const index = notifications.findIndex(item => item?.id === id);
+    if (index < 0) return null;
+    const current = notifications[index];
+    if (current.deliveryState !== "retrying" || current.claimToken !== claimToken) return safeItem(current);
+    const { claimToken: omittedClaim, leaseUntil, ...rest } = current;
+    const next = sent
+      ? { ...rest, deliveryState: "sent", sentAt: new Date().toISOString(), nextAttemptAt: null }
+      : {
+        ...rest,
+        deliveryState: "failed",
+        nextAttemptAt: permanent ? null : nextAttemptAt,
+        ...(permanent ? { retryExhaustedAt: new Date().toISOString() } : {}),
+      };
     notifications[index] = next;
     write(notifications);
     return safeItem(next);
@@ -148,6 +215,8 @@ export function createAccountNotificationStore({ storePath, companyEmail = null,
     markAborted: id => setCommitState(id, false),
     markSent: id => setDeliveryOutcome(id, "sent"),
     markFailed: id => setDeliveryOutcome(id, "failed"),
+    claimNext,
+    completeClaim,
     canSecureRecovery: () => typeof encryptionKey === "string" && Boolean(encryptionKey),
   };
 }

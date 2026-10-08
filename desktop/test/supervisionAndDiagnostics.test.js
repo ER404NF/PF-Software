@@ -44,6 +44,7 @@ test("known secret shapes are removed from anything that is logged or reported",
   assert.equal(redact("Authorization: Bearer abcdefghijklmnop123456"), "Authorization: Bearer [hidden]");
   assert.equal(redact('{"sessionSecret":"topsecretvalue1"}'), '{"sessionSecret":"[hidden]"}');
   assert.equal(redact("password=hunter2hunter2"), "password=[hidden]");
+  assert.equal(redact("SMTP_PASS=private-smtp-password"), "SMTP_PASS=[hidden]");
   assert.equal(redact(`key ${hex}`), "key [hidden]");
   assert.equal(redact("port 4173 started in 320 ms"), "port 4173 started in 320 ms", "ordinary lines are untouched");
 });

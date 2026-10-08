@@ -10,7 +10,7 @@ const path = require("path");
 const SECRET_PATTERNS = [
   [/\bpfs_[A-Za-z0-9_-]{8,}/g, "pfs_[hidden]"],
   [/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, "Bearer [hidden]"],
-  [/((?:secret|token|password|passwd|api[_-]?key|master[_-]?key)["']?\s*[:=]\s*["']?)[^\s"',;]{6,}/gi, "$1[hidden]"],
+  [/((?:secret|token|password|passwd|pass|smtp[_-]?pass|api[_-]?key|master[_-]?key)["']?\s*[:=]\s*["']?)[^\s"',;]{6,}/gi, "$1[hidden]"],
   [/\b[0-9a-f]{64}\b/gi, "[hidden]"],
 ];
 
@@ -83,18 +83,68 @@ function describeConfig(config) {
   return keys.length ? keys.join(", ") : "empty";
 }
 
+// "a1b2c3d, built 2026-10-07" for an installed build; a development run has no build record.
+function describeBuild(build) {
+  if (!build) return "development build";
+  const built = build.builtAt ? `, built ${String(build.builtAt).slice(0, 10)}` : "";
+  return build.commit && build.commit !== "unknown" ? `${build.commit}${built}` : `unknown commit${built}`;
+}
+
+// Reads the record the installer left beside the server, or null when there is none (a development run).
+function readBuildRecord(file) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    return typeof raw?.commit === "string" ? { commit: raw.commit, builtAt: typeof raw.builtAt === "string" ? raw.builtAt : null } : null;
+  } catch {
+    return null;
+  }
+}
+
+// What automatic phone setup is doing, as reported by the Bodun server in a small status file in Bodun's own storage. It names
+// the record file and its folder, never a full path. `current` says whether the process that wrote it is still running.
+function describeAutomaticSetup(setup) {
+  if (!setup) return ["Automatic phone setup: no report yet (setup is off, or Bodun has not started it)"];
+  const lines = [`Automatic phone setup: ${setup.state} (${setup.code})`, `  ${setup.message}`];
+  if (setup.recordFile) lines.push(`  Record file: ${setup.recordFile}, in the folder ${setup.folder ?? "Bodun's storage"}`);
+  lines.push(setup.current
+    ? `  (reported by the running Bodun server at ${setup.writtenAt})`
+    : `  (last reported at ${setup.writtenAt}; the server is not running)`);
+  return lines;
+}
+
+// Reads the status file; only the fields that belong in a report are kept. `runningPids` are the processes this app is running,
+// so a file written by a process that is gone is recognised. null when there is no usable file.
+function readSetupStatusFile(file, runningPids = []) {
+  try {
+    const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (typeof raw?.state !== "string" || typeof raw?.code !== "string" || typeof raw?.message !== "string") return null;
+    return {
+      state: raw.state, code: raw.code, message: raw.message,
+      recordFile: typeof raw.recordFile === "string" ? raw.recordFile : null, folder: typeof raw.folder === "string" ? raw.folder : null,
+      pid: Number.isSafeInteger(raw.pid) ? raw.pid : null, writtenAt: typeof raw.writtenAt === "string" ? raw.writtenAt : "an unknown time",
+      current: Number.isSafeInteger(raw.pid) && runningPids.includes(raw.pid),
+    };
+  } catch {
+    return null;
+  }
+}
+
 function buildDiagnosticsReport({
-  appVersion, electronVersion, nodeVersion, mode, preflight, config, wda, tools = {}, serverState, agentState, logLines = [], logFile,
+  appVersion, build, electronVersion, nodeVersion, mode, preflight, config, wda, tools = {}, serverState, agentState, logLines = [], logFile,
+  automaticSetup = null, processRecords = null,
   platform = process.platform, arch = process.arch, osRelease = os.release(), now = new Date(),
 } = {}) {
   const lines = [
     "Bodun diagnostics",
     `Created: ${now.toISOString()}`,
     `App version: ${appVersion ?? "unknown"} (Electron ${electronVersion ?? "?"}, Node ${nodeVersion ?? "?"})`,
+    `Build: ${describeBuild(build)}`,
     `System: ${platform} ${arch}, release ${osRelease}`,
     `Mode: ${mode ?? "not chosen yet"}`,
     `Server: ${serverState ?? "not running"}`,
     ...(agentState ? [`Site agent: ${agentState}`] : []),
+    ...describeAutomaticSetup(automaticSetup),
+    ...(processRecords ? [`Process record of Bodun's own server and site agent: ${processRecords}`] : []),
     `Saved settings: ${describeConfig(config)}`,
     "",
     "Prerequisites:",
@@ -112,4 +162,4 @@ function buildDiagnosticsReport({
   return lines.join("\n");
 }
 
-module.exports = { buildDiagnosticsReport, createLogger, describeConfig, redact };
+module.exports = { buildDiagnosticsReport, createLogger, describeAutomaticSetup, describeBuild, describeConfig, readBuildRecord, readSetupStatusFile, redact };

@@ -201,6 +201,7 @@ async function bootAndProbe(resourcesDir, nodeExecutable, { timeoutMs = 30_000 }
     FILE_STORE_DIR: path.join(scratch, "files"),
     ACCOUNT_NOTIFICATION_STORE_PATH: path.join(scratch, "notifications.json"),
     DEVICE_PROVISIONING_STORE_PATH: path.join(scratch, "device-provisioning.json"),
+    PROCESS_OWNERSHIP_PATH: path.join(scratch, "process-ownership.json"),
     WDA_DERIVED_DATA_ROOT: path.join(scratch, "wda-derived-data"),
     PROXY_POOL_STORE_PATH: path.join(scratch, "proxy-pool.json"),
     USB_NETWORK_STORE_PATH: path.join(scratch, "usb-network.json"),

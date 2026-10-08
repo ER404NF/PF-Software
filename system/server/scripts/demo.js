@@ -17,6 +17,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { SiteStore } from "../src/siteStore.js";
+import { brokenPhonesEnvironment, brokenPhonesRequested, pausedSetupRequested } from "./demoOptions.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const serverRoot = path.resolve(here, "..");
@@ -26,6 +27,10 @@ const PORT = process.env.PORT || "4173";
 const WDA_PORT = 8199;
 const VIDEO_PORT = 8200;
 const PASSWORD = "demo-password";
+// `npm run demo -- --broken-phones` (or DEMO_BROKEN_PHONES=1) adds two phones in the states seen in the recording.
+// `npm run demo -- --paused-setup` (or DEMO_PAUSED_SETUP=1) also shows automatic phone setup paused on a damaged record.
+const PAUSED_SETUP = pausedSetupRequested();
+const BROKEN_PHONES = brokenPhonesRequested() || PAUSED_SETUP;
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-demo-"));
 const salt = crypto.randomBytes(16).toString("hex");
@@ -92,7 +97,9 @@ process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
 start("fake-wda", [path.join(serverRoot, "fixtures/fake-wda-server.js"), String(WDA_PORT), String(VIDEO_PORT)]);
-start("server", [path.join(serverRoot, "src/index.js")], {
+start("server", [path.join(serverRoot, BROKEN_PHONES ? "scripts/demoServer.js" : "src/index.js")], {
+  ...(BROKEN_PHONES ? { ...brokenPhonesEnvironment(), DEMO_ADMIN_USER: "demo-admin", DEMO_ADMIN_PASSWORD: PASSWORD } : {}),
+  ...(PAUSED_SETUP ? { DEMO_PAUSED_SETUP: "1" } : {}),
   PORT,
   DEVICE_CONFIG_PATH: devicesPath,
   OPERATORS_CONFIG_PATH: operatorsPath,

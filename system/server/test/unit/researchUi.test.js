@@ -82,7 +82,10 @@ test("refresh before account discovery finishes does not cancel the account resp
   await h.elements.get("research-refresh").listeners.click();
   resolve({ ok: true, json: async () => ({ accounts: [] }) });
   await opening;
-  assert.match(h.elements.get("research-message").textContent, /No research accounts assigned/);
+  assert.match(h.elements.get("research-message").textContent, /No research accounts are assigned to you yet\. Ask your manager/);
+  const placeholder = h.elements.get("research-account").children[0];
+  assert.equal(placeholder.textContent, "No research accounts yet");
+  assert.equal(placeholder.disabled, true);
 });
 
 test("sign-out clears research immediately even before the logout request finishes", () => {
@@ -92,4 +95,13 @@ test("sign-out clears research immediately even before the logout request finish
   h.elements.get("logout-button").listeners.click();
   assert.equal(h.elements.get("research-panel").hidden, true);
   assert.equal(h.elements.get("research-message").textContent, "");
+});
+
+test("an admin with no research accounts is told how to add one, not to ask an administrator", async () => {
+  const h = harness(async () => ({ ok: true, json: async () => ({ accounts: [] }) }));
+  h.context.window.phoneFarmCan = capability => capability === "users:manage";
+  await h.elements.get("research-toggle").listeners.click();
+  const message = h.elements.get("research-message").textContent;
+  assert.match(message, /Add a research workspace to a user under Operations/);
+  assert.doesNotMatch(message, /Ask an administrator/i);
 });

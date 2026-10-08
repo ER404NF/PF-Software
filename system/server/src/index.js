@@ -10,6 +10,7 @@ import fs from "fs";
 import { createHmac, randomUUID } from "crypto";
 import { fileURLToPath } from "url";
 import { isDirectExecution } from "./directExecution.js";
+import { loadBuildInfo } from "./buildInfo.js";
 import { WdaDevice, deviceControlPathReady } from "./wdaDevice.js";
 import { StreamHub } from "./streamHub.js";
 import { frameKind } from "./mjpegParser.js";
@@ -42,6 +43,7 @@ import {
   hashPassword, validatePassword,
   recordOperatorLoginIp,
   normalizeGmail,
+  isActiveAdministrator, SELF_CHANGE_MESSAGE, LAST_ADMINISTRATOR_MESSAGE,
 } from "./authStore.js";
 import { createBanStore } from "./banStore.js";
 import { createFilePushLinkStore } from "./filePushLinkStore.js";
@@ -97,10 +99,11 @@ import { createFileResearchEvidenceRepository } from "./persistence/fileResearch
 import { createPresenceStore } from "./presenceStore.js";
 import { ASSIGNMENT_STATUSES } from "./assignmentStore.js";
 import { createFileAssignmentRepository } from "./persistence/fileAssignmentRepository.js";
-import { OPERATOR_ROLES } from "./roleCapabilities.js";
+import { OPERATOR_ROLES, normalizeRole } from "./roleCapabilities.js";
 import { monitorState } from "./monitorContract.js";
 import { createFileNotificationRepository } from "./persistence/fileNotificationRepository.js";
 import { createMailSender } from "./mailSender.js";
+import { createNotificationOutbox } from "./notificationOutbox.js";
 import { createAuthenticationThrottle, createRecoveryThrottle } from "./recoveryThrottle.js";
 import { createSchedulerGuard } from "./schedulerGuard.js";
 import { decryptTotpSecret, encryptTotpSecret, generateRecoveryCodes, generateTotpSecret, otpauthUri, recoveryCodeDigest, verifyRecoveryCode, verifyTotp } from "./twoFactor.js";
@@ -125,10 +128,15 @@ import { createInvitationService } from "./services/invitationService.js";
 import { createIdentityMfaService } from "./services/identityMfaService.js";
 import { createEmailActionService } from "./services/emailActionService.js";
 import { createCloudApi } from "./cloudApi/createCloudApi.js";
-import { discoverIosDevices } from "./deviceDiscovery.js";
+import { discoverIosDevices, DiscoveredIosDevice } from "./deviceDiscovery.js";
 import { loadDeviceConfig } from "./deviceConfigLoader.js";
 import { loadDevices } from "./deviceRegistry.js";
 import { startAutoProvisioning } from "./provisioningBoot.js";
+import { LifecycleError, lifecycleErrorBody } from "./provisioningResults.js";
+import { buildSetupStatus, phoneReasonForStatus } from "./setupStatus.js";
+import { createShutdownHandler } from "./shutdown.js";
+import { createEnrollmentLock } from "./networkEnrollmentLock.js";
+import { lifecycleGuidance } from "./deviceProvisioner.js";
 import { TunManager } from "./tunManager.js";
 import { PrivilegedOps } from "./privilegedOps.js";
 import { NetworkRoutingOrchestrator } from "./networkRoutingOrchestrator.js";
@@ -150,6 +158,8 @@ const applicationVersion = /^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$/.test(requestedApp
   ? requestedApplicationVersion
   : packageVersion;
 const applicationChannel = process.env.PHONE_FARM_APP_CHANNEL === "demo" ? "demo" : null;
+// Which build this is (short commit and build date). Only an installed build has one; a development run has none.
+const applicationBuild = loadBuildInfo(process.env.PHONE_FARM_BUILD_INFO_PATH || path.join(__dirname, "../../build-info.json"));
 const configPath = process.env.DEVICE_CONFIG_PATH || path.join(__dirname, "../../devices.config.json");
 const rawDeviceConfig = loadDeviceConfig({ env: process.env, defaultPath: configPath });
 const discoveredIosDevices = process.env.AUTO_DISCOVER_IOS_DEVICES === "false" ? [] : discoverIosDevices();
@@ -220,6 +230,8 @@ app.get("/api/app-info", (_req, res) => res.json({
   version: applicationVersion,
   channel: applicationChannel,
   displayVersion: `${applicationVersion}${applicationChannel ? ` (${applicationChannel})` : ""}`,
+  buildId: applicationBuild.buildId,
+  builtAt: applicationBuild.builtAt,
 }));
 app.use(express.static(clientDir));
 registerHealthRoutes({ app, databasePool: applicationDatabasePool, checkDatabaseHealth });
@@ -367,34 +379,40 @@ const mailSender = createMailSender({
   port: process.env.SMTP_PORT || null,
   user: process.env.SMTP_USER || null,
   pass: process.env.SMTP_PASS || null,
+  from: process.env.COMPANY_FROM_EMAIL || null,
   secure: process.env.SMTP_SECURE === "true",
+  timeouts: {
+    connection: process.env.SMTP_CONNECTION_TIMEOUT_MS,
+    greeting: process.env.SMTP_GREETING_TIMEOUT_MS,
+    socket: process.env.SMTP_SOCKET_TIMEOUT_MS,
+    overall: process.env.SMTP_SEND_TIMEOUT_MS,
+  },
 });
 if (isMain && !mailSender.isConfigured()) {
-  console.warn("SMTP_HOST/SMTP_PORT/SMTP_USER/SMTP_PASS not fully set — account notification emails will stay queued, not sent.");
+  console.warn(`Account email delivery is not configured; missing ${mailSender.configurationStatus().missing.join(", ")}. Notifications will stay queued.`);
 }
+const accountNotificationOutbox = createNotificationOutbox({
+  store: accountNotificationStore,
+  mailSender,
+  maxAttempts: Number(process.env.ACCOUNT_EMAIL_MAX_ATTEMPTS) || 5,
+  baseDelayMs: Number(process.env.ACCOUNT_EMAIL_RETRY_BASE_MS) || 5_000,
+  maxDelayMs: Number(process.env.ACCOUNT_EMAIL_RETRY_MAX_MS) || 15 * 60_000,
+  onFailure: error => logOperationalFailure("Account notification email send failed", error),
+});
 // Sends one already-queued notification and advances its deliveryState to
 // "sent"/"failed". A failed send is swallowed here (logged, not thrown) —
 // the account action that triggered the notification (approve/reject,
 // recovery request) must never fail because outbound mail did.
 async function deliverAccountNotification(id) {
-  if (!mailSender.isConfigured()) return null;
+  if (!mailSender.isConfigured()) return accountNotificationStore.deliveryContent(id);
   try {
-    const content = accountNotificationStore.deliveryContent(id);
-    if (!content || content.deliveryState !== "queued") return content;
-    await mailSender.send({ to: content.to, from: content.from, subject: content.subject, body: content.body });
-    return accountNotificationStore.markSent(id);
+    return await accountNotificationOutbox.deliver(id);
   } catch (error) {
-    logOperationalFailure("Account notification email send failed", error);
-    try {
-      return accountNotificationStore.markFailed(id);
-    } catch (persistenceError) {
-      // The account mutation is already committed and the SMTP attempt has
-      // already failed. Preserve that result even if recording the delivery
-      // failure also encounters a storage outage; reconciliation can inspect
-      // the still-queued outbox entry later.
-      logOperationalFailure("Account notification failure-state write failed", persistenceError);
-      return { id, deliveryState: "pending_reconciliation" };
-    }
+    // The account mutation is already committed. A storage failure while
+    // claiming or recording the outcome must not invite a duplicate account
+    // mutation; the durable outbox can be reconciled after storage recovers.
+    logOperationalFailure("Account notification reconciliation failed", error);
+    return { id, deliveryState: "needs_reconciliation" };
   }
 }
 // Same "default to the shared 2FA master key, allow a dedicated override"
@@ -418,21 +436,45 @@ const usbNetworkStorePath = process.env.USB_NETWORK_STORE_PATH || path.join(__di
 // in between) — a relay restart mid-enrollment just means starting over,
 // which is fine and matches the guide's own "stop for a human, never
 // guess" philosophy for this inherently manual step.
-const networkEnrollmentSnapshots = new Map(); // deviceId -> session-bound pending enrollment
 const NETWORK_ENROLLMENT_TTL_MS = 5 * 60_000;
+// Looked up through this object so a test can stand in for the Mac's `ifconfig`.
+const enrollmentTools = { listBridgeMembers, discoverBridgeOwnIp, captureDeviceTraffic };
+const networkEnrollmentLock = createEnrollmentLock({ ttlMs: NETWORK_ENROLLMENT_TTL_MS, onExpire: () => broadcastDeviceList() });
+function advanceNetworkIdentityGeneration(deviceId) {
+  return networkEnrollmentLock.advance(deviceId);
+}
+function networkIdentityConflict(message = "The phone's network setup changed while this request was running. Try again.") {
+  return Object.assign(new Error(message), { code: "ENROLLMENT_STALE_OPERATION", status: 409 });
+}
+async function authorizeNetworkIdentityCommit(req, deviceId, generation, reservation = null) {
+  const current = await authorizeRoutingMutation(req, deviceId);
+  if (!knownDevice(deviceId) || !canAccessDevice(current, deviceId)) throw networkIdentityConflict();
+  if (!networkEnrollmentLock.isCurrent(deviceId, generation, reservation)) throw networkIdentityConflict();
+  if (networkRoutingOrchestrator?.getRoute(deviceId)) {
+    throw networkIdentityConflict("Routing started while the phone's network identity was being checked. Stop routing, then try again.");
+  }
+  return current;
+}
+const BRIDGE_UNREADABLE_MESSAGE = "Bodun could not read this Mac's network connections. Check that Internet Sharing is set up, then try again.";
 function enrollmentFailure(res, code, error, extra = {}) {
   return res.status(409).json({ error, code, state: "enrollment_failed", ...extra });
 }
 function enrollmentStateFor(deviceId, operator, sessionId) {
-  const pending = networkEnrollmentSnapshots.get(deviceId);
-  if (!pending) return { state: "required" };
-  const remainingMs = NETWORK_ENROLLMENT_TTL_MS - (Date.now() - pending.createdAt);
-  if (remainingMs <= 0) {
-    networkEnrollmentSnapshots.delete(deviceId);
-    return { state: "stale" };
+  const pending = networkEnrollmentLock.get(deviceId);
+  if (!pending) {
+    // Another phone's enrollment blocks this one: say which, and for how long.
+    const other = networkEnrollmentLock.active();
+    if (other && other.deviceId !== deviceId) {
+      return {
+        state: "blocked_by_other", otherDeviceId: other.deviceId,
+        otherLabel: devices.get(other.deviceId)?.label ?? other.deviceId, remainingMs: other.remainingMs,
+      };
+    }
+    return { state: "required" };
   }
+  const remainingMs = networkEnrollmentLock.remainingMs(deviceId);
   if (!operator || pending.operatorUsername !== operator.username || pending.sessionId !== sessionId) {
-    return { state: "owned_by_other_session" };
+    return { state: "owned_by_other_session", remainingMs };
   }
   return { state: "pending", expiresInMs: remainingMs };
 }
@@ -995,9 +1037,11 @@ registerPrivacyRoutes({
   hmacKey: SESSION_SECRET,
   resolveCurrentSession: req => currentStoredOperator(req),
   revokeAccountAccess: (username, sessionId) => {
-    presenceStore.removeSession(sessionId);
+    if (sessionId) presenceStore.removeSession(sessionId);
     revokeLiveOperatorSessions(username);
   },
+  authorizeAccountDeletion,
+  afterAccountsChanged: () => { broadcastPresence(); broadcastDeviceList(); },
   destroyCurrentSession: req => new Promise(resolve => req.session.destroy(error => {
     if (error) logOperationalFailure("Privacy request session-destroy failed", error);
     resolve();
@@ -1431,8 +1475,20 @@ app.get("/api/admin/users", requireAnyCapability(CAPABILITIES.MANAGE_USERS, CAPA
       && (user.accountStatus ?? "approved") === "approved"
       && user.role === OPERATOR_ROLES.ADMIN).length;
     const visibleUsers = allUsers.filter(user => canManagePerson(current, user.username));
+    const administratorCount = allUsers.filter(isActiveAdministrator).length;
     res.json({ users: visibleUsers.map(user => ({
       ...user,
+      // What the editor needs to explain itself: why this account's role / active state is locked, and
+      // whether the signed-in person may delete it. The server enforces every one of these rules again.
+      protection: (() => {
+        const self = user.username === current.username;
+        const lastAdministrator = isActiveAdministrator(user) && administratorCount === 1;
+        const deletion = deletionDecision(current, user, administratorCount);
+        return {
+          self, lastAdministrator, canDelete: deletion.ok, deleteReason: deletion.ok ? null : deletion.reason,
+          reason: self ? SELF_CHANGE_MESSAGE : lastAdministrator ? LAST_ADMINISTRATOR_MESSAGE : null,
+        };
+      })(),
       canRename: current.role === OPERATOR_ROLES.ADMIN || user.username !== current.username,
       canReview: user.username !== current.username
         && !(user.role === OPERATOR_ROLES.ADMIN && user.active !== false
@@ -1632,7 +1688,7 @@ app.patch("/api/admin/users/:username/rename", requireAnyCapability(CAPABILITIES
 });
 
 app.get("/api/admin/account-notifications", requireCapability(CAPABILITIES.MANAGE_USERS), (req, res) => {
-  res.json({ notifications: accountNotificationStore.list().map(item => ({
+  res.json({ configuration: mailSender.configurationStatus(), notifications: accountNotificationStore.list().map(item => ({
     id: item.id,
     to: item.to,
     from: item.from,
@@ -1690,6 +1746,8 @@ app.patch("/api/admin/users/:username", requireCapability(CAPABILITIES.MANAGE_US
     if (resourceError) return res.status(400).json({ error: resourceError });
     let currentAtCommit = null;
     const result = await operatorAccountService.updateAccount(req.params.username, req.body, {
+      // The signed-in person, so the store can refuse changes to their own role or active state.
+      actor: req.currentOperator.username,
       authorize: async () => {
         const current = await authorizeCurrentPersonManager(req, req.params.username, [CAPABILITIES.MANAGE_USERS]);
         if (Object.hasOwn(req.body ?? {}, "role") && !maxAssignableRoles(current).has(req.body.role)) {
@@ -1722,7 +1780,7 @@ app.patch("/api/admin/users/:username", requireCapability(CAPABILITIES.MANAGE_US
     }, "Operator update audit write");
     res.json({ operator: result.operator });
   } catch (error) {
-    if (error?.status) return res.status(error.status).json({ error: error.message });
+    if (error?.status) return res.status(error.status).json({ error: error.message, ...(error.code ? { code: error.code } : {}) });
     next(error);
   }
 });
@@ -1900,6 +1958,35 @@ const SELF_PROGRESS_ROLES = new Set([
   OPERATOR_ROLES.CONTENT_CREATOR,
   OPERATOR_ROLES.EDITOR,
 ]);
+
+// Who outranks whom when it comes to deleting an account (equal ranks cannot delete each other).
+const DELETION_RANK = Object.freeze({
+  [OPERATOR_ROLES.HOST]: 5, [OPERATOR_ROLES.ADMIN]: 4,
+  [OPERATOR_ROLES.SPECIAL_MANAGER]: 3, [OPERATOR_ROLES.MANAGER]: 3,
+  [OPERATOR_ROLES.VA]: 1, [OPERATOR_ROLES.CONTENT_CREATOR]: 1, [OPERATOR_ROLES.EDITOR]: 1,
+});
+const deletionRank = role => DELETION_RANK[normalizeRole(role)] ?? 1;
+
+// May `actor` delete `target`? Own account: use the privacy page. Only someone who outranks the account
+// (and, for a manager, only inside their own team), never the last admin/host, never the main host.
+function deletionDecision(actor, target, administratorCount) {
+  if (!target) return { ok: false, reason: "That account does not exist.", status: 404 };
+  if (target.username === actor.username) return { ok: false, reason: "To delete your own account use Privacy, then Delete my account.", status: 409 };
+  if (target.isMainHost) return { ok: false, reason: "The main host account can't be deleted. Transfer main-host responsibility first.", status: 409 };
+  if (target.privacyDeletionState) return { ok: false, reason: "This account is already being deleted.", status: 409 };
+  if (isActiveAdministrator(target) && administratorCount <= 1) return { ok: false, reason: LAST_ADMINISTRATOR_MESSAGE, status: 409 };
+  if (deletionRank(actor.role) <= deletionRank(target.role)) return { ok: false, reason: "You can only delete accounts below your own role.", status: 403 };
+  if (!canManagePerson(actor, target.username)) return { ok: false, reason: "This account is outside your team.", status: 403 };
+  return { ok: true };
+}
+
+async function authorizeAccountDeletion(req, username) {
+  const current = await authorizeCurrentOperator(req, [CAPABILITIES.MANAGE_USERS, CAPABILITIES.MANAGE_TEAM_MEMBERS]);
+  const accounts = await operatorAccountService.listAccounts();
+  const decision = deletionDecision(current, accounts.find(account => account.username === username), accounts.filter(isActiveAdministrator).length);
+  if (!decision.ok) throw httpAuthorizationError(decision.reason, decision.status);
+  return current;
+}
 
 function canManagePerson(operator, username) {
   const target = operators.get(username);
@@ -2215,8 +2302,19 @@ const summary = (d, viewer = null, viewerSocket = null) => {
       latestError: null,
       recentEvents: [],
     } : null,
-    wdaLifecycle: hasCapability(viewer, CAPABILITIES.MANAGE_WDA_LIFECYCLE)
-      ? deviceProvisioner?.getLifecycleState(d.id) ?? null : null,
+    // Everyone with the lifecycle capability gets an answer whenever automatic provisioning exists: the
+    // live state, or an explicit "not managed" for a manually configured phone. null only means that
+    // automatic provisioning is switched off on this Mac (the card then explains that).
+    wdaLifecycle: hasCapability(viewer, CAPABILITIES.MANAGE_WDA_LIFECYCLE) && deviceProvisioner
+      ? deviceProvisioner.getLifecycleState(d.id, { inUse: humanOwners.has(d.id) }) ?? {
+        managed: false, attached: false, enabled: false, state: "unmanaged", inUse: false,
+        // A detected phone that automatic setup will adopt once it is running says that setup is paused (or checking), not
+        // that Bodun does not manage it; phones that are not part of automatic setup keep their own wording.
+        ...lifecycleGuidance({
+          managed: false,
+          unmanagedReason: d instanceof DiscoveredIosDevice ? phoneReasonForStatus(deviceProvisioner.getSetupStatus?.()) : null,
+        }),
+      } : null,
     controllerMode: deviceLease.getMode(d.id),
     currentOperator: humanOwners.get(d.id)?.operatorUsername ?? null,
     ...deviceOpenDecision(d, viewer, viewerSocket),
@@ -2300,14 +2398,14 @@ async function authorizeWdaLifecycle(req) {
 app.post("/api/admin/devices/:deviceId/control-diagnostic",
   requireCapability(CAPABILITIES.MANAGE_WDA_LIFECYCLE), async (req, res, next) => {
     try {
-      if (!deviceProvisioner) return res.status(409).json({ error: "automatic device provisioning is not enabled on this relay" });
+      if (!deviceProvisioner) return res.status(409).json({ error: "Automatic phone setup is turned off on this Mac." });
       if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
       await authorizeWdaLifecycle(req);
       const diagnostic = await deviceProvisioner.diagnoseDevice(req.params.deviceId, {
         authorize: () => authorizeWdaLifecycle(req),
       });
       const current = await authorizeWdaLifecycle(req);
-      if (!diagnostic) return res.status(409).json({ error: "this device is not managed by automatic provisioning" });
+      if (!diagnostic) return res.status(409).json({ error: "Bodun is not managing this phone's setup." });
       logAuditBestEffort({ operator: current.username, type: "wda_control_diagnostic", deviceId: req.params.deviceId,
         detail: { readinessPassed: diagnostic.readinessPassed, readinessChecked: diagnostic.readinessChecked } },
       "WDA control diagnostic audit write");
@@ -2319,13 +2417,22 @@ app.post("/api/admin/devices/:deviceId/wda/:action",
   requireCapability(CAPABILITIES.MANAGE_WDA_LIFECYCLE), async (req, res, next) => {
     try {
       if (!new Set(["start", "stop", "restart"]).has(req.params.action)) return res.status(404).json({ error: "unknown WDA action" });
-      if (!deviceProvisioner) return res.status(409).json({ error: "automatic device provisioning is not enabled on this relay" });
+      if (!deviceProvisioner) return res.status(409).json(lifecycleErrorBody(new LifecycleError("provisioning_off")));
       if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
       let currentAtCommit = null;
       const authorizeMutation = async () => {
         const current = await authorizeWdaLifecycle(req);
-        if (["stop", "restart"].includes(req.params.action) && devices.get(req.params.deviceId)?.status === "in-use") {
-          throw httpAuthorizationError("release this phone before stopping WDA control", 409);
+        // Human ownership is independent of the card's mutable health/status field. A closing socket
+        // remains the owner until any submitted input settles, so lifecycle work cannot overlap it.
+        const ownerSocket = humanOwners.get(req.params.deviceId);
+        const lifecycle = deviceProvisioner.getLifecycleState?.(req.params.deviceId, { inUse: Boolean(ownerSocket) });
+        const restartNeedsStart = req.params.action === "restart" && lifecycle?.enabled === false;
+        if (["stop", "restart"].includes(req.params.action) && ownerSocket && !restartNeedsStart) {
+          const ownerUsername = ownerSocket.operatorUsername;
+          const ownerAccount = ownerUsername ? operators.get(ownerUsername) : null;
+          const operatorLabel = ownerAccount?.fullName?.trim() || ownerUsername || "another operator";
+          const phoneLabel = devices.get(req.params.deviceId)?.label?.trim() || "This phone";
+          throw new LifecycleError("phone_in_use", { phoneLabel, operatorLabel });
         }
         currentAtCommit = current;
         return current;
@@ -2335,13 +2442,21 @@ app.post("/api/admin/devices/:deviceId/wda/:action",
         : req.params.action === "restart"
           ? await deviceProvisioner.restartDevice(req.params.deviceId, { authorize: authorizeMutation })
           : await deviceProvisioner.stopDevice(req.params.deviceId, { authorize: authorizeMutation });
-      if (!lifecycle) return res.status(409).json({ error: "this device is not managed by automatic provisioning" });
+      if (!lifecycle) return res.status(409).json(lifecycleErrorBody(new LifecycleError("device_not_managed")));
       if (!currentAtCommit) throw new Error("WDA lifecycle mutation completed without commit authorization");
       logAuditBestEffort({ operator: currentAtCommit.username, type: `wda_${req.params.action}`,
         deviceId: req.params.deviceId }, `WDA ${req.params.action} audit write`);
       broadcastDeviceList();
       res.json({ ok: true, lifecycle });
-    } catch (error) { next(error); }
+    } catch (error) {
+      // A failure the operator can act on (a port held by another program, a process that would not
+      // stop…) is answered with its plain message, a machine code and the right status.
+      if (error instanceof LifecycleError) {
+        broadcastDeviceList();
+        return res.status(error.status).json(lifecycleErrorBody(error));
+      }
+      next(error);
+    }
   });
 
 // Stamps a device-scoped audit event's detail with which network egress the
@@ -2456,21 +2571,53 @@ registerNetworkCheckRoutes({
 // `provisioning_error` (WDA/iproxy exhausted its restart budget). No-op
 // route (409) when automatic provisioning isn't enabled on this relay.
 app.post("/api/admin/devices/:deviceId/retry-provisioning", requireCapability(CAPABILITIES.MANAGE_DEVICES), async (req, res, next) => {
-  if (!deviceProvisioner) return res.status(409).json({ error: "automatic device provisioning is not enabled on this relay" });
+  if (!deviceProvisioner) return res.status(409).json({ error: "Automatic phone setup is turned off on this Mac." });
   if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
   if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
     return res.status(403).json({ error: "not authorized for this device" });
   }
   try {
-    const ok = await deviceProvisioner.retryDevice(req.params.deviceId);
-    if (!ok) return res.status(409).json({ error: "this device is not currently managed by automatic provisioning" });
+    const result = await deviceProvisioner.retryDevice(req.params.deviceId);
     logAuditBestEffort({
       operator: req.currentOperator.username,
       type: "provisioning_retry",
       deviceId: req.params.deviceId,
+      detail: { code: result.code },
     }, "Provisioning retry audit write");
-    res.json({ ok: true });
-  } catch (error) { next(error); }
+    res.json({ ok: true, code: result.code });
+  } catch (error) {
+    // Each way a retry can fail has its own plain message, machine code and status.
+    if (error instanceof LifecycleError) {
+      logAuditBestEffort({
+        operator: req.currentOperator.username, type: "provisioning_retry_failed",
+        deviceId: req.params.deviceId, detail: { code: error.code },
+      }, "Provisioning retry audit write");
+      return res.status(error.status).json(lifecycleErrorBody(error));
+    }
+    next(error);
+  }
+});
+
+// "Check again": look once more at Bodun's earlier phone connections when automatic phone setup is paused. The check only
+// looks and reclaims under the same exact-match rules as at start-up. Pressing twice shares one check (the provisioner
+// guarantees it); while Bodun is shutting down it is refused.
+app.post("/api/admin/automatic-setup/check", requireCapability(CAPABILITIES.MANAGE_DEVICES), async (req, res, next) => {
+  if (!deviceProvisioner?.recheckNow) return res.status(409).json(lifecycleErrorBody(new LifecycleError("provisioning_off")));
+  try {
+    const status = await deviceProvisioner.recheckNow();
+    logAuditBestEffort({
+      operator: req.currentOperator.username, type: "automatic_setup_check", detail: { code: status.code },
+    }, "Automatic setup check audit write");
+    res.json({ ok: true, status: automaticSetupFor(req.currentOperator) });
+  } catch (error) {
+    if (error instanceof LifecycleError) {
+      logAuditBestEffort({
+        operator: req.currentOperator.username, type: "automatic_setup_check_refused", detail: { code: error.code },
+      }, "Automatic setup check audit write");
+      return res.status(error.status).json(lifecycleErrorBody(error));
+    }
+    next(error);
+  }
 });
 
 // Shared proxy pool (Phase B, Phone_Farm_Automation_Architecture.md §4.6):
@@ -2544,32 +2691,69 @@ registerProxyPoolRoutes({
 // feature's gate (`networkRoutingOrchestrator` existing) since their
 // output only matters once that feature is actually configured.
 app.post("/api/admin/devices/:deviceId/network-enrollment/start", requireCapability(CAPABILITIES.MANAGE_ROUTING), async (req, res) => {
-  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "automatic proxy tunnel routing is not enabled on this relay" });
+  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "Automatic network setup is turned off on this Mac." });
+  if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
+  if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
+    return res.status(403).json({ error: "not authorized for this device" });
+  }
+  const reservation = networkEnrollmentLock.tryStart(req.params.deviceId, {
+    before: null, ready: false, operatorUsername: req.currentOperator.username, sessionId: req.sessionID, generation: null,
+  });
+  if (!reservation) {
+    const active = networkEnrollmentLock.active();
+    const minutes = Math.max(1, Math.ceil((active?.remainingMs ?? NETWORK_ENROLLMENT_TTL_MS) / 60_000));
+    const label = devices.get(active?.deviceId)?.label ?? "Another phone";
+    return enrollmentFailure(res, "ENROLLMENT_CONCURRENT",
+      `${label} is being set up for networking. Cancel that one or wait ${minutes} minute${minutes === 1 ? "" : "s"}.`);
+  }
+  const generation = advanceNetworkIdentityGeneration(req.params.deviceId);
+  networkEnrollmentLock.update(req.params.deviceId, reservation, { generation });
+  try {
+    const before = await enrollmentTools.listBridgeMembers({ bridgeIface: networkRoutingOrchestrator.bridgeIface });
+    const current = await authorizeNetworkIdentityCommit(req, req.params.deviceId, generation, reservation);
+    const committed = networkEnrollmentLock.update(req.params.deviceId, reservation, {
+      before, ready: true, operatorUsername: current.username,
+    });
+    if (!committed) {
+      return enrollmentFailure(res, "ENROLLMENT_CANCELLED", "This enrollment was cancelled while it was starting. Start it again.");
+    }
+    broadcastDeviceList();
+    res.json({ ok: true, enrollment: { state: "pending", expiresInMs: NETWORK_ENROLLMENT_TTL_MS } });
+  } catch (error) {
+    networkEnrollmentLock.clear(req.params.deviceId, reservation);
+    if (error?.code === "IFCONFIG_FAILED") return enrollmentFailure(res, "ENROLLMENT_NETWORK_UNREADABLE", BRIDGE_UNREADABLE_MESSAGE);
+    if (error?.code === "ENROLLMENT_STALE_OPERATION") return enrollmentFailure(res, error.code, error.message);
+    sendRoutingHttpFailure(res, error, { code: "N201" });
+  }
+});
+
+// Cancels the pending enrollment so another phone can be set up straight away. Anyone who may manage
+// routing can do it (the lock would otherwise hold every other phone for up to five minutes); it is audited.
+app.delete("/api/admin/devices/:deviceId/network-enrollment", requireCapability(CAPABILITIES.MANAGE_ROUTING), async (req, res) => {
+  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "Automatic network setup is turned off on this Mac." });
   if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
   if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
     return res.status(403).json({ error: "not authorized for this device" });
   }
   try {
-    const active = [...networkEnrollmentSnapshots.entries()].find(([, pending]) => Date.now() - pending.createdAt < NETWORK_ENROLLMENT_TTL_MS);
-    if (active && (active[0] !== req.params.deviceId
-      || active[1].sessionId !== req.sessionID
-      || active[1].operatorUsername !== req.currentOperator.username)) {
-      return enrollmentFailure(res, "ENROLLMENT_CONCURRENT", "Finish or wait for the pending phone enrollment before starting another one.");
+    if (!networkEnrollmentLock.has(req.params.deviceId)) {
+      return enrollmentFailure(res, "ENROLLMENT_NOTHING_TO_CANCEL", "There is no enrollment waiting for this phone.");
     }
-    const before = await listBridgeMembers({ bridgeIface: networkRoutingOrchestrator.bridgeIface });
     const current = await authorizeRoutingMutation(req, req.params.deviceId);
-    networkEnrollmentSnapshots.set(req.params.deviceId, {
-      before, operatorUsername: current.username, sessionId: req.sessionID, createdAt: Date.now(),
-    });
+    advanceNetworkIdentityGeneration(req.params.deviceId);
+    networkEnrollmentLock.clear(req.params.deviceId);
+    logAuditBestEffort({
+      operator: current.username, type: "network_enrollment_cancelled", deviceId: req.params.deviceId,
+    }, "Network enrollment cancel audit write");
     broadcastDeviceList();
-    res.json({ ok: true, enrollment: { state: "pending", expiresInMs: NETWORK_ENROLLMENT_TTL_MS } });
+    res.json({ ok: true });
   } catch (error) {
     sendRoutingHttpFailure(res, error, { code: "N201" });
   }
 });
 
 app.post("/api/admin/devices/:deviceId/network-enrollment/confirm", requireCapability(CAPABILITIES.MANAGE_ROUTING), async (req, res) => {
-  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "automatic proxy tunnel routing is not enabled on this relay" });
+  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "Automatic network setup is turned off on this Mac." });
   if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
   if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
     return res.status(403).json({ error: "not authorized for this device" });
@@ -2577,35 +2761,40 @@ app.post("/api/admin/devices/:deviceId/network-enrollment/confirm", requireCapab
   if (networkRoutingOrchestrator.getRoute(req.params.deviceId)) {
     return res.status(409).json({ error: "stop routing for this device before changing its network identity" });
   }
-  const pending = networkEnrollmentSnapshots.get(req.params.deviceId);
+  const pending = networkEnrollmentLock.get(req.params.deviceId);
   if (!pending) {
-    const other = [...networkEnrollmentSnapshots.entries()].find(([, value]) => value.sessionId === req.sessionID
-      && value.operatorUsername === req.currentOperator.username && Date.now() - value.createdAt < NETWORK_ENROLLMENT_TTL_MS);
+    if (networkEnrollmentLock.consumeExpired(req.params.deviceId)) {
+      return enrollmentFailure(res, "ENROLLMENT_STALE", "This enrollment waited too long and expired. Start it again.");
+    }
+    const other = networkEnrollmentLock.pendingFor(entry => entry.sessionId === req.sessionID
+      && entry.operatorUsername === req.currentOperator.username);
     return other
-      ? enrollmentFailure(res, "ENROLLMENT_WRONG_DEVICE", "This session started enrollment for a different phone.")
-      : enrollmentFailure(res, "ENROLLMENT_MISSING", "Start network enrollment for this phone first.");
-  }
-  if (Date.now() - pending.createdAt >= NETWORK_ENROLLMENT_TTL_MS) {
-    networkEnrollmentSnapshots.delete(req.params.deviceId);
-    return enrollmentFailure(res, "ENROLLMENT_STALE", "The enrollment snapshot expired. Start enrollment again.");
+      ? enrollmentFailure(res, "ENROLLMENT_WRONG_DEVICE", "You started setting up a different phone. Finish or cancel that one first.")
+      : enrollmentFailure(res, "ENROLLMENT_MISSING", "No enrollment is waiting for this phone. Start it first (if Bodun restarted, start it again).");
   }
   if (pending.operatorUsername !== req.currentOperator.username) {
-    return enrollmentFailure(res, "ENROLLMENT_OWNER_MISMATCH", "Only the operator that started this enrollment can confirm it.");
+    return enrollmentFailure(res, "ENROLLMENT_OWNER_MISMATCH", "Only the person who started this enrollment can confirm it.");
   }
   if (pending.sessionId !== req.sessionID) {
-    return enrollmentFailure(res, "ENROLLMENT_WRONG_SESSION", "Confirm enrollment from the same signed-in session that started it.");
+    return enrollmentFailure(res, "ENROLLMENT_WRONG_SESSION", "Confirm from the same signed-in window that started the enrollment.");
+  }
+  if (!pending.ready) {
+    return enrollmentFailure(res, "ENROLLMENT_STARTING", "Bodun is still reading this Mac's network connections. Wait a moment, then confirm again.");
   }
   try {
-    const after = await listBridgeMembers({ bridgeIface: networkRoutingOrchestrator.bridgeIface });
+    const after = await enrollmentTools.listBridgeMembers({ bridgeIface: networkRoutingOrchestrator.bridgeIface });
     const diff = diffBridgeMembers(pending.before, after);
     if (diff.state !== "assigned") {
       const code = diff.newMembers?.length > 1 ? "ENROLLMENT_MULTIPLE_CHANGES" : "ENROLLMENT_NO_CHANGE";
       return enrollmentFailure(res, code, diff.reason, { newMemberCount: diff.newMembers?.length ?? 0 });
     }
-    const currentAtCommit = await authorizeRoutingMutation(req, req.params.deviceId);
+    const currentAtCommit = await authorizeNetworkIdentityCommit(req, req.params.deviceId, pending.generation, pending);
+    // No await is allowed between this final route/generation check and the
+    // synchronous atomic store mutation.
+    if (networkRoutingOrchestrator.getRoute(req.params.deviceId)) throw networkIdentityConflict();
     const record = setUsbIface(usbNetworkStorePath, req.params.deviceId, diff.iface);
     refreshUsbNetworkCache(req.params.deviceId);
-    networkEnrollmentSnapshots.delete(req.params.deviceId);
+    networkEnrollmentLock.clear(req.params.deviceId);
     logAuditBestEffort({
       operator: currentAtCommit.username, type: "network_enrollment_confirmed",
       deviceId: req.params.deviceId, detail: { usbIface: diff.iface },
@@ -2613,12 +2802,17 @@ app.post("/api/admin/devices/:deviceId/network-enrollment/confirm", requireCapab
     broadcastDeviceList();
     res.json({ network: record });
   } catch (error) {
+    if (error?.code === "IFCONFIG_FAILED") return enrollmentFailure(res, "ENROLLMENT_NETWORK_UNREADABLE", BRIDGE_UNREADABLE_MESSAGE);
+    if (error?.code === "ENROLLMENT_STALE_OPERATION") {
+      networkEnrollmentLock.clear(req.params.deviceId, pending);
+      return enrollmentFailure(res, error.code, error.message);
+    }
     sendRoutingHttpFailure(res, error, { code: "N201" });
   }
 });
 
 app.post("/api/admin/devices/:deviceId/discover-ip", requireCapability(CAPABILITIES.MANAGE_ROUTING), async (req, res) => {
-  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "automatic proxy tunnel routing is not enabled on this relay" });
+  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "Automatic network setup is turned off on this Mac." });
   if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
   if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
     return res.status(403).json({ error: "not authorized for this device" });
@@ -2628,12 +2822,14 @@ app.post("/api/admin/devices/:deviceId/discover-ip", requireCapability(CAPABILIT
   }
   const enrolled = getUsbNetworkRecord(usbNetworkStorePath, req.params.deviceId);
   if (!enrolled) return res.status(409).json({ error: "complete network enrollment for this device first" });
+  const generation = advanceNetworkIdentityGeneration(req.params.deviceId);
   try {
-    const ownIp = await discoverBridgeOwnIp({ bridgeIface: networkRoutingOrchestrator.bridgeIface });
-    const capture = await captureDeviceTraffic({ iface: enrolled.usbIface });
+    const ownIp = await enrollmentTools.discoverBridgeOwnIp({ bridgeIface: networkRoutingOrchestrator.bridgeIface });
+    const capture = await enrollmentTools.captureDeviceTraffic({ iface: enrolled.usbIface });
     const result = discoverDeviceIp(capture, { excludeIps: [ownIp] });
     if (result.state !== "resolved") return res.status(409).json({ error: result.reason, state: result.state, candidates: result.candidates });
-    const currentAtCommit = await authorizeRoutingMutation(req, req.params.deviceId);
+    const currentAtCommit = await authorizeNetworkIdentityCommit(req, req.params.deviceId, generation);
+    if (networkRoutingOrchestrator.getRoute(req.params.deviceId)) throw networkIdentityConflict();
     const record = setUsbIp(usbNetworkStorePath, req.params.deviceId, result.ip);
     refreshUsbNetworkCache(req.params.deviceId);
     logAuditBestEffort({
@@ -2643,6 +2839,7 @@ app.post("/api/admin/devices/:deviceId/discover-ip", requireCapability(CAPABILIT
     broadcastDeviceList();
     res.json({ network: record });
   } catch (error) {
+    if (error?.code === "ENROLLMENT_STALE_OPERATION") return enrollmentFailure(res, error.code, error.message);
     sendRoutingHttpFailure(res, error, { code: "N202" });
   }
 });
@@ -2653,7 +2850,7 @@ app.post("/api/admin/devices/:deviceId/discover-ip", requireCapability(CAPABILIT
 // already-built PROXY_LEASED -> TUN_STARTING -> PF_APPLYING -> ROUTED
 // state machine for a device that already has a pool proxy leased.
 app.post("/api/admin/devices/:deviceId/start-routing", requireCapability(CAPABILITIES.MANAGE_ROUTING), async (req, res) => {
-  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "automatic proxy tunnel routing is not enabled on this relay" });
+  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "Automatic network setup is turned off on this Mac." });
   if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
   if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
     return res.status(403).json({ error: "not authorized for this device" });
@@ -2663,6 +2860,7 @@ app.post("/api/admin/devices/:deviceId/start-routing", requireCapability(CAPABIL
     return res.status(400).json({ error: "usbIp is required (supply it, or run network enrollment + IP discovery for this device first)" });
   }
   try {
+    advanceNetworkIdentityGeneration(req.params.deviceId);
     let currentAtCommit = null;
     const route = await networkRoutingOrchestrator.startRouting(req.params.deviceId, {
       usbIp,
@@ -2671,7 +2869,7 @@ app.post("/api/admin/devices/:deviceId/start-routing", requireCapability(CAPABIL
         return currentAtCommit;
       },
     });
-    if (!currentAtCommit) throw new Error("routing orchestrator did not perform its required commit authorization");
+    if (!currentAtCommit) throw new Error("Network setup could not confirm your permission. Try again.");
     logAuditBestEffort({
       operator: currentAtCommit.username,
       type: "routing_started",
@@ -2692,12 +2890,13 @@ app.post("/api/admin/devices/:deviceId/start-routing", requireCapability(CAPABIL
 });
 
 app.post("/api/admin/devices/:deviceId/stop-routing", requireCapability(CAPABILITIES.MANAGE_ROUTING), async (req, res) => {
-  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "automatic proxy tunnel routing is not enabled on this relay" });
+  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "Automatic network setup is turned off on this Mac." });
   if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
   if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
     return res.status(403).json({ error: "not authorized for this device" });
   }
   try {
+    advanceNetworkIdentityGeneration(req.params.deviceId);
     // Once teardown has begun it is a fail-closed safety operation. Finish it
     // even if the initiating session is revoked while PF/tunnel cleanup waits.
     await networkRoutingOrchestrator.stopRouting(req.params.deviceId);
@@ -3350,6 +3549,23 @@ function sendWebSocketJsonBestEffort(client, message, context) {
   }
 }
 
+// The one plain status of automatic phone setup that the Fleet page shows to everyone. `canCheckAgain` is true only for
+// people who hold the device provisioning capability, and only while setup is paused.
+function automaticSetupFor(viewer) {
+  const status = deviceProvisioner?.getSetupStatus?.() ?? buildSetupStatus("setup_off");
+  return {
+    state: status.state, code: status.code, message: status.message,
+    canCheckAgain: Boolean(deviceProvisioner?.recheckNow) && status.state === "paused" && hasCapability(viewer, CAPABILITIES.MANAGE_DEVICES),
+  };
+}
+
+function deviceListMessage(viewer, ws) {
+  const visibleDevices = viewer && hasCapability(viewer, CAPABILITIES.VIEW_FLEET)
+    ? [...devices.values()].map(device => summary(device, viewer, ws))
+    : [];
+  return { type: "device_list", devices: visibleDevices, automaticSetup: automaticSetupFor(viewer) };
+}
+
 function broadcastDeviceList() {
   for (const client of wss.clients) {
     if (client.readyState !== client.OPEN) continue;
@@ -3357,10 +3573,7 @@ function broadcastDeviceList() {
       client.releaseUnauthorizedSelection?.("fleet_updated", false);
       client.releaseUnauthorizedWatch?.("fleet_updated");
       const operator = client.currentOperator?.();
-      const visibleDevices = operator && hasCapability(operator, CAPABILITIES.VIEW_FLEET)
-        ? [...devices.values()].map(device => summary(device, operator, client))
-        : [];
-      sendWebSocketJsonBestEffort(client, { type: "device_list", devices: visibleDevices }, "Device-list broadcast failed");
+      sendWebSocketJsonBestEffort(client, deviceListMessage(operator, client), "Device-list broadcast failed");
     } catch (error) {
       logOperationalFailure("Device-list broadcast failed", error);
       try { client.terminate?.(); } catch { /* the peer is already unusable */ }
@@ -3662,9 +3875,7 @@ wss.on("connection", (ws, request) => {
 
   const initialViewer = currentOperator();
   ws.send(JSON.stringify({ type: "operator_profile", operator: publicOperator(initialViewer) }));
-  ws.send(JSON.stringify({ type: "device_list", devices: initialViewer
-    && hasCapability(initialViewer, CAPABILITIES.VIEW_FLEET)
-    ? [...devices.values()].map(device => summary(device, initialViewer, ws)) : [] }));
+  ws.send(JSON.stringify(deviceListMessage(initialViewer, ws)));
   broadcastPresence();
 
   // A real device is a network call that can fail (phone locked, iproxy not
@@ -4523,6 +4734,7 @@ wss.on("connection", (ws, request) => {
 // default port — importing must be side-effect-free with respect to networking.
 let queueTickTimer;
 let wdaReadinessTimer;
+let accountNotificationTimer;
 if (isMain) {
   researchTaskRunner.start();
   // Dispatch only after the worker and UI listeners exist. Dispatching from
@@ -4550,6 +4762,12 @@ if (isMain) {
   wdaReadinessTimer = setInterval(() => {
     void refreshWdaReadiness().catch(error => logOperationalFailure("WDA readiness refresh failed", error));
   }, WDA_READINESS_INTERVAL_MS);
+  const ACCOUNT_NOTIFICATION_INTERVAL_MS = Number(process.env.ACCOUNT_EMAIL_DRAIN_INTERVAL_MS) || 30_000;
+  void accountNotificationOutbox.drain().catch(error => logOperationalFailure("Account notification startup delivery retry failed", error));
+  accountNotificationTimer = setInterval(() => {
+    void accountNotificationOutbox.drain().catch(error => logOperationalFailure("Account notification delivery retry failed", error));
+  }, ACCOUNT_NOTIFICATION_INTERVAL_MS);
+  accountNotificationTimer.unref?.();
 
   // Opt-in (AUTO_PROVISION_WDA=true): find USB iPhones and set up WebDriverAgent on
   // each. Manually pinned devices.config.json WDA entries are left untouched. Shared
@@ -4558,6 +4776,10 @@ if (isMain) {
     devices,
     manualUdids: manualWdaUdids,
     onDeviceListChanged: broadcastDeviceList,
+    onAudit: event => logAuditBestEffort({
+      operator: "bodun", type: event.type, deviceId: event.deviceId ?? undefined,
+      detail: { port: event.port, program: event.program, pid: event.pid, outcome: event.outcome },
+    }, "Port ownership audit write"),
   });
 
   // Opt-in, independent of AUTO_PROVISION_WDA above (a device can be
@@ -4646,15 +4868,21 @@ function cleanupRuntime() {
   clearInterval(heartbeatTimer);
   if (queueTickTimer) clearInterval(queueTickTimer);
   if (wdaReadinessTimer) clearInterval(wdaReadinessTimer);
+  if (accountNotificationTimer) clearInterval(accountNotificationTimer);
   runtimeCleanupPromise = (async () => {
-    autoNetworkEnrollment?.stop();
-    networkRoutingOrchestrator?.stopHealthChecks();
-    await researchTaskRunner.stop();
-    for (const deviceId of networkRoutingOrchestrator?.routes.keys() ?? []) {
-      try { await networkRoutingOrchestrator.stopRouting(deviceId); }
-      catch (error) { logOperationalFailure("Proxy route shutdown cleanup failed", error); }
-    }
-    await deviceProvisioner?.stop();
+    // Stopping the phones' processes starts first and runs alongside the rest, so a slow research or
+    // routing stop can never delay (or prevent) terminating iproxy and WebDriverAgent.
+    const stoppingPhones = Promise.resolve(deviceProvisioner?.stop?.());
+    const stoppingTheRest = (async () => {
+      await autoNetworkEnrollment?.stop?.();
+      networkRoutingOrchestrator?.stopHealthChecks();
+      await researchTaskRunner.stop();
+      for (const deviceId of networkRoutingOrchestrator?.routes.keys() ?? []) {
+        try { await networkRoutingOrchestrator.stopRouting(deviceId); }
+        catch (error) { logOperationalFailure("Proxy route shutdown cleanup failed", error); }
+      }
+    })();
+    await Promise.allSettled([stoppingPhones, stoppingTheRest]);
     await applicationDatabasePool?.end();
   })().catch(error => logOperationalFailure("Server shutdown cleanup failed", error));
   return runtimeCleanupPromise;
@@ -4665,21 +4893,29 @@ server.on("close", () => {
 });
 
 if (isMain) {
-  let signalShutdownStarted = false;
-  const handleSignal = () => {
-    if (signalShutdownStarted) return;
-    signalShutdownStarted = true;
-    const forceExit = setTimeout(() => process.exit(1), 12_000);
-    forceExit.unref?.();
-    server.close(() => {
-      void cleanupRuntime().finally(() => {
-        clearTimeout(forceExit);
-        process.exit(0);
-      });
-    });
-  };
+  // The desktop app waits up to 10 s for this process; the hard stop here is 8 s.
+  const handleSignal = createShutdownHandler({ server, cleanupRuntime, hardStopMs: 8000, log: line => console.error(`[shutdown] ${line}`) });
   process.once("SIGTERM", handleSignal);
   process.once("SIGINT", handleSignal);
+}
+
+// Test seam: lets an integration test drive the network-enrollment routes without a Mac (no real bridge,
+// no real `ifconfig`).
+export function setNetworkRoutingForTests({ orchestrator, listBridgeMembers: fakeListBridgeMembers,
+  discoverBridgeOwnIp: fakeDiscoverBridgeOwnIp, captureDeviceTraffic: fakeCaptureDeviceTraffic, setupState } = {}) {
+  if (process.env.NODE_ENV !== "test") throw new Error("setNetworkRoutingForTests is only available in tests");
+  networkRoutingOrchestrator = orchestrator;
+  if (setupState) networkRoutingSetupState = setupState; // lets the demo show a card with routing switched on
+  enrollmentTools.listBridgeMembers = fakeListBridgeMembers ?? listBridgeMembers;
+  enrollmentTools.discoverBridgeOwnIp = fakeDiscoverBridgeOwnIp ?? discoverBridgeOwnIp;
+  enrollmentTools.captureDeviceTraffic = fakeCaptureDeviceTraffic ?? captureDeviceTraffic;
+}
+
+// Test seam: lets an integration test drive the WDA lifecycle and retry routes with a fake
+// provisioner (the real one only exists when a Mac with iPhones is attached).
+export function setDeviceProvisionerForTests(provisioner) {
+  if (process.env.NODE_ENV !== "test") throw new Error("setDeviceProvisionerForTests is only available in tests");
+  deviceProvisioner = provisioner;
 }
 
 export {
@@ -4698,6 +4934,7 @@ export {
   deviceMonitorConfig,
   wss,
   devices,
+  broadcastDeviceList,
   deviceHealth,
   heartbeatTimer,
   auditLog,

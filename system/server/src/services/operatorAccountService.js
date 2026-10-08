@@ -38,6 +38,9 @@ export function createOperatorAccountService({ repository }) {
     async requestDeletion(username, password, options) {
       return repository.requestDeletion(username, password, options);
     },
+    async requestDeletionByAuthority(username, options) {
+      return repository.requestDeletionByAuthority(username, options);
+    },
     async validateDeletion(username, password, options) {
       return repository.validateDeletion(username, password, options);
     },

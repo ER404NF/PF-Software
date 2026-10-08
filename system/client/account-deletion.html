@@ -6,6 +6,7 @@
   <meta name="theme-color" content="#071a2f" />
   <link rel="icon" href="/icons/bodun-logo.png" type="image/png" />
   <title>Privacy center — Bodun</title>
+  <script src="/theme-bootstrap.js"></script>
   <link rel="stylesheet" href="/style.css" />
 </head>
 <body class="privacy-page">
@@ -56,7 +57,7 @@
           <strong>Permanent action</strong>
           <p>Confirm your password and type the phrase exactly. Your access is revoked immediately.</p>
           <label class="privacy-field">Current password<input id="self-deletion-password" type="password" autocomplete="current-password" maxlength="512" required /></label>
-          <label class="privacy-field">Type <span>DELETE MY ACCOUNT</span><input id="self-deletion-confirmation" autocomplete="off" required /></label>
+          <label class="privacy-field"><span class="privacy-field-label">Type <strong>DELETE MY ACCOUNT</strong> to confirm</span><input id="self-deletion-confirmation" autocomplete="off" required /></label>
           <button type="submit" class="privacy-danger-button">Lock account and request deletion</button>
         </div>
         <a class="privacy-button secondary privacy-cancel" href="/">Cancel and return to Bodun</a>

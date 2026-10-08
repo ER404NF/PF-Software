@@ -37,11 +37,18 @@ test("every tool and signing setting comes from the supplied environment", () =>
     iproxyBin: "/opt/homebrew/bin/iproxy", xcodeSelectBin: "/usr/bin/xcode-select", xcodebuildBin: "/usr/bin/xcodebuild",
     ideviceIdBin: "/opt/homebrew/bin/idevice_id", ideviceInfoBin: "/opt/homebrew/bin/ideviceinfo",
   });
-  assert.deepEqual(seen.wda, {
+  const { ownershipStore: wdaStore, ...wdaOptions } = seen.wda;
+  assert.deepEqual(wdaOptions, {
     wdaRepoPath: "/Users/op/WebDriverAgent", xcodebuildBin: "/usr/bin/xcodebuild",
     developmentTeam: "ABCDE12345", bundleId: "com.example.wda",
   });
-  assert.deepEqual(seen.iproxy, { bin: "/opt/homebrew/bin/iproxy" });
+  const { ownershipStore: iproxyStore, ...iproxyOptions } = seen.iproxy;
+  assert.deepEqual(iproxyOptions, { bin: "/opt/homebrew/bin/iproxy" });
+  // Every process Bodun starts is remembered, by the same store, which the provisioner also gets.
+  assert.ok(wdaStore && wdaStore === iproxyStore && wdaStore === seen.provisioner.ownershipStore);
+  assert.ok(seen.provisioner.portReclaimer);
+  assert.equal(seen.provisioner.ownerServer.pid, process.pid);
+  assert.equal(seen.provisioner.iproxyBin, "/opt/homebrew/bin/iproxy");
   seen.provisioner.discoverIosDevices();
   assert.deepEqual(seen.discovered, { ideviceIdBin: "/opt/homebrew/bin/idevice_id", ideviceInfoBin: "/opt/homebrew/bin/ideviceinfo" });
 });
@@ -81,4 +88,29 @@ test("a failed preflight starts nothing and says why", () => {
   } finally {
     console.error = original;
   }
+});
+
+test("the ownership file path: explicit setting, else beside the provisioning store, else the repository storage folder", async () => {
+  const { resolveOwnershipStorePath } = await import("../../src/provisioningBoot.js");
+  assert.equal(resolveOwnershipStorePath({ PROCESS_OWNERSHIP_PATH: "/data/owned.json", DEVICE_PROVISIONING_STORE_PATH: "/other/p.json" }), "/data/owned.json");
+  const beside = resolveOwnershipStorePath({ DEVICE_PROVISIONING_STORE_PATH: "/Users/op/Library/Application Support/Bodun/device-provisioning.json" });
+  assert.equal(beside.replaceAll("\\", "/"), "/Users/op/Library/Application Support/Bodun/process-ownership.json");
+  assert.match(resolveOwnershipStorePath({}).replaceAll("\\", "/"), /storage\/process-ownership\.json$/);
+});
+
+test("the ownership store lives where the environment says, and audit events go to the supplied callback", () => {
+  const events = [];
+  const seen = {};
+  const deps = {
+    runPreflight: () => ({ ok: true, checks: [] }), discover: () => [],
+    createWdaManager: options => ({ options }), createIproxyManager: options => ({ options }),
+    createProvisioner: options => { seen.options = options; return { start() {} }; },
+    createInspector: () => ({ supported: false, describe: async () => null, findListeners: async () => ({ supported: false, listeners: [] }), isAlive: async () => false }),
+  };
+  startAutoProvisioning({
+    env: { ...HOST_ENV, PROCESS_OWNERSHIP_PATH: "/data/owned.json" }, devices: new Map(), manualUdids: new Set(), deps,
+    onAudit: event => events.push(event),
+  });
+  assert.equal(seen.options.ownershipStore.filePath, "/data/owned.json");
+  assert.equal(typeof seen.options.portReclaimer.resolvePort, "function");
 });

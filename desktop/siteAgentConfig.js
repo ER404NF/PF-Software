@@ -41,6 +41,7 @@ function siteAgentEnvironment(settings, { storageRoot, path }) {
     SITE_TOKEN: settings.siteToken,
     AUTO_PROVISION_WDA: "true",
     DEVICE_PROVISIONING_STORE_PATH: path.join(storageRoot, "device-provisioning.json"),
+    PROCESS_OWNERSHIP_PATH: path.join(storageRoot, "process-ownership.json"),
     WDA_DERIVED_DATA_ROOT: path.join(storageRoot, "wda-derived-data"),
   };
 }

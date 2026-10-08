@@ -309,8 +309,68 @@ test("start()/stop() run an immediate tick, then on the interval, then nothing a
   assert.equal(ticks, 1);
   await new Promise(resolve => setTimeout(resolve, 45));
   assert.ok(ticks >= 2);
-  enrollment.stop();
+  await enrollment.stop();
   const ticksAtStop = ticks;
   await new Promise(resolve => setTimeout(resolve, 45));
   assert.equal(ticks, ticksAtStop);
+});
+
+test("stop waits for blocked discovery and prevents its stale enrollment write or route start", async () => {
+  let releaseMembers;
+  const membersReady = new Promise(resolve => { releaseMembers = resolve; });
+  const { enrollment, usbNetworkStorePath, startRoutingCalls } = makeEnrollment({
+    attached: [{ id: "x", udid: UDID_A, label: "Phone A" }],
+    startRouting: async () => ({ state: "routed" }),
+  });
+  enrollment.listBridgeMembers = async () => membersReady;
+
+  const tick = enrollment.tick();
+  await new Promise(resolve => setImmediate(resolve));
+  let stopped = false;
+  const stopping = enrollment.stop().then(() => { stopped = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(stopped, false, "stop drains the active operation instead of returning early");
+
+  releaseMembers(["en5"]);
+  await Promise.all([tick, stopping]);
+  assert.equal(getUsbNetworkRecord(usbNetworkStorePath, discoveredDeviceId(UDID_A)), null);
+  assert.equal(startRoutingCalls.length, 0);
+});
+
+test("overlapping ticks share one asynchronous bridge inspection", async () => {
+  let bridgeCalls = 0;
+  let releaseMembers;
+  const membersReady = new Promise(resolve => { releaseMembers = resolve; });
+  const { enrollment } = makeEnrollment({
+    attached: [{ id: "x", udid: UDID_A, label: "Phone A" }],
+  });
+  enrollment.listBridgeMembers = async () => {
+    bridgeCalls += 1;
+    return membersReady;
+  };
+
+  const first = enrollment.tick();
+  const second = enrollment.tick();
+  assert.equal(first, second, "callers observe the same in-flight operation");
+  releaseMembers(["en5"]);
+  await Promise.all([first, second]);
+  assert.equal(bridgeCalls, 1);
+});
+
+test("a stopped generation cannot replace newer enrollment status", async () => {
+  let releaseMembers;
+  const membersReady = new Promise(resolve => { releaseMembers = resolve; });
+  const { enrollment } = makeEnrollment({
+    attached: [{ id: "x", udid: UDID_A, label: "Phone A" }],
+  });
+  enrollment.listBridgeMembers = async () => membersReady;
+  const logicalId = discoveredDeviceId(UDID_A);
+
+  const oldTick = enrollment.tick();
+  const stopping = enrollment.stop();
+  enrollment.status.set(logicalId, { state: "newer", note: null, updatedAt: "later" });
+  releaseMembers(["en5"]);
+  await Promise.all([oldTick, stopping]);
+
+  assert.equal(enrollment.getStatus(logicalId).state, "newer");
 });

@@ -42,6 +42,9 @@ export function registerPrivacyRoutes({
   deletionProcessor = null,
   requirePrivacyAdmin = null,
   authorizePrivacyAdmin = null,
+  // Deleting SOMEONE ELSE's account (a higher role, in order): decides who may, throwing a status error otherwise.
+  authorizeAccountDeletion = null,
+  afterAccountsChanged = () => {},
 }) {
   if (!app || typeof app.post !== "function" || typeof app.get !== "function") throw new TypeError("privacy routes require app");
   if (typeof requireAuth !== "function") throw new TypeError("privacy routes require requireAuth");
@@ -142,6 +145,53 @@ export function registerPrivacyRoutes({
       next(error);
     }
   });
+
+  // Delete an account that is below yours (Host over Admin, Admin over Manager, a manager over their own team's
+  // members). The account is locked at once exactly as if its owner had asked, and the privacy process then removes
+  // its data. Typing the username confirms it; the rules themselves are enforced by `authorizeAccountDeletion`.
+  if (typeof authorizeAccountDeletion === "function" && typeof accountService.requestDeletionByAuthority === "function") {
+    app.delete("/api/admin/users/:username", requireAuth, async (req, res, next) => {
+      const username = req.params.username;
+      let request = null;
+      let accountLocked = false;
+      try {
+        if (req.body?.confirmUsername !== username) {
+          return res.status(400).json({ error: "Type the person's username to confirm.", code: "CONFIRMATION_REQUIRED" });
+        }
+        const actor = await authorizeAccountDeletion(req, username);
+        request = requestStore.createVerified({
+          lookupDigest: identifierDigest(username.toLowerCase(), hmacKey),
+          accountUsername: username,
+        });
+        await accountService.requestDeletionByAuthority(username, {
+          actor: actor.username,
+          // The commit point: the same rules are checked again against the stored accounts.
+          authorize: () => authorizeAccountDeletion(req, username),
+        });
+        accountLocked = true;
+        try { revokeAccountAccess(username, null); }
+        catch (error) { logFailure?.("Account deletion live-access revocation failed", error); }
+        try { requestStore.markAccountLocked(request.id); }
+        catch (error) { logFailure?.("Account deletion request-state write failed", error); }
+        try { recordAudit?.({ operator: actor.username, type: "account_deleted_by_authority", detail: { target: username, requestId: request.id } }); }
+        catch (error) { logFailure?.("Account deletion audit write failed", error); }
+        try { afterAccountsChanged(); }
+        catch (error) { logFailure?.("Account deletion refresh failed", error); }
+        return res.json({ ok: true, requestId: request.id, status: "account_locked" });
+      } catch (error) {
+        if (accountLocked) {
+          logFailure?.("Account deletion post-commit handling failed", error);
+          return res.json({ ok: true, requestId: request?.id ?? null, status: "account_locked" });
+        }
+        if (request) {
+          try { requestStore.markFailed(request.id); }
+          catch (storeError) { logFailure?.("Account deletion failure-state write failed", storeError); }
+        }
+        if (error?.status) return res.status(error.status).json({ error: error.message, ...(error.code ? { code: error.code } : {}) });
+        next(error);
+      }
+    });
+  }
 
   app.get("/api/me/data-export", requireAuth, async (req, res, next) => {
     const username = req.currentOperator.username;

@@ -1,0 +1,21 @@
+{
+  "note": "One list of record-file contents and the verdict each must get, read by the tests of BOTH packages (the server's process-ownership record and the desktop's children record) so their shape rules cannot drift. $KEY is replaced by the record's own key (processes, children).",
+  "cases": [
+    { "name": "valid, empty", "text": "{\"version\":1,\"$KEY\":{}}", "verdict": "ok" },
+    { "name": "valid, one record", "text": "{\"version\":1,\"$KEY\":{\"a:b\":{\"pid\":1}}}", "verdict": "ok" },
+    { "name": "valid without a version", "text": "{\"$KEY\":{}}", "verdict": "ok" },
+    { "name": "zero length", "text": "", "verdict": "damaged" },
+    { "name": "only spaces", "text": "   \n", "verdict": "damaged" },
+    { "name": "truncated in the middle of a record", "text": "{\"version\":1,\"$KEY\":{\"a:", "verdict": "damaged" },
+    { "name": "truncated after the opening brace", "text": "{", "verdict": "damaged" },
+    { "name": "an array at the top", "text": "[]", "verdict": "damaged" },
+    { "name": "null at the top", "text": "null", "verdict": "damaged" },
+    { "name": "a string at the top", "text": "\"text\"", "verdict": "damaged" },
+    { "name": "a number at the top", "text": "5", "verdict": "damaged" },
+    { "name": "the records value is an array", "text": "{\"version\":1,\"$KEY\":[]}", "verdict": "damaged" },
+    { "name": "the records value is null", "text": "{\"version\":1,\"$KEY\":null}", "verdict": "damaged" },
+    { "name": "the records value is a string", "text": "{\"version\":1,\"$KEY\":\"x\"}", "verdict": "damaged" },
+    { "name": "the records key is missing", "text": "{\"version\":1}", "verdict": "damaged" },
+    { "name": "binary garbage", "text": "\u0000\u0001\u0002�", "verdict": "damaged" }
+  ]
+}

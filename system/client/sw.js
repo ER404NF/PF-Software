@@ -3,9 +3,9 @@
 // always come live from the hub (they are per-operator and security-sensitive), and
 // the shell is fetched network-first so a deploy is never hidden behind a stale copy.
 
-const CACHE = "phone-farm-shell-v1";
+const CACHE = "phone-farm-shell-v2";
 const SHELL = [
-  "/", "/style.css", "/app.js", "/phoneStage.js", "/liveViewController.js", "/research.js",
+  "/", "/style.css", "/app.js", "/phoneStage.js", "/liveViewController.js", "/research.js", "/cardMessages.js", "/automaticSetupBanner.js", "/deviceCardModel.js",
   "/manifest.webmanifest", "/icons/bodun-logo.png", "/icons/icon-192.png", "/icons/icon-512.png", "/icons/icon-maskable-512.png",
 ];
 

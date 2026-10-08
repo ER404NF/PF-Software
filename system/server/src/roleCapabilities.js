@@ -57,11 +57,10 @@ export const ROLE_CAPABILITIES = Object.freeze({
   // as admin — the distinction between them is about role-assignment ceilings
   // and multi-hub ownership, not which app features are reachable.
   [OPERATOR_ROLES.HOST]: Object.freeze(Object.values(CAPABILITIES)),
-  // WDA lifecycle control can interrupt a physical phone. It is deliberately
-  // narrower than ordinary administration: only the host and the explicitly
-  // promoted special-manager rank receive it.
-  [OPERATOR_ROLES.ADMIN]: Object.freeze(Object.values(CAPABILITIES)
-    .filter(capability => capability !== CAPABILITIES.MANAGE_WDA_LIFECYCLE)),
+  // WDA lifecycle control can interrupt a physical phone. Host, Admin and the explicitly promoted
+  // special-manager rank receive it; an ordinary Manager and every lower role do not. (Admin was
+  // excluded until the customer asked for Admin to see and use the Start/Stop/Restart WDA buttons.)
+  [OPERATOR_ROLES.ADMIN]: Object.freeze(Object.values(CAPABILITIES)),
   [OPERATOR_ROLES.SPECIAL_MANAGER]: Object.freeze([
     ...lowerOperational,
     CAPABILITIES.CONTROL_DEVICE,
