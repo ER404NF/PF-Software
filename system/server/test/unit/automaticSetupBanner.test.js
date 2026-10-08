@@ -166,7 +166,7 @@ test("the page loads the banner script before app.js, and the offline shell list
 
 test("app.js hands every device list's status to the banner and the cards, and the banner never writes to the page-level line", () => {
   assert.match(app, /window\.createAutomaticSetupBanner\(\{/);
-  assert.match(app, /automaticSetupStatus = msg\.automaticSetup \?\? null;\s*automaticSetupBanner\.update\(automaticSetupStatus\);\s*renderFleetSafely\(msg\.devices\);/);
+  assert.match(app, /automaticSetupStatus = msg\.automaticSetup \?\? null;\s*automaticSetupBanner\.update\(automaticSetupStatus\);\s*renderFleetSafely\(msg\.devices, \{ preserveViewport: true \}\);/);
   assert.match(app, /deviceCardModel\.lifecycleButtons\(device\.wdaLifecycle, wdaInFlight\.get\(device\.id\) \?\? null, automaticSetupStatus\)/);
   const module = fs.readFileSync(client("automaticSetupBanner.js"), "utf8");
   assert.doesNotMatch(module, /select-error|selectError/);

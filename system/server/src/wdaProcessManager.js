@@ -69,6 +69,7 @@ export class WdaProcessManager {
   isRunning(udid) { return this.group.isRunning(udid); }
   getStatus(udid) { return this.group.getStatus(udid); }
   getLog(udid) { return this.group.getLog(udid); }
+  getCurrentRunLog(udid) { return this.group.getCurrentRunLog(udid); }
   stop(udid) { return this.group.stop(udid); }
   stopAll() { return this.group.stopAll(); }
   clearBlockedStop(udid, options) { return this.group.clearBlockedStop(udid, options); }

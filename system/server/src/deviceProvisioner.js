@@ -95,13 +95,16 @@ export function buildControlDiagnosticReport({ enabled, attachment, wdaStatus, i
     : !readinessChecked ? "not checked: prerequisite process unavailable"
       : readinessPassed ? `ready on local forwarding port ${localPort}`
         : `${readiness?.state ?? "unavailable"}; failures: ${readiness?.consecutiveFailures ?? 0}`;
+  const startupPending = readinessChecked && !readinessPassed && readiness?.state === "STARTING";
   checks.push(diagnosticCheck("wda_endpoint", "WDA /status endpoint", endpointObserved,
-    `ready within ${timeoutMs} ms`, readinessPassed ? "pass" : readinessChecked ? "fail" : "blocked",
+    `ready within ${timeoutMs} ms`, readinessPassed ? "pass" : startupPending ? "wait" : readinessChecked ? "fail" : "blocked",
     readinessPassed ? "The forwarded WDA endpoint returned a valid ready response."
-      : readinessChecked ? (readiness?.lastError?.why || "The endpoint did not return a valid ready response.")
+      : startupPending ? "WDA is still building, signing, installing, or launching inside its startup grace period."
+        : readinessChecked ? (readiness?.lastError?.why || "The endpoint did not return a valid ready response.")
         : "The endpoint probe cannot run until lifecycle, attachment, WDA, and iproxy prerequisites are available.",
     readinessPassed ? "No endpoint action is required."
-      : readiness?.lastError?.operatorAction || "Resolve the first failed prerequisite above, then run Check control again."));
+      : startupPending ? "Keep the phone connected and unlocked while startup completes."
+        : readiness?.lastError?.operatorAction || "Resolve the first failed prerequisite above, then run Check control again."));
   for (const probe of [sessionProbe, windowProbe, screenshotProbe].filter(Boolean)) {
     checks.push(diagnosticCheck(probe.id, probe.label, probe.observed, probe.expected,
       probe.status, probe.meaning, probe.action));
@@ -151,12 +154,10 @@ function failedProbe(id, label, error) {
 // DiscoveredIosDevice (deviceDiscovery.js) already uses and that
 // index.js's summary()/deviceOpenDecision() already forward to clients.
 //
-// Readiness itself is NOT polled here: once a WdaDevice is registered into
-// the live `devices` map, index.js's existing 10s refreshWdaReadiness()
-// loop already calls checkReadiness() on every WdaDevice and flips status
-// offline -> idle. This loop only observes that side effect (via `status`)
-// to know when to clear the "provisioning" banner — it never duplicates
-// the HTTP polling.
+// Once a WdaDevice is registered, index.js's 10s readiness loop remains the
+// safety net. Process lifecycle events may request an immediate probe as well;
+// WdaDevice coalesces every caller so one phone still has only one in-flight
+// /status operation for the current process generation.
 const defaultTimers = {
   setTimeout: (fn, ms) => { const handle = setTimeout(fn, ms); handle.unref?.(); return handle; },
   clearTimeout: handle => clearTimeout(handle),
@@ -708,6 +709,14 @@ export class DeviceProvisioner {
       if (!entry.wdaEnabled) continue;
       const wdaState = this._managerState(this.wdaProcessManager, udid);
       const iproxyState = this._managerState(this.iproxyManager, udid);
+      if (wdaState === "running" && wdaDevice.readiness?.state !== "HEALTHY"
+        && wdaDevice.componentHealth.recovery !== "USER_ACTION_REQUIRED") {
+        const currentLog = this.wdaProcessManager.getCurrentRunLog?.(udid) ?? [];
+        if (this._applyWdaManualPrerequisite(udid, entry, currentLog.join(""))) {
+          changed = true;
+          continue;
+        }
+      }
       const currentIproxyHealth = wdaDevice.componentHealth.iproxy;
       // A port conflict or an unconfirmed stop is a latched cause: until a retry/start/restart (or an
       // unplug) changes something, the process states must not be rewritten from the managers — they
@@ -766,7 +775,24 @@ export class DeviceProvisioner {
     }
     recovery.lastAttemptAt = this.now();
     recovery.attempts += 1;
-    if (recovery.stage !== "IPROXY") {
+    const category = entry.wdaDevice.readiness?.lastFailureCategory || "request_failed";
+    // ECONNREFUSED identifies the tunnel only when the local forwarding port
+    // is actually absent. If Bodun's owned listener is present, the same
+    // symptom came through a live tunnel and recovery belongs at the WDA layer.
+    let localListenerMissing = false;
+    if (category === "connection_refused") {
+      try {
+        localListenerMissing = await this._portIsFree(entry.port);
+      } catch {
+        // An unavailable OS-level port inspection is not permission to restart
+        // a tunnel that may still be healthy. Fail closed at the WDA layer.
+      }
+    }
+    const recoverIproxy = localListenerMissing && recovery.stage !== "IPROXY";
+    entry.wdaDevice.recordDiagnosticEvent("WDA_RECOVERY_SELECTED", {
+      category, component: recoverIproxy ? "IPROXY" : "WDA", attempt: recovery.attempts,
+    });
+    if (recoverIproxy) {
       recovery.stage = "IPROXY";
       const error = diagnosticError("I202", { technical: { attempt: recovery.attempts } });
       entry.wdaDevice.readiness.lastError = error;
@@ -803,7 +829,8 @@ export class DeviceProvisioner {
     // Keep component identifiers consistent with the public health model.
     // Process-manager events use lowercase `iproxy`, while recovery states
     // and diagnostics intentionally expose `IPROXY`/`WDA`.
-    entry.wdaDevice.invalidateReadiness(kind === "WDA" ? "WDA" : "IPROXY");
+    if (kind === "WDA") entry.wdaDevice.beginStartup();
+    else entry.wdaDevice.invalidateReadiness("IPROXY");
     entry.wdaDevice.setComponentHealth(kind === "WDA" ? { wdaProcess: "STARTING" } : { iproxy: "STARTING" });
     entry.wdaDevice.refreshControlHealth();
     entry.wdaDevice.recordDiagnosticEvent(`${kind === "WDA" ? "WDA" : "IPROXY"}_STARTING`);
@@ -833,6 +860,8 @@ export class DeviceProvisioner {
   _onProcessExit(kind, udid, log) {
     const entry = this.runtime.get(udid);
     if (!entry) return;
+    if (kind === "WDA" && entry.wdaDevice.componentHealth.recovery === "USER_ACTION_REQUIRED") return;
+    if (kind === "WDA" && this._applyWdaManualPrerequisite(udid, entry, log.join(""))) return;
     const code = kind === "WDA" ? "W202" : "I201";
     const detail = kind === "WDA" ? diagnosticError(code) : (classifyIproxyFailure(log.join("")) ?? diagnosticError(code));
     entry.wdaDevice.invalidateReadiness(kind);
@@ -847,14 +876,11 @@ export class DeviceProvisioner {
       void this._recoverOccupiedIproxyPorts(udid, entry).catch(() => {});
       return;
     }
-    // classifyWdaFailure's patterns (untrusted cert, Developer Mode, App ID
-    // limit) are all about Xcode/WDA app installation and don't apply to
-    // iproxy (a USB port-forwarder) — misapplying them to an iproxy exit
-    // whose log happens to match one could send the operator to fix the
-    // wrong thing. iproxy failures are left to the ordinary restart/backoff
-    // path (_onRestartLimitExceeded already labels those with `kind`).
-    if (kind !== "WDA") return;
-    const known = classifyWdaFailure(log.join(""));
+  }
+
+  _applyWdaManualPrerequisite(udid, entry, logText) {
+    if (entry.wdaDevice.componentHealth.recovery === "USER_ACTION_REQUIRED") return true;
+    const known = classifyWdaFailure(logText);
     if (!known) return;
     const manualError = diagnosticError("W205", { why: known, operatorAction: known });
     entry.wdaDevice.discoveryState = "user_action_required";
@@ -873,6 +899,7 @@ export class DeviceProvisioner {
     this.wdaProcessManager.stop(udid);
     this.iproxyManager.stop(udid);
     this.onDeviceListChanged();
+    return true;
   }
 
   // The tunnel died because its port was busy. Stop the supervisor's retry loop, find out who
@@ -1554,6 +1581,12 @@ export class DeviceProvisioner {
     const operation = (async () => {
       const healthy = await entry.wdaDevice.checkReadiness();
       if (this.runtime.get(udid) !== entry || !entry.wdaEnabled) return false;
+      if (!healthy) {
+        // Inspect only this xcodebuild generation. Historic output is kept for
+        // diagnostics but must never poison a later, unrelated launch.
+        const currentLog = this.wdaProcessManager.getCurrentRunLog?.(udid) ?? [];
+        if (this._applyWdaManualPrerequisite(udid, entry, currentLog.join(""))) return false;
+      }
       if (healthy) {
         entry.wdaDevice.discoveryState = null;
         entry.wdaDevice.discoveryStateMessage = null;

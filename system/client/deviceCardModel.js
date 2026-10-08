@@ -271,6 +271,41 @@
     return true;
   }
 
+  // Background health updates rebuild the cards. Preserve a semantic viewport
+  // anchor so a card above the viewport changing height cannot move the phone
+  // the operator is reading. The absolute scroll position is only a fallback
+  // when that phone disappeared from the refreshed fleet.
+  function captureViewportAnchor(root, win = root?.ownerDocument?.defaultView) {
+    if (!root || !win) return null;
+    const cards = [...root.querySelectorAll("[data-device-id]")];
+    const card = cards.find(candidate => {
+      const rect = candidate.getBoundingClientRect();
+      return rect.bottom > 0 && rect.top < win.innerHeight;
+    });
+    return {
+      deviceId: card?.dataset?.deviceId ?? null,
+      offsetTop: card ? card.getBoundingClientRect().top : null,
+      scrollY: Number.isFinite(win.scrollY) ? win.scrollY : 0,
+    };
+  }
+
+  function restoreViewportAnchor(root, saved, win = root?.ownerDocument?.defaultView) {
+    if (!root || !saved || !win) return false;
+    const card = saved.deviceId
+      ? [...root.querySelectorAll("[data-device-id]")].find(candidate => candidate.dataset.deviceId === saved.deviceId)
+      : null;
+    const documentElement = root.ownerDocument?.documentElement;
+    const body = root.ownerDocument?.body;
+    const scrollHeight = Math.max(documentElement?.scrollHeight ?? 0, body?.scrollHeight ?? 0);
+    const maxScroll = Math.max(0, scrollHeight - (win.innerHeight ?? 0));
+    const desired = card && Number.isFinite(saved.offsetTop)
+      ? (win.scrollY ?? 0) + card.getBoundingClientRect().top - saved.offsetTop
+      : saved.scrollY;
+    const top = Math.min(maxScroll, Math.max(0, Number.isFinite(desired) ? desired : 0));
+    win.scrollTo({ top, left: Number.isFinite(win.scrollX) ? win.scrollX : 0, behavior: "auto" });
+    return Boolean(card);
+  }
+
   // How many phone cards fit side by side: a card is at least 235px wide with an 18px gap, never more than four across,
   // never more columns than phones. A width of 0 (the page is hidden and has not been measured) assumes a wide window.
   const CARD_MIN_WIDTH = 235;
@@ -296,7 +331,7 @@
     return network?.providerLabel || network?.gatewayLabel || network?.egress || "No egress assigned";
   }
 
-  const exported = { lifecycleButtons, describeLifecycle, chipFor, deviceStateSummary, formatDiagnostics, errorRows, asSentence, createCardMemory, captureFocus, restoreFocus, egressLabel, fleetColumnCount, proxyName, providerName, providerKey, PROVISIONING_OFF, BUSY, LIFECYCLE_LABELS };
+  const exported = { lifecycleButtons, describeLifecycle, chipFor, deviceStateSummary, formatDiagnostics, errorRows, asSentence, createCardMemory, captureFocus, restoreFocus, captureViewportAnchor, restoreViewportAnchor, egressLabel, fleetColumnCount, proxyName, providerName, providerKey, PROVISIONING_OFF, BUSY, LIFECYCLE_LABELS };
   if (typeof module !== "undefined" && module.exports) module.exports = exported;
   if (root) root.deviceCardModel = exported;
 })(typeof window !== "undefined" ? window : null);

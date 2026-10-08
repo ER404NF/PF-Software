@@ -370,10 +370,13 @@ UDID:
   bounded restart/backoff;
 - registers the device into the live fleet immediately, in the existing
   `offline` state, with `discoveryState: "provisioning"` — the **existing**
-  readiness verification flips it to `idle`. The periodic 10-second sweep remains
-  a safety net; an iproxy recovery now triggers an immediate coalesced check so a
-  healthy phone does not remain stuck behind a stale recovery banner.
-  once `/status` reports ready; provisioning never polls `/status` itself.
+  readiness verification flips it to `idle` once `/status` reports ready. The
+  periodic 10-second sweep remains a safety net; process lifecycle events can
+  trigger an immediate check, and every caller shares the same per-device probe.
+  A fresh WDA process gets a startup grace period (`WDA_STARTUP_GRACE_MS`, default
+  120000 ms) so normal build/sign/install time does not consume the endpoint
+  failure or recovery budget. Known trust/signing prerequisites still surface
+  immediately as W205 from the current xcodebuild run and stop automatic recovery.
 
 A device whose WDA process exits with a recognized manual-prerequisite
 message (an untrusted developer certificate, Developer Mode disabled, "Trust

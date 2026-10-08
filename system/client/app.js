@@ -1331,7 +1331,7 @@ function connect() {
     if (msg.type === "device_list") {
       automaticSetupStatus = msg.automaticSetup ?? null;
       automaticSetupBanner.update(automaticSetupStatus);
-      renderFleetSafely(msg.devices);
+      renderFleetSafely(msg.devices, { preserveViewport: true });
       populateAssignmentForm();
       if (currentView === "assignments" && can(UI_CAPABILITIES.VIEW_ASSIGNMENTS)) void refreshAssignments();
     }
@@ -1492,7 +1492,7 @@ checkSession();
 // overwrite a newer one's, occasionally flashing stale AI-status data.
 let renderToken = 0;
 
-async function renderFleetSafely(devices) {
+async function renderFleetSafely(devices, { preserveViewport = false } = {}) {
   lastDevices = devices;
   // Lazy, once-per-login load: the picker needs the full pool (to compute
   // exclusivity across devices), not just what device_list carries for one
@@ -1527,8 +1527,11 @@ async function renderFleetSafely(devices) {
     : [new Map(), new Map()];
   if (token !== renderToken) return; // a newer device_list has already re-rendered
   lastTasksByDevice = tasksByDevice;
+  const savedViewport = preserveViewport && currentView === "fleet"
+    ? deviceCardModel.captureViewportAnchor(fleetGroupsEl, window)
+    : null;
   renderFleetSummary(devices);
-  renderFleet(devices, tasksByDevice, lastActionByDevice);
+  renderFleet(devices, tasksByDevice, lastActionByDevice, savedViewport);
   const detailDeviceId = currentDeviceId || watchedDeviceId;
   if (currentView === "detail" && detailDeviceId) {
     renderDeviceFacts(devices.find(device => device.id === detailDeviceId));
@@ -1552,7 +1555,7 @@ function renderFleetSummary(devices) {
   const counts = [
     ["Physical devices", `${healthy.physical}/${devices.length}`],
     ["Device control", `${healthy.control}/${devices.length}`],
-    ["WDA", `${healthy.wda}/${devices.length}`],
+    ["WDA ready", `${healthy.wda}/${devices.length}`],
     ["iproxy", `${healthy.iproxy}/${devices.length}`],
     ["Proxy tunnels", `${healthy.tunnels}/${devices.length}`],
     ["Protected routes", `${healthy.protectedRoutes}/${devices.length}`],
@@ -1665,7 +1668,7 @@ document.addEventListener("focusin", event => {
 });
 document.addEventListener("pointerdown", () => { lastCardFocus = null; });
 
-function renderFleet(devices, tasksByDevice, lastActionByDevice) {
+function renderFleet(devices, tasksByDevice, lastActionByDevice, savedViewport = null) {
   fleetColumnLimit = currentFleetColumnLimit();
   errorCardMemory.prune(new Set(devices.map(device => device.id)));
   wdaReportMemory.prune(new Set(devices.map(device => device.id)));
@@ -1701,6 +1704,7 @@ function renderFleet(devices, tasksByDevice, lastActionByDevice) {
     fleetGroupsEl.appendChild(section);
   }
   deviceCardModel.restoreFocus(fleetGroupsEl, savedFocus);
+  if (savedViewport) deviceCardModel.restoreViewportAnchor(fleetGroupsEl, savedViewport, window);
 }
 
 // Where the result of an action on a phone's card goes: onto that card (it is rebuilt on every update, so the text is

@@ -48,6 +48,10 @@ export class SupervisedProcessGroup extends EventEmitter {
     return this.entries.get(key)?.log ?? [];
   }
 
+  getCurrentRunLog(key) {
+    return [...(this.entries.get(key)?.currentRunLog ?? [])];
+  }
+
   getStatus(key) {
     if (this.blockedStops.has(key)) return { state: "stop_failed", restartCount: 0, error: this.blockedStops.get(key) };
     const entry = this.entries.get(key);

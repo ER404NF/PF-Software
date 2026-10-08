@@ -189,8 +189,10 @@ test("exit classification receives only the current launch log while getLog keep
   group.start("udid-1", "xcodebuild", []);
 
   children[0].stderr.emit("data", Buffer.from("Signing requires a development team"));
+  assert.deepEqual(group.getCurrentRunLog("udid-1"), ["Signing requires a development team"]);
   children[0].emit("exit", 1, null);
   await new Promise(resolve => setTimeout(resolve, 20));
+  assert.deepEqual(group.getCurrentRunLog("udid-1"), [], "a replacement launch cannot inherit an earlier trust/signing failure");
   children[1].stderr.emit("data", Buffer.from("Lost connection to the phone"));
   children[1].emit("exit", 1, null);
 
