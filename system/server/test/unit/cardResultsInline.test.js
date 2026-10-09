@@ -16,7 +16,7 @@ function body(name) {
 
 // Every function that handles a click on a fleet card must show its result on that card.
 const CARD_BUILDERS = [
-  "buildProxySwitch", "buildNetworkCheckButton", "buildRetryProvisioningButton", "buildWdaLifecyclePanel",
+  "buildProxySwitch", "buildNetworkCheckButton", "buildWdaLifecyclePanel",
   "buildProxyPoolPicker", "triggerRoutingAction", "cancelEnrollment", "retryDeviceDiagnostic",
   "buildDeviceErrorCard", "buildNetworkRoutingPanel", "requestDeviceOpen", "requestDeviceWatch",
 ];

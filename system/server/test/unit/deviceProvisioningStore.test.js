@@ -83,3 +83,28 @@ test("the operator WDA enablement choice persists through partial updates", () =
   const updated = upsertProvisioningRecord(storePath, "00008110-ABCDEF1234567890", { displayName: "Renamed" });
   assert.equal(updated.wdaEnabled, false);
 });
+
+test("new and legacy records without an explicit lifecycle choice migrate fail closed", () => {
+  const storePath = tempStorePath();
+  const created = upsertProvisioningRecord(storePath, "00008110-ABCDEF1234567890", { logicalId: "ios-safe" });
+  assert.equal(created.lifecycleIntent, "stopped");
+  assert.equal(created.wdaEnabled, false);
+
+  fs.writeFileSync(storePath, JSON.stringify({ devices: {
+    "00008110-ABCDEF1234567890": { udid: "00008110-ABCDEF1234567890", logicalId: "ios-safe" },
+  } }));
+  const migrated = getProvisioningRecord(storePath, "00008110-ABCDEF1234567890");
+  assert.equal(migrated.lifecycleIntent, "stopped");
+  assert.equal(migrated.wdaEnabled, false);
+});
+
+test("explicit legacy lifecycle choices migrate without changing operator intent", () => {
+  const storePath = tempStorePath();
+  fs.writeFileSync(storePath, JSON.stringify({ devices: {
+    "00008110-ABCDEF1234567890": { udid: "00008110-ABCDEF1234567890", logicalId: "ios-on", wdaEnabled: true },
+    "00008110-ABCDEF1234567891": { udid: "00008110-ABCDEF1234567891", logicalId: "ios-off", wdaEnabled: false },
+  } }));
+  const records = loadProvisioningRecords(storePath);
+  assert.equal(records["00008110-ABCDEF1234567890"].lifecycleIntent, "running");
+  assert.equal(records["00008110-ABCDEF1234567891"].lifecycleIntent, "stopped");
+});

@@ -2285,6 +2285,7 @@ const summary = (d, viewer = null, viewerSocket = null) => {
     status: d.status,
     discoveryState: d.discoveryState ?? null,
     discoveryStateMessage: d.discoveryStateMessage ?? null,
+    pairing: d.pairing ? { state: d.pairing.state, label: d.pairing.label } : null,
     hostLabel: deviceHost.get(d.id) ?? DEFAULT_HOST_LABEL,
     siteId: d.siteId ?? null,
     siteName: d.siteName ?? null,
@@ -2416,7 +2417,7 @@ app.post("/api/admin/devices/:deviceId/control-diagnostic",
 app.post("/api/admin/devices/:deviceId/wda/:action",
   requireCapability(CAPABILITIES.MANAGE_WDA_LIFECYCLE), async (req, res, next) => {
     try {
-      if (!new Set(["start", "stop", "restart"]).has(req.params.action)) return res.status(404).json({ error: "unknown WDA action" });
+      if (!new Set(["start", "stop", "restart", "primary"]).has(req.params.action)) return res.status(404).json({ error: "unknown WDA action" });
       if (!deviceProvisioner) return res.status(409).json(lifecycleErrorBody(new LifecycleError("provisioning_off")));
       if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
       let currentAtCommit = null;
@@ -2437,7 +2438,12 @@ app.post("/api/admin/devices/:deviceId/wda/:action",
         currentAtCommit = current;
         return current;
       };
-      const lifecycle = req.params.action === "start"
+      const lifecycle = req.params.action === "primary"
+        ? await deviceProvisioner.performPrimaryAction(req.params.deviceId, {
+          authorize: authorizeMutation,
+          inUse: () => Boolean(humanOwners.get(req.params.deviceId)),
+        })
+        : req.params.action === "start"
         ? await deviceProvisioner.startDevice(req.params.deviceId, { authorize: authorizeMutation })
         : req.params.action === "restart"
           ? await deviceProvisioner.restartDevice(req.params.deviceId, { authorize: authorizeMutation })

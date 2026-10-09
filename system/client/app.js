@@ -1800,32 +1800,6 @@ function buildNetworkCheckButton(device, statusEl = null) {
   return button;
 }
 
-function buildRetryProvisioningButton(device) {
-  const button = document.createElement("button");
-  button.type = "button";
-  button.className = "network-check-button";
-  button.textContent = "Retry setup";
-  button.title = "Restarts WebDriverAgent and USB forwarding for this phone. Keeps its proxy, user assignment, identity, and audit history.";
-  const say = sayOnCard(device);
-  button.addEventListener("click", async () => {
-    button.disabled = true;
-    say(`Retrying setup for ${device.label}…`, "info");
-    try {
-      await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/retry-provisioning`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: "{}",
-      });
-      say(`Retrying automatic setup for ${device.label}.`, "success");
-    } catch (error) {
-      say(error.message, "error");
-    } finally {
-      button.disabled = false;
-    }
-  });
-  return button;
-}
-
 // What is running on each phone's control service right now (device id -> "start" | "stop" | "restart" | "check").
 // Kept outside the cards because the fleet is rebuilt on every update: a double click, or an update arriving
 // mid-action, must not start a second action or re-enable the buttons.
@@ -1836,14 +1810,7 @@ const wdaReportMemory = deviceCardModel.createCardMemory();
 
 
 const WDA_ACTIONS = {
-  start: { path: "start", timeoutMs: 20_000, doing: "Starting WDA…", done: () => "WDA is starting. Control will unlock after the readiness check passes." },
-  stop: { path: "stop", timeoutMs: 20_000, doing: "Stopping WDA…", done: () => "WDA control stopped." },
-  restart: {
-    path: "restart", timeoutMs: 30_000, doing: "Restarting WDA and its USB tunnel…",
-    done: body => (body?.lifecycle?.controlReady
-      ? "WDA restarted and control is ready."
-      : "WDA restarted. Control is still being verified; use Check control for details."),
-  },
+  primary: { path: "primary", timeoutMs: 30_000, doing: "Updating WDA…", done: () => "WDA lifecycle action accepted." },
 };
 
 function buildWdaLifecyclePanel(device) {
@@ -2001,7 +1968,7 @@ function buildWdaLifecyclePanel(device) {
             : "Control is not ready. Open device diagnostics for the failing layer.", passed ? "success" : "error");
         return;
       }
-      const action = WDA_ACTIONS[key];
+      const action = WDA_ACTIONS.primary;
       cardMessages.begin(wdaMessageKey, action.doing, "info");
       const { body } = await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/wda/${action.path}`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
@@ -2533,7 +2500,7 @@ function diagnosticForDevice(device) {
 
 function diagnosticRetryKind(diagnostic) {
   const component = diagnostic?.component;
-  if (["device-discovery", "wda-process", "wda-endpoint", "iproxy", "device-reconciler"].includes(component)) return "provisioning";
+  if (component === "iproxy") return "iproxy";
   if (component === "network-verification") return "network";
   return null;
 }
@@ -2563,11 +2530,11 @@ async function retryDeviceDiagnostic(device, button, statusEl = null) {
   const retryKind = diagnosticRetryKind(diagnostic);
   button.disabled = true;
   try {
-    if (retryKind === "provisioning" && can(UI_CAPABILITIES.MANAGE_DEVICES)) {
+    if (retryKind === "iproxy" && can(UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) {
       await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/retry-provisioning`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
       });
-      say(`Retrying automatic setup for ${device.label}.`, "success");
+      say(`Retrying the USB tunnel for ${device.label}.`, "success");
       return;
     }
     if (retryKind === "network" && can(UI_CAPABILITIES.RUN_NETWORK_CHECK)) {
@@ -2614,12 +2581,12 @@ function buildDeviceErrorCard(device, statusEl = null, shownText = "") {
   const actions = document.createElement("div");
   actions.className = "device-error-actions";
   const retryKind = diagnosticRetryKind(error);
-  const canRetry = retryKind === "provisioning" ? can(UI_CAPABILITIES.MANAGE_DEVICES)
+  const canRetry = retryKind === "iproxy" ? can(UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)
     : retryKind === "network" ? can(UI_CAPABILITIES.RUN_NETWORK_CHECK) : false;
   if (error.retryable && canRetry) {
     const retry = document.createElement("button");
     retry.type = "button";
-    retry.textContent = "Retry";
+    retry.textContent = retryKind === "iproxy" ? "Retry USB tunnel" : "Retry network check";
     retry.addEventListener("click", () => void retryDeviceDiagnostic(device, retry, statusEl));
     actions.appendChild(retry);
   }
@@ -2758,10 +2725,6 @@ function renderDeviceCard(d, task, lastAction) {
   if (can(UI_CAPABILITIES.MANAGE_PROXY) && isProxyEgress(d.network?.egress)) tools.appendChild(buildProxySwitch(d));
   if (can(UI_CAPABILITIES.RUN_NETWORK_CHECK) && d.assignedToViewer) {
     tools.appendChild(buildNetworkCheckButton(d));
-  }
-  if (can(UI_CAPABILITIES.MANAGE_DEVICES)
-    && (d.accessState === "wda_user_action_required" || d.accessState === "wda_provisioning_error")) {
-    tools.appendChild(buildRetryProvisioningButton(d));
   }
   // Shown for everyone who may manage the control service. When the server has no lifecycle for the phone
   // (automatic setup is off, or the phone is not managed) the panel is disabled and says why.

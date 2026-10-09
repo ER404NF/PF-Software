@@ -57,6 +57,22 @@ test("findListeners asks lsof for exactly this port and parses the pids", async 
   assert.deepEqual(calls[0], ["lsof", "-nP", "-iTCP:8101", "-sTCP:LISTEN", "-F", "pcn"]);
 });
 
+test("findProcesses resolves matching process descriptions without exposing them itself", async () => {
+  const inspector = createProcessInspector({
+    platform: "darwin",
+    execFile: fakeExecFile({
+      "pgrep -x xcodebuild": "4121\n",
+      "ps -ww -o ppid=,pgid=,lstart= -p 4121": "1 4121 Tue Oct  6 20:20:28 2026\n",
+      "ps -o comm= -p 4121": "/usr/bin/xcodebuild\n",
+      "ps -ww -o command= -p 4121": "/usr/bin/xcodebuild -scheme WebDriverAgentRunner -destination id=PRIVATE\n",
+    }),
+  });
+  const found = await inspector.findProcesses("xcodebuild");
+  assert.equal(found.supported, true);
+  assert.equal(found.processes.length, 1);
+  assert.equal(found.processes[0].program, "xcodebuild");
+});
+
 test("findListeners: lsof exits 1 with nothing printed means nobody is listening", async () => {
   const inspector = createProcessInspector({ platform: "darwin", execFile: fakeExecFile({ "lsof": null }) });
   assert.deepEqual(await inspector.findListeners(8101), { supported: true, listeners: [] });

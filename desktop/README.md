@@ -24,9 +24,12 @@ proves this on every build — see [Verification](#verification).
 ## Host behaviour on first launch (unchanged)
 
 On a Mac, **Set up a new host** runs host preflight — Xcode, `idevice_id`, `ideviceinfo`,
-`iproxy`, WebDriverAgent — then starts the server with `AUTO_PROVISION_WDA=true`. Each trusted
-iPhone gets its own `xcodebuild` WDA instance (unique derived-data path and port) and its own
-`iproxy -u <UDID>`. Tools are found in Homebrew and system locations without relying on the
+`iproxy`, WebDriverAgent — then starts the server with `AUTO_PROVISION_WDA=true`. Each newly
+detected iPhone is registered with WDA stopped. After an authorized operator uses **Start WDA**,
+the phone gets its own `xcodebuild` instance (unique derived-data path and port) and scoped
+`iproxy -u <UDID>` tunnel; that running choice survives relaunch and reconnect. **Check control**
+reports USB pairing separately from WDA signing without exposing raw device identifiers. Tools are
+found in Homebrew and system locations without relying on the
 Finder's `PATH`. No Terminal is needed to operate the app after installation.
 
 ### Settings for this Mac (the Bodun menu)

@@ -1,5 +1,5 @@
 (function publishCardMessages(root) {
-  // The result of an action on one phone's card (Retry setup, Start WDA, Check network…) must appear
+  // The result of an action on one phone's card (Start WDA, Check control, Check network…) must appear
   // ON that card. The fleet is rebuilt on every update, so the text is kept here, per phone, and
   // handed to whichever card element currently exists. Successes fade after a while; an error stays
   // until the operator acts on that phone again (or leaves the page).

@@ -220,10 +220,11 @@ test("WDA lifecycle and end-to-end control diagnostics are capability-gated", ()
   const model = fs.readFileSync(path.join(clientDir, "deviceCardModel.js"), "utf8");
   assert.match(app, /MANAGE_WDA_LIFECYCLE:\s*"wda:lifecycle"/);
   assert.match(app, /function buildWdaLifecyclePanel\(device\)/);
-  // three separate buttons (labels live in the model), each posting to its own route
-  for (const label of ["Start WDA", "Stop WDA", "Restart WDA", "Check control"]) assert.match(model, new RegExp(label));
+  // one server-selected lifecycle action plus independent diagnostics
+  assert.match(model, /lifecycle\.primaryLabel/);
+  assert.match(model, /label: "Check control"/);
   assert.match(app, /\/wda\/\$\{action\.path\}/);
-  assert.match(app, /path: "start"[\s\S]*path: "stop"[\s\S]*path: "restart"/);
+  assert.match(app, /primary:\s*\{ path: "primary"/);
   // shown to every holder of the capability, even when the lifecycle is null (then it is a disabled panel)
   assert.match(app, /if \(can\(UI_CAPABILITIES\.MANAGE_WDA_LIFECYCLE\)\) \{\s*tools\.appendChild\(buildWdaLifecyclePanel\(d\)\);/);
   assert.doesNotMatch(app, /can\(UI_CAPABILITIES\.MANAGE_WDA_LIFECYCLE\) && d\.wdaLifecycle/);

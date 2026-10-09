@@ -22,14 +22,15 @@ const MAX_PORT_RECLAIMS = 2;
 // "the app should not loop WDA launches while a known manual prerequisite
 // is unresolved" (guide §13).
 const KNOWN_FAILURES = [
-  { pattern: /trust this computer/i, message: "Trust this computer on the phone (USB prompt), then click Retry." },
-  { pattern: /developer mode/i, message: "Enable Developer Mode on the phone (Settings > Privacy & Security), then click Retry." },
-  { pattern: /untrusted developer|verify.{0,20}app|trust.{0,20}certificate/i, message: "Trust the developer certificate on the phone (Settings > General > VPN & Device Management), then click Retry." },
+  { pattern: /(?:device is not paired|pairing dialogue|trust this computer.{0,80}(?:required|failed|declined))/i, message: "Trust this computer on the phone (USB prompt), then use Start WDA." },
+  { pattern: /developer mode.{0,80}(?:disabled|required|not enabled)/i, message: "Enable Developer Mode on the phone (Settings > Privacy & Security), then use Start WDA." },
+  { pattern: /untrusted developer|application verification failed|could not launch.{0,80}(?:not trusted|verification)/i, message: "Trust the developer application on the phone (Settings > General > VPN & Device Management), then use Start WDA." },
   { pattern: /maximum app id limit/i, message: "Apple's App ID creation limit was hit for this signing account. Reuse an existing bundle id instead of generating a new one." },
-  { pattern: /requires a provisioning profile|no profiles for|provisioning profile .* (?:doesn't include|not found)|signing for .* requires a development team|code signing is required/i, message: "WDA signing needs to be configured once in Xcode. With Phone Farm's bundled WebDriverAgent, enter your Apple Developer Team ID in host setup (and stay signed in to Xcode); with your own WebDriverAgent checkout, open WebDriverAgent.xcodeproj, select a development team for WebDriverAgentRunner, run it once. Then click Retry." },
+  { pattern: /requires a provisioning profile|no profiles for|provisioning profile .* (?:doesn't include|not found)|signing for .* requires a development team|code signing is required/i, message: "WDA signing needs to be configured once in Xcode. With Bodun's bundled WebDriverAgent, enter your Apple Developer Team ID in host setup; with your own checkout, configure its development team once. Then use Start WDA." },
 ];
 
-export function classifyWdaFailure(logText) {
+export function classifyWdaFailure(logText, { fatal = true } = {}) {
+  if (!fatal) return null;
   for (const { pattern, message } of KNOWN_FAILURES) {
     if (pattern.test(logText)) return message;
   }
@@ -70,12 +71,12 @@ function processDiagnostic(id, label, status) {
   if (state === "stop_failed") return diagnosticCheck(id, label, observed, "running", "fail",
     `${label} could not be stopped cleanly, so Bodun will not launch a conflicting replacement.`, "Quit Bodun completely, reopen it, then run this check again.");
   return diagnosticCheck(id, label, observed, "running", "fail",
-    `${label} is not running, so the control path is incomplete.`, "Use Retry setup after reviewing the reported device prerequisite.");
+    `${label} is not running, so the control path is incomplete.`, "Use the WDA lifecycle action after reviewing the reported prerequisite.");
 }
 
 export function buildControlDiagnosticReport({ enabled, attachment, wdaStatus, iproxyStatus,
   readinessChecked, readinessPassed, readiness, control, localPort, timeoutMs, recovery,
-  sessionProbe = null, windowProbe = null, screenshotProbe = null, recentEvents = [] } = {}) {
+  pairing = null, sessionProbe = null, windowProbe = null, screenshotProbe = null, recentEvents = [] } = {}) {
   const checks = [];
   checks.push(diagnosticCheck("lifecycle", "WDA lifecycle", enabled ? "enabled" : "stopped", "enabled",
     enabled ? "pass" : "fail",
@@ -88,6 +89,15 @@ export function buildControlDiagnosticReport({ enabled, attachment, wdaStatus, i
         : "The iPhone is not present in physical-device discovery.",
     attachment === "CONNECTED" ? "No attachment action is required."
       : "Reconnect and unlock the iPhone, accept Trust if shown, then run the check again."));
+  const pairingState = pairing?.state ?? "unknown";
+  checks.push(diagnosticCheck("pairing", "USB pairing", pairing?.label ?? "Pairing unknown; inspect diagnostics", "Pairing valid",
+    pairingState === "valid" ? "pass" : pairingState === "rejected" ? "fail" : "blocked",
+    pairingState === "valid" ? "The iPhone device tools confirmed pairing independently of WDA signing."
+      : pairingState === "rejected" ? "The phone rejected or has not completed USB pairing."
+        : "Bodun could not independently verify USB pairing.",
+    pairingState === "valid" ? "No pairing action is required."
+      : pairingState === "rejected" ? "Unlock the phone, reconnect it, and accept Trust This Computer."
+        : "Reconnect and unlock the phone, then run Check control again."));
   checks.push(processDiagnostic("wda_process", "WDA process", wdaStatus));
   checks.push(processDiagnostic("iproxy_process", "USB tunnel (iproxy)", iproxyStatus));
 
@@ -535,7 +545,13 @@ export class DeviceProvisioner {
     const logicalId = discoveredDeviceId(udid);
     const derivedDataPath = path.join(this.derivedDataRoot, logicalId);
     const usedPorts = new Set([...this.runtime.values()].flatMap(entry => [entry.port, entry.mjpegPort]).filter(Boolean));
-    const existingRecord = this._loadRecord(udid);
+    let existingRecord;
+    try {
+      existingRecord = this._loadRecord(udid);
+    } catch {
+      // An unreadable lifecycle record is never permission to launch WDA.
+      existingRecord = { lifecycleIntent: "stopped", wdaEnabled: false };
+    }
     let reservation;
     let adoptOwnedTunnel = false;
     let blockedForeignTunnel = false;
@@ -594,7 +610,8 @@ export class DeviceProvisioner {
     } else {
       wdaDevice.mjpegPort = mjpegPort;
     }
-    const wdaEnabled = existingRecord?.wdaEnabled !== false;
+    wdaDevice.pairing = discovered.pairing ?? { state: "unknown", label: "Pairing unknown; inspect diagnostics" };
+    const wdaEnabled = existingRecord?.lifecycleIntent === "running";
     wdaDevice.discoveryState = wdaEnabled ? "provisioning" : "wda_stopped";
     wdaDevice.discoveryStateMessage = wdaEnabled
       ? "Starting WDA. Starting the USB tunnel. Waiting for device readiness. This can take a minute."
@@ -625,6 +642,7 @@ export class DeviceProvisioner {
         this._applyConflictBanner(wdaDevice, portConflict);
       } else if (wdaEnabled) {
         if (this.stopping || generation !== this.generation) return;
+        await this._assertNoForeignWda(udid, derivedDataPath);
         wdaStartAttempted = true;
         assertStartResult(this.wdaProcessManager.start({ udid, derivedDataPath }));
         if (this.stopping || generation !== this.generation) {
@@ -709,14 +727,8 @@ export class DeviceProvisioner {
       if (!entry.wdaEnabled) continue;
       const wdaState = this._managerState(this.wdaProcessManager, udid);
       const iproxyState = this._managerState(this.iproxyManager, udid);
-      if (wdaState === "running" && wdaDevice.readiness?.state !== "HEALTHY"
-        && wdaDevice.componentHealth.recovery !== "USER_ACTION_REQUIRED") {
-        const currentLog = this.wdaProcessManager.getCurrentRunLog?.(udid) ?? [];
-        if (this._applyWdaManualPrerequisite(udid, entry, currentLog.join(""))) {
-          changed = true;
-          continue;
-        }
-      }
+      // A still-running xcodebuild may print guidance and informational trust text.
+      // Manual-prerequisite classification happens only from a confirmed fatal exit.
       const currentIproxyHealth = wdaDevice.componentHealth.iproxy;
       // A port conflict or an unconfirmed stop is a latched cause: until a retry/start/restart (or an
       // unplug) changes something, the process states must not be rewritten from the managers — they
@@ -861,7 +873,7 @@ export class DeviceProvisioner {
     const entry = this.runtime.get(udid);
     if (!entry) return;
     if (kind === "WDA" && entry.wdaDevice.componentHealth.recovery === "USER_ACTION_REQUIRED") return;
-    if (kind === "WDA" && this._applyWdaManualPrerequisite(udid, entry, log.join(""))) return;
+    if (kind === "WDA" && this._applyWdaManualPrerequisite(udid, entry, log.join(""), { fatal: true })) return;
     const code = kind === "WDA" ? "W202" : "I201";
     const detail = kind === "WDA" ? diagnosticError(code) : (classifyIproxyFailure(log.join("")) ?? diagnosticError(code));
     entry.wdaDevice.invalidateReadiness(kind);
@@ -878,9 +890,9 @@ export class DeviceProvisioner {
     }
   }
 
-  _applyWdaManualPrerequisite(udid, entry, logText) {
+  _applyWdaManualPrerequisite(udid, entry, logText, { fatal = false } = {}) {
     if (entry.wdaDevice.componentHealth.recovery === "USER_ACTION_REQUIRED") return true;
-    const known = classifyWdaFailure(logText);
+    const known = classifyWdaFailure(logText, { fatal });
     if (!known) return;
     const manualError = diagnosticError("W205", { why: known, operatorAction: known });
     entry.wdaDevice.discoveryState = "user_action_required";
@@ -1021,8 +1033,8 @@ export class DeviceProvisioner {
     const detail = diagnosticError(stopFailed ? "I210" : "I205", {
       why: error.message,
       operatorAction: stopFailed
-        ? "Restart Bodun, then use Retry setup."
-        : "Close that program, then use Retry setup. Bodun will not stop other programs.",
+        ? "Restart Bodun, then use Start WDA."
+        : "Close that program, then use Start WDA. Bodun will not stop other programs.",
       technical: error.details?.program ? { program: error.details.program, pid: error.details.pid, port: error.details.port } : { port: error.details?.port ?? null },
     });
     wdaDevice.discoveryState = "provisioning_error";
@@ -1057,6 +1069,16 @@ export class DeviceProvisioner {
       this._markIproxyStopFailed(entry);
       return;
     }
+    if (["external_wda_running", "wda_ownership_unavailable"].includes(error?.code)) {
+      const detail = diagnosticError("W206", { why: error.message, operatorAction: error.message });
+      entry.wdaDevice.discoveryState = "provisioning_error";
+      entry.wdaDevice.discoveryStateMessage = error.message;
+      entry.wdaDevice.setComponentError("wdaProcess", detail);
+      entry.wdaDevice.setComponentHealth({ wdaProcess: "FAILED", control: "UNAVAILABLE", recovery: "BLOCKED_PROCESS" });
+      entry.wdaDevice.recordDiagnosticEvent("WDA_FOREIGN_OWNER_BLOCKED", { error: detail });
+      this.onDeviceListChanged();
+      return;
+    }
     if (error?.code !== "process_replacement_pending") return;
     entry.wdaDevice.discoveryState = "provisioning_error";
     entry.wdaDevice.discoveryStateMessage = error.message;
@@ -1073,6 +1095,7 @@ export class DeviceProvisioner {
   _onPersistentFailure(kind, udid, log) {
     const entry = this.runtime.get(udid);
     if (!entry) return;
+    if (kind === "WDA" && this._applyWdaManualPrerequisite(udid, entry, log.join(""), { fatal: true })) return;
     const detail = kind === "iproxy"
       ? (classifyIproxyFailure(log.join("")) ?? diagnosticError("I203"))
       : diagnosticError("W202", { technical: { retriesExhausted: true } });
@@ -1106,9 +1129,10 @@ export class DeviceProvisioner {
     this.onDeviceListChanged();
   }
 
-  _onRestartLimitExceeded(kind, udid, _log) {
+  _onRestartLimitExceeded(kind, udid, log) {
     const entry = this.runtime.get(udid);
     if (!entry) return;
+    if (kind === "WDA" && this._applyWdaManualPrerequisite(udid, entry, log.join(""), { fatal: true })) return;
     entry.wdaDevice.discoveryState = "provisioning_error";
     // Process output can contain a raw UDID, host username, checkout path,
     // signing identity, or command arguments. Device summaries are visible
@@ -1144,6 +1168,7 @@ export class DeviceProvisioner {
     const entry = this.runtime.get(udid);
     if (!entry) throw new LifecycleError("device_not_attached");
     if (this.stopping) throw new LifecycleError("shutting_down");
+    await this._assertNoForeignWda(udid, entry.derivedDataPath, { allowManaged: true });
     const adoptOwnedTunnel = this._ownsIproxyMapping(udid, entry);
     const stopped = await Promise.all([
       this.wdaProcessManager.stop(udid),
@@ -1214,22 +1239,22 @@ export class DeviceProvisioner {
     if (!entry) {
       // Unplugged within this session: no processes, but the operator's choice (enabled or stopped) is
       // still on record, and Stop must keep working so it can be changed.
-      let enabled = true;
-      try { enabled = this._loadRecord(udid)?.wdaEnabled !== false; } catch { /* keep the default */ }
+      let enabled = false;
+      try { enabled = this._loadRecord(udid)?.lifecycleIntent === "running"; } catch { /* fail closed */ }
       const inUse = typeof authoritativeInUse === "boolean"
         ? authoritativeInUse : this.devices.get(logicalId)?.status === "in-use";
-      return {
+      return withPrimaryAction({
         managed: true, attached: false, enabled, state: "detached", wdaProcess: "stopped", iproxyProcess: "stopped",
         endpointReady: false, controlReady: false, inUse,
         ...lifecycleGuidance({ state: "detached", attached: false, inUse }),
         canStop: enabled, stopReason: enabled ? null : "Already stopped.",
-      };
+      });
     }
     const wdaProcess = this._managerState(this.wdaProcessManager, udid);
     const iproxyProcess = this._managerState(this.iproxyManager, udid);
     const endpointReady = entry.wdaDevice.readiness?.ready === true;
     const controlReady = entry.wdaDevice.componentHealth.control === "READY";
-    const state = ["BLOCKED_PORT", "STOP_FAILED"].includes(entry.wdaDevice.componentHealth.recovery)
+    const state = ["BLOCKED_PORT", "STOP_FAILED", "BLOCKED_PROCESS", "USER_ACTION_REQUIRED"].includes(entry.wdaDevice.componentHealth.recovery)
       || [wdaProcess, iproxyProcess].includes("stop_failed")
       ? "failed" : !entry.wdaEnabled
       ? (wdaProcess === "stopped" && iproxyProcess === "stopped" ? "stopped" : "failed")
@@ -1239,7 +1264,7 @@ export class DeviceProvisioner {
             : controlReady ? "ready" : "enabled";
     const inUse = typeof authoritativeInUse === "boolean"
       ? authoritativeInUse : entry.wdaDevice.status === "in-use";
-    return {
+    return withPrimaryAction({
       managed: true,
       attached: true,
       enabled: entry.wdaEnabled,
@@ -1249,15 +1274,28 @@ export class DeviceProvisioner {
       endpointReady,
       controlReady,
       inUse,
+      recovery: entry.wdaDevice.componentHealth.recovery,
       ...lifecycleGuidance({
         state, inUse, attached: true,
         anyRunning: ["running", "starting", "restarting"].includes(wdaProcess) || ["running", "starting", "restarting"].includes(iproxyProcess),
         // A short instruction, not a repeat of the explanation that the card already shows above its buttons.
-        blockedMessage: entry.wdaDevice.componentHealth.recovery === "BLOCKED_PORT" ? "Close the other program first, then use Retry setup."
+        blockedMessage: entry.wdaDevice.componentHealth.recovery === "BLOCKED_PORT" ? "Close the other program first, then use Start WDA."
           : entry.wdaDevice.componentHealth.recovery === "STOP_FAILED" ? "Restart this Mac first, then try again."
             : null,
       }),
-    };
+    });
+  }
+
+  performPrimaryAction(logicalId, { authorize = null, inUse = null } = {}) {
+    const authoritativeInUse = typeof inUse === "function" ? Boolean(inUse()) : null;
+    const current = this.getLifecycleState(logicalId, { inUse: authoritativeInUse });
+    const action = current?.primaryAction;
+    if (!action) throw new LifecycleError("lifecycle_state_changed");
+    const options = { authorize, expectedPrimaryAction: action, inUse };
+    if (action === "start") return this.startDevice(logicalId, options);
+    if (action === "stop") return this.stopDevice(logicalId, options);
+    if (action === "restart") return this.restartDevice(logicalId, options);
+    throw new LifecycleError("lifecycle_state_changed");
   }
 
   // A process Bodun tried to stop but could not confirm gone leaves its supervisor "blocked" for good.
@@ -1272,6 +1310,20 @@ export class DeviceProvisioner {
       if (!cleared) return false;
     }
     return true;
+  }
+
+  async _assertNoForeignWda(udid, derivedDataPath, { allowManaged = true } = {}) {
+    if (allowManaged && this.wdaProcessManager.ownsProcess?.(udid, { derivedDataPath })) return "owned";
+    const inspector = this.portReclaimer?.inspector;
+    if (!inspector?.findProcesses) return "not-supported";
+    const found = await inspector.findProcesses("xcodebuild");
+    if (!found?.supported) throw new LifecycleError("wda_ownership_unavailable");
+    const matches = found.processes.filter(process => {
+      const command = String(process.command || "");
+      return command.includes("WebDriverAgentRunner") && command.includes(`id=${udid}`);
+    });
+    if (matches.length) throw new LifecycleError("external_wda_running");
+    return "free";
   }
 
   async _reclaimOwnProcess(kind, udid) {
@@ -1306,11 +1358,13 @@ export class DeviceProvisioner {
     if (this.runtime.get(udid) !== entry) throw new LifecycleError("device_not_attached");
   }
 
-  restartDevice(logicalId, { authorize = null } = {}) {
+  restartDevice(logicalId, { authorize = null, expectedPrimaryAction = null, inUse = null } = {}) {
     return this._serializeLifecycle(logicalId, async () => {
       const { udid, entry } = this._lifecycleEntry(logicalId);
       if (authorize) await authorize();
+      if (expectedPrimaryAction && this.getLifecycleState(logicalId, { inUse: typeof inUse === "function" ? Boolean(inUse()) : null })?.primaryAction !== expectedPrimaryAction) throw new LifecycleError("lifecycle_state_changed");
       if (!entry.wdaEnabled) throw new LifecycleError("wda_not_running");
+      await this._assertNoForeignWda(udid, entry.derivedDataPath, { allowManaged: true });
       if ([this.wdaProcessManager, this.iproxyManager].some(manager => manager.getStatus?.(udid)?.state === "stop_failed")
         && !(await this._clearStopFailures(udid))) {
         this._markIproxyStopFailed(entry);
@@ -1380,10 +1434,11 @@ export class DeviceProvisioner {
     });
   }
 
-  stopDevice(logicalId, { authorize = null } = {}) {
+  stopDevice(logicalId, { authorize = null, expectedPrimaryAction = null, inUse = null } = {}) {
     return this._serializeLifecycle(logicalId, async () => {
       const { udid, entry } = this._lifecycleEntry(logicalId, { allowDetached: true });
       if (authorize) await authorize();
+      if (expectedPrimaryAction && this.getLifecycleState(logicalId, { inUse: typeof inUse === "function" ? Boolean(inUse()) : null })?.primaryAction !== expectedPrimaryAction) throw new LifecycleError("lifecycle_state_changed");
       if (!entry) {
         // Unplugged in this session: there is no running process to stop, but the operator's choice
         // is still recorded, so the phone comes back stopped when it is plugged in again.
@@ -1440,10 +1495,11 @@ export class DeviceProvisioner {
     });
   }
 
-  startDevice(logicalId, { authorize = null } = {}) {
+  startDevice(logicalId, { authorize = null, expectedPrimaryAction = null, inUse = null } = {}) {
     return this._serializeLifecycle(logicalId, async () => {
       const { udid, entry } = this._lifecycleEntry(logicalId);
       if (authorize) await authorize();
+      if (expectedPrimaryAction && this.getLifecycleState(logicalId, { inUse: typeof inUse === "function" ? Boolean(inUse()) : null })?.primaryAction !== expectedPrimaryAction) throw new LifecycleError("lifecycle_state_changed");
       if (entry.wdaEnabled) {
         const current = this.getLifecycleState(logicalId);
         // Already on and working (or still coming up): nothing to do.
@@ -1453,6 +1509,7 @@ export class DeviceProvisioner {
           throw new LifecycleError("running_not_responding");
         }
       }
+      await this._assertNoForeignWda(udid, entry.derivedDataPath, { allowManaged: true });
       if ([this.wdaProcessManager, this.iproxyManager].some(manager => manager.getStatus?.(udid)?.state === "stop_failed")) {
         if (!(await this._clearStopFailures(udid))) {
           this._markIproxyStopFailed(entry);
@@ -1570,6 +1627,7 @@ export class DeviceProvisioner {
         localPort: entry.port,
         timeoutMs: entry.wdaDevice.timeoutMs,
         recovery: health.recovery,
+        pairing: entry.wdaDevice.pairing,
         ...probes,
         recentEvents: health.recentEvents,
       }),
@@ -1585,7 +1643,7 @@ export class DeviceProvisioner {
         // Inspect only this xcodebuild generation. Historic output is kept for
         // diagnostics but must never poison a later, unrelated launch.
         const currentLog = this.wdaProcessManager.getCurrentRunLog?.(udid) ?? [];
-        if (this._applyWdaManualPrerequisite(udid, entry, currentLog.join(""))) return false;
+        // Do not infer a fatal trust/signing prerequisite while xcodebuild is alive.
       }
       if (healthy) {
         entry.wdaDevice.discoveryState = null;
@@ -1657,6 +1715,34 @@ export function lifecycleGuidance({ state, anyRunning = false, inUse = false, at
   else canRestart = ["ready", "enabled", "failed"].includes(state);
 
   return { canStart, canStop, canRestart, startReason, stopReason, restartReason };
+}
+
+function withPrimaryAction(lifecycle) {
+  const blocked = ["BLOCKED_PORT", "STOP_FAILED", "BLOCKED_PROCESS"].includes(lifecycle.recovery);
+  let primaryAction = "none";
+  let primaryLabel = lifecycle.state === "starting" ? "Starting WDA…"
+    : lifecycle.state === "restarting" ? "Restarting WDA…" : "WDA unavailable";
+  let reason = null;
+  if (!lifecycle.attached) reason = "Plug the phone in first.";
+  else if (lifecycle.inUse) reason = "Release the phone first.";
+  else if (blocked) reason = lifecycle.startReason;
+  else if (lifecycle.state === "stopped") { primaryAction = "start"; primaryLabel = "Start WDA"; }
+  else if (["ready", "enabled"].includes(lifecycle.state)) { primaryAction = "stop"; primaryLabel = "Stop WDA"; }
+  else if (lifecycle.state === "failed" && lifecycle.recovery === "USER_ACTION_REQUIRED"
+    && lifecycle.wdaProcess === "stopped" && lifecycle.iproxyProcess === "stopped") {
+    primaryAction = "start";
+    primaryLabel = "Start WDA";
+  }
+  else if (lifecycle.state === "failed") { primaryAction = "restart"; primaryLabel = "Restart WDA"; }
+  else if (["starting", "restarting"].includes(lifecycle.state)) reason = "Wait for the current WDA operation to finish.";
+  return {
+    ...lifecycle,
+    primaryAction,
+    primaryLabel,
+    reason,
+    busy: ["starting", "restarting"].includes(lifecycle.state),
+    progressState: ["starting", "restarting"].includes(lifecycle.state) ? lifecycle.state : null,
+  };
 }
 
 function processHealthState(state) {

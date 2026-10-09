@@ -9,6 +9,15 @@ function run(command, args, execFile) {
   }
 }
 
+export function pairingSummary(result) {
+  if (result?.ok) return { state: "valid", label: "Pairing valid" };
+  const evidence = `${result?.error?.message ?? ""} ${result?.error?.stderr ?? ""}`;
+  if (/not paired|pairing.{0,40}(?:failed|rejected)|trust this computer/i.test(evidence)) {
+    return { state: "rejected", label: "Pairing rejected" };
+  }
+  return { state: "unknown", label: "Pairing unknown; inspect diagnostics" };
+}
+
 export function discoveredDeviceId(udid) {
   return `ios-${crypto.createHash("sha256").update(udid).digest("hex").slice(0, 16)}`;
 }
@@ -47,6 +56,7 @@ export function discoverIosDevicesResult({
       id: discoveredDeviceId(udid),
       udid,
       label: detectedName || `Connected iPhone ${udid.slice(-6)}`,
+      pairing: pairingSummary(info),
     });
   }
   return { ok: true, devices };

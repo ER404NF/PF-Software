@@ -25,6 +25,8 @@ test("start() builds the argv xcodebuild expects, as an array (never a shell str
     "-derivedDataPath", "/tmp/derived/ios-abc",
     "test",
   ]);
+  assert.equal(manager.ownsProcess("00008110-ABCDEF1234567890", { derivedDataPath: "/tmp/derived/ios-abc" }), true);
+  assert.equal(manager.ownsProcess("00008110-ABCDEF1234567890", { derivedDataPath: "/tmp/derived/other" }), false);
 });
 
 // Production-readiness audit §5: WDA's own MJPEG server was never tuned,

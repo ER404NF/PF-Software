@@ -32,6 +32,7 @@ function build({ withReclaimer = true } = {}) {
 
 async function blockThePort(fixture, program = "proxy-tool") {
   await fixture.provisioner.pollOnce();
+  await fixture.provisioner.startDevice(fixture.id, { authorize: async () => {} });
   const tunnel = fixture.iproxy.starts[0];
   for (const port of [tunnel.localPort, tunnel.mjpegLocalPort]) fixture.world.holdPort(port, 7421, { program, command: `${program} --listen ${port}` });
   fixture.iproxy.emitExit("UDID-BLOCK-0001", ["bind: Address already in use"]);
@@ -39,7 +40,7 @@ async function blockThePort(fixture, program = "proxy-tool") {
 }
 
 test("guidance: a blocked phone's Start says what is wrong instead of 'running but not responding'", () => {
-  const message = "Close the other program first, then use Retry setup.";
+  const message = "Close the other program first, then use Start WDA.";
   const guidance = lifecycleGuidance({ state: "failed", anyRunning: true, blockedMessage: message });
   assert.equal(guidance.canStart, false);
   assert.equal(guidance.startReason, message);
@@ -57,7 +58,7 @@ test("a phone blocked by another program: Start says what to do, and does not re
   await blockThePort(f);
   const lifecycle = f.provisioner.getLifecycleState(f.id);
   assert.equal(lifecycle.canStart, false);
-  assert.equal(lifecycle.startReason, "Close the other program first, then use Retry setup.");
+  assert.equal(lifecycle.startReason, "Close the other program first, then use Start WDA.");
   assert.doesNotMatch(lifecycle.startReason, /running but not responding/);
   assert.notEqual(lifecycle.startReason, f.devices.get(f.id).discoveryStateMessage, "the sentence is shown once on the card");
   assertPlainOperatorText(lifecycle.startReason, "blocked start reason");
@@ -69,7 +70,7 @@ test("a phone blocked by a program Bodun cannot name still gets a plain reason",
   await blockThePort(f);
   const lifecycle = f.provisioner.getLifecycleState(f.id);
   assert.equal(lifecycle.canStart, false);
-  assert.equal(lifecycle.startReason, "Close the other program first, then use Retry setup.");
+  assert.equal(lifecycle.startReason, "Close the other program first, then use Start WDA.");
   assertPlainOperatorText(lifecycle.startReason, "unnamed blocked start reason");
   await f.provisioner.stop();
 });
@@ -77,6 +78,7 @@ test("a phone blocked by a program Bodun cannot name still gets a plain reason",
 test("stopping a phone on purpose clears the old error, so the card does not show a failure for it", async () => {
   const f = build();
   await f.provisioner.pollOnce();
+  await f.provisioner.startDevice(f.id, { authorize: async () => {} });
   const device = f.devices.get(f.id);
   device.readiness = { ...device.readiness, lastError: { code: "W204", name: "WDA endpoint unavailable", why: "No answer.", operatorAction: "Check the phone." } };
   device.componentErrors.wdaProcess = { code: "W202", name: "WDA process exited" };
@@ -101,6 +103,7 @@ test("a phone stopped on purpose is not probed again, so no new 'endpoint unavai
   const { mock } = await import("node:test");
   const f = build();
   await f.provisioner.pollOnce();
+  await f.provisioner.startDevice(f.id, { authorize: async () => {} });
   await f.provisioner.stopDevice(f.id, { authorize: async () => {} });
   const device = f.devices.get(f.id);
   const fetchSpy = mock.method(globalThis, "fetch", async () => { throw new Error("must not be called for a stopped phone"); });

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { discoverIosDevices, discoverIosDevicesResult, discoveredDeviceId } from "../../src/deviceDiscovery.js";
+import { discoverIosDevices, discoverIosDevicesResult, discoveredDeviceId, pairingSummary } from "../../src/deviceDiscovery.js";
 
 test("Mac discovery reads connected UDIDs and their current iPhone names", () => {
   const calls = [];
@@ -11,10 +11,18 @@ test("Mac discovery reads connected UDIDs and their current iPhone names", () =>
   };
   const devices = discoverIosDevices({ platform: "darwin", execFile });
   assert.deepEqual(devices, [
-    { id: discoveredDeviceId("00008110-ABCDEF1234567890"), udid: "00008110-ABCDEF1234567890", label: "Studio iPhone" },
-    { id: discoveredDeviceId("00008120-1111222233334444"), udid: "00008120-1111222233334444", label: "Travel iPhone" },
+    { id: discoveredDeviceId("00008110-ABCDEF1234567890"), udid: "00008110-ABCDEF1234567890", label: "Studio iPhone", pairing: { state: "valid", label: "Pairing valid" } },
+    { id: discoveredDeviceId("00008120-1111222233334444"), udid: "00008120-1111222233334444", label: "Travel iPhone", pairing: { state: "valid", label: "Pairing valid" } },
   ]);
   assert.equal(calls.filter(([command]) => command === "ideviceinfo").length, 2);
+});
+
+test("pairing validation is separate, bounded, and safe", () => {
+  assert.deepEqual(pairingSummary({ ok: true }), { state: "valid", label: "Pairing valid" });
+  assert.deepEqual(pairingSummary({ ok: false, error: new Error("device is not paired; Trust This Computer") }),
+    { state: "rejected", label: "Pairing rejected" });
+  assert.deepEqual(pairingSummary({ ok: false, error: new Error("private path and device details unavailable") }),
+    { state: "unknown", label: "Pairing unknown; inspect diagnostics" });
 });
 
 test("discovery is empty away from macOS or when libimobiledevice is unavailable", () => {

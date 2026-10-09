@@ -77,6 +77,17 @@ export function createProcessInspector({ execFile = nodeExecFile, platform = pro
   return {
     supported,
 
+    async findProcesses(program) {
+      if (!supported) return { supported: false, processes: [] };
+      if (typeof program !== "string" || !/^[A-Za-z0-9._-]{1,80}$/.test(program)) throw new Error("a valid program name is required");
+      const result = await run("pgrep", ["-x", program]);
+      if (result.status === "unsupported" || result.status === "unavailable") return { supported: false, processes: [] };
+      if (result.status === "missing") return { supported: true, processes: [] };
+      const pids = result.stdout.split(/\s+/).filter(Boolean).map(Number).filter(validPid);
+      const described = await Promise.all(pids.map(pid => this.describe(pid).catch(() => undefined)));
+      return { supported: true, processes: described.filter(Boolean) };
+    },
+
     async findListeners(port) {
       if (!supported) return { supported: false, listeners: [] };
       if (!Number.isSafeInteger(port) || port < 1 || port > 65535) throw new Error("a valid port is required");

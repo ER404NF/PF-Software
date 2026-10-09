@@ -13,10 +13,13 @@ test("no what-to-do sentence names a retry button that does not exist", () => {
   for (const text of sentences) assert.doesNotMatch(text, /retry automatic setup/i, text);
 });
 
-test("the sentences that point at the retry button use the name on the button", () => {
-  const pointing = sentences.filter(text => /Retry setup/.test(text));
-  assert.ok(pointing.length >= 7, `expected the retry-button sentences to say "Retry setup", found ${pointing.length}`);
-  assert.match(app, /button\.textContent = "Retry setup";/);
+test("WDA guidance names lifecycle actions and only iproxy guidance names its contextual retry", () => {
+  assert.equal(sentences.filter(text => /Retry setup/.test(text)).length, 0);
+  assert.ok(sentences.some(text => /Start WDA/.test(text)));
+  assert.ok(sentences.some(text => /Restart WDA/.test(text)));
+  assert.ok(sentences.some(text => /Retry USB tunnel/.test(text)));
+  assert.doesNotMatch(app, /button\.textContent = "Retry setup";/);
+  assert.match(app, /"Retry USB tunnel"/);
 });
 
 test("the what-to-do sentences do not use the internal word 'bounded'", () => {

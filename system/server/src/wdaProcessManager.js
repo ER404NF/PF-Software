@@ -70,6 +70,13 @@ export class WdaProcessManager {
   getStatus(udid) { return this.group.getStatus(udid); }
   getLog(udid) { return this.group.getLog(udid); }
   getCurrentRunLog(udid) { return this.group.getCurrentRunLog(udid); }
+  ownsProcess(udid, { derivedDataPath } = {}) {
+    const definition = this.group.getDefinition(udid);
+    return this.group.isRunning(udid)
+      && definition?.bin === this.xcodebuildBin
+      && definition.args.includes(`id=${udid}`)
+      && definition.args.includes(derivedDataPath);
+  }
   stop(udid) { return this.group.stop(udid); }
   stopAll() { return this.group.stopAll(); }
   clearBlockedStop(udid, options) { return this.group.clearBlockedStop(udid, options); }

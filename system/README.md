@@ -360,6 +360,10 @@ than looping broken launches. When it passes, `deviceProvisioner.js` polls
 `idevice_id -l` continuously (not just at startup), and for each newly seen
 UDID:
 
+- records the phone in manual/stopped mode until an authorized operator uses
+  **Start WDA**. Running intent is then remembered across application restart,
+  Mac restart, and cable reconnect; **Stop WDA** persists stopped intent;
+
 - allocates a stable local WDA port (`WDA_PORT_RANGE_START`/`_END`, default
   8100-8199), persisted per-UDID in `storage/device-provisioning.json` so a
   replug or relay restart reuses the same port and derived-data directory;
@@ -376,16 +380,18 @@ UDID:
   A fresh WDA process gets a startup grace period (`WDA_STARTUP_GRACE_MS`, default
   120000 ms) so normal build/sign/install time does not consume the endpoint
   failure or recovery budget. Known trust/signing prerequisites still surface
-  immediately as W205 from the current xcodebuild run and stop automatic recovery.
+  as W205 only after the current xcodebuild run fatally exits with specific
+  evidence. Informational text from a still-running build never becomes W205.
 
 A device whose WDA process exits with a recognized manual-prerequisite
 message (an untrusted developer certificate, Developer Mode disabled, "Trust
 This Computer") surfaces as `discoveryState: "user_action_required"` with a
 plain-language instruction, and stops retrying rather than looping against
 an unresolved prompt. Exhausting the restart budget surfaces
-`"provisioning_error"` instead. Both show a "Retry automatic setup" button
-on the fleet card (Admin-only, `device:provision` capability) that calls
-`POST /api/admin/devices/:deviceId/retry-provisioning`.
+`"provisioning_error"` instead. The fleet card exposes one server-selected
+primary action: **Start WDA**, **Stop WDA**, or **Restart WDA**. **Check control**
+remains separate. A diagnosed iproxy failure may offer **Retry USB tunnel**;
+there is no generic WDA Retry setup action.
 
 **Start-up check and the status of automatic phone setup.** Before the first discovery pass the provisioner
 looks at the process records of earlier sessions (`process-ownership.json`): up to three looks, two seconds

@@ -9,18 +9,27 @@ import { discoveredDeviceId } from "../../src/deviceDiscovery.js";
 import { DeviceProvisioner, buildControlDiagnosticReport, classifyIproxyFailure, classifyWdaFailure } from "../../src/deviceProvisioner.js";
 import { LifecycleError } from "../../src/provisioningResults.js";
 import { createPortReclaimer } from "../../src/portReclaimer.js";
+import { getProvisioningRecord, upsertProvisioningRecord } from "../../src/deviceProvisioningStore.js";
 import { assertPlainOperatorText } from "../helpers/plainText.js";
 
-test("classifyWdaFailure recognizes known manual-prerequisite failures", () => {
-  assert.match(classifyWdaFailure("please Trust This Computer on the device"), /Trust this computer/);
+test("classifyWdaFailure recognizes known fatal manual-prerequisite failures", () => {
+  assert.match(classifyWdaFailure("Trust This Computer is required; pairing failed"), /Trust this computer/);
   assert.match(classifyWdaFailure("Developer Mode is disabled"), /Enable Developer Mode/);
-  assert.match(classifyWdaFailure("Untrusted Developer"), /Trust the developer certificate/);
+  assert.match(classifyWdaFailure("Untrusted Developer"), /Trust the developer application/);
   assert.match(classifyWdaFailure("Your maximum App ID limit has been reached"), /App ID creation limit/);
   assert.match(classifyWdaFailure("Signing for WebDriverAgentRunner requires a development team"), /configured once in Xcode/);
 });
 
 test("classifyWdaFailure returns null for an unrecognized error", () => {
   assert.equal(classifyWdaFailure("connection reset by peer"), null);
+});
+
+test("WDA failure classification requires fatal evidence and ignores informational trust text", () => {
+  assert.equal(classifyWdaFailure("Verify App in Settings if iOS asks you later", { fatal: false }), null);
+  assert.equal(classifyWdaFailure("certificate trust settings are available", { fatal: true }), null);
+  assert.equal(classifyWdaFailure("connection reset by peer", { fatal: true }), null);
+  assert.match(classifyWdaFailure("Untrusted Developer: application verification failed", { fatal: true }), /developer application/i);
+  assert.match(classifyWdaFailure("Signing for WebDriverAgentRunner requires a development team", { fatal: true }), /configured once in Xcode/i);
 });
 
 test("classifyIproxyFailure exposes safe root-cause categories without returning raw process output", () => {
@@ -52,6 +61,7 @@ test("control diagnostics identify a restarting iproxy as the immediate blocker 
     localPort: 8102,
     timeoutMs: 8000,
     recovery: "IPROXY_RESTART",
+    pairing: { state: "valid", label: "Pairing valid" },
   });
   assert.equal(report.outcome, "unavailable");
   assert.match(report.summary, /USB tunnel.*is still restarting/);
@@ -152,7 +162,7 @@ function tempStorePath() {
 }
 
 function makeProvisioner({ manualUdids = new Set(), recoveryCooldownMs, now, provisioningStorePath = tempStorePath(),
-  isPortAvailable = async () => true, extra = {} } = {}) {
+  isPortAvailable = async () => true, rememberedRunning = true, extra = {} } = {}) {
   const state = { attached: [] };
   const devices = new Map();
   const wdaProcessManager = new FakeProcessManager();
@@ -160,7 +170,18 @@ function makeProvisioner({ manualUdids = new Set(), recoveryCooldownMs, now, pro
   const changes = [];
   const provisioner = new DeviceProvisioner({
     devices,
-    discoverIosDevices: () => state.attached,
+    discoverIosDevices: () => {
+      if (rememberedRunning) {
+        for (const device of state.attached) {
+          if (!getProvisioningRecord(provisioningStorePath, device.udid)) {
+            upsertProvisioningRecord(provisioningStorePath, device.udid, {
+              logicalId: discoveredDeviceId(device.udid), lifecycleIntent: "running",
+            });
+          }
+        }
+      }
+      return state.attached;
+    },
     manualUdids,
     wdaProcessManager,
     iproxyManager,
@@ -176,7 +197,7 @@ function makeProvisioner({ manualUdids = new Set(), recoveryCooldownMs, now, pro
   return { provisioner, wdaProcessManager, iproxyManager, devices, changes, state };
 }
 
-test("a newly discovered, unconfigured UDID is provisioned automatically", async () => {
+test("a remembered-running device is provisioned automatically", async () => {
   const { provisioner, wdaProcessManager, iproxyManager, devices, changes, state } = makeProvisioner();
   state.attached = [{ id: "ignored", udid: "00008110-ABCDEF1234567890", label: "Studio iPhone" }];
   await provisioner.pollOnce();
@@ -193,6 +214,33 @@ test("a newly discovered, unconfigured UDID is provisioned automatically", async
   assert.equal(iproxyManager.starts.length, 1);
   assert.equal(iproxyManager.starts[0].localPort, 9000);
   assert.ok(changes.length > 0);
+});
+
+test("a newly discovered phone stays stopped until an operator chooses Start WDA", async () => {
+  const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner({ rememberedRunning: false });
+  state.attached = [{ id: "ignored", udid: "00008110-ABCDEF1234567890", label: "Studio iPhone" }];
+  await provisioner.pollOnce();
+  const device = devices.get(discoveredDeviceId("00008110-ABCDEF1234567890"));
+  assert.equal(device.discoveryState, "wda_stopped");
+  assert.equal(wdaProcessManager.starts.length, 0);
+  assert.equal(iproxyManager.starts.length, 0);
+  assert.equal(provisioner.getLifecycleState(device.id).primaryAction, "start");
+});
+
+test("an external Xcode WDA run blocks Bodun from launching a duplicate and is never signalled", async () => {
+  const inspector = {
+    findProcesses: async () => ({ supported: true, processes: [{ pid: 71, command: "xcodebuild -scheme WebDriverAgentRunner -destination id=UDID-00000001" }] }),
+  };
+  const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner({
+    extra: { portReclaimer: { inspector } },
+  });
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  assert.equal(wdaProcessManager.starts.length, 0);
+  assert.equal(iproxyManager.starts.length, 0);
+  const device = devices.get(discoveredDeviceId("UDID-00000001"));
+  assert.equal(device.discoveryState, "provisioning_error");
+  assert.match(device.discoveryStateMessage, /Another program is already running WDA/);
 });
 
 test("automatic attach stops before iproxy when the WDA supervisor is blocked", async () => {
@@ -511,15 +559,18 @@ test("a recognized WDA failure surfaces as user_action_required and stops retryi
 
   const device = devices.get(discoveredDeviceId("UDID-00000001"));
   assert.equal(device.discoveryState, "user_action_required");
-  assert.match(device.discoveryStateMessage, /Trust the developer certificate/);
+  assert.match(device.discoveryStateMessage, /Trust the developer application/);
   assert.equal(device.status, "offline");
   assert.equal(device.readiness.lastError.code, "W205");
   assert.equal(device.componentHealth.recovery, "USER_ACTION_REQUIRED");
   assert.ok(wdaProcessManager.stops.includes("UDID-00000001"));
   assert.ok(iproxyManager.stops.includes("UDID-00000001"));
+  const lifecycle = provisioner.getLifecycleState(discoveredDeviceId("UDID-00000001"));
+  assert.equal(lifecycle.primaryAction, "start");
+  assert.equal(lifecycle.primaryLabel, "Start WDA");
 });
 
-test("a live current-run trust failure becomes W205 before xcodebuild exits", async () => {
+test("a still-running xcodebuild log fragment never becomes W205", async () => {
   const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner();
   state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
   await provisioner.pollOnce();
@@ -528,11 +579,11 @@ test("a live current-run trust failure becomes W205 before xcodebuild exits", as
 
   await provisioner.pollOnce();
 
-  assert.equal(device.discoveryState, "user_action_required");
-  assert.equal(device.readiness.lastError.code, "W205");
-  assert.equal(device.componentHealth.recovery, "USER_ACTION_REQUIRED");
-  assert.ok(wdaProcessManager.stops.includes("UDID-00000001"));
-  assert.ok(iproxyManager.stops.includes("UDID-00000001"));
+  assert.notEqual(device.discoveryState, "user_action_required");
+  assert.notEqual(device.readiness.lastError?.code, "W205");
+  assert.notEqual(device.componentHealth.recovery, "USER_ACTION_REQUIRED");
+  assert.equal(wdaProcessManager.stops.includes("UDID-00000001"), false);
+  assert.equal(iproxyManager.stops.includes("UDID-00000001"), false);
 });
 
 test("generic current output and a manual-prerequisite line from an older run cannot produce W205", async () => {
@@ -1689,6 +1740,25 @@ test("Stop, Start and Restart requests queue and never interleave", async () => 
   assert.deepEqual(events, ["stop", "start", "stop", "start", "stop"]);
   assert.equal(provisioner.getLifecycleState(logicalId).state, "stopped");
   assert.equal(iproxyManager.running.size, 0);
+});
+
+test("concurrent primary actions cannot toggle WDA twice from one stale state", async () => {
+  const { provisioner, wdaProcessManager, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  wdaProcessManager.stops.length = 0;
+
+  const results = await Promise.allSettled([
+    provisioner.performPrimaryAction(logicalId),
+    provisioner.performPrimaryAction(logicalId),
+  ]);
+
+  assert.equal(results.filter(result => result.status === "fulfilled").length, 1);
+  const rejected = results.find(result => result.status === "rejected");
+  assert.equal(rejected.reason.code, "lifecycle_state_changed");
+  assert.equal(wdaProcessManager.stops.filter(id => id === "UDID-00000001").length, 1);
+  assert.equal(provisioner.getLifecycleState(logicalId).state, "stopped");
 });
 
 test("a phone unplugged in this session can be stopped, and comes back stopped when plugged in again", async () => {

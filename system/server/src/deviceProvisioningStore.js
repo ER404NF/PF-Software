@@ -17,6 +17,15 @@ function readRaw(storePath) {
     || parsed.devices === null || Array.isArray(parsed.devices)) {
     throw new Error("device-provisioning store is corrupt: expected { devices: {} }");
   }
+  parsed.devices = Object.fromEntries(Object.entries(parsed.devices).map(([udid, record]) => {
+    if (!record || typeof record !== "object" || Array.isArray(record)) {
+      throw new Error("device-provisioning store is corrupt: expected device records");
+    }
+    const lifecycleIntent = record.lifecycleIntent === "running" || record.lifecycleIntent === "stopped"
+      ? record.lifecycleIntent
+      : record.wdaEnabled === true ? "running" : "stopped";
+    return [udid, { ...record, lifecycleIntent, wdaEnabled: lifecycleIntent === "running" }];
+  }));
   return parsed;
 }
 
@@ -46,6 +55,10 @@ export function upsertProvisioningRecord(storePath, udid, patch = {}) {
   const raw = readRaw(storePath);
   const now = new Date().toISOString();
   const existing = raw.devices[udid];
+  const requestedIntent = patch.lifecycleIntent === "running" || patch.lifecycleIntent === "stopped"
+    ? patch.lifecycleIntent
+    : typeof patch.wdaEnabled === "boolean" ? (patch.wdaEnabled ? "running" : "stopped")
+      : existing?.lifecycleIntent ?? "stopped";
   const record = {
     udid,
     logicalId: patch.logicalId ?? existing?.logicalId,
@@ -53,7 +66,8 @@ export function upsertProvisioningRecord(storePath, udid, patch = {}) {
     wdaLocalPort: patch.wdaLocalPort ?? existing?.wdaLocalPort ?? null,
     mjpegLocalPort: patch.mjpegLocalPort ?? existing?.mjpegLocalPort ?? null,
     derivedDataPath: patch.derivedDataPath ?? existing?.derivedDataPath ?? null,
-    wdaEnabled: typeof patch.wdaEnabled === "boolean" ? patch.wdaEnabled : existing?.wdaEnabled ?? true,
+    lifecycleIntent: requestedIntent,
+    wdaEnabled: requestedIntent === "running",
     createdAt: existing?.createdAt ?? now,
     updatedAt: now,
   };

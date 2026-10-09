@@ -25,22 +25,17 @@
     return PROVISIONING_OFF;
   }
 
-  // The three actions the operator can take, plus the control check.
+  // One server-selected primary action plus the independent diagnostic action.
   //   lifecycle: device.wdaLifecycle from the server (null = automatic setup is off)
   //   inFlight:  the action currently running for this phone, if any
   function lifecycleButtons(lifecycle, inFlight = null, setup = null) {
     const offReason = setupReason(setup);
-    const actions = [
-      { key: "start", label: "Start WDA", can: "canStart", reason: "startReason" },
-      { key: "stop", label: "Stop WDA", can: "canStop", reason: "stopReason" },
-      { key: "restart", label: "Restart WDA", can: "canRestart", reason: "restartReason" },
-    ];
-    const buttons = actions.map(action => {
-      if (!lifecycle) return { key: action.key, label: action.label, disabled: true, reason: offReason };
-      if (inFlight) return { key: action.key, label: action.label, disabled: true, reason: BUSY };
-      const allowed = lifecycle[action.can] === true;
-      return { key: action.key, label: action.label, disabled: !allowed, reason: allowed ? null : (lifecycle[action.reason] || "Not available right now.") };
-    });
+    const primary = !lifecycle
+      ? { key: "primary", label: "WDA unavailable", disabled: true, reason: offReason }
+      : { key: "primary", label: lifecycle.primaryLabel || "WDA unavailable",
+        disabled: lifecycle.managed === false || !["start", "stop", "restart"].includes(lifecycle.primaryAction) || Boolean(inFlight),
+        reason: inFlight ? BUSY : lifecycle.reason || lifecycle.startReason || (lifecycle.primaryAction === "none" ? "Not available right now." : null) };
+    const buttons = [primary];
     const check = {
       key: "check", label: "Check control",
       disabled: !lifecycle || lifecycle.managed === false || Boolean(inFlight),

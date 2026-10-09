@@ -97,6 +97,11 @@ export async function installBrokenPhones({ devices, onDeviceListChanged = () =>
   const idA = discoveredDeviceId(PHONE_A.udid);
   const idB = discoveredDeviceId(PHONE_B.udid);
 
+  // Newly discovered real phones now fail closed in the stopped/manual state. The demo must make its
+  // synthetic operator intent explicit too; otherwise it would accidentally depend on the old auto-start default.
+  await provisioner.startDevice(idA, { authorize: async () => {} });
+  await provisioner.startDevice(idB, { authorize: async () => {} });
+
   // Phone A: another program takes the phone's connection port, then its tunnel fails with "address already in use".
   const tunnel = iproxyManager.starts.find(start => start.udid === PHONE_A.udid);
   for (const port of [tunnel.localPort, tunnel.mjpegLocalPort]) {

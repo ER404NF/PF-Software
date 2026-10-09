@@ -15,35 +15,25 @@ const attach = (state, extra = {}) => ({
 });
 const states = lifecycle => Object.fromEntries(lifecycleButtons(lifecycle).buttons.map(button => [button.key, !button.disabled]));
 
-test("there are three separate WDA buttons plus the control check, in order", () => {
-  const { buttons } = lifecycleButtons(attach("ready"));
-  assert.deepEqual(Array.from(buttons, button => button.label), ["Start WDA", "Stop WDA", "Restart WDA", "Check control"]);
+test("the server-selected primary WDA action is the only lifecycle button beside diagnostics", () => {
+  const { buttons } = lifecycleButtons({ ...attach("ready"), primaryAction: "stop", primaryLabel: "Stop WDA" });
+  assert.deepEqual(Array.from(buttons, button => button.label), ["Stop WDA", "Check control"]);
 });
 
-test("Start is enabled only when stopped or failed with nothing running", () => {
-  assert.equal(states(attach("stopped")).start, true);
-  assert.equal(states(attach("failed")).start, true);
-  for (const state of ["starting", "restarting", "ready", "enabled"]) assert.equal(states(attach(state)).start, false, state);
+test("the primary button follows only the server action and label", () => {
+  for (const [state, action, label] of [
+    ["stopped", "start", "Start WDA"], ["ready", "stop", "Stop WDA"], ["enabled", "stop", "Stop WDA"], ["failed", "restart", "Restart WDA"],
+  ]) {
+    const lifecycle = { ...attach(state), primaryAction: action, primaryLabel: label };
+    const primary = lifecycleButtons(lifecycle).buttons[0];
+    assert.deepEqual({ label: primary.label, disabled: primary.disabled }, { label, disabled: false }, state);
+  }
 });
 
-test("Stop is enabled when starting, running, failed, and not when stopped", () => {
-  for (const state of ["starting", "restarting", "ready", "enabled", "failed"]) assert.equal(states(attach(state)).stop, true, state);
-  assert.equal(states(attach("stopped")).stop, false);
-});
-
-test("Restart is enabled when running or failed", () => {
-  for (const state of ["ready", "enabled", "failed"]) assert.equal(states(attach(state)).restart, true, state);
-  for (const state of ["stopped", "starting", "restarting"]) assert.equal(states(attach(state)).restart, false, state);
-});
-
-test("a disabled button always states why, using the server's sentence", () => {
-  const model = lifecycleButtons(attach("ready"));
-  const start = model.buttons.find(button => button.key === "start");
-  assert.equal(start.disabled, true);
-  assert.equal(start.reason, "Already running.");
-  assert.deepEqual(Array.from(model.reasons, entry => entry.label), ["Start WDA"]);
-  const busy = lifecycleButtons({ ...attach("ready"), inUse: true, ...lifecycleGuidance({ state: "ready", anyRunning: true, inUse: true }) });
-  assert.deepEqual(Array.from(busy.reasons, entry => entry.reason), ["Already running.", "Release the phone first.", "Release the phone first."]);
+test("a disabled primary action states the server's safe reason", () => {
+  const model = lifecycleButtons({ ...attach("starting"), primaryAction: "none", primaryLabel: "Starting WDA…", reason: "Wait for the current WDA operation to finish." });
+  assert.equal(model.buttons[0].disabled, true);
+  assert.equal(model.buttons[0].reason, "Wait for the current WDA operation to finish.");
 });
 
 test("while one action runs every button is disabled with the same reason (double clicks do nothing)", () => {
@@ -63,9 +53,9 @@ test("a phone Bodun does not manage shows the server's explanation for all of th
   assert.equal(model.note, "Bodun is not managing this phone's control service.");
 });
 
-test("an unplugged phone can only be stopped", () => {
-  const detached = { managed: true, attached: false, enabled: true, state: "detached", ...lifecycleGuidance({ state: "detached", attached: false }) };
-  assert.deepEqual(states(detached), { start: false, stop: true, restart: false, check: true });
+test("an unplugged phone has no primary lifecycle action", () => {
+  const detached = { managed: true, attached: false, enabled: true, state: "detached", primaryAction: "none", primaryLabel: "WDA unavailable", reason: "Plug the phone in first." };
+  assert.deepEqual(states(detached), { primary: false, check: true });
 });
 
 test("every lifecycle state has a plain label and tone", () => {
@@ -111,8 +101,8 @@ test("with setup off, running, or no status at all, the old wording is unchanged
 test("a lifecycle answer from the server is never overridden by the status", () => {
   const model = lifecycleButtons({ managed: false, startReason: "Automatic phone setup is paused. See the notice at the top of this page." }, null, { state: "paused" });
   assert.match(model.note, /See the notice at the top of this page/);
-  const ready = lifecycleButtons(attach("ready"), null, { state: "paused" });
-  assert.equal(ready.buttons.find(button => button.key === "restart").disabled, false);
+  const ready = lifecycleButtons({ ...attach("ready"), primaryAction: "stop", primaryLabel: "Stop WDA" }, null, { state: "paused" });
+  assert.equal(ready.buttons.find(button => button.key === "primary").disabled, false);
 });
 
 test("the header word for a phone with no lifecycle says setup is paused while it is", () => {

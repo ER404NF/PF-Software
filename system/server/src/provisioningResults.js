@@ -37,6 +37,9 @@ const DEFINITIONS = {
   wda_not_running: { status: 409, message: () => "Phone control is stopped. Use Start WDA instead." },
   running_not_responding: { status: 409, message: () => "Control is running but not responding. Use Restart WDA." },
   provisioning_off: { status: 409, message: () => "Automatic phone setup is turned off on this Mac." },
+  lifecycle_state_changed: { status: 409, message: () => "The phone control state changed. Review the current action and try again." },
+  external_wda_running: { status: 409, message: () => "Another program is already running WDA for this phone. Stop the Xcode run, then use Start WDA in Bodun." },
+  wda_ownership_unavailable: { status: 503, message: () => "Bodun could not verify who owns the existing WDA process. It will not start a duplicate. Review diagnostics and try again." },
 };
 
 export function resultDefinition(code) {

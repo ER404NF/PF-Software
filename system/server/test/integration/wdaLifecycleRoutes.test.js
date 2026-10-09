@@ -97,6 +97,7 @@ function fakeProvisioner(overrides = {}) {
     startDevice: async (_id, { authorize }) => { await authorize(); return { enabled: true, state: "starting" }; },
     stopDevice: async (_id, { authorize }) => { await authorize(); return { enabled: false, state: "stopped" }; },
     restartDevice: async (_id, { authorize }) => { await authorize(); return { enabled: true, state: "starting" }; },
+    performPrimaryAction: async (_id, { authorize }) => { await authorize(); return { enabled: false, state: "stopped", primaryAction: "start", primaryLabel: "Start WDA" }; },
     ...overrides,
   };
 }
@@ -113,6 +114,17 @@ test("a successful action answers ok with the new lifecycle state", async () => 
   const res = await post("/api/admin/devices/mock-1/wda/restart", hostCookie);
   assert.equal(res.status, 200);
   assert.deepEqual(await res.json(), { ok: true, lifecycle: { enabled: true, state: "starting" } });
+});
+
+test("the primary route executes the server-selected action without a client action name", async () => {
+  let calls = 0;
+  setDeviceProvisionerForTests(fakeProvisioner({
+    performPrimaryAction: async (_id, { authorize }) => { calls += 1; await authorize(); return { state: "stopped", primaryAction: "start" }; },
+  }));
+  const res = await post("/api/admin/devices/mock-1/wda/primary", hostCookie);
+  assert.equal(res.status, 200);
+  assert.equal(calls, 1);
+  assert.equal((await res.json()).lifecycle.primaryAction, "start");
 });
 
 test("a port held by another program is a 409 with a plain message and a machine code — not a 500", async () => {
