@@ -5,8 +5,20 @@
 set -eu
 
 CONFIG_DIR=/app/system/storage/config
-mkdir -p "$CONFIG_DIR"
+
+# Railway volumes are mounted root-owned after the image is built. Initialize
+# their ownership at runtime, then run the application without root privileges.
+if [ "$(id -u)" = "0" ]; then
+  mkdir -p "$CONFIG_DIR"
+else
+  mkdir -p "$CONFIG_DIR"
+fi
 [ -f "$OPERATORS_CONFIG_PATH" ] || echo '{"operators":[]}' > "$OPERATORS_CONFIG_PATH"
 [ -f "$DEVICE_CONFIG_PATH" ] || echo '{"devices":[]}' > "$DEVICE_CONFIG_PATH"
+
+if [ "$(id -u)" = "0" ]; then
+  chown -R node:node /app/system/storage
+  exec su-exec node:node "$@"
+fi
 
 exec "$@"

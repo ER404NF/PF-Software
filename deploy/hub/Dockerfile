@@ -3,6 +3,7 @@
 FROM node:22-alpine
 
 WORKDIR /app/system
+RUN apk add --no-cache su-exec
 COPY system/package.json system/package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 
@@ -23,7 +24,6 @@ ENV NODE_ENV=production \
 # Railway rejects Dockerfile VOLUME instructions and uses Railway Volumes instead;
 # docker-compose.yml declares the equivalent hub-data mount for a bare VPS.
 EXPOSE 4173
-USER node
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
   CMD wget -qO- http://127.0.0.1:4173/healthz >/dev/null || exit 1
 ENTRYPOINT ["docker-entrypoint.sh"]
