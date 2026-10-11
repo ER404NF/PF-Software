@@ -19,7 +19,9 @@ ENV NODE_ENV=production \
     DEVICE_CONFIG_PATH=/app/system/storage/config/devices.config.json
 
 # Everything that must survive an upgrade (sessions, audit, queue, sites, accounts) lives here.
-VOLUME /app/system/storage
+# Mount persistent storage at /app/system/storage in the deployment platform.
+# Railway rejects Dockerfile VOLUME instructions and uses Railway Volumes instead;
+# docker-compose.yml declares the equivalent hub-data mount for a bare VPS.
 EXPOSE 4173
 USER node
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
