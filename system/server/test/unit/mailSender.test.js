@@ -12,9 +12,53 @@ test("createMailSender reports unconfigured when any SMTP field is missing", () 
   }
 });
 
+test("whitespace-only SMTP and sender fields are unconfigured, matching recovery capability", () => {
+  const sender = createMailSender({ host: " ", port: " ", user: " ", pass: " ", from: " " });
+  assert.equal(sender.isConfigured(), false);
+  assert.deepEqual(sender.configurationStatus().missing,
+    ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "COMPANY_FROM_EMAIL"]);
+});
+
+test("an invalid SMTP port is unconfigured instead of advertising unusable recovery", () => {
+  for (const port of ["not-a-port", "0", "65536", "1.5"]) {
+    const sender = createMailSender({ host: "smtp.example.test", port, user: "user", pass: "pass", from: "from@example.test" });
+    assert.equal(sender.isConfigured(), false, port);
+    assert.deepEqual(sender.configurationStatus().missing, ["SMTP_PORT"], port);
+  }
+});
+
 test("send() throws instead of silently no-op'ing when unconfigured", async () => {
   const sender = createMailSender({});
   await assert.rejects(() => sender.send({ to: "a@example.com", subject: "s", body: "b" }), /not configured/);
+});
+
+test("Brevo HTTPS transport is configured without SMTP and sends the expected safe payload", async () => {
+  const calls = [];
+  const sender = createMailSender({
+    apiKey: "brevo-secret", from: "Phone Farm <noreply@example.com>",
+    fetchImpl: async (url, options) => { calls.push({ url, options }); return { ok: true, status: 201 }; },
+  });
+  assert.equal(sender.isConfigured(), true);
+  assert.deepEqual(sender.configurationStatus(), { configured: true, missing: [] });
+  await sender.send({ to: "person@example.com", subject: "Hello", body: "World" });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "https://api.brevo.com/v3/smtp/email");
+  assert.equal(calls[0].options.headers["api-key"], "brevo-secret");
+  assert.deepEqual(JSON.parse(calls[0].options.body), {
+    sender: { email: "noreply@example.com", name: "Phone Farm" },
+    to: [{ email: "person@example.com" }], subject: "Hello", textContent: "World",
+  });
+});
+
+test("Brevo HTTPS transport returns a stable error without exposing provider details", async () => {
+  const sender = createMailSender({
+    apiKey: "brevo-secret", from: "noreply@example.com",
+    fetchImpl: async () => ({ ok: false, status: 401 }),
+  });
+  await assert.rejects(
+    () => sender.send({ to: "person@example.com", subject: "Hello", body: "private-token" }),
+    error => error.code === "MAIL_SEND_FAILED" && !/brevo-secret|private-token|401/.test(error.message),
+  );
 });
 
 test("a configured sender calls nodemailer's sendMail with the expected envelope", async () => {

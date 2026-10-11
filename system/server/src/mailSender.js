@@ -11,29 +11,49 @@
 // with a logged reason, never a hard startup crash.
 
 import nodemailer from "nodemailer";
+import { smtpConfigurationStatus } from "./secureRecoveryCapability.js";
 
 const DEFAULT_TIMEOUTS = Object.freeze({ connection: 10_000, greeting: 10_000, socket: 20_000, overall: 30_000 });
 const MAX_TIMEOUT_MS = 120_000;
+const DEFAULT_BREVO_API_URL = "https://api.brevo.com/v3/smtp/email";
 
 function boundedTimeout(value, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, MAX_TIMEOUT_MS) : fallback;
 }
 
-export function createMailSender({ host, port, user, pass, from: configuredFrom, secure = false, timeouts = {} } = {}) {
-  const missing = [
-    ...(!host ? ["SMTP_HOST"] : []), ...(!port ? ["SMTP_PORT"] : []),
-    ...(!user ? ["SMTP_USER"] : []), ...(!pass ? ["SMTP_PASS"] : []),
-    ...(!configuredFrom ? ["COMPANY_FROM_EMAIL"] : []),
-  ];
-  const configured = missing.length === 0;
+function nonBlank(value) {
+  return typeof value === "string" && value.trim().length > 0;
+}
+
+function brevoSender(value) {
+  const trimmed = value.trim();
+  const named = trimmed.match(/^(.*?)\s*<([^>]+)>$/);
+  return named
+    ? { email: named[2].trim(), ...(named[1].trim() ? { name: named[1].trim().replace(/^"|"$/g, "") } : {}) }
+    : { email: trimmed };
+}
+
+export function createMailSender({
+  host, port, user, pass, from: configuredFrom, secure = false, timeouts = {},
+  apiKey = process.env.BREVO_API_KEY,
+  apiUrl = process.env.BREVO_API_URL || DEFAULT_BREVO_API_URL,
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  const configuration = smtpConfigurationStatus({
+    SMTP_HOST: host, SMTP_PORT: String(port ?? ""), SMTP_USER: user,
+    SMTP_PASS: pass, COMPANY_FROM_EMAIL: configuredFrom,
+  });
+  const apiConfigured = nonBlank(apiKey) && nonBlank(configuredFrom) && typeof fetchImpl === "function";
+  const missing = apiConfigured ? [] : configuration.missing;
+  const configured = apiConfigured || configuration.configured;
   const resolvedTimeouts = {
     connection: boundedTimeout(timeouts.connection, DEFAULT_TIMEOUTS.connection),
     greeting: boundedTimeout(timeouts.greeting, DEFAULT_TIMEOUTS.greeting),
     socket: boundedTimeout(timeouts.socket, DEFAULT_TIMEOUTS.socket),
     overall: boundedTimeout(timeouts.overall, DEFAULT_TIMEOUTS.overall),
   };
-  const transporter = configured
+  const transporter = configuration.configured
     ? nodemailer.createTransport({
       host, port: Number(port), secure: Boolean(secure), auth: { user, pass },
       connectionTimeout: resolvedTimeouts.connection,
@@ -43,8 +63,35 @@ export function createMailSender({ host, port, user, pass, from: configuredFrom,
     : null;
 
   async function send({ to, from: messageFrom, subject, body }) {
-    if (!transporter) throw new Error("SMTP is not configured");
+    if (!configured) throw new Error("Email delivery is not configured");
     if (typeof to !== "string" || !to) throw new Error("a recipient address is required");
+    if (apiConfigured) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), resolvedTimeouts.overall);
+      timer.unref?.();
+      try {
+        const response = await fetchImpl(apiUrl, {
+          method: "POST",
+          headers: { "api-key": apiKey, "content-type": "application/json", accept: "application/json" },
+          body: JSON.stringify({
+            sender: brevoSender(messageFrom || configuredFrom),
+            to: [{ email: to }],
+            subject,
+            textContent: body,
+          }),
+          signal: controller.signal,
+        });
+        if (!response?.ok) throw Object.assign(new Error("Brevo rejected email delivery."), { code: "MAIL_SEND_FAILED" });
+        return;
+      } catch (error) {
+        const timedOut = error?.name === "AbortError";
+        const safe = new Error(timedOut ? "Email delivery timed out." : "Email delivery failed.");
+        safe.code = timedOut ? "MAIL_SEND_TIMEOUT" : "MAIL_SEND_FAILED";
+        throw safe;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
     let timer;
     try {
       await Promise.race([
