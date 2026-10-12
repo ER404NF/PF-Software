@@ -12,6 +12,9 @@ on:
     paths:
       - "system/server/src/redis/**"
       - "system/server/test/**/redis/**"
+      - "system/server/scripts/run-external-integration.js"
+      - "system/server/src/externalIntegrationRunner.js"
+      - "system/server/test/unit/externalIntegrationRunner.test.js"
       - "system/package.json"
       - "system/package-lock.json"
       - ".github/workflows/redis-foundation.yml"
@@ -19,6 +22,9 @@ on:
     paths:
       - "system/server/src/redis/**"
       - "system/server/test/**/redis/**"
+      - "system/server/scripts/run-external-integration.js"
+      - "system/server/src/externalIntegrationRunner.js"
+      - "system/server/test/unit/externalIntegrationRunner.test.js"
       - "system/package.json"
       - "system/package-lock.json"
       - ".github/workflows/redis-foundation.yml"
