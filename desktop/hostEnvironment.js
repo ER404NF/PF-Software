@@ -185,6 +185,7 @@ function resolveMacHostDependencies({
     xcodeSelect: resolveBinary("xcode-select", resolverOptions),
     ideviceId: resolveBinary("idevice_id", resolverOptions),
     ideviceInfo: resolveBinary("ideviceinfo", resolverOptions),
+    idevicePair: resolveBinary("idevicepair", resolverOptions),
     iproxy: resolveBinary("iproxy", resolverOptions),
     tun2proxy: resolveBinary(["tun2proxy", "tun2proxy-bin"], resolverOptions),
     git: resolveBinary("git", resolverOptions),
@@ -213,9 +214,9 @@ function resolveMacHostDependencies({
     {
       id: "ios-device-tools",
       label: "iOS device tools",
-      ok: Boolean(tools.ideviceId && tools.ideviceInfo),
+      ok: Boolean(tools.ideviceId && tools.ideviceInfo && tools.idevicePair),
       ...(toolsFix ? { fixable: toolsFix } : {}),
-      message: tools.ideviceId && tools.ideviceInfo ? "Ready"
+      message: tools.ideviceId && tools.ideviceInfo && tools.idevicePair ? "Ready"
         : brew ? "The iPhone tools are not installed yet. Click Fix it to install them automatically (a few minutes)."
           : "Install libimobiledevice: brew install libimobiledevice (Homebrew is needed first: https://brew.sh)",
     },
@@ -317,6 +318,7 @@ function buildHostEnvironment(baseEnv, resolved) {
   env.XCODE_SELECT_BIN = resolved.tools.xcodeSelect;
   env.IDEVICE_ID_BIN = resolved.tools.ideviceId;
   env.IDEVICEINFO_BIN = resolved.tools.ideviceInfo;
+  env.IDEVICEPAIR_BIN = resolved.tools.idevicePair;
   env.IPROXY_BIN = resolved.tools.iproxy;
   if (resolved.tools.tun2proxy) env.TUN2PROXY_BIN = resolved.tools.tun2proxy;
   if (resolved.routingEnabled) env.AUTO_ROUTE_PROXY_TUNNELS = "true";

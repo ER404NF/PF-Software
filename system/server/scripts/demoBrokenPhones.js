@@ -43,6 +43,7 @@ export function createPretendSystem() {
     inspector: {
       supported: true,
       describe: async pid => processes.get(pid) ?? null,
+      findProcesses: async () => ({ supported: true, processes: [] }),
       findListeners: async port => ({ supported: true, listeners: (listeners.get(port) ?? []).map(pid => ({ pid })) }),
     },
     isPortAvailable: async port => (listeners.get(port) ?? []).length === 0,

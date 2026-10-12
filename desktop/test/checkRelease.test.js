@@ -16,7 +16,7 @@ test("the real repository passes every check that does not depend on git history
   const results = runChecks({ repo, git: quietGit });
   const failed = results.filter(result => result.status === "fail");
   assert.deepEqual(failed.map(result => `${result.id}: ${result.detail}`), []);
-  assert.deepEqual(results.map(result => result.id), ["files", "ignored", "committed", "push", "workflows", "packaged", "lock-system", "lock-desktop", "version", "resources", "plan"]);
+  assert.deepEqual(results.map(result => result.id), ["files", "ignored", "committed", "push", "workflows", "packaged", "lock-system", "lock-desktop", "version", "resources", "prebuilt", "plan"]);
 });
 
 test("a needed file that git would ignore is a failure, not a surprise on the build machine", () => {

@@ -114,3 +114,35 @@ test("the ownership store lives where the environment says, and audit events go 
   assert.equal(seen.options.ownershipStore.filePath, "/data/owned.json");
   assert.equal(typeof seen.options.portReclaimer.resolvePort, "function");
 });
+
+test("an injected process ownership runtime is shared by WDA, iproxy, and the provisioner", () => {
+  const seen = {};
+  const sharedStore = { filePath: "/shared/process-ownership.json" };
+  const sharedInspector = {
+    supported: true,
+    describe: async () => null,
+    findListeners: async () => ({ supported: true, listeners: [] }),
+    isAlive: async () => false,
+  };
+  const sharedOwner = { pid: 4321, startTime: "owner-start" };
+  const deps = {
+    runPreflight: () => ({ ok: true, checks: [] }), discover: () => [],
+    createWdaManager: options => { seen.wda = options; return {}; },
+    createIproxyManager: options => { seen.iproxy = options; return {}; },
+    createProvisioner: options => { seen.provisioner = options; return { start() {} }; },
+    createInspector: () => { throw new Error("a second inspector must not be created"); },
+  };
+
+  startAutoProvisioning({
+    env: HOST_ENV,
+    devices: new Map(),
+    manualUdids: new Set(),
+    processOwnership: { store: sharedStore, inspector: sharedInspector, owner: sharedOwner },
+    deps,
+  });
+
+  assert.equal(seen.wda.ownershipStore, sharedStore);
+  assert.equal(seen.iproxy.ownershipStore, sharedStore);
+  assert.equal(seen.provisioner.ownershipStore, sharedStore);
+  assert.equal(seen.provisioner.ownerServer, sharedOwner);
+});

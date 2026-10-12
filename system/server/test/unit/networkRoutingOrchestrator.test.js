@@ -20,7 +20,7 @@ function samplePayload(overrides = {}) {
 }
 
 class FakePrivilegedOps {
-  constructor({ testResult = { ok: true }, inspectOutput = "" } = {}) {
+  constructor({ testResult = { ok: true }, inspectOutput = "", quarantineError = null } = {}) {
     this.testResult = testResult;
     this.inspectOutput = inspectOutput;
     this.testCalls = [];
@@ -28,16 +28,24 @@ class FakePrivilegedOps {
     this.clearStateCalls = [];
     this.clearAnchorCalls = 0;
     this.inspectCalls = 0;
+    this.quarantineCalls = [];
+    this.quarantineError = quarantineError;
   }
   async testRuleset(text) { this.testCalls.push(text); return this.testResult; }
   async loadRuleset(text) { this.loadCalls.push(text); return { ok: true }; }
   async clearState(ip) { this.clearStateCalls.push(ip); return { ok: true }; }
   async clearAnchor() { this.clearAnchorCalls += 1; return { ok: true }; }
+  async quarantineBridge(iface) {
+    this.quarantineCalls.push(iface);
+    if (this.quarantineError) throw this.quarantineError;
+    return { ok: true };
+  }
   async inspectRules() {
     this.inspectCalls += 1;
     if (this.inspectOutput instanceof Error) throw this.inspectOutput;
     return this.inspectOutput;
   }
+  async inspectBridge() { return { available: true, up: true }; }
 }
 
 class FakeTunManager {
@@ -57,11 +65,13 @@ class FakeTunManager {
   // (e.g. crashed, killed externally) — isRunning() must reflect that.
   simulateCrash(deviceId) { this.runningDeviceIds.delete(deviceId); }
   isRunning(deviceId) { return this.runningDeviceIds.has(deviceId); }
+  getStatus(deviceId) { return { state: this.isRunning(deviceId) ? "running" : "stopped" }; }
+  listManagedDeviceIds() { return [...this.runningDeviceIds]; }
 }
 
 function makeOrchestrator({ proxyPoolStorePath, testResult, inspectOutput,
   peerResult = { localIp: "10.0.0.2", peerIp: "10.0.0.1" }, interfaces = ["lo0", "en0"],
-  listAllInterfaces = null, recoveryDelayMs, setTimeoutFn, clearTimeoutFn } = {}) {
+  listAllInterfaces = null, recoveryDelayMs, setTimeoutFn, clearTimeoutFn, quarantineStorePath = null } = {}) {
   const tunManager = new FakeTunManager();
   const privilegedOps = new FakePrivilegedOps({ testResult, inspectOutput });
   const changes = [];
@@ -83,6 +93,7 @@ function makeOrchestrator({ proxyPoolStorePath, testResult, inspectOutput,
     ...(recoveryDelayMs === undefined ? {} : { recoveryDelayMs }),
     ...(setTimeoutFn ? { setTimeoutFn } : {}),
     ...(clearTimeoutFn ? { clearTimeoutFn } : {}),
+    ...(quarantineStorePath ? { quarantineStorePath } : {}),
   });
   return { orchestrator, tunManager, privilegedOps, changes };
 }
@@ -96,6 +107,26 @@ test("startRouting refuses to run without a leased pool proxy", async () => {
 test("startRouting requires a known usbIp before doing anything else", async () => {
   const { orchestrator, tunManager } = makeOrchestrator({ proxyPoolStorePath: tempStorePath() });
   await assert.rejects(() => orchestrator.startRouting("mock-1", {}), /requires a known usbIp/);
+  assert.equal(tunManager.starts.length, 0);
+});
+
+test("startup reconciliation clears only the private stale PF anchor before routing", async () => {
+  const storePath = tempStorePath();
+  const proxy = createProxy(storePath, samplePayload(), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxy.id });
+  const { orchestrator, privilegedOps } = makeOrchestrator({ proxyPoolStorePath: storePath, inspectOutput: "stale private anchor rule" });
+  await orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" });
+  assert.equal(privilegedOps.clearAnchorCalls, 1);
+  assert.equal(orchestrator.reconciled, true);
+});
+
+test("routing refuses to start when private-anchor reconciliation cannot be inspected", async () => {
+  const storePath = tempStorePath();
+  const proxy = createProxy(storePath, samplePayload(), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxy.id });
+  const { orchestrator, tunManager } = makeOrchestrator({ proxyPoolStorePath: storePath, inspectOutput: new Error("permission denied") });
+  await assert.rejects(() => orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" }),
+    error => error.code === "ROUTING_RECONCILIATION_REQUIRED" && error.status === 503);
   assert.equal(tunManager.starts.length, 0);
 });
 
@@ -212,6 +243,29 @@ test("a failure discovering/allocating the tun interface still lands in tun_erro
   assert.equal(route.latestError.code, "T202");
   assert.doesNotMatch(JSON.stringify(route), /ifconfig -l failed/);
   assert.equal(tunManager.starts.length, 0, "never got as far as starting a tunnel");
+});
+
+test("a stale tunnel cleanup failure before route startup is classified and remains unprotected", async () => {
+  const storePath = tempStorePath();
+  const proxy = createProxy(storePath, samplePayload(), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxy.id });
+  const { orchestrator, tunManager } = makeOrchestrator({ proxyPoolStorePath: storePath });
+  orchestrator.routes.set("mock-1", {
+    state: ROUTING_STATES.TUN_ERROR, usbIp: "192.168.2.10", proxyId: proxy.id, protected: false,
+  });
+  tunManager.stop = async () => { throw new Error("stale tunnel could not be stopped"); };
+
+  await assert.rejects(
+    () => orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" }),
+    /stale tunnel could not be stopped/,
+  );
+
+  const route = orchestrator.getRoute("mock-1");
+  assert.equal(route.state, ROUTING_STATES.TUN_ERROR);
+  assert.equal(route.latestError.code, "T202");
+  assert.equal(route.protected, false);
+  assert.equal(route.internetBlocked, true, "the existing USB path is blocked when PF remains available");
+  assert.doesNotMatch(JSON.stringify(route), /stale tunnel could not be stopped/);
 });
 
 test("a PF syntax failure ends in pf_syntax_error, the ruleset is never loaded, and the tunnel is torn down", async () => {
@@ -391,6 +445,23 @@ test("checkHealth records the PF packet counter on an otherwise-healthy routed d
   assert.ok(route.lastHealthCheckAt);
 });
 
+test("current-route proof requires the live tunnel, its PF rule and an active bridge", async () => {
+  const storePath = tempStorePath();
+  const proxy = createProxy(storePath, samplePayload(), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxy.id });
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({
+    proxyPoolStorePath: storePath, inspectOutput: inspectFor("192.168.2.10", 1),
+  });
+  await orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" });
+  tunManager.hasCurrentOwnership = async () => true;
+  assert.equal(await orchestrator.verifyCurrentRoute("mock-1"), true);
+  tunManager.hasCurrentOwnership = async () => false;
+  assert.equal(await orchestrator.verifyCurrentRoute("mock-1"), false);
+  tunManager.hasCurrentOwnership = async () => true;
+  privilegedOps.inspectBridge = async () => ({ available: true, up: false });
+  assert.equal(await orchestrator.verifyCurrentRoute("mock-1"), false);
+});
+
 test("checkHealth marks a device route_lost when its tunnel process has died outside of stopRouting", async () => {
   const storePath = tempStorePath();
   const proxy = createProxy(storePath, samplePayload(), MASTER_KEY);
@@ -405,6 +476,477 @@ test("checkHealth marks a device route_lost when its tunnel process has died out
   assert.equal(route.state, ROUTING_STATES.ROUTE_LOST);
   assert.equal(route.latestError.code, "T206");
   assert.equal(route.internetBlocked, true);
+});
+
+test("route loss with a PF block failure stops forwarding and requires explicit host recovery", async () => {
+  const storePath = tempStorePath();
+  const proxy = createProxy(storePath, samplePayload(), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxy.id });
+  const timers = [];
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({
+    proxyPoolStorePath: storePath,
+    inspectOutput: inspectFor("192.168.2.10", 1),
+    recoveryDelayMs: 0,
+    setTimeoutFn: fn => { timers.push(fn); return { unref() {} }; },
+    clearTimeoutFn() {},
+  });
+  await orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" });
+  tunManager.simulateCrash("mock-1");
+  privilegedOps.loadRuleset = async text => {
+    privilegedOps.loadCalls.push(text);
+    if (/block in quick/.test(text)) throw new Error("pfctl unavailable");
+    return { ok: true };
+  };
+
+  await orchestrator.checkHealth();
+
+  let route = orchestrator.getRoute("mock-1");
+  assert.equal(route.state, ROUTING_STATES.ROUTE_LOST);
+  assert.equal(route.routeFailure.code, "T206", "the original route-loss cause remains available");
+  assert.equal(route.protectionError.code, "F202");
+  assert.equal(route.protectionState, "bridge_quarantined");
+  assert.equal(route.internetBlocked, true, "verified bridge shutdown is an emergency block, not proxy protection");
+  assert.equal(route.deviceQuarantined, true);
+  assert.equal(route.manualInterventionRequired, true);
+  assert.deepEqual(privilegedOps.quarantineCalls, ["bridge0"]);
+  assert.equal(route.protected, false);
+  assert.equal(tunManager.isRunning("mock-1"), false, "the forwarding tunnel is shut down; direct-route blocking still needs PF proof");
+  assert.equal(timers.length, 0, "host quarantine must cancel automatic protection and routing retries");
+  assert.equal(orchestrator.getHostRoutingStatus().state, "quarantined");
+});
+
+test("shared-bridge quarantine stops and marks every routed phone, not only the trigger", async () => {
+  const storePath = tempStorePath();
+  const proxyA = createProxy(storePath, samplePayload({ label: "A" }), MASTER_KEY);
+  const proxyB = createProxy(storePath, samplePayload({ label: "B" }), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxyA.id });
+  assignProxyToDevice(storePath, { deviceId: "mock-2", proxyId: proxyB.id });
+  const timers = [];
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({
+    proxyPoolStorePath: storePath,
+    inspectOutput: [inspectFor("192.168.2.10", 1), inspectFor("192.168.2.11", 1)].join("\n"),
+    recoveryDelayMs: 0,
+    setTimeoutFn: fn => { timers.push(fn); return { unref() {} }; },
+    clearTimeoutFn() {},
+  });
+  await orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" });
+  await orchestrator.startRouting("mock-2", { usbIp: "192.168.2.11" });
+  tunManager.simulateCrash("mock-1");
+  privilegedOps.loadRuleset = async text => {
+    if (/block in quick/.test(text)) throw new Error("pfctl unavailable");
+    return { ok: true };
+  };
+
+  await orchestrator.checkHealth();
+
+  for (const deviceId of ["mock-1", "mock-2"]) {
+    const route = orchestrator.getRoute(deviceId);
+    assert.equal(route.state, ROUTING_STATES.ROUTE_LOST);
+    assert.equal(route.protectionState, "bridge_quarantined");
+    assert.equal(route.protected, false);
+    assert.equal(route.manualInterventionRequired, true);
+    assert.equal(tunManager.isRunning(deviceId), false);
+  }
+  assert.equal(orchestrator.getRoute("mock-2").latestError.code, "F209");
+  assert.deepEqual(privilegedOps.quarantineCalls, ["bridge0"]);
+
+  const startsBeforeRefusal = tunManager.starts.length;
+  await assert.rejects(
+    () => orchestrator.startRouting("mock-2", { usbIp: "192.168.2.11" }),
+    error => error.code === "ROUTING_HOST_QUARANTINED" && error.status === 409,
+  );
+  assert.equal(tunManager.starts.length, startsBeforeRefusal, "quarantine cannot be bypassed by another start request");
+});
+
+test("emergency quarantine stops a supervisor-managed tunnel absent from routes and persists the complete inventory", async () => {
+  const storePath = tempStorePath();
+  const quarantineStorePath = path.join(path.dirname(storePath), "routing-quarantine.json");
+  const { orchestrator, tunManager } = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  orchestrator.routes.set("trigger", { state: ROUTING_STATES.ROUTE_LOST, usbIp: "192.168.2.10" });
+  tunManager.runningDeviceIds.add("orphan-managed");
+
+  await orchestrator._enforceEmergencyQuarantine("trigger", new Error("pf failed"));
+
+  assert.equal(tunManager.stops.includes("orphan-managed"), true);
+  const persisted = JSON.parse(fs.readFileSync(quarantineStorePath, "utf8"));
+  assert.deepEqual(new Set(persisted.affectedDeviceIds), new Set(["trigger", "orphan-managed"]));
+  assert.equal(persisted.affectedDeviceInventoryComplete, true);
+  assert.equal(persisted.state, "quarantined");
+});
+
+test("an invalid managed-tunnel inventory forces recovery-required and cannot publish quarantine complete", async () => {
+  const storePath = tempStorePath();
+  const quarantineStorePath = path.join(path.dirname(storePath), "routing-quarantine.json");
+  const { orchestrator, tunManager } = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  orchestrator.routes.set("trigger", { state: ROUTING_STATES.ROUTE_LOST, usbIp: "192.168.2.10" });
+  tunManager.listManagedDeviceIds = () => ({ invalid: true });
+
+  await orchestrator._enforceEmergencyQuarantine("trigger", new Error("pf failed"));
+
+  const persisted = JSON.parse(fs.readFileSync(quarantineStorePath, "utf8"));
+  assert.equal(persisted.affectedDeviceInventoryComplete, false);
+  assert.equal(persisted.state, "recovery_required");
+  await assert.rejects(orchestrator.recoverHostRouting(), /complete affected-device inventory/);
+});
+
+test("a persisted-only tunnel that remains managed after stop keeps emergency quarantine in recovery-required", async () => {
+  const storePath = tempStorePath();
+  const quarantineStorePath = path.join(path.dirname(storePath), "routing-quarantine.json");
+  const { orchestrator, tunManager } = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  orchestrator.routes.set("trigger", { state: ROUTING_STATES.ROUTE_LOST, usbIp: "192.168.2.10" });
+  tunManager.runningDeviceIds.add("persisted-only");
+  tunManager.stop = deviceId => { tunManager.stops.push(deviceId); };
+
+  await orchestrator._enforceEmergencyQuarantine("trigger", new Error("pf failed"));
+
+  assert.equal(tunManager.stops.includes("persisted-only"), true);
+  const persisted = JSON.parse(fs.readFileSync(quarantineStorePath, "utf8"));
+  assert.equal(persisted.state, "recovery_required");
+  assert.equal(persisted.reasonCode, "T202");
+});
+
+test("a concurrent device cannot start while shared-bridge quarantine is awaiting shutdown", async () => {
+  const storePath = tempStorePath();
+  const proxyA = createProxy(storePath, samplePayload({ label: "A" }), MASTER_KEY);
+  const proxyB = createProxy(storePath, samplePayload({ label: "B" }), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxyA.id });
+  assignProxyToDevice(storePath, { deviceId: "mock-2", proxyId: proxyB.id });
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({
+    proxyPoolStorePath: storePath, inspectOutput: inspectFor("192.168.2.10", 1),
+  });
+  await orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" });
+  tunManager.simulateCrash("mock-1");
+  privilegedOps.loadRuleset = async text => {
+    if (/block in quick/.test(text)) throw new Error("sensitive pf failure");
+    return { ok: true };
+  };
+  let releaseBridge;
+  let quarantineStarted;
+  const started = new Promise(resolve => { quarantineStarted = resolve; });
+  privilegedOps.quarantineBridge = async iface => {
+    privilegedOps.quarantineCalls.push(iface);
+    quarantineStarted();
+    await new Promise(resolve => { releaseBridge = resolve; });
+    return { ok: true };
+  };
+
+  const health = orchestrator.checkHealth();
+  await started;
+  const startsBefore = tunManager.starts.length;
+  const loadsBefore = privilegedOps.loadCalls.length;
+  await assert.rejects(
+    () => orchestrator.startRouting("mock-2", { usbIp: "192.168.2.11" }),
+    error => error.code === "ROUTING_HOST_QUARANTINED" && !String(error.message).includes("sensitive"),
+  );
+  assert.equal(tunManager.starts.length, startsBefore);
+  assert.equal(privilegedOps.loadCalls.length, loadsBefore, "the blocked phone must not load another PF ruleset");
+  releaseBridge();
+  await health;
+});
+
+test("bridge shutdown failure persists recovery-required state and blocks starts after restart", async () => {
+  const storePath = tempStorePath();
+  const quarantineStorePath = path.join(path.dirname(storePath), "routing-quarantine.json");
+  const proxyA = createProxy(storePath, samplePayload({ label: "A" }), MASTER_KEY);
+  const proxyB = createProxy(storePath, samplePayload({ label: "B" }), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxyA.id });
+  assignProxyToDevice(storePath, { deviceId: "mock-2", proxyId: proxyB.id });
+  const first = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath,
+    inspectOutput: inspectFor("192.168.2.10", 1) });
+  await first.orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" });
+  first.tunManager.simulateCrash("mock-1");
+  first.privilegedOps.loadRuleset = async text => {
+    if (/block in quick/.test(text)) throw new Error("pf unavailable: credential=secret");
+    return { ok: true };
+  };
+  first.privilegedOps.quarantineBridge = async () => { throw new Error("ifconfig raw stderr /private/path"); };
+  await first.orchestrator.checkHealth();
+  assert.equal(first.orchestrator.getHostRoutingStatus().state, "recovery_required");
+  const raw = fs.readFileSync(quarantineStorePath, "utf8");
+  assert.doesNotMatch(raw, /credential|secret|private\/path|pf unavailable/i);
+
+  const second = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  assert.equal(second.orchestrator.getHostRoutingStatus().state, "recovery_required");
+  await assert.rejects(
+    () => second.orchestrator.startRouting("mock-2", { usbIp: "192.168.2.11" }),
+    error => error.code === "ROUTING_RECOVERY_REQUIRED",
+  );
+  assert.equal(second.tunManager.starts.length, 0);
+});
+
+test("quarantine preserves the triggering failure and records route cleanup failures separately", async () => {
+  const storePath = tempStorePath();
+  const proxyA = createProxy(storePath, samplePayload({ label: "A" }), MASTER_KEY);
+  const proxyB = createProxy(storePath, samplePayload({ label: "B" }), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxyA.id });
+  assignProxyToDevice(storePath, { deviceId: "mock-2", proxyId: proxyB.id });
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({
+    proxyPoolStorePath: storePath,
+    inspectOutput: [inspectFor("192.168.2.10", 1), inspectFor("192.168.2.11", 1)].join("\n"),
+  });
+  await orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" });
+  await orchestrator.startRouting("mock-2", { usbIp: "192.168.2.11" });
+  tunManager.simulateCrash("mock-1");
+  const originalStop = tunManager.stop.bind(tunManager);
+  tunManager.stop = async deviceId => {
+    if (deviceId === "mock-2") throw new Error("private cleanup stderr secret=1");
+    return originalStop(deviceId);
+  };
+  privilegedOps.loadRuleset = async text => {
+    if (/block in quick/.test(text)) throw new Error("primary pf failure");
+    return { ok: true };
+  };
+  await orchestrator.checkHealth();
+  assert.equal(orchestrator.getRoute("mock-1").routeFailure.code, "T206");
+  assert.equal(orchestrator.getRoute("mock-2").cleanupError.code, "T202");
+  assert.doesNotMatch(JSON.stringify(orchestrator.getRoute("mock-2").cleanupError), /secret|private cleanup/i);
+  assert.equal(orchestrator.getHostRoutingStatus().state, "recovery_required");
+});
+
+test("corrupt persisted quarantine fails closed", async () => {
+  const storePath = tempStorePath();
+  const quarantineStorePath = path.join(path.dirname(storePath), "routing-quarantine.json");
+  fs.writeFileSync(quarantineStorePath, "{not-json", { mode: 0o600 });
+  const { orchestrator, tunManager } = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  assert.equal(orchestrator.getHostRoutingStatus().state, "recovery_required");
+  await assert.rejects(() => orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" }),
+    error => error.code === "ROUTING_RECOVERY_REQUIRED");
+  assert.equal(tunManager.starts.length, 0);
+});
+
+test("explicit recovery refuses an unsafe bridge, then clears quarantine idempotently after checks pass", async () => {
+  const storePath = tempStorePath();
+  const quarantineStorePath = path.join(path.dirname(storePath), "routing-quarantine.json");
+  fs.writeFileSync(quarantineStorePath, `${JSON.stringify({
+    version: 1, state: "quarantined", bridgeIface: "bridge0", reasonCode: "F202",
+    timestamp: new Date().toISOString(), manualInterventionRequired: true, affectedDeviceIds: ["mock-1"],
+    affectedDeviceInventoryComplete: true,
+  })}\n`, { mode: 0o600 });
+  const { orchestrator, privilegedOps } = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  privilegedOps.inspectBridge = async () => ({ available: true, up: false });
+  await assert.rejects(() => orchestrator.recoverHostRouting(), error => error.code === "ROUTING_BRIDGE_UNAVAILABLE");
+  assert.equal(fs.existsSync(quarantineStorePath), true);
+
+  privilegedOps.inspectBridge = async () => ({ available: true, up: true });
+  const recovered = await orchestrator.recoverHostRouting();
+  assert.equal(recovered.state, "healthy");
+  assert.equal(fs.existsSync(quarantineStorePath), false);
+  assert.equal((await orchestrator.recoverHostRouting()).state, "healthy");
+});
+
+test("revoked recovery authorization cannot clear the durable host barrier", async () => {
+  const storePath = tempStorePath();
+  const quarantineStorePath = path.join(path.dirname(storePath), "routing-quarantine.json");
+  fs.writeFileSync(quarantineStorePath, `${JSON.stringify({
+    version: 1, state: "quarantined", bridgeIface: "bridge0", reasonCode: "F202",
+    timestamp: new Date().toISOString(), manualInterventionRequired: true, affectedDeviceIds: ["mock-1"],
+    affectedDeviceInventoryComplete: true,
+  })}\n`, { mode: 0o600 });
+  const { orchestrator } = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  let checks = 0;
+  await assert.rejects(() => orchestrator.recoverHostRouting({
+    authorize: async () => {
+      checks += 1;
+      if (checks >= 3) { const error = new Error("revoked"); error.status = 403; throw error; }
+    },
+  }), /revoked/);
+  assert.equal(fs.existsSync(quarantineStorePath), true);
+  assert.equal(orchestrator.getHostRoutingStatus().state, "quarantined");
+});
+
+test("recovery is rejected while emergency quarantine is still running and durable state stays deterministic", async () => {
+  const storePath = tempStorePath();
+  const quarantineStorePath = path.join(path.dirname(storePath), "routing-quarantine.json");
+  const { orchestrator, privilegedOps } = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  orchestrator.routes.set("mock-1", { state: ROUTING_STATES.ROUTE_LOST, usbIp: "192.168.2.10" });
+  let releaseBridge;
+  privilegedOps.quarantineBridge = () => new Promise(resolve => { releaseBridge = resolve; });
+  const quarantine = orchestrator._enforceEmergencyQuarantine("mock-1", new Error("pf failed"));
+  assert.equal(orchestrator.getHostRoutingStatus().state, "quarantining");
+  await assert.rejects(() => orchestrator.recoverHostRouting(), error => error.code === "ROUTING_QUARANTINE_IN_PROGRESS");
+  assert.equal(orchestrator.getHostRoutingStatus().state, "quarantining");
+  releaseBridge({ ok: true });
+  await quarantine;
+  assert.equal(orchestrator.getHostRoutingStatus().state, "quarantined");
+  assert.equal(JSON.parse(fs.readFileSync(quarantineStorePath, "utf8")).state, "quarantined");
+});
+
+test("emergency quarantine waits for an in-flight host setup before shutting down the shared bridge", async () => {
+  const storePath = tempStorePath();
+  const quarantineStorePath = path.join(path.dirname(storePath), "routing-quarantine.json");
+  const { orchestrator, privilegedOps } = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  orchestrator.routes.set("mock-1", { state: ROUTING_STATES.ROUTE_LOST, usbIp: "192.168.2.10" });
+  let releaseSetup;
+  const setup = orchestrator.runHostRoutingSetup(() => new Promise(resolve => { releaseSetup = resolve; }));
+  const setupRejected = assert.rejects(setup, error => error.code === "ROUTING_HOST_QUARANTINED");
+  await Promise.resolve();
+  const quarantine = orchestrator._enforceEmergencyQuarantine("mock-1", new Error("pf failed"));
+  assert.equal(orchestrator.getHostRoutingStatus().state, "quarantining");
+  assert.equal(privilegedOps.quarantineCalls.length, 0);
+  releaseSetup({ ok: true });
+  await setupRejected;
+  await quarantine;
+  assert.deepEqual(privilegedOps.quarantineCalls, ["bridge0"]);
+  assert.equal(orchestrator.getHostRoutingStatus().state, "quarantined");
+});
+
+test("concurrent recovery calls perform only one destructive recovery sequence", async () => {
+  const storePath = tempStorePath();
+  const quarantineStorePath = path.join(path.dirname(storePath), "routing-quarantine.json");
+  fs.writeFileSync(quarantineStorePath, `${JSON.stringify({
+    version: 1, state: "quarantined", bridgeIface: "bridge0", reasonCode: "F202",
+    timestamp: new Date().toISOString(), manualInterventionRequired: true, affectedDeviceIds: ["mock-1"],
+    affectedDeviceInventoryComplete: true,
+  })}\n`, { mode: 0o600 });
+  const { orchestrator, privilegedOps } = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  let releaseClear;
+  let clearCalls = 0;
+  privilegedOps.clearAnchor = () => { clearCalls += 1; return new Promise(resolve => { releaseClear = resolve; }); };
+  const first = orchestrator.recoverHostRouting();
+  await Promise.resolve();
+  await assert.rejects(() => orchestrator.recoverHostRouting(), error => error.code === "ROUTING_RECOVERY_IN_PROGRESS");
+  assert.equal(clearCalls, 1);
+  releaseClear({ ok: true });
+  assert.equal((await first).state, "healthy");
+});
+
+test("recovery stops persisted and newly enumerated managed tunnels before clearing quarantine", async () => {
+  const storePath = tempStorePath();
+  const quarantineStorePath = path.join(path.dirname(storePath), "routing-quarantine.json");
+  fs.writeFileSync(quarantineStorePath, `${JSON.stringify({
+    version: 1, state: "quarantined", bridgeIface: "bridge0", reasonCode: "F202",
+    timestamp: new Date().toISOString(), manualInterventionRequired: true,
+    affectedDeviceIds: ["mock-1"], affectedDeviceInventoryComplete: true,
+  })}\n`, { mode: 0o600 });
+  const { orchestrator, tunManager } = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  tunManager.runningDeviceIds.add("synthetic-managed-device");
+  const recovered = await orchestrator.recoverHostRouting();
+  assert.equal(recovered.operationInProgress, false);
+  assert.deepEqual(tunManager.stops.sort(), ["mock-1", "synthetic-managed-device"]);
+});
+
+test("a resolved stop failure keeps recovery blocked and does not clear firewall state", async () => {
+  const storePath = tempStorePath();
+  const quarantineStorePath = path.join(path.dirname(storePath), "routing-quarantine.json");
+  fs.writeFileSync(quarantineStorePath, `${JSON.stringify({
+    version: 1, state: "quarantined", bridgeIface: "bridge0", reasonCode: "F202",
+    timestamp: new Date().toISOString(), manualInterventionRequired: true,
+    affectedDeviceIds: ["mock-1"], affectedDeviceInventoryComplete: true,
+  })}\n`, { mode: 0o600 });
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  tunManager.stop = () => ({ ok: false, error: "private process detail" });
+  tunManager.getStatus = () => ({ state: "stop_failed" });
+  await assert.rejects(() => orchestrator.recoverHostRouting(), error =>
+    error.code === "ROUTING_RECOVERY_UNSAFE" && !error.message.includes("private process detail"));
+  assert.equal(privilegedOps.clearAnchorCalls, 0);
+  assert.equal(orchestrator.getHostRoutingStatus().state, "quarantined");
+  assert.equal(fs.existsSync(quarantineStorePath), true);
+});
+
+test("a resolved stop failure forces emergency quarantine into recovery-required", async () => {
+  const storePath = tempStorePath();
+  const quarantineStorePath = path.join(path.dirname(storePath), "routing-quarantine.json");
+  const { orchestrator, tunManager } = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  orchestrator.routes.set("mock-1", { state: ROUTING_STATES.ROUTE_LOST, usbIp: "192.168.2.10" });
+  tunManager.stop = () => ({ ok: false, error: "unconfirmed" });
+  tunManager.getStatus = () => ({ state: "stop_failed" });
+  await orchestrator._enforceEmergencyQuarantine("mock-1", new Error("pf failed"));
+  assert.equal(orchestrator.getHostRoutingStatus().state, "recovery_required");
+  assert.equal(orchestrator.getHostRoutingStatus().reasonCode, "T202");
+  assert.equal(JSON.parse(fs.readFileSync(quarantineStorePath, "utf8")).state, "recovery_required");
+});
+
+test("a malformed failure marker cannot be repaired into a guessed recoverable inventory", async () => {
+  const storePath = tempStorePath();
+  const quarantineStorePath = path.join(path.dirname(storePath), "routing-quarantine.json");
+  fs.writeFileSync(`${quarantineStorePath}.failure`, "{broken-marker", { mode: 0o600 });
+  const { orchestrator, privilegedOps } = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  await assert.rejects(
+    () => orchestrator.repairHostRoutingState({ confirmed: true, authorize: async () => {} }),
+    error => error.code === "ROUTING_RECOVERY_UNSAFE",
+  );
+  assert.equal(privilegedOps.clearAnchorCalls, 0);
+  assert.equal(fs.readFileSync(`${quarantineStorePath}.failure`, "utf8"), "{broken-marker");
+});
+
+test("initial quarantine persistence failure remains blocked after restart", async () => {
+  const storePath = tempStorePath();
+  const quarantineStorePath = path.join(path.dirname(storePath), "routing-quarantine.json");
+  fs.mkdirSync(quarantineStorePath);
+  const first = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  first.orchestrator.routes.set("mock-1", { state: ROUTING_STATES.ROUTE_LOST, usbIp: "192.168.2.10" });
+  await first.orchestrator._enforceEmergencyQuarantine("mock-1", new Error("pf failed"));
+  assert.equal(first.orchestrator.getHostRoutingStatus().state, "recovery_required");
+  await assert.rejects(() => first.orchestrator.startRouting("mock-2", { usbIp: "192.168.2.11" }),
+    error => error.code === "ROUTING_RECOVERY_REQUIRED");
+  assert.equal(first.tunManager.starts.length, 0);
+  const second = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  assert.equal(second.orchestrator.getHostRoutingStatus().state, "recovery_required");
+});
+
+test("final quarantine persistence failure remains blocked after restart without temporary leakage", async () => {
+  const storePath = tempStorePath();
+  const root = path.dirname(storePath);
+  const quarantineStorePath = path.join(root, "routing-quarantine.json");
+  const first = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  first.orchestrator.routes.set("mock-1", { state: ROUTING_STATES.ROUTE_LOST, usbIp: "192.168.2.10" });
+  let releaseBridge;
+  first.privilegedOps.quarantineBridge = () => new Promise(resolve => { releaseBridge = resolve; });
+  const quarantine = first.orchestrator._enforceEmergencyQuarantine("mock-1", new Error("pf failed secret=hidden"));
+  fs.rmSync(quarantineStorePath);
+  fs.mkdirSync(quarantineStorePath);
+  releaseBridge({ ok: true });
+  await quarantine;
+  assert.equal(first.orchestrator.getHostRoutingStatus().state, "recovery_required");
+  const second = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  assert.equal(second.orchestrator.getHostRoutingStatus().state, "recovery_required");
+  assert.deepEqual(fs.readdirSync(root).filter(name => name.endsWith(".tmp")), []);
+  assert.doesNotMatch(JSON.stringify(second.orchestrator.getHostRoutingStatus()), /secret|hidden/i);
+});
+
+test("explicit malformed-state repair preserves evidence and requires confirmation and live authorization", async () => {
+  const storePath = tempStorePath();
+  const quarantineStorePath = path.join(path.dirname(storePath), "routing-quarantine.json");
+  const original = "{broken-state";
+  fs.writeFileSync(quarantineStorePath, original, { mode: 0o600 });
+  const { orchestrator } = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  assert.equal(orchestrator.getHostRoutingStatus().repairRequired, true);
+  await assert.rejects(() => orchestrator.repairHostRoutingState(),
+    error => error.code === "ROUTING_REPAIR_CONFIRMATION_REQUIRED");
+  assert.equal(fs.readFileSync(quarantineStorePath, "utf8"), original);
+
+  let checks = 0;
+  await assert.rejects(() => orchestrator.repairHostRoutingState({
+    confirmed: true,
+    authorize: async () => { checks += 1; if (checks >= 3) throw Object.assign(new Error("revoked"), { status: 403 }); },
+  }), /revoked/);
+  assert.equal(fs.readFileSync(quarantineStorePath, "utf8"), original);
+
+  const repaired = await orchestrator.repairHostRoutingState({ confirmed: true, authorize: async () => {} });
+  assert.equal(repaired.state, "recovery_required");
+  assert.equal(repaired.originalPreserved, true);
+  assert.equal(repaired.operationInProgress, false);
+  const backup = fs.readdirSync(path.dirname(quarantineStorePath)).find(name => name.includes(".invalid-") && name.endsWith(".bak"));
+  assert.ok(backup);
+  assert.equal(fs.readFileSync(path.join(path.dirname(quarantineStorePath), backup), "utf8"), original);
+  assert.doesNotMatch(JSON.stringify(repaired), /broken-state|routing-quarantine|[A-Z]:\\/i);
+});
+
+test("a resolved stop failure prevents malformed-state repair from touching PF or evidence", async () => {
+  const storePath = tempStorePath();
+  const quarantineStorePath = path.join(path.dirname(storePath), "routing-quarantine.json");
+  const original = "{broken-state";
+  fs.writeFileSync(quarantineStorePath, original, { mode: 0o600 });
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({ proxyPoolStorePath: storePath, quarantineStorePath });
+  tunManager.listManagedDeviceIds = () => ["mock-1"];
+  tunManager.stop = () => ({ ok: false, error: "private process output" });
+  tunManager.getStatus = () => ({ state: "stop_failed" });
+  await assert.rejects(
+    () => orchestrator.repairHostRoutingState({ confirmed: true, authorize: async () => {} }),
+    error => error.code === "ROUTING_RECOVERY_UNSAFE" && !error.message.includes("private process output"),
+  );
+  assert.equal(privilegedOps.clearAnchorCalls, 0);
+  assert.equal(fs.readFileSync(quarantineStorePath, "utf8"), original);
 });
 
 test("checkHealth marks a device route_lost when its PF rule has vanished from the anchor", async () => {
@@ -526,10 +1068,12 @@ test("verification quarantine stops the tunnel even when the fail-closed PF relo
   await orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" });
   privilegedOps.loadRuleset = async () => { throw new Error("pfctl unavailable"); };
 
-  await assert.rejects(() => orchestrator.quarantineRoute("mock-1"), /pfctl unavailable/);
+  await orchestrator.quarantineRoute("mock-1");
 
   assert.equal(tunManager.isRunning("mock-1"), false);
   assert.equal(orchestrator.getRoute("mock-1").protected, false);
+  assert.equal(orchestrator.getRoute("mock-1").protectionState, "bridge_quarantined");
+  assert.deepEqual(privilegedOps.quarantineCalls, ["bridge0"]);
 });
 
 test("checkHealth fails closed when PF rules cannot be inspected", async () => {
@@ -559,9 +1103,10 @@ test("checkHealth only ever inspects PF once per tick, even with multiple routed
   await orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" });
   await orchestrator.startRouting("mock-2", { usbIp: "192.168.2.11" });
 
+  const beforeHealth = privilegedOps.inspectCalls;
   await orchestrator.checkHealth();
 
-  assert.equal(privilegedOps.inspectCalls, 1);
+  assert.equal(privilegedOps.inspectCalls, beforeHealth + 1);
   assert.equal(orchestrator.getRoute("mock-1").lastPackets, 5);
   assert.equal(orchestrator.getRoute("mock-2").lastPackets, 9);
 });
@@ -573,9 +1118,10 @@ test("startHealthChecks runs an immediate check and then on the configured inter
   const { orchestrator, privilegedOps } = makeOrchestrator({ proxyPoolStorePath: storePath, inspectOutput: inspectFor("192.168.2.10", 1) });
   await orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" });
 
+  const beforeHealth = privilegedOps.inspectCalls;
   orchestrator.startHealthChecks({ intervalMs: 20 });
   await new Promise(resolve => setTimeout(resolve, 5)); // let the immediate check land
-  assert.equal(privilegedOps.inspectCalls, 1);
+  assert.equal(privilegedOps.inspectCalls, beforeHealth + 1);
 
   await new Promise(resolve => setTimeout(resolve, 45));
   assert.ok(privilegedOps.inspectCalls >= 2, "expected at least one interval tick beyond the immediate check");

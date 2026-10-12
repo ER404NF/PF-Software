@@ -5,8 +5,8 @@
 ### Direct arm64 installer from `git pull` (internal/development use)
 
 The latest successful `main` build is also stored at `prebuilt/mac/Phone-Farm.pkg`. This is the fixed internal
-path for the Apple-silicon (`arm64`) installer; public versioned packages and the existing
-the legacy-named `Install Phone Farm.command` flow continue to use GitHub Releases.
+path for the Apple-silicon (`arm64`) installer; public versioned packages and the
+legacy-named `Install Phone Farm.command` flow continue to use GitHub Releases.
 
 Git LFS is required because the package is about 130 MB:
 

@@ -448,6 +448,23 @@ test("while a frame is decoding, only the newest waiting frame is kept", async (
   assert.equal(screen.children[0].drawn.length, 2);
 });
 
+test("clearing a stale picture preserves the active stream generation for recovery", async () => {
+  const { stage, screen, frame } = makeStage();
+  stage.setStream(42);
+  const packet = new Uint8Array([2, 0, 0, 0, 42, 1]);
+  assert.equal(stage.handleBinary(packet), true);
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(stage.hasPicture, true);
+
+  stage.clearPicture();
+  assert.equal(stage.hasPicture, false);
+  assert.equal(frame.classes.has("has-picture"), false);
+  assert.equal(stage.handleBinary(packet), true, "the next fresh frame from the same stream is still accepted");
+  await new Promise(resolve => setTimeout(resolve, 5));
+  assert.equal(stage.hasPicture, true);
+  assert.equal(screen.children[0].drawn.length, 2);
+});
+
 test("a frame that fails to decode is skipped and the next one still paints", async () => {
   const clock = manualClock();
   const screen = new FakeElement();

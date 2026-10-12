@@ -132,6 +132,12 @@ test("releasing a device stops live polling before clearing the control view", (
   assert.equal(streamResets, 1, "releasing a phone stops its live video");
   assert.equal(context.currentDeviceId, null);
 });
+
+test("an interrupted video stream clears its stale picture and labels the wait for a fresh frame", () => {
+  const block = section("function handleStreamMessage(msg)", "function stopLiveView(options)");
+  assert.match(block, /phoneStage\.clearPicture\(\)/);
+  assert.match(block, /Video interrupted\. Waiting for a fresh frame/);
+});
 test("task status ignores historical and queued entries", async () => {
   const context = vm.createContext({ requestJson: async () => ({ body: { tasks: [
     { id: "active", state: "RUNNING", deviceSelector: { deviceId: "a" } },
@@ -504,6 +510,37 @@ test("routing host setup states are explicit and cannot send enrollment requests
     assert.equal(action.action, null);
     assert.equal(action.disabled, true);
   }
+});
+
+test("host quarantine overrides stale per-device routing success and offers explicit recovery", () => {
+  const context = vm.createContext({ enrollmentPendingDeviceIds: new Set() });
+  vm.runInContext(section("const ROUTING_TERMINAL_ERROR_STATES", "function networkRoutingStatusText"), context);
+  for (const state of ["quarantining", "quarantined", "recovery_required"]) {
+    const action = vm.runInContext(`networkRoutingNextAction({
+      routingFeature: { state: "enabled", hostRouting: { state: "${state}" } },
+      routing: { state: "routed", protected: true }
+    })`, context);
+    assert.equal(action.action, null);
+    assert.equal(action.disabled, true);
+    assert.notEqual(action.label, "Stop routing");
+    assert.equal(action.recoverHost, state !== "quarantining");
+  }
+});
+
+test("malformed host routing state is distinguished from ordinary recovery and uses an explicit repair action", () => {
+  const context = vm.createContext({ enrollmentPendingDeviceIds: new Set() });
+  vm.runInContext(section("const ROUTING_TERMINAL_ERROR_STATES", "function networkRoutingStatusText"), context);
+  const action = vm.runInContext(`networkRoutingNextAction({
+    routingFeature: { state: "recovery_required", hostRouting: { state: "recovery_required", repairRequired: true } },
+    routing: { state: "routed", protected: true }
+  })`, context);
+  assert.equal(action.action, null);
+  assert.equal(action.disabled, true);
+  assert.equal(action.recoverHost, true);
+  assert.match(action.reason, /invalid.*preserve and repair/i);
+  assert.match(source, /repair\.textContent = "Repair host routing state"/);
+  assert.match(source, /profileRequestActive\(generation, UI_CAPABILITIES\.MANAGE_ROUTING\)/);
+  assert.doesNotMatch(source, /routingFeature\?\.hostRouting\?\.(?:path|raw|contents|credentials)/);
 });
 
 test("the re-enroll escape hatch appears once enrolled and idle, but not while start-enrollment is already offered or while actively routed", () => {

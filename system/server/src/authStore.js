@@ -19,6 +19,7 @@ import { fileURLToPath } from "url";
 import { validResearchId } from "./researchId.js";
 import { OPERATOR_ROLES, normalizeRole, capabilitiesForRole, hasCapability } from "./roleCapabilities.js";
 import { decryptTotpSecret, verifyRecoveryCode, verifyTotp } from "./twoFactor.js";
+import { canUseSecureEmailRecovery } from "./secureRecoveryCapability.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 // Env-overridable so a spawned relay process under test can point at a
@@ -295,6 +296,21 @@ export function validateOperatorConfig(raw) {
       && (!Number.isSafeInteger(operator.authVersion) || operator.authVersion < 0)) {
       throw new Error(`operators.config.json: operator "${username}" has an invalid authVersion`);
     }
+    if (Object.hasOwn(operator, "fullName") && operator.fullName !== null) {
+      try { operator.fullName = validateFullName(operator.fullName); } catch {
+        throw new Error(`operators.config.json: operator "${username}" has an invalid fullName`);
+      }
+    }
+    if (Object.hasOwn(operator, "email") && operator.email !== null) {
+      try { operator.email = normalizeGmail(operator.email); } catch {
+        throw new Error(`operators.config.json: operator "${username}" has an invalid email`);
+      }
+    }
+    if (Object.hasOwn(operator, "teamId")) {
+      try { operator.teamId = validateTeamId(operator.teamId); } catch {
+        throw new Error(`operators.config.json: operator "${username}" has an invalid teamId`);
+      }
+    }
     if (typeof operator.passwordHash !== "string" || !/^[0-9a-f]{32}:[0-9a-f]{128}$/i.test(operator.passwordHash)) {
       throw new Error(`operators.config.json: operator "${username}" has an invalid passwordHash`);
     }
@@ -349,7 +365,12 @@ function validateResearchGrants(value) {
   return uniqueStringList(value, { field: "allowedResearchWorkspaces", validator: validResearchId });
 }
 
-function publicOperatorAccount(operator) {
+export function publicOperatorAccount(operator) {
+  const recoveryMethods = [];
+  if (operator.twoFactorSecret) recoveryMethods.push("authenticator");
+  if (operator.recoveryCodeDigests?.length) recoveryMethods.push("recovery_codes");
+  if (canUseSecureEmailRecovery({ email: operator.email })) recoveryMethods.push("email");
+  recoveryMethods.push("admin_assisted");
   return {
     username: operator.username,
     role: normalizeRole(operator.role),
@@ -363,7 +384,7 @@ function publicOperatorAccount(operator) {
     ...(operator.twoFactorRequired ? {
       twoFactorRequired: true,
       twoFactorEnabled: Boolean(operator.twoFactorSecret),
-      recoveryMethods: ["authenticator", "recovery_codes", "email", "admin_assisted"],
+      recoveryMethods,
     } : {}),
     ...(operator.securityFlagReason ? {
       securityFlagReason: operator.securityFlagReason,
@@ -814,7 +835,10 @@ export function createEmailRecoveryToken(identifier) {
   if (index < 0) {
     let email;
     try { email = normalizeGmail(identifier); } catch { return null; }
-    index = raw.operators.findIndex(operator => operator?.email && normalizeGmail(operator.email) === email);
+    index = raw.operators.findIndex(operator => {
+      if (!operator?.email) return false;
+      try { return normalizeGmail(operator.email) === email; } catch { return false; }
+    });
   }
   if (index < 0) return null;
   const current = internalOperator(raw.operators[index]);

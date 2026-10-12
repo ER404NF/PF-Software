@@ -37,6 +37,7 @@ export class AutoNetworkEnrollment {
     captureDeviceTraffic = defaultCaptureDeviceTraffic,
     pollIntervalMs = DEFAULT_POLL_INTERVAL_MS,
     onStatusChanged = () => {},
+    assertRoutingAvailable = () => true,
   }) {
     if (!bridgeIface) throw new Error("bridgeIface is required");
     this.bridgeIface = bridgeIface;
@@ -50,6 +51,7 @@ export class AutoNetworkEnrollment {
     this.captureDeviceTraffic = captureDeviceTraffic;
     this.pollIntervalMs = pollIntervalMs;
     this.onStatusChanged = onStatusChanged;
+    this.assertRoutingAvailable = assertRoutingAvailable;
     this.status = new Map(); // logicalId -> { state, note, updatedAt }
     this.ipAttempts = new Map(); // logicalId -> { lastAttemptAt, count }
     this.attachedLastTick = new Set();
@@ -106,6 +108,10 @@ export class AutoNetworkEnrollment {
   }
 
   async _tick(generation) {
+    try { this.assertRoutingAvailable(); }
+    catch {
+      return;
+    }
     let attached;
     try {
       attached = this.discoverIosDevices();
@@ -122,6 +128,7 @@ export class AutoNetworkEnrollment {
     const attachedIds = new Set(candidateDevices.map(device => discoveredDeviceId(device.udid)));
     for (const previousId of this.attachedLastTick) {
       if (attachedIds.has(previousId)) continue;
+      try { this.assertRoutingAvailable(); } catch { return; }
       if (!this._isCurrent(generation)) return;
       clearUsbNetworkRecord(this.usbNetworkStorePath, previousId);
       this.validatedMappings.delete(previousId);
@@ -151,6 +158,7 @@ export class AutoNetworkEnrollment {
       const record = records[logicalId];
       if (!record?.usbIface || this.validatedMappings.has(logicalId)) continue;
       if (!this._isCurrent(generation)) return;
+      try { this.assertRoutingAvailable(); } catch { return; }
       if (!members.includes(record.usbIface)) {
         clearUsbNetworkRecord(this.usbNetworkStorePath, logicalId);
         delete records[logicalId];
@@ -170,6 +178,7 @@ export class AutoNetworkEnrollment {
       const logicalId = discoveredDeviceId(pendingDevices[0].udid);
       try {
         if (!this._isCurrent(generation)) return;
+        this.assertRoutingAvailable();
         setUsbIface(this.usbNetworkStorePath, logicalId, pendingMembers[0]);
         this.validatedMappings.add(logicalId);
         this._setStatus(logicalId, "discovering_ip", null, generation);
@@ -217,6 +226,7 @@ export class AutoNetworkEnrollment {
           continue;
         }
         if (!this._isCurrent(generation)) return;
+        this.assertRoutingAvailable();
         setUsbIp(this.usbNetworkStorePath, logicalId, result.ip);
         this.ipAttempts.delete(logicalId);
         await this._maybeAutoRoute(logicalId, result.ip, generation);

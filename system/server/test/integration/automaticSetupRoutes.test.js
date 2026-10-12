@@ -94,7 +94,8 @@ function fakeProvisioner(code, overrides = {}) {
 test("without automatic setup the page is told it is off, and nobody can ask for a check", async () => {
   setDeviceProvisionerForTests(undefined);
   const { automaticSetup } = await deviceListMessage(hostCookie);
-  assert.deepEqual(automaticSetup, { state: "off", code: "setup_off", message: "Automatic phone setup is turned off on this Mac.", canCheckAgain: false });
+  assert.deepEqual(automaticSetup, { state: "off", code: "setup_off", message: "Automatic phone setup is turned off on this Mac.", canCheckAgain: false,
+    canRepairProvisioning: false });
 });
 
 test("a running setup is reported to everyone, with no Check again", async () => {
@@ -142,6 +143,12 @@ test("Check again needs a signed-in person with the provisioning capability", as
   setDeviceProvisionerForTests(fakeProvisioner("setup_paused_cannot_check"));
   assert.equal((await fetch(`${httpUrl}/api/admin/automatic-setup/check`, { method: "POST" })).status, 401);
   assert.equal((await post("/api/admin/automatic-setup/check", vaCookie)).status, 403);
+});
+
+test("Check again uses lifecycle authority and refreshes it around the long check", () => {
+  const source = fs.readFileSync(new URL("../../src/index.js", import.meta.url), "utf8");
+  assert.match(source,
+    /automatic-setup\/check", requireCapability\(CAPABILITIES\.MANAGE_WDA_LIFECYCLE\)[\s\S]*?authorizeCurrentOperator\(req, \[CAPABILITIES\.MANAGE_WDA_LIFECYCLE\]\)[\s\S]*?await deviceProvisioner\.recheckNow\(\);[\s\S]*?authorizeCurrentOperator\(req, \[CAPABILITIES\.MANAGE_WDA_LIFECYCLE\]\)/);
 });
 
 test("Check again answers with the new status and writes one audit entry that names the result", async () => {
@@ -204,6 +211,30 @@ test("an unexpected failure is a server error, not a made-up answer", async () =
   setDeviceProvisionerForTests(fakeProvisioner("setup_paused_cannot_check", { recheckNow: async () => { throw new Error("odd"); } }));
   const res = await post("/api/admin/automatic-setup/check", hostCookie);
   assert.equal(res.status, 500);
+});
+
+test("saved-state repair needs lifecycle authority and forwards destructive confirmation without exposing paths", async () => {
+  const calls = [];
+  setDeviceProvisionerForTests(fakeProvisioner("setup_paused_record_damaged", {
+    hasCorruptProvisioningState: () => true,
+    repairProvisioningState: async options => {
+      await options.authorize();
+      calls.push(options.destructiveReset);
+      return { repaired: true, reason: "selective_repair", repairId: "opaque-id",
+        preservedCount: 2, quarantinedCount: 1, unrecoverableCount: 1, manualRepairRequired: false };
+    },
+  }));
+  assert.equal((await post("/api/admin/automatic-setup/repair-provisioning-state", vaCookie)).status, 403);
+  const response = await fetch(`${httpUrl}/api/admin/automatic-setup/repair-provisioning-state`, {
+    method: "POST", headers: { "Content-Type": "application/json", Cookie: hostCookie },
+    body: JSON.stringify({ confirmDestructiveReset: true }),
+  });
+  assert.equal(response.status, 200);
+  const body = await response.json();
+  assert.deepEqual(calls, [true]);
+  assert.equal(body.repairId, "opaque-id");
+  assert.equal(body.preservedCount, 2);
+  assert.equal(JSON.stringify(body).includes("Path"), false);
 });
 
 // ---- phone cards while setup is paused -----------------------------------------------------------------------

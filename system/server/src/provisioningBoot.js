@@ -50,7 +50,8 @@ function describeOwnershipEvent(event) {
 
 // Returns the running provisioner, undefined when provisioning is not enabled, or
 // null when it was enabled but could not start (the reason is logged loudly).
-export function startAutoProvisioning({ env = process.env, devices, manualUdids, onDeviceListChanged = () => {}, onAudit = null, deps = {} }) {
+export function startAutoProvisioning({ env = process.env, devices, manualUdids, onDeviceListChanged = () => {}, onAudit = null,
+  processOwnership = null, deps = {} }) {
   if (env.AUTO_PROVISION_WDA !== "true") return undefined;
   const use = { ...REAL, ...deps };
   const tools = {
@@ -69,10 +70,12 @@ export function startAutoProvisioning({ env = process.env, devices, manualUdids,
   try {
     // Ownership of every process Bodun starts is remembered on disk, so a leftover from an earlier
     // run can be recognised (and only a provable leftover is ever stopped).
-    const inspector = use.createInspector();
-    const owner = { pid: process.pid, startTime: null };
-    Promise.resolve(inspector.describe(process.pid)).then(description => { if (description?.startTime) owner.startTime = description.startTime; }).catch(() => {});
-    const ownershipStore = createProcessOwnershipStore({
+    const inspector = processOwnership?.inspector ?? use.createInspector();
+    const owner = processOwnership?.owner ?? { pid: process.pid, startTime: null };
+    if (!processOwnership) {
+      Promise.resolve(inspector.describe(process.pid)).then(description => { if (description?.startTime) owner.startTime = description.startTime; }).catch(() => {});
+    }
+    const ownershipStore = processOwnership?.store ?? createProcessOwnershipStore({
       filePath: resolveOwnershipStorePath(env), inspector, owner, log: line => console.warn(`[ownership] ${line}`),
     });
     const portReclaimer = createPortReclaimer({

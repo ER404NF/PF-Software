@@ -10,7 +10,7 @@ const {
   smtpChildEnvironment,
 } = require("../hostEnvironment");
 
-const UDID_TOOLS = ["idevice_id", "ideviceinfo", "iproxy"];
+const UDID_TOOLS = ["idevice_id", "ideviceinfo", "idevicepair", "iproxy"];
 
 function fakeMac({ prefix, tunName = null, wdaPath = "/Users/operator/WebDriverAgent", omit = [] } = {}) {
   const files = new Set([
@@ -46,6 +46,7 @@ test("Apple Silicon Homebrew tools and ~/WebDriverAgent are discovered without F
   const result = resolveMacHostDependencies(fakeMac({ prefix: "/opt/homebrew/bin", tunName: "tun2proxy-bin" }));
   assert.equal(result.ok, true);
   assert.equal(result.tools.ideviceId, "/opt/homebrew/bin/idevice_id");
+  assert.equal(result.tools.idevicePair, "/opt/homebrew/bin/idevicepair");
   assert.equal(result.tools.iproxy, "/opt/homebrew/bin/iproxy");
   assert.equal(result.tools.tun2proxy, "/opt/homebrew/bin/tun2proxy-bin");
   assert.equal(result.wdaRepoPath, "/Users/operator/WebDriverAgent");
@@ -94,6 +95,7 @@ test("host environment enables automatic WDA with resolved absolute tools and le
   assert.equal(env.WDA_REPO_PATH, "/Users/operator/WebDriverAgent");
   assert.equal(env.IPROXY_BIN, "/opt/homebrew/bin/iproxy");
   assert.equal(env.IDEVICE_ID_BIN, "/opt/homebrew/bin/idevice_id");
+  assert.equal(env.IDEVICEPAIR_BIN, "/opt/homebrew/bin/idevicepair");
   assert.equal(env.XCODEBUILD_BIN, "/usr/bin/xcodebuild");
   assert.equal(env.TUN2PROXY_BIN, "/opt/homebrew/bin/tun2proxy-bin");
   assert.equal(env.AUTO_ROUTE_PROXY_TUNNELS, "false");

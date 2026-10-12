@@ -77,6 +77,7 @@ const automaticSetupBanner = window.createAutomaticSetupBanner({
   banner: document.getElementById("automatic-setup-banner"),
   text: document.getElementById("automatic-setup-text"),
   button: document.getElementById("automatic-setup-check"),
+  repairButton: document.getElementById("automatic-setup-repair"),
   result: document.getElementById("automatic-setup-result"),
   requestJson,
 });
@@ -547,9 +548,15 @@ function handleStreamMessage(msg) {
       setStreamStatus("live", streamLabel());
     } else if (msg.state === "closed") {
       streamActive = false;
+      phoneStage.clearPicture();
+      stageOverlayEl.textContent = "Video interrupted. Waiting for a fresh frame…";
       setStreamStatus("reconnecting", "Video restarting…");
       scheduleStreamRetry(500);
     } else {
+      if (msg.state === "reconnecting") {
+        phoneStage.clearPicture();
+        stageOverlayEl.textContent = "Video interrupted. Waiting for a fresh frame…";
+      }
       setStreamStatus(msg.state === "reconnecting" ? "reconnecting" : "connecting", msg.state === "reconnecting" ? "Reconnecting video…" : "Connecting video…");
     }
   } else if (msg.type === "stream_stopped") {
@@ -2068,12 +2075,32 @@ function enrollmentMinutes(ms) {
 }
 
 function networkRoutingNextAction(device) {
+  const hostState = device.routingFeature?.hostRouting?.state;
+  if (["quarantining", "quarantined", "recovery_required"].includes(hostState)) {
+    return {
+      label: hostState === "quarantining" ? "Quarantine in progress" : "Host recovery required",
+      action: null,
+      disabled: true,
+      reason: device.routingFeature?.hostRouting?.repairRequired === true
+        ? "Routing is blocked because its saved host-safety state is invalid. An administrator must preserve and repair it before recovery checks can run."
+        : hostState === "recovery_required"
+        ? "Routing is blocked because host cleanup could not be verified. Restore the bridge and remove stale routing state, then run host recovery."
+        : "Routing is blocked for every phone until an administrator completes host recovery checks.",
+      recoverHost: hostState !== "quarantining",
+    };
+  }
   const feature = device.routingFeature?.state;
   if (feature === "disabled") return { label: "Routing disabled", action: null, disabled: true, reason: "Proxy routing is turned off on this Mac. Turn it on from the Bodun menu, then restart Bodun." };
   if (feature === "bridge_missing") return { label: "Bridge required", action: null, disabled: true, reason: "Internet Sharing is not set up on this Mac yet." };
   if (feature === "setup_failed") return { label: "Setup failed", action: null, disabled: true, reason: "Proxy routing could not be set up on this Mac. Check Help > Copy Diagnostics." };
   if (feature === "starting") return { label: "Routing starting…", action: null, disabled: true, reason: "Proxy routing is starting. This takes a moment." };
   const routingState = device.routing?.state;
+  if (device.routing?.manualInterventionRequired === true) {
+    return { label: "Manual recovery required", action: null, disabled: true,
+      reason: device.routing.protectionState === "bridge_quarantined"
+        ? "Bodun disabled the shared phone bridge after firewall protection failed. Repair PF, then restore Internet Sharing from the Mac."
+        : "Bodun could not verify a network block. Disconnect the phone or disable Internet Sharing, then review host diagnostics." };
+  }
   if (routingState === "routed") return { label: "Stop routing", action: "stop-routing", kind: "stop" };
   if (routingState && !ROUTING_TERMINAL_ERROR_STATES.has(routingState)) {
     return { label: "Routing…", action: null, disabled: true, reason: "The route is being set up. This takes a moment." };
@@ -2103,6 +2130,8 @@ function networkRoutingNextAction(device) {
 function networkRoutingStatusText(device) {
   const parts = [];
   if (device.routingFeature?.message) parts.push(device.routingFeature.message);
+  const hostState = device.routingFeature?.hostRouting?.state;
+  if (hostState && hostState !== "healthy") parts.push(`Host routing: ${hostState.replaceAll("_", " ")}`);
   // Informational only — the auto-enrollment background loop (when
   // enabled) drives usbNetwork/routing on its own; the manual buttons
   // below remain available as a fallback/override regardless, e.g. if
@@ -2112,6 +2141,9 @@ function networkRoutingStatusText(device) {
   if (device.usbNetwork?.usbIface) parts.push(`Enrolled: ${device.usbNetwork.usbIface}`);
   if (device.usbNetwork?.usbIp) parts.push(`IP: ${device.usbNetwork.usbIp}`);
   if (device.routing?.state) parts.push(`Routing: ${device.routing.state.replaceAll("_", " ")}`);
+  if (device.routing?.protectionState === "bridge_quarantined") parts.push("Emergency block: shared bridge disabled; manual recovery required");
+  if (device.routing?.protectionState === "quarantine_failed") parts.push("Emergency block failed; disconnect the phone and review host diagnostics");
+  if (device.routing?.cleanupError?.name) parts.push(`Cleanup: ${device.routing.cleanupError.name}`);
   if (device.routing?.lastError) parts.push(`Error: ${device.routing.lastError}`);
   return parts.length ? parts.join(" · ") : "Not enrolled";
 }
@@ -2142,6 +2174,51 @@ async function triggerRoutingAction(device, action, button) {
     }
     broadcastLocalFleetRefresh();
   } catch (error) {
+    say(error.message, "error");
+    button.disabled = false;
+    button.textContent = originalLabel;
+  }
+}
+
+async function recoverHostRouting(device, button) {
+  const generation = operatorProfileGeneration;
+  const say = sayOnCard(device);
+  const originalLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = "Checking host…";
+  say("");
+  try {
+    await requestJson("/api/admin/routing/recover", { method: "POST" });
+    if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_ROUTING)) return;
+    say("Host routing recovery checks passed. Routing may be started again.", "success");
+    broadcastLocalFleetRefresh();
+  } catch (error) {
+    if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_ROUTING)) return;
+    say(error.message, "error");
+    button.disabled = false;
+    button.textContent = originalLabel;
+  }
+}
+
+async function repairHostRoutingState(device, button) {
+  if (!window.confirm("Preserve the invalid host-routing state and begin explicit repair? Routing will remain blocked until recovery checks pass.")) return;
+  const generation = operatorProfileGeneration;
+  const say = sayOnCard(device);
+  const originalLabel = button.textContent;
+  button.disabled = true;
+  button.textContent = "Repairing state…";
+  say("");
+  try {
+    await requestJson("/api/admin/routing/repair", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirm: true }),
+    });
+    if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_ROUTING)) return;
+    say("Invalid routing state was preserved. Run host recovery checks to re-enable routing.", "success");
+    broadcastLocalFleetRefresh();
+  } catch (error) {
+    if (!profileRequestActive(generation, UI_CAPABILITIES.MANAGE_ROUTING)) return;
     say(error.message, "error");
     button.disabled = false;
     button.textContent = originalLabel;
@@ -2184,15 +2261,22 @@ function buildNetworkRoutingPanel(device) {
   wrap.className = "network-routing-panel";
   const statusGrid = document.createElement("dl");
   statusGrid.className = "network-routing-status-grid";
+  const hostRoutingBlocked = ["quarantining", "quarantined", "recovery_required"]
+    .includes(device.routingFeature?.hostRouting?.state);
   const rows = [
-    ["Proxy routing", device.routingFeature?.state === "enabled" ? "Enabled" : "Disabled"],
+    ["Proxy routing", hostRoutingBlocked ? "Blocked" : device.routingFeature?.state === "enabled" ? "Enabled" : "Disabled"],
     ["Bridge", device.routingFeature?.state === "bridge_missing" ? "Missing"
-      : device.routingFeature?.state === "enabled" ? "Configured" : "Unavailable"],
+      : hostRoutingBlocked ? "Recovery required"
+        : device.routingFeature?.state === "enabled" ? "Configured" : "Unavailable"],
+    ["Host safety", device.routingFeature?.hostRouting?.state
+      ? device.routingFeature.hostRouting.state.replaceAll("_", " ") : "Unavailable"],
     ["Enrollment", device.usbNetwork?.usbIface ? "Confirmed"
       : device.networkEnrollment?.state === "pending" ? "Pending"
         : device.networkEnrollment?.state === "owned_by_other_session" ? "In progress elsewhere" : "Required"],
     ["Route", device.routing?.state === "routed" && device.routing?.protected === true ? "Protected"
-      : device.routing?.state === "route_lost" ? "Lost"
+      : device.routing?.protectionState === "bridge_quarantined" ? "Emergency block (bridge off)"
+        : device.routing?.protectionState === "quarantine_failed" ? "UNPROTECTED — disconnect phone"
+          : device.routing?.state === "route_lost" ? "Lost"
         : device.routing?.state ? device.routing.state.replaceAll("_", " ") : "Unverified"],
   ];
   for (const [term, value] of rows) {
@@ -2254,6 +2338,25 @@ function buildNetworkRoutingPanel(device) {
     button.addEventListener("click", () => triggerRoutingAction(device, next.action, button));
   }
   wrap.appendChild(button);
+  if (next.recoverHost && can(UI_CAPABILITIES.MANAGE_ROUTING)) {
+    if (device.routingFeature?.hostRouting?.repairRequired === true) {
+      const repair = document.createElement("button");
+      repair.type = "button";
+      repair.className = "network-check-button secondary";
+      repair.textContent = "Repair host routing state";
+      repair.addEventListener("click", () => repairHostRoutingState(device, repair));
+      wrap.appendChild(repair);
+    } else {
+      const recover = document.createElement("button");
+      recover.type = "button";
+      recover.className = "network-check-button secondary";
+      recover.textContent = device.routingFeature?.hostRouting?.operationInProgress
+        ? "Host safety check in progress" : "Run host recovery checks";
+      recover.disabled = device.routingFeature?.hostRouting?.operationInProgress === true;
+      recover.addEventListener("click", () => recoverHostRouting(device, recover));
+      wrap.appendChild(recover);
+    }
+  }
   const cancelTarget = next.pending ? { deviceId: device.id, label: device.label } : next.cancelOther;
   if (cancelTarget) {
     const cancel = document.createElement("button");
@@ -2531,7 +2634,7 @@ async function retryDeviceDiagnostic(device, button, statusEl = null) {
   button.disabled = true;
   try {
     if (retryKind === "iproxy" && can(UI_CAPABILITIES.MANAGE_WDA_LIFECYCLE)) {
-      await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/retry-provisioning`, {
+      await requestJson(`/api/admin/devices/${encodeURIComponent(device.id)}/retry-tunnel`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
       });
       say(`Retrying the USB tunnel for ${device.label}.`, "success");

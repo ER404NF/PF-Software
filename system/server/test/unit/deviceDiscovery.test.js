@@ -15,12 +15,19 @@ test("Mac discovery reads connected UDIDs and their current iPhone names", () =>
     { id: discoveredDeviceId("00008120-1111222233334444"), udid: "00008120-1111222233334444", label: "Travel iPhone", pairing: { state: "valid", label: "Pairing valid" } },
   ]);
   assert.equal(calls.filter(([command]) => command === "ideviceinfo").length, 2);
+  assert.equal(calls.filter(([command]) => command === "idevicepair").length, 2);
 });
 
 test("pairing validation is separate, bounded, and safe", () => {
   assert.deepEqual(pairingSummary({ ok: true }), { state: "valid", label: "Pairing valid" });
   assert.deepEqual(pairingSummary({ ok: false, error: new Error("device is not paired; Trust This Computer") }),
+    { state: "not_paired", label: "iPhone is not paired" });
+  assert.deepEqual(pairingSummary({ ok: false, error: new Error("pairing rejected by user") }),
     { state: "rejected", label: "Pairing rejected" });
+  assert.deepEqual(pairingSummary({ ok: false, error: Object.assign(new Error("missing"), { code: "ENOENT" }) }),
+    { state: "unavailable", label: "Pairing check unavailable" });
+  assert.deepEqual(pairingSummary({ ok: false, error: Object.assign(new Error("timed out"), { code: "ETIMEDOUT" }) }),
+    { state: "timeout", label: "Pairing check timed out" });
   assert.deepEqual(pairingSummary({ ok: false, error: new Error("private path and device details unavailable") }),
     { state: "unknown", label: "Pairing unknown; inspect diagnostics" });
 });
@@ -49,6 +56,7 @@ test("discovery uses resolved absolute libimobiledevice binaries", () => {
     platform: "darwin",
     ideviceIdBin: "/opt/homebrew/bin/idevice_id",
     ideviceInfoBin: "/opt/homebrew/bin/ideviceinfo",
+    idevicePairBin: "/opt/homebrew/bin/idevicepair",
     execFile: (command, args) => {
       calls.push([command, args]);
       return args[0] === "-l" ? "UDID-00000001\n" : "Phone\n";
@@ -57,4 +65,20 @@ test("discovery uses resolved absolute libimobiledevice binaries", () => {
   assert.equal(devices.length, 1);
   assert.equal(calls[0][0], "/opt/homebrew/bin/idevice_id");
   assert.equal(calls[1][0], "/opt/homebrew/bin/ideviceinfo");
+  assert.equal(calls[2][0], "/opt/homebrew/bin/idevicepair");
+});
+
+test("successful ideviceinfo alone never proves pairing", () => {
+  const devices = discoverIosDevices({
+    platform: "darwin",
+    execFile: (command, args) => {
+      if (command === "idevice_id") return "UDID-00000001\n";
+      if (command === "ideviceinfo") return "Trusted-looking phone name\n";
+      assert.equal(command, "idevicepair");
+      assert.deepEqual(args, ["-u", "UDID-00000001", "validate"]);
+      throw Object.assign(new Error("command unavailable"), { code: "ENOENT" });
+    },
+  });
+  assert.equal(devices[0].label, "Trusted-looking phone name");
+  assert.deepEqual(devices[0].pairing, { state: "unavailable", label: "Pairing check unavailable" });
 });

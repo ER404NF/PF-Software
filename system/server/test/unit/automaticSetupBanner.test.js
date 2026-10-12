@@ -24,15 +24,17 @@ function element() {
   return el;
 }
 
-function build({ requestJson } = {}) {
-  const banner = element(); const text = element(); const button = element(); const result = element();
+function build({ requestJson, confirmFn = () => true } = {}) {
+  const banner = element(); const text = element(); const button = element(); const repairButton = element(); const result = element();
   button.textContent = "Check again";
+  repairButton.textContent = "Repair saved phone setup";
   const timers = [];
   const controller = createAutomaticSetupBanner({
-    banner, text, button, result, requestJson: requestJson ?? (async () => ({ body: { ok: true, status: { state: "running" } } })),
+    banner, text, button, repairButton, result, confirmFn,
+    requestJson: requestJson ?? (async () => ({ body: { ok: true, status: { state: "running" } } })),
     setTimeoutFn: (fn, ms) => { timers.push({ fn, ms }); return timers.length; }, clearTimeoutFn: () => {},
   });
-  return { banner, text, button, result, controller, timers };
+  return { banner, text, button, repairButton, result, controller, timers };
 }
 
 const paused = (extra = {}) => ({ state: "paused", code: "setup_paused_cannot_check", message: "Automatic phone setup is paused. Bodun could not check.", canCheckAgain: true, ...extra });
@@ -78,6 +80,24 @@ test("Check again is shown only when the server says this person may use it", ()
   assert.equal(button.hidden, true);
   controller.update({ state: "running", code: "setup_running", message: "x", canCheckAgain: true });
   assert.equal(button.hidden, true, "never while nothing is paused");
+});
+
+test("repair is shown only for lifecycle-authorized corrupt state and reports bounded counts", async () => {
+  const calls = [];
+  const { banner, repairButton, result, controller } = build({
+    requestJson: async (url, options) => {
+      calls.push([url, JSON.parse(options.body)]);
+      return { body: { repaired: true, preservedCount: 2, quarantinedCount: 1 } };
+    },
+  });
+  controller.update({ state: "running", code: "setup_running", message: "Running", canRepairProvisioning: true });
+  assert.equal(banner.hidden, false);
+  assert.equal(repairButton.hidden, false);
+  await repairButton.listeners.click();
+  assert.deepEqual(calls, [["/api/admin/automatic-setup/repair-provisioning-state", {}]]);
+  assert.match(result.textContent, /Preserved 2; quarantined 1/);
+  controller.update({ state: "running", code: "setup_running", message: "Running", canRepairProvisioning: false });
+  assert.equal(repairButton.hidden, true);
 });
 
 test("an unchanged status is not written again (nothing is announced twice)", () => {

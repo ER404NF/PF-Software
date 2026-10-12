@@ -118,7 +118,7 @@ jobs:
       # reset the same disposable service database. The glob prevents a newly
       # added database contract from silently being omitted by a stale list.
       - name: Real PostgreSQL integration suite — all database contracts
-        run: node --test --test-concurrency=1 server/test/integration/db/*.test.js
+        run: npm run test:postgres:real
         env:
           TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/phonefarm_test
 

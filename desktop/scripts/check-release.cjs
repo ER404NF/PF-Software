@@ -11,6 +11,7 @@
 const fs = require("fs");
 const path = require("path");
 const { spawnSync } = require("child_process");
+const { inspectPrebuiltRelease } = require("./prebuilt-release-status.cjs");
 
 const REPO = path.resolve(__dirname, "..", "..");
 
@@ -211,6 +212,10 @@ function runChecks({ repo = REPO, git = defaultGit } = {}) {
     guarded(() => checkLockfile(repo, "desktop"), "lock-desktop", "desktop lockfile"),
     guarded(() => checkVersionAndWda(repo), "version", "Version numbers and the pinned WebDriverAgent are sane"),
     guarded(() => checkPackageResources(repo), "resources", "Installer pages and entitlements are in place"),
+    guarded(() => {
+      const result = inspectPrebuiltRelease({ repo, git });
+      return { id: "prebuilt", title: "The tracked macOS package matches the current source", ...result };
+    }, "prebuilt", "The tracked macOS package matches the current source"),
     guarded(() => checkDryRun(repo), "plan", "The build plan is complete"),
   ];
 }

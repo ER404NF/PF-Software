@@ -18,6 +18,11 @@ process.env.RESEARCH_EVIDENCE_DIR = path.join(root, "evidence");
 process.env.SESSION_SECRET = "operator-management-test-secret";
 process.env.TWO_FACTOR_MASTER_KEY = "operator-management-test-two-factor-key-123456";
 process.env.ACCOUNT_NOTIFICATION_STORE_PATH = path.join(root, "account-notifications.json");
+process.env.SMTP_HOST = "127.0.0.1";
+process.env.SMTP_PORT = "1";
+process.env.SMTP_USER = "fixture-user";
+process.env.SMTP_PASS = "fixture-password";
+process.env.COMPANY_FROM_EMAIL = "fixture@example.test";
 process.env.DEVICE_CONFIG_PATH = path.resolve("server/fixtures/network-devices.config.json");
 process.env.AUTO_DISCOVER_IOS_DEVICES = "false";
 
@@ -211,7 +216,8 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
       body: { status: "approved" },
     });
     assert.equal(approved.status, 200);
-    assert.equal(approved.body.notification.deliveryState, "awaiting_sender_configuration");
+    assert.equal(approved.body.notification.deliveryState, "failed",
+      "the fixture configures delivery so secure recovery is usable, but its unreachable SMTP endpoint fails safely");
 
     const firstLogin = await fetch(`${baseUrl}/api/login`, {
       method: "POST",
@@ -512,7 +518,7 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
       allowedResearchWorkspaces: [],
       twoFactorRequired: true,
       twoFactorEnabled: false,
-      recoveryMethods: ["authenticator", "recovery_codes", "email", "admin_assisted"],
+      recoveryMethods: ["admin_assisted"],
     });
     assert.equal("passwordHash" in created.body.operator, false);
     const persisted = fs.readFileSync(process.env.OPERATORS_CONFIG_PATH, "utf8");

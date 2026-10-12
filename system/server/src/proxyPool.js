@@ -37,7 +37,9 @@ function writeRaw(storePath, raw) {
   fs.mkdirSync(path.dirname(storePath), { recursive: true });
   const temporary = path.join(path.dirname(storePath), `.${path.basename(storePath)}.${randomUUID()}.tmp`);
   try {
-    fs.writeFileSync(temporary, `${JSON.stringify(raw, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+    fs.writeFileSync(temporary, `${JSON.stringify(raw, null, 2)}\n`, {
+      encoding: "utf8", flag: "wx", mode: 0o600,
+    });
     fs.renameSync(temporary, storePath);
   } finally {
     fs.rmSync(temporary, { force: true });

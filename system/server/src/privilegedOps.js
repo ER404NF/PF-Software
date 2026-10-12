@@ -20,10 +20,10 @@ import { randomUUID } from "crypto";
 // binaries this module (and its siblings tunManager.js, usbIpDiscovery.js)
 // invoke, e.g. in /etc/sudoers.d/phone-farm:
 //
-//   phonefarm ALL=(root) NOPASSWD: /opt/homebrew/bin/pfctl, /opt/homebrew/bin/tun2proxy, /usr/sbin/tcpdump
+//   phonefarm ALL=(root) NOPASSWD: /opt/homebrew/bin/pfctl, /opt/homebrew/bin/tun2proxy, /usr/sbin/tcpdump, /sbin/ifconfig
 //
 // Use the real resolved paths for this host (`which pfctl tun2proxy
-// tcpdump`), not bare names, so the rule can't be satisfied by a different
+// tcpdump ifconfig`), not bare names, so the rule can't be satisfied by a different
 // binary earlier on PATH. `sudo -n` fails closed (nonzero exit, no
 // password prompt) if that rule is missing or the paths don't match
 // exactly.
@@ -58,13 +58,15 @@ function writeTempRuleFile(rulesetText) {
 }
 
 export class PrivilegedOps {
-  constructor({ execFile = nodeExecFile, sudoBin = "sudo", pfctlBin = process.env.PFCTL_BIN || "pfctl", anchor } = {}) {
+  constructor({ execFile = nodeExecFile, sudoBin = "sudo", pfctlBin = process.env.PFCTL_BIN || "pfctl",
+    ifconfigBin = process.env.IFCONFIG_BIN || (process.platform === "darwin" ? "/sbin/ifconfig" : "ifconfig"), anchor } = {}) {
     if (typeof anchor !== "string" || !/^[a-zA-Z0-9_./-]{1,200}$/.test(anchor)) {
       throw new Error("a valid PF anchor path is required (e.g. com.apple/phonefarm)");
     }
     this.execFile = execFile;
     this.sudoBin = sudoBin;
     this.pfctlBin = pfctlBin;
+    this.ifconfigBin = ifconfigBin;
     this.anchor = anchor;
   }
 
@@ -121,5 +123,39 @@ export class PrivilegedOps {
   async clearAnchor() {
     await run(this.execFile, this.sudoBin, [this.pfctlBin, "-a", this.anchor, "-F", "all"]);
     return { ok: true };
+  }
+
+  // Last-resort network kill switch. PF is the normal per-phone authority;
+  // when PF itself cannot enforce a block, taking Bodun's configured Internet
+  // Sharing bridge down prevents every attached phone from falling through to
+  // the Mac's direct uplink. This intentionally needs manual recovery.
+  async quarantineBridge(bridgeIface) {
+    if (typeof bridgeIface !== "string" || !/^[A-Za-z0-9_.-]{1,32}$/.test(bridgeIface)) {
+      throw new Error("bridge quarantine requires a valid interface name");
+    }
+    await run(this.execFile, this.sudoBin, [this.ifconfigBin, bridgeIface, "down"]);
+    const { stdout } = await run(this.execFile, this.sudoBin, [this.ifconfigBin, bridgeIface]);
+    if (/flags=.*<[^>]*\bUP\b/i.test(stdout) || /^\s*status:\s*active\s*$/im.test(stdout)) {
+      throw new Error("bridge quarantine could not be verified");
+    }
+    return { ok: true };
+  }
+
+  async inspectBridge(bridgeIface) {
+    if (typeof bridgeIface !== "string" || !/^[A-Za-z0-9_.-]{1,32}$/.test(bridgeIface)) {
+      throw new Error("bridge inspection requires a valid interface name");
+    }
+    try {
+      const { stdout } = await run(this.execFile, this.sudoBin, [this.ifconfigBin, bridgeIface]);
+      return {
+        available: true,
+        up: /flags=.*<[^>]*\bUP\b/i.test(stdout) && !/^\s*status:\s*inactive\s*$/im.test(stdout),
+      };
+    } catch (error) {
+      if (/does not exist|not found|no such interface/i.test(String(error?.message || ""))) {
+        return { available: false, up: false };
+      }
+      throw error;
+    }
   }
 }

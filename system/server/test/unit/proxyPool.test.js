@@ -42,6 +42,17 @@ test("createProxy persists a record and encrypts the password at rest", () => {
   assert.ok(!JSON.stringify(onDisk).includes("s3cret-pass"), "plaintext password must never hit disk");
 });
 
+test("the encrypted proxy credential store is written with owner-only permissions", () => {
+  const storePath = tempStorePath();
+  createProxy(storePath, sampleFields(), MASTER_KEY);
+  if (process.platform === "win32") {
+    const source = fs.readFileSync(new URL("../../src/proxyPool.js", import.meta.url), "utf8");
+    assert.match(source, /writeFileSync\(temporary,[\s\S]*?mode: 0o600/);
+  } else {
+    assert.equal(fs.statSync(storePath).mode & 0o777, 0o600);
+  }
+});
+
 test("saved proxies preserve exact provider username syntax and password bytes", () => {
   const storePath = tempStorePath();
   const username = " customer-country-US-session-abc ";

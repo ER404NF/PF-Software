@@ -27,7 +27,8 @@ function fakeChild(pid) {
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
   child.exitCode = null;
-  child.kill = () => {};
+  child.killed = false;
+  child.kill = () => { child.killed = true; };
   return child;
 }
 
@@ -142,6 +143,40 @@ test("confirmGone: no record, dead pid and reused pid are proof; a live matching
   } finally { file.cleanup(); }
 });
 
+test("inspectCurrent proves exact redacted identity, detects pid reuse, and preserves foreign owners", async () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "ownership-inspect-"));
+  const file = path.join(folder, "owned.json");
+  let target = {
+    pid: 7300, ppid: 1, startTime: "target-a", program: "sudo",
+    command: "sudo -n tun2proxy --tun utun7 --proxy socks5://name:secret@proxy.invalid:7000",
+  };
+  let ownerProcess = null;
+  const inspector = { supported: true, describe: async pid => pid === 7300 ? target : pid === 88 ? ownerProcess : null };
+  const sanitizeCommand = value => String(value).replace(/(--proxy\s+)\S+/, "$1<redacted>");
+  const store = createProcessOwnershipStore({
+    filePath: file, inspector, owner: { pid: 99, startTime: "current-server" }, sleep: async () => {},
+  });
+  await store.record({ kind: "tun2proxy", udid: "phone-a", pid: 7300, bin: "sudo", args: [], sanitizeCommand,
+    metadata: { tunIface: "utun7", password: "must-not-persist" } });
+  assert.equal((await store.inspectCurrent({ kind: "tun2proxy", udid: "phone-a", sanitizeCommand })).status, "owned");
+  assert.doesNotMatch(fs.readFileSync(file, "utf8"), /secret|name|proxy\.invalid|must-not-persist/);
+
+  target = { ...target, startTime: "target-b" };
+  assert.equal((await store.inspectCurrent({ kind: "tun2proxy", udid: "phone-a", sanitizeCommand })).status, "reused");
+  target = { ...target, startTime: "target-a", command: "foreign --different" };
+  assert.equal((await store.inspectCurrent({ kind: "tun2proxy", udid: "phone-a", sanitizeCommand })).status, "foreign");
+
+  const raw = JSON.parse(fs.readFileSync(file, "utf8"));
+  raw.processes["tun2proxy:phone-a"].ownerServerPid = 88;
+  raw.processes["tun2proxy:phone-a"].ownerServerStartTime = "owner-a";
+  fs.writeFileSync(file, JSON.stringify(raw));
+  store.reload();
+  target = { ...target, command: "sudo -n tun2proxy --tun utun7 --proxy socks5://other:token@elsewhere.invalid:9000" };
+  ownerProcess = { pid: 88, startTime: "owner-a", program: "node", command: "node server" };
+  assert.equal((await store.inspectCurrent({ kind: "tun2proxy", udid: "phone-a", sanitizeCommand })).status, "foreign");
+  fs.rmSync(folder, { recursive: true, force: true });
+});
+
 // ---- supervisor + manager integration ------------------------------------------------
 
 test("the supervisor records a spawned process and releases it on a confirmed exit", async () => {
@@ -172,14 +207,22 @@ test("a deliberate stop releases ownership once the exit is confirmed", async ()
   assert.ok(events.length >= 1 && events.every(event => event.key === "U" && event.pid === 2000));
 });
 
-test("an ownership hook that throws or rejects never disturbs supervision", () => {
-  const spawn = () => fakeChild(3000);
+test("an ownership hook failure stops the unrecorded process and blocks replacement", async () => {
+  const child = fakeChild(3000);
+  const events = [];
+  const spawn = () => child;
   const group = new SupervisedProcessGroup({
     spawn,
-    ownership: { onSpawn: () => { throw new Error("disk full"); }, onRelease: () => Promise.reject(new Error("nope")) },
+    ownership: { onSpawn: () => Promise.reject(new Error("disk full")), onRelease: () => Promise.reject(new Error("nope")) },
   });
+  group.on("replacement-blocked", event => events.push(event));
   assert.equal(group.start("U", "iproxy", []), "started");
-  assert.equal(group.isRunning("U"), true);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(child.killed, true);
+  assert.equal(group.isRunning("U"), false);
+  assert.equal(group.getStatus("U").state, "stop_failed");
+  assert.equal(group.start("U", "iproxy", []), "blocked");
+  assert.ok(events.length >= 1);
 });
 
 test("start() reports what happened: started, running, queued and blocked", async () => {

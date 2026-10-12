@@ -40,6 +40,34 @@ export class SupervisedProcessGroup extends EventEmitter {
     }
   }
 
+  _recordOwnership(key, entry, child, bin, args) {
+    if (!this.ownership?.onSpawn || !Number.isSafeInteger(child.pid)) {
+      entry.ownershipPromise = Promise.resolve(true);
+      return true;
+    }
+    const failClosed = () => {
+      if (this.entries.get(key) !== entry || entry.child !== child || entry.stopped) return;
+      entry.stopped = true;
+      entry.state = "failed";
+      this.entries.delete(key);
+      const reason = "process ownership could not be recorded; replacement is blocked until Bodun restarts";
+      this.blockedStops.set(key, reason);
+      try { child.kill?.(); } catch { /* ownership remains unproven and replacement stays blocked */ }
+      this.emit("replacement-blocked", { key, reason });
+    };
+    try {
+      const result = this.ownership.onSpawn({ key, pid: child.pid, bin, args });
+      entry.ownershipPromise = result && typeof result.then === "function"
+        ? Promise.resolve(result).then(() => true, () => { failClosed(); return false; })
+        : Promise.resolve(true);
+      return true;
+    } catch {
+      failClosed();
+      entry.ownershipPromise = Promise.resolve(false);
+      return false;
+    }
+  }
+
   isRunning(key) {
     return this.entries.has(key) && !this.entries.get(key).stopped;
   }
@@ -62,6 +90,20 @@ export class SupervisedProcessGroup extends EventEmitter {
   getDefinition(key) {
     const entry = this.entries.get(key);
     return entry ? { bin: entry.bin, args: [...entry.args] } : null;
+  }
+
+  waitForOwnership(key) {
+    const entry = this.entries.get(key);
+    if (entry?.ownershipPromise) return entry.ownershipPromise;
+    return Promise.resolve(!this.blockedStops.has(key));
+  }
+
+  listManagedKeys() {
+    return [...new Set([
+      ...this.entries.keys(),
+      ...this.pendingStops.keys(),
+      ...this.blockedStops.keys(),
+    ])];
   }
 
   // `bin`/`args` describe the OS process; `key` is this group's identity
@@ -135,7 +177,7 @@ export class SupervisedProcessGroup extends EventEmitter {
     }
     entry.child = child;
     entry.state = "running";
-    if (Number.isSafeInteger(child.pid)) this._ownershipCall("onSpawn", { key, pid: child.pid, bin, args });
+    if (!this._recordOwnership(key, entry, child, bin, args)) return;
     this.emit("starting", { key });
     // A missing executable emits `error` without `exit`. Some other child
     // failures can emit both, so settle this spawn exactly once.

@@ -12,8 +12,15 @@ function run(command, args, execFile) {
 export function pairingSummary(result) {
   if (result?.ok) return { state: "valid", label: "Pairing valid" };
   const evidence = `${result?.error?.message ?? ""} ${result?.error?.stderr ?? ""}`;
-  if (/not paired|pairing.{0,40}(?:failed|rejected)|trust this computer/i.test(evidence)) {
+  if (result?.error?.code === "ENOENT") return { state: "unavailable", label: "Pairing check unavailable" };
+  if (result?.error?.killed || ["ETIMEDOUT", "TIMEOUT"].includes(result?.error?.code)) {
+    return { state: "timeout", label: "Pairing check timed out" };
+  }
+  if (/trust.{0,30}(?:rejected|denied)|pairing.{0,40}rejected/i.test(evidence)) {
     return { state: "rejected", label: "Pairing rejected" };
+  }
+  if (/not paired|no pairing record|pairing.{0,40}failed|trust this computer/i.test(evidence)) {
+    return { state: "not_paired", label: "iPhone is not paired" };
   }
   return { state: "unknown", label: "Pairing unknown; inspect diagnostics" };
 }
@@ -27,6 +34,7 @@ export function discoverIosDevicesResult({
   execFile = execFileSync,
   ideviceIdBin = process.env.IDEVICE_ID_BIN || "idevice_id",
   ideviceInfoBin = process.env.IDEVICEINFO_BIN || "ideviceinfo",
+  idevicePairBin = process.env.IDEVICEPAIR_BIN || "idevicepair",
 } = {}) {
   if (platform !== "darwin") return { ok: true, devices: [] };
   const listed = run(ideviceIdBin, ["-l"], execFile);
@@ -51,12 +59,13 @@ export function discoverIosDevicesResult({
     if (!/^[A-Za-z0-9-]{8,100}$/.test(udid) || seen.has(udid)) continue;
     seen.add(udid);
     const info = run(ideviceInfoBin, ["-u", udid, "-k", "DeviceName"], execFile);
+    const pairing = run(idevicePairBin, ["-u", udid, "validate"], execFile);
     const detectedName = info.ok ? info.output : "";
     devices.push({
       id: discoveredDeviceId(udid),
       udid,
       label: detectedName || `Connected iPhone ${udid.slice(-6)}`,
-      pairing: pairingSummary(info),
+      pairing: pairingSummary(pairing),
     });
   }
   return { ok: true, devices };

@@ -103,14 +103,14 @@ test("a folder that cannot be flushed (some systems cannot open one) does not un
   assert.deepEqual(logs, [], "no failure is reported for a best-effort folder flush");
 });
 
-test("a write that fails halfway leaves no temporary file behind and the failure is logged without a path", async () => {
+test("a write that fails halfway rejects, leaves no temporary file, and logs no path", async () => {
   const folder = tempFolder();
   const file = path.join(folder, "process-ownership.json");
   const failing = { ...fs, fsyncSync: () => { throw Object.assign(new Error("disk"), { code: "EIO" }); } };
   const logs = [];
   const store = createProcessOwnershipStore({ filePath: file, inspector: { supported: true, describe: async () => ({ startTime: "t", command: "c" }) }, fsImpl: failing, sleep: async () => {}, log: line => logs.push(line) });
-  await store.record({ kind: "iproxy", udid: "U", pid: 5, bin: "iproxy", args: [] });
-  await store.flush();
+  await assert.rejects(store.record({ kind: "iproxy", udid: "U", pid: 5, bin: "iproxy", args: [] }), /disk/);
+  await assert.rejects(store.flush(), /disk/);
   assert.deepEqual(fs.readdirSync(folder), [], "neither the record nor a temporary file");
   assert.ok(logs.some(line => /could not be written/.test(line)));
   for (const line of logs) assert.ok(!line.includes(folder), "no path in a log line");

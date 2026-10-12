@@ -7,6 +7,8 @@
   "scripts": {
     "start": "node server/src/index.js",
     "test": "node server/scripts/run-tests.js",
+    "test:postgres:real": "node server/scripts/run-external-integration.js postgres",
+    "test:redis:real": "node server/scripts/run-external-integration.js redis",
     "soak": "node server/scripts/soak-test.js",
     "demo": "node server/scripts/demo.js",
     "bench": "node server/bench/run.js",

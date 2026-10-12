@@ -25,7 +25,9 @@ function build({ withReclaimer = true } = {}) {
     provisioningStorePath: path.join(folder, "store.json"), derivedDataRoot: path.join(folder, "derived"),
     portRange: { start: 38300, end: 38309 }, mjpegPortRange: { start: 38400, end: 38409 },
     isPortAvailable: world.isPortAvailable,
-    ...(withReclaimer ? { portReclaimer: createPortReclaimer({ inspector: world.inspector, kill: () => { throw new Error("never signalled"); }, sleep: async () => {} }) } : {}),
+    portReclaimer: withReclaimer
+      ? createPortReclaimer({ inspector: world.inspector, kill: () => { throw new Error("never signalled"); }, sleep: async () => {} })
+      : { inspector: world.inspector, resolvePort: async ({ port }) => ({ status: "unidentified", port }) },
   });
   return { provisioner, devices, world, wda, iproxy, id: discoveredDeviceId("UDID-BLOCK-0001") };
 }

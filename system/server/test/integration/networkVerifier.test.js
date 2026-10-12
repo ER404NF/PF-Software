@@ -109,6 +109,18 @@ test("proxy and host-route checks remain VERIFYING until a device-originated egr
   assert.match(result.networkVerificationMessage, /device-originated/);
 });
 
+test("a proxy egress result cannot become protected without fresh tunnel, PF and bridge proof", async () => {
+  const verifier = makeVerifier([{ id: "d1", network: { egress: "commercial-proxy", profileId: "p1", controlIface: "usb" } }]);
+  const unproven = await verifier.checkDevice("d1", CHECK_URL);
+  assert.equal(unproven.networkVerified, false);
+  assert.equal(unproven.networkProtectionState, "FAILED");
+  assert.match(unproven.networkMismatchReason, /could not be proven/);
+
+  const proven = await verifier.checkDevice("d1", CHECK_URL, { proveCurrentRoute: async () => true });
+  assert.equal(proven.networkVerified, true);
+  assert.equal(proven.networkProtectionState, "PROTECTED");
+});
+
 test("two devices on different SIMs sharing an observed IP are both flagged as a mismatch", async () => {
   const verifier = makeVerifier([
     { id: "d1", network: { egress: "cellular-sim", simIccid: "111", controlIface: "usb" } },
@@ -144,8 +156,8 @@ test("two devices on the SAME vlanId sharing an observed IP is expected, not a m
   ]);
 
   await setIp("9.9.9.9");
-  await verifier.checkDevice("d1", CHECK_URL);
-  const second = await verifier.checkDevice("d2", CHECK_URL);
+  await verifier.checkDevice("d1", CHECK_URL, { proveCurrentRoute: async () => true });
+  const second = await verifier.checkDevice("d2", CHECK_URL, { proveCurrentRoute: async () => true });
 
   assert.equal(second.networkVerified, true);
   assert.equal(second.networkMismatch, false);

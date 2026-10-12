@@ -374,3 +374,19 @@ test("a stopped generation cannot replace newer enrollment status", async () => 
 
   assert.equal(enrollment.getStatus(logicalId).state, "newer");
 });
+
+test("host quarantine prevents automatic enrollment from observing or mutating bridge state", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pf-auto-enroll-quarantine-"));
+  let bridgeReads = 0;
+  const enrollment = new AutoNetworkEnrollment({
+    bridgeIface: "bridge0",
+    usbNetworkStorePath: path.join(root, "usb-network.json"),
+    proxyPoolStorePath: path.join(root, "proxy-pool.json"),
+    discoverIosDevices: () => [{ udid: "00008020-001C2D1234567890" }],
+    listBridgeMembers: async () => { bridgeReads += 1; return ["en7"]; },
+    assertRoutingAvailable: () => { const error = new Error("blocked"); error.code = "ROUTING_HOST_QUARANTINED"; throw error; },
+  });
+  await enrollment.tick();
+  assert.equal(bridgeReads, 0);
+  assert.equal(fs.existsSync(path.join(root, "usb-network.json")), false);
+});

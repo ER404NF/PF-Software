@@ -3465,3 +3465,298 @@ but the next high-value proofs are gated by a disposable PostgreSQL/Redis
 environment, deployment/owner decisions, or physical Mac/iPhone hardware.
 
 ---
+# 2026-10-09 control-path hardening addendum
+
+The local implementation now fails closed when WDA process ownership cannot be inspected, separates USB-tunnel retry from full WDA retry, explicitly validates pairing with `idevicepair`, blocks automatic provisioning on corrupt state until an authorized explicit repair preserves the original bytes, reauthorizes provider inventory before and after external calls, and reconciles the private PF anchor before the first routing operation. Recovery metadata now advertises only mechanisms that are actually usable. These are automated/local claims only.
+
+The following remain explicit external or product gates and must not be presented as enabled or verified: live provider inventory/leases without an approved provider or owned exit API; automatic bridge selection and USB-IP enrollment without Mac network evidence; general `/time` execution and non-research workers without registered workers; live AI providers/accounts/platform skills; SMTP delivery, bounce reconciliation, and inbox receipt without provider configuration; billing/subscriptions/entitlements/invoices/refunds/webhooks without an approved billing provider and product decisions; native mobile signing/store metadata/physical validation; PostgreSQL-authoritative production operation without the configured database suite; and physical Mac/iPhone WDA, iproxy, PF, tun2proxy, two-phone isolation, device-originated egress, and leak testing. A stale tunnel process from an earlier server is not signalled unless exact ownership is provable; the private PF anchor is cleared first so it cannot remain routed, and new routing is refused if that reconciliation cannot be inspected.
+
+## 2026-10-09 corrective hardening completion
+
+The routing authority now reconciles its private PF anchor before the HTTP
+listener opens. A failed per-phone PF block stops the tunnel without masking
+the original error, records cleanup failures independently, and attempts the
+only implemented OS-level fallback: verified shutdown of the configured shared
+Internet Sharing bridge. That emergency state remains `protected: false`, is
+labelled as a manual-recovery quarantine in the Fleet UI, and never substitutes
+for device-originated routing verification. Automatic retry work is bounded and
+timer failures are contained.
+
+Provisioning-state repair is now selective. Valid phone records survive,
+invalid records move to a locally permission-restricted quarantine, and the API
+returns only an opaque repair ID and category counts. Structurally unreadable
+state requires a second explicit destructive-reset confirmation. The repair
+route uses the stronger WDA lifecycle capability and reauthorizes before its
+planning and mutation boundaries. The Fleet setup banner exposes the action
+only when the server reports both damage and current authorization.
+
+Email recovery availability now comes from one shared capability check: SMTP
+delivery, a sender address, notification encryption, and an account email must
+all be present. Public account metadata and token/outbox creation therefore
+cannot disagree. Missing configuration disables email recovery and is reported
+at startup without exposing values.
+
+Local verification: focused corrective tests **82/82 passed**; complete system
+suite **2,190 passed, 0 failed, 32 skipped across 2,222 tests in 256 files**;
+desktop **313/313 passed**; both production dependency audits **0
+vulnerabilities**; desktop release check passed with only the expected dirty-tree
+warning; `node --check` **29/29** changed or untracked JavaScript files;
+`git diff --check` passed; refined credential scan **32 paths, 0
+high-confidence matches**. The tree contains **29 tracked modifications, 3
+untracked files, 0 staged files**. No commit or push was performed.
+
+The 32 database/cache tests remain unexecuted without PostgreSQL/Redis. The
+bridge fallback, PF/tun2proxy behavior, WDA/iproxy control, SMTP delivery,
+provider routing, egress/leak isolation, and installer behavior remain subject
+to their real Mac, iPhone, provider, mail, database, and CI acceptance gates.
+
+## 2026-10-09 review-loop follow-up
+
+A further correctness/security review closed seven locally reproducible gaps:
+
+- USB-tunnel retry cleanup no longer masks the initiating authorization or
+  readiness error when iproxy itself cannot be stopped. The phone retains its
+  true WDA health and reports `STOP_FAILED` for manual tunnel cleanup.
+- Restart WDA reauthorizes after the fresh readiness probe. Revocation during
+  that wait removes the replacement WDA/iproxy pair instead of publishing a
+  successful privileged result.
+- Emergency shutdown of the shared Internet Sharing bridge quarantines every
+  affected phone, cancels their pending recovery timers, and refuses a new
+  routing start until the quarantined route is explicitly torn down.
+- Network-enrollment start/confirm, USB-IP discovery, route start, and route
+  stop now refresh routing authority before private host observation or the
+  first generation/state mutation. Teardown remains deliberately
+  non-cancellable after that fresh authorization because completing cleanup is
+  the fail-closed action.
+- Automatic setup “Check again” now uses the dedicated WDA lifecycle
+  capability and refreshes it before and after the potentially long reclaim
+  check.
+- A provisioning-state repair that commits successfully but cannot refresh
+  discovery now returns `refreshPending: true`; it never falsely reports the
+  durable repair as failed or invites a second destructive repair.
+- Provisioning state (raw device identities and host paths) and the encrypted
+  proxy credential pool are created with owner-only POSIX permissions.
+
+Focused review suites passed **217/217**, **46/46**, **26/26**, and **142/142**
+at their respective boundaries, with no focused failures. The final complete
+system suite passed **2,202/2,234**, with **0 failures** and **32 unexecuted
+PostgreSQL/Redis tests**, across **256 files**. The desktop suite remained green
+at **313/313**. Both production dependency audits reported **0
+vulnerabilities**. The desktop release check passed every gate with only the
+expected dirty-tree warning. `node --check` passed for all **34** changed or
+untracked JavaScript files; `git diff --check` passed; and the high-confidence
+credential scan checked **37** paths with **0 matches**.
+
+The final local inventory is **34 tracked modifications, 3 untracked files,
+and 0 staged files**. No commit or push was performed. This evidence remains
+local: PostgreSQL/Redis, SMTP delivery, macOS packaging/install, WDA/iproxy,
+PF/tun2proxy, physical iPhones, device-originated egress/leak isolation, live
+provider infrastructure, live AI accounts, and production deployment still
+require their corresponding external acceptance environments.
+
+## 2026-10-10 durable host-routing quarantine
+
+The emergency routing fallback now establishes a host-wide fail-closed barrier
+before awaiting bridge shutdown. Its bounded state is persisted atomically as
+`QUARANTINING`, `QUARANTINED`, or `RECOVERY_REQUIRED`; malformed or unreadable
+existing state fails closed instead of being replaced. While the barrier is
+active, manual starts, automatic enrollment, retries, recovery timers, and
+late asynchronous route completions cannot start a tunnel, apply PF state, or
+publish a routed/protected result for any device.
+
+Emergency cleanup is serialized across the host. It cancels pending recovery
+work, stops every known routing tunnel, preserves the initiating routing error,
+records cleanup failures separately, and never changes WDA/iproxy ownership.
+The Fleet diagnostics expose only bounded host-safety status and provide an
+administrator-only explicit recovery action. Recovery repeatedly reauthorizes,
+verifies that the private PF anchor is empty, that the bridge is available and
+up, and that no managed tunnel remains before atomically clearing the durable
+barrier. Stopping an individual route does not clear host quarantine.
+
+Focused routing, persistence, authorization, enrollment, diagnostics, and
+client-boundary tests passed **141/141** with no skips. The complete system
+suite passed **2,214/2,246**, with **0 failures** and **32 unexecuted external
+PostgreSQL/Redis tests**, across **257 files**. The desktop suite passed
+**313/313**. Both production dependency audits reported **0 vulnerabilities**;
+`node --check` passed for all **39** changed or untracked JavaScript files;
+`git diff --check` passed; and the refined non-fixture credential scan checked
+**22** changed paths with **0 high-confidence matches**. Fixture-only credential
+shapes were reviewed separately and contain synthetic test values.
+
+This is local fail-closed evidence only. Actual bridge shutdown, PF/tun2proxy
+cleanup, restart recovery, WDA/iproxy independence, two-phone route isolation,
+and device-originated egress/leak behavior still require the physical Mac mini,
+iPhones, and configured routing environment. No commit or push was performed.
+
+## 2026-10-10 routing-quarantine lifecycle correction
+
+Emergency quarantine and administrator recovery now share an explicit
+host-level lifecycle guard. Recovery is rejected with a bounded conflict while
+quarantine is still running, concurrent recovery/repair calls cannot perform
+destructive checks together, and recovery cannot clear the barrier while route
+startup or automatic host setup remains active. Automatic Internet Sharing is
+registered as host setup work, so quarantine waits for it and performs bridge
+shutdown last rather than allowing a late setup completion to re-enable the
+bridge.
+
+Quarantine persistence now uses a separate bounded failure marker when the
+primary atomic write fails. Startup checks that marker and probes an otherwise
+empty authority directory before treating it as a healthy first run. Invalid,
+oversized, mismatched, non-file, unreadable, or unwritable authority state
+therefore stays `RECOVERY_REQUIRED` across restart. Temporary files and raw
+errors are not retained.
+
+Malformed authority state has an explicit confirmed administrator repair path.
+It reauthorizes around each managed-tunnel, PF, bridge, and durable mutation;
+preserves readable original bytes in an owner-only backup; publishes only
+bounded status; and writes a valid `RECOVERY_REQUIRED` record. Routing remains
+blocked until the separate recovery checks pass. Managers and VAs cannot call
+either host operation, and the Fleet UI shows repair, recovery, and operation-
+in-progress states separately without paths or raw contents.
+
+The final focused routing/client suite passed **124/124**. A complete-suite
+review also removed a Windows-only port-allocation test flake caused by assuming
+two adjacent dynamic ports were bindable; its corrected real-listener test
+passed **20/20** repetitions. The final system suite passed
+**2,225/2,257**, with **0 failures** and **32 unexecuted external
+PostgreSQL/Redis tests**, across **257 files**. Desktop remained **313/313**.
+Both production dependency audits reported **0 vulnerabilities**;
+`node --check` passed for all **40** changed or untracked JavaScript files;
+`git diff --check` passed; and a refined non-fixture credential scan checked
+**22** changed paths with **0 high-confidence matches**. The preserved working
+tree contains **38 tracked modifications, 5 untracked files, and 0 staged
+files**.
+
+These results are local. Physical bridge shutdown, PF/tun2proxy enforcement,
+restart recovery on macOS, two-phone isolation, WDA/iproxy independence, and
+device-originated egress/DNS/WebRTC/IPv6 checks remain unverified pending the
+Mac mini and iPhones. No commit, push, installer rebuild, or prebuilt package
+change was performed.
+
+## 2026-10-10 routing-quarantine stop-proof correction
+
+Host recovery and malformed-state repair now treat a supervised tunnel stop as
+successful only when the supervisor does not return a resolved failure and its
+bounded status no longer reports a running, starting, restarting, or
+stop-failed process. A failed proof leaves the durable host barrier intact and
+returns the bounded `ROUTING_RECOVERY_UNSAFE` conflict without process output.
+Emergency quarantine applies the same check and records an unconfirmed stop as
+cleanup failure, forcing `RECOVERY_REQUIRED` instead of `QUARANTINED`.
+
+Quarantine authority records and fallback markers now retain the sanitized,
+deduplicated affected-device IDs plus an explicit inventory-completeness bit.
+Recovery also enumerates current supervisor-owned tunnels, including a managed
+tunnel absent from the in-memory route map. A malformed failure marker supplies
+no guessed inventory and cannot be repaired into a state that recovery could
+clear. The original marker bytes remain untouched. Successful recovery and
+repair responses are built only after their operation promise is unregistered,
+so they truthfully report `operationInProgress: false`.
+
+Focused routing, enrollment, persistence, supervisor, and privileged-operation
+tests passed **137/137**, followed by the complete system suite: **257 files,
+2,264 tests, 2,232 passed, 0 failed, 32 skipped**. The skipped tests require
+external PostgreSQL or Redis and were not executed. Desktop passed **313/313**.
+Both production dependency audits reported **0 vulnerabilities**. `node
+--check` passed for all **43** changed or untracked JavaScript files; the
+high-confidence credential scan checked all **46** changed paths with **0
+matches**; and `git diff --check` passed. The preserved tree contains **41
+tracked modifications, 5 untracked files, and 0 staged files**. The prebuilt
+macOS package was not modified.
+
+This remains local evidence. macOS PF/tun2proxy process termination, bridge
+quarantine, restart recovery, two-phone isolation, device-originated egress and
+leak checks still require the physical Mac mini, configured routing stack, and
+iPhones. No commit or push was performed.
+
+## 2026-10-10 pre-hardware readiness pass
+
+The external-database test boundary now has deterministic repository-owned
+runners for the complete PostgreSQL and Redis integration subsets. They probe
+the configured disposable service before running tests, distinguish missing
+configuration, unavailable infrastructure, and test failure with separate exit
+codes, and never echo connection URLs. The existing CI workflows use these
+runners instead of duplicating file lists. This Windows host has no Docker
+runtime and no configured `TEST_DATABASE_URL` or `TEST_REDIS_URL`, so the 32
+external tests remain unexecuted rather than passed.
+
+The tracked macOS package now has a machine-readable `BUILD_INFO.json` contract
+covering source commit, application version, architecture, signing level, and
+package SHA-256. Release checking validates that contract, the Git LFS object or
+smudged package, the checksum and signing sidecars, and whether application
+source changed after the recorded build. The current check correctly fails the
+freshness gate: the tracked arm64 package predates 25 source changes. Neither
+`prebuilt/mac/Phone-Farm.pkg` nor its checksum was modified or rebuilt here.
+
+Three additional fail-closed defects were repaired. A detached WDA stop no
+longer reports success when its durable lifecycle-state write fails. Device
+diagnostics authorize before private readiness or process probes and reauthorize
+around each awaited observation. Live-screen reconnect and close events clear
+the stale picture immediately, while a generation guard prevents an older
+decode from repainting after that clear. Finally, a supervised WDA or iproxy
+process is terminated and removed from managed state when durable ownership
+registration fails; replacement remains blocked until ownership can be proven.
+
+Focused evidence: external-runner **3/3**, package/release **33/33**, WDA
+provisioning **118/118**, live-screen boundaries **78/78**, process ownership
+and WDA/iproxy lifecycle **169/169**, routing/fail-closed **92/92**, and proxy
+diagnostics **64/64**, all passed. The complete system suite passed **2,239 of
+2,271**, with **0 failures** and **32 unexecuted PostgreSQL/Redis skips**, across
+**258 files**. Desktop passed **319/319**. Both production dependency audits
+reported **0 vulnerabilities**, and `node --check` passed all **56** changed or
+untracked JavaScript files.
+
+This is code and local-simulation evidence only. The real PostgreSQL/Redis
+runs, fresh macOS package build, clean Mac installation, WDA signing, USB
+iproxy ownership and recovery, live-screen latency/input, PF/tun2proxy routing,
+two-phone isolation, device-originated egress and DNS/WebRTC/IPv6 leak checks
+remain external gates. No commit, push, installer rebuild, or protected package
+change was performed.
+
+## 2026-10-10 durable tun2proxy ownership and route-proof closure
+
+The routing process now participates in the same durable process-ownership
+authority as WDA and iproxy. A tunnel launch must persist its PID, start time,
+executable identity, normalized command shape, and bounded interface metadata
+before PF setup can continue. The persisted command removes the complete proxy
+URL, so the proxy host, port, username, password, and protocol are not retained.
+Startup recovery signals only an exact, provably Bodun-owned leftover. PID
+reuse, a live prior server, a foreign command, unsupported inspection, and an
+unverified record all block routing without signaling the process. Both
+single-device stop and all-device shutdown wait for ownership persistence.
+
+The WDA/iproxy startup sweep now ignores tun2proxy records, preventing a second
+process owner from dropping or signaling routing state it cannot validate.
+Emergency host quarantine enumerates live supervisor keys and persisted tunnel
+records before its first destructive wait. Missing, malformed, or incomplete
+inventory and any tunnel whose stop cannot be proved force
+`RECOVERY_REQUIRED`; they cannot publish `QUARANTINED`. Finally, a proxy egress
+result reaches `PROTECTED` only after a fresh proof that the exact tunnel is
+owned and running, the expected route-to PF rule is loaded, and the configured
+bridge is active.
+
+Two review defects were also closed: startup ownership injection is now
+explicitly tested to prove WDA, iproxy, and the provisioner share one store,
+and clean `stopAll()` now flushes durable ownership deletion before shutdown
+completes. The focused final routing/ownership suite passed **104/104**; the
+broader focused gate passed **130/130**. The fixed-tree complete system run
+passed **2,252 of 2,284**, with **0 failures** and **32 unexecuted external
+PostgreSQL/Redis skips**, across **258 files**. Desktop passed **319/319**.
+Both production dependency audits reported **0 vulnerabilities**. `node
+--check` passed all **61** changed or untracked JavaScript files; the
+high-confidence credential scan checked **71 paths with 0 matches**; and `git
+diff --check` passed. The final inventory is **60 tracked modifications, 11
+untracked files, and 0 staged files**.
+
+Real PostgreSQL and Redis commands were attempted but refused with the bounded
+`configuration_missing` result because neither `TEST_DATABASE_URL` nor
+`TEST_REDIS_URL` is configured on this host; no external test was executed.
+The tracked package freshness check correctly remains **not ready** because the
+package predates **25 source changes**. The package and checksum were not
+modified or rebuilt. The current local tree is preserved and uncommitted.
+
+This raises the local routing ownership and fail-closed implementation evidence
+above the code gate, but not the physical score. Exact macOS process signaling,
+PF/bridge enforcement, reboot recovery, two-phone isolation, device-originated
+egress, and DNS/WebRTC/IPv6 leak behavior still require the Mac mini and real
+iPhones. A fresh package also requires the macOS workflow after an authorized
+commit and push.

@@ -616,7 +616,8 @@ leased pool proxy: `networkRoutingOrchestrator.js` drives
   even while the automatic loop is running (e.g. to unstick an `ambiguous`
   device without unplugging everything else).
 - Every privileged OS operation goes through `privilegedOps.js`'s narrow
-  `sudo -n` boundary (`pfctl` only, scoped to this app's private anchor —
+  `sudo -n` boundary (`pfctl`, plus `/sbin/ifconfig <configured-bridge> down`
+  only as an emergency fail-closed fallback, scoped to this app's private anchor —
   `PF_ANCHOR`, default `com.apple/phonefarm` — never the main ruleset) and
   `tunManager.js` (`tun2proxy`, never `--setup`, per-device supervised).
   The main server process never runs as root; see `privilegedOps.js`'s
@@ -650,6 +651,14 @@ actual firewall routing/leak testing (Architecture guide's AT-05/AT-06
 acceptance tests), and the sudoers configuration itself. Every state
 transition and error path is covered by
 `networkRoutingOrchestrator.test.js` against fakes.
+
+If a per-phone PF block cannot be loaded, Bodun stops that phone's tunnel and
+attempts to take the configured shared Internet Sharing bridge down. A verified
+bridge shutdown is reported as an emergency quarantine requiring manual host
+recovery, never as a protected proxy route. If that fallback cannot be verified,
+the UI reports the phone as unprotected and tells the operator to disconnect it
+or disable Internet Sharing. This fallback and its sudoers entry still require
+physical Mac acceptance.
 
 ### `network` (optional, Phase 0 of per-phone network isolation)
 
@@ -1322,3 +1331,45 @@ The AI research/chat side panel and full `ContentCandidate` fields
 (`platform_actions[]`, `evidence_refs[]`, etc.) are implemented. Verified
 discoveries now populate candidates automatically and attach evidence captured
 by the control plane. Live app/device acceptance remains the MS8 gate.
+
+## Real PostgreSQL and Redis integration runs
+
+The normal `npm test` command keeps the external PostgreSQL and Redis suites
+visible as skips when their services are unavailable. To execute every test in
+one external-service family, configure a disposable service and run the
+corresponding command from `system`:
+
+```powershell
+$env:TEST_DATABASE_URL = '<disposable PostgreSQL connection URL>'
+npm.cmd run test:postgres:real
+
+$env:TEST_REDIS_URL = '<disposable Redis connection URL>'
+npm.cmd run test:redis:real
+```
+
+The runner discovers the repository's complete integration subset, probes the
+service before starting tests, and uses distinct exit categories: `2` for
+missing configuration, `3` for an unavailable service, and `1` for a test
+failure. It never prints the configured connection URL. A skipped run is not a
+passing external-service run.
+
+## Durable routing-process ownership
+
+Automatic proxy routing records each Bodun-owned `tun2proxy` process in the
+same durable ownership store used by WDA and iproxy. The stored tunnel command
+is normalized: its proxy URL, endpoint, username, and password are never
+persisted. Route setup does not proceed to PF until that ownership record is
+durable. Startup recovery signals a leftover tunnel only when PID, process
+start time, executable, normalized command, and prior server ownership can all
+be proved; PID reuse, foreign ownership, or unavailable inspection blocks
+routing without signaling the process. Clean single-device and all-device
+shutdowns wait for ownership persistence before completing.
+
+Emergency routing quarantine enumerates both live supervisor entries and
+persisted tunnel records. An incomplete inventory or an unconfirmed stop keeps
+the host in `RECOVERY_REQUIRED`; it can never publish a successful quarantine
+or protected-device result. A device-originated proxy check can report
+`PROTECTED` only after a fresh proof of the current owned tunnel, matching PF
+route, and active configured bridge. These are local safety contracts; their
+PF, tun2proxy, bridge, and two-phone behavior still requires the ordered Mac
+mini acceptance run.

@@ -93,6 +93,10 @@ export function registerProxyProviderRoutes({
   // and never claim that changing provider state changed a phone's route.
   app.get("/api/admin/proxy-providers", requireCapability(capabilities.VIEW_PROXY_POOL), async (req, res, next) => {
     try {
+      // Middleware authorization is only a snapshot. Resolve the live operator
+      // before any external provider can observe the request, and again before
+      // privileged inventory is returned.
+      await authorizeInventoryRead(req);
       const providers = await Promise.all([...registry.values()].map(async provider => {
         try {
           return {

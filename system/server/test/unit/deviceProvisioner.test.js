@@ -9,7 +9,7 @@ import { discoveredDeviceId } from "../../src/deviceDiscovery.js";
 import { DeviceProvisioner, buildControlDiagnosticReport, classifyIproxyFailure, classifyWdaFailure } from "../../src/deviceProvisioner.js";
 import { LifecycleError } from "../../src/provisioningResults.js";
 import { createPortReclaimer } from "../../src/portReclaimer.js";
-import { getProvisioningRecord, upsertProvisioningRecord } from "../../src/deviceProvisioningStore.js";
+import { getProvisioningRecord, loadProvisioningRecords, upsertProvisioningRecord } from "../../src/deviceProvisioningStore.js";
 import { assertPlainOperatorText } from "../helpers/plainText.js";
 
 test("classifyWdaFailure recognizes known fatal manual-prerequisite failures", () => {
@@ -191,6 +191,10 @@ function makeProvisioner({ manualUdids = new Set(), recoveryCooldownMs, now, pro
     ...(recoveryCooldownMs === undefined ? {} : { recoveryCooldownMs }),
     ...(now ? { now } : {}),
     isPortAvailable,
+    portReclaimer: {
+      inspector: { findProcesses: async () => ({ supported: true, processes: [] }) },
+      resolvePort: async ({ port }) => ({ status: "unidentified", port }),
+    },
     onDeviceListChanged: () => changes.push(true),
     ...extra,
   });
@@ -227,6 +231,48 @@ test("a newly discovered phone stays stopped until an operator chooses Start WDA
   assert.equal(provisioner.getLifecycleState(device.id).primaryAction, "start");
 });
 
+test("corrupt provisioning state blocks attach without overwriting and explicit repair recovers safely", async () => {
+  const storePath = tempStorePath();
+  const original = "{broken-state";
+  fs.writeFileSync(storePath, original);
+  const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner({
+    provisioningStorePath: storePath, rememberedRunning: false,
+  });
+  state.attached = [{ udid: "00008110-ABCDEF1234567890", label: "Studio iPhone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId(state.attached[0].udid);
+  assert.equal(devices.get(logicalId).discoveryState, "provisioning_state_corrupt");
+  assert.equal(fs.readFileSync(storePath, "utf8"), original);
+  assert.equal(wdaProcessManager.starts.length, 0);
+  assert.equal(iproxyManager.starts.length, 0);
+
+  const planning = await provisioner.repairProvisioningState({ authorize: async () => true });
+  assert.equal(planning.reason, "destructive_reset_required");
+  assert.equal(fs.readFileSync(storePath, "utf8"), original);
+  const repaired = await provisioner.repairProvisioningState({ authorize: async () => true, destructiveReset: true });
+  assert.equal(repaired.repaired, true);
+  assert.equal(repaired.reason, "destructive_reset");
+  assert.equal(devices.get(logicalId).discoveryState, "wda_stopped");
+  assert.equal(wdaProcessManager.starts.length, 0);
+  assert.equal(iproxyManager.starts.length, 0);
+  assert.ok(fs.readdirSync(path.dirname(storePath)).some(name => name.includes(".corrupt-") && name.endsWith(".bak")));
+});
+
+test("a post-repair discovery failure reports committed repair with refresh pending", async () => {
+  const storePath = tempStorePath();
+  fs.writeFileSync(storePath, "{broken-state");
+  const { provisioner, state } = makeProvisioner({ provisioningStorePath: storePath, rememberedRunning: false });
+  state.attached = [{ udid: "00008110-ABCDEF1234567890", label: "Studio iPhone" }];
+  await provisioner.pollOnce();
+  provisioner.pollOnce = async () => { throw new Error("discovery refresh failed"); };
+
+  const repaired = await provisioner.repairProvisioningState({ authorize: async () => true, destructiveReset: true });
+
+  assert.equal(repaired.repaired, true);
+  assert.equal(repaired.refreshPending, true);
+  assert.deepEqual(loadProvisioningRecords(storePath), {});
+});
+
 test("an external Xcode WDA run blocks Bodun from launching a duplicate and is never signalled", async () => {
   const inspector = {
     findProcesses: async () => ({ supported: true, processes: [{ pid: 71, command: "xcodebuild -scheme WebDriverAgentRunner -destination id=UDID-00000001" }] }),
@@ -242,6 +288,28 @@ test("an external Xcode WDA run blocks Bodun from launching a duplicate and is n
   assert.equal(device.discoveryState, "provisioning_error");
   assert.match(device.discoveryStateMessage, /Another program is already running WDA/);
 });
+
+for (const [name, inspector] of [
+  ["missing", {}],
+  ["unsupported", { findProcesses: async () => ({ supported: false, processes: [] }) }],
+  ["malformed", { findProcesses: async () => ({ supported: true, processes: null }) }],
+  ["unavailable", { findProcesses: async () => { throw new Error("process table unavailable"); } }],
+]) {
+  test(`automatic attach fails closed when WDA process inspection is ${name}`, async () => {
+    const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner({
+      extra: { portReclaimer: { inspector } },
+    });
+    state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+
+    await provisioner.pollOnce();
+
+    assert.equal(wdaProcessManager.starts.length, 0);
+    assert.equal(iproxyManager.starts.length, 0);
+    const device = devices.get(discoveredDeviceId("UDID-00000001"));
+    assert.equal(device.componentHealth.recovery, "BLOCKED_PROCESS");
+    assert.match(device.discoveryStateMessage, /could not verify who owns the existing WDA process/i);
+  });
+}
 
 test("automatic attach stops before iproxy when the WDA supervisor is blocked", async () => {
   const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner();
@@ -870,6 +938,105 @@ test("manual WDA start restores the isolated WDA and iproxy pipeline", async () 
   assert.equal(devices.get(logicalId).discoveryState, "provisioning");
 });
 
+test("USB-tunnel retry preserves healthy WDA and requires a fresh endpoint check", async () => {
+  const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  const device = devices.get(logicalId);
+  device.checkReadiness = async () => {
+    device.readiness = { ...device.readiness, ready: true, state: "HEALTHY" };
+    device.setComponentHealth({ wdaEndpoint: "HEALTHY", control: "READY" });
+    return true;
+  };
+  const wdaStarts = wdaProcessManager.starts.length;
+  const wdaStops = wdaProcessManager.stops.length;
+  const tunnelStarts = iproxyManager.starts.length;
+
+  const result = await provisioner.retryTunnelDevice(logicalId, { authorize: async () => {} });
+
+  assert.equal(result.ok, true);
+  assert.equal(wdaProcessManager.starts.length, wdaStarts);
+  assert.equal(wdaProcessManager.stops.length, wdaStops);
+  assert.equal(iproxyManager.starts.length, tunnelStarts + 1);
+  assert.equal(device.componentHealth.control, "READY");
+});
+
+test("USB-tunnel retry refuses a failed WDA without interrupting a healthy tunnel", async () => {
+  const { provisioner, wdaProcessManager, iproxyManager, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  wdaProcessManager.running.delete("UDID-00000001");
+  const tunnelStops = iproxyManager.stops.length;
+
+  await assert.rejects(() => provisioner.retryTunnelDevice(logicalId), error => error.code === "wda_not_running");
+
+  assert.equal(iproxyManager.stops.length, tunnelStops);
+  assert.equal(iproxyManager.running.has("UDID-00000001"), true);
+});
+
+test("USB-tunnel retry rolls back a partial start without stopping WDA", async () => {
+  const { provisioner, wdaProcessManager, iproxyManager, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  const wdaStops = wdaProcessManager.stops.length;
+  iproxyManager.start = () => { throw new Error("tunnel spawn failed"); };
+
+  await assert.rejects(() => provisioner.retryTunnelDevice(logicalId), /tunnel spawn failed/);
+
+  assert.equal(wdaProcessManager.stops.length, wdaStops);
+  assert.equal(wdaProcessManager.running.has("UDID-00000001"), true);
+  assert.equal(iproxyManager.running.has("UDID-00000001"), false);
+});
+
+test("authorization revoked after tunnel start removes the replacement and keeps WDA running", async () => {
+  const { provisioner, wdaProcessManager, iproxyManager, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  let checks = 0;
+  const denied = Object.assign(new Error("authorization revoked"), { status: 403 });
+
+  await assert.rejects(() => provisioner.retryTunnelDevice(logicalId, {
+    authorize: async () => { checks += 1; if (checks === 5) throw denied; },
+  }), error => error === denied);
+
+  assert.equal(wdaProcessManager.running.has("UDID-00000001"), true);
+  assert.equal(iproxyManager.running.has("UDID-00000001"), false);
+});
+
+test("tunnel rollback failure preserves the authorization error and reports manual cleanup without stopping WDA", async () => {
+  const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  const wdaHealthBeforeRetry = devices.get(logicalId).componentHealth.wdaProcess;
+  const originalStop = iproxyManager.stop.bind(iproxyManager);
+  let stops = 0;
+  iproxyManager.stop = async udid => {
+    stops += 1;
+    if (stops === 2) throw new Error("rollback stop failed");
+    return originalStop(udid);
+  };
+  let checks = 0;
+  const denied = Object.assign(new Error("authorization revoked"), { status: 403 });
+
+  await assert.rejects(() => provisioner.retryTunnelDevice(logicalId, {
+    authorize: async () => { checks += 1; if (checks === 5) throw denied; },
+  }), error => error === denied);
+
+  const device = devices.get(logicalId);
+  assert.equal(wdaProcessManager.running.has("UDID-00000001"), true);
+  assert.equal(iproxyManager.running.has("UDID-00000001"), true);
+  assert.equal(device.componentHealth.wdaProcess, wdaHealthBeforeRetry);
+  assert.equal(device.componentHealth.iproxy, "FAILED");
+  assert.equal(device.componentHealth.control, "UNAVAILABLE");
+  assert.equal(device.componentHealth.recovery, "STOP_FAILED");
+  assert.equal(device.componentErrors.iproxy?.code, "I210");
+});
+
 test("Restart refuses a control service that was intentionally stopped and does not launch anything", async () => {
   const { provisioner, wdaProcessManager, iproxyManager, state } = makeProvisioner();
   state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
@@ -949,6 +1116,22 @@ test("full control diagnostics coalesce overlapping readiness probes", async () 
   assert.equal(results.every(result => result.report.checks.find(check => check.id === "window_geometry")?.observed.includes("390 x 844")), true);
 });
 
+test("control diagnostics authorize before probing private device state", async () => {
+  const { provisioner, devices, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  const device = devices.get(logicalId);
+  let readinessChecks = 0;
+  device.checkReadiness = async () => { readinessChecks += 1; return false; };
+
+  await assert.rejects(
+    provisioner.diagnoseDevice(logicalId, { authorize: async () => { throw new Error("access revoked"); } }),
+    /access revoked/,
+  );
+  assert.equal(readinessChecks, 0);
+});
+
 test("stop() tears down every managed process", async () => {
   const { provisioner, wdaProcessManager, iproxyManager, state } = makeProvisioner();
   state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
@@ -991,11 +1174,32 @@ test("restart waits for both stops, starts one pair, and reports readiness truth
   iproxyManager.starts.length = 0;
   let authorizations = 0;
   const lifecycle = await provisioner.restartDevice(logicalId, { authorize: async () => { authorizations += 1; } });
-  assert.equal(authorizations, 2);
+  assert.equal(authorizations, 3);
   assert.equal(wdaProcessManager.starts.length, 1);
   assert.equal(iproxyManager.starts.length, 1);
   assert.equal(lifecycle.state, "ready");
   assert.equal(lifecycle.controlReady, true);
+});
+
+test("restart revoked during readiness does not publish success and removes the replacement processes", async () => {
+  const { provisioner, wdaProcessManager, iproxyManager, devices, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  devices.get(logicalId).checkReadiness = async () => true;
+  let authorizations = 0;
+  const denied = Object.assign(new Error("authorization revoked"), { status: 403 });
+
+  await assert.rejects(() => provisioner.restartDevice(logicalId, {
+    authorize: async () => {
+      authorizations += 1;
+      if (authorizations === 3) throw denied;
+    },
+  }), error => error === denied);
+
+  assert.equal(wdaProcessManager.running.has("UDID-00000001"), false);
+  assert.equal(iproxyManager.running.has("UDID-00000001"), false);
+  assert.equal(provisioner.getLifecycleState(logicalId).controlReady, false);
 });
 
 test("restart failure stops partial replacements and reports a failed, disabled lifecycle", async () => {
@@ -1044,6 +1248,7 @@ function conflictWorld() {
   const inspector = {
     supported: true,
     describe: async pid => processes.get(pid) ?? null,
+    findProcesses: async () => ({ supported: true, processes: [] }),
     findListeners: async port => ({ supported: true, listeners: (listeners.get(port) ?? []).map(pid => ({ pid })) }),
   };
   const world = {
@@ -1240,6 +1445,23 @@ test("sweep: a record whose process is gone is dropped", async () => {
   assert.equal(dropped.length, 1);
   assert.equal(summary.dropped, 1);
   assert.equal(world.signals.length, 0);
+});
+
+test("sweep: tun2proxy ownership is left for the routing owner even when its command is redacted", async () => {
+  const world = conflictWorld();
+  const routingRecord = {
+    kind: "tun2proxy", udid: "phone-a", pid: 8123, startTime: "Tue Oct 6 19:00:00 2026",
+    command: "sudo -n tun2proxy --tun utun7 --proxy <redacted>", unverified: false,
+  };
+  world.processes.set(8123, {
+    pid: 8123, ppid: 1, startTime: routingRecord.startTime, program: "sudo",
+    command: "sudo -n tun2proxy --tun utun7 --proxy socks5://private@proxy.invalid:7000",
+  });
+  const { provisioner, dropped } = sweepFixture(world, [routingRecord]);
+  const summary = await provisioner.sweepStaleOwnership();
+  assert.deepEqual(summary, { dropped: 0, reclaimed: 0, skipped: 0, cannotLook: 0, ownerAlive: 0, reclaimFailed: 0, unverifiedAlive: 0 });
+  assert.deepEqual(dropped, []);
+  assert.deepEqual(world.signals, []);
 });
 
 test("sweep: an unavailable process inspection preserves the record and blocks replacement", async () => {
@@ -1518,6 +1740,20 @@ test("a phone unplugged in this session reports 'detached', can still be stopped
 test("an unknown logical id has no lifecycle", () => {
   const { provisioner } = makeProvisioner();
   assert.equal(provisioner.getLifecycleState("ios-nothing"), null);
+});
+
+test("stopping a detached phone fails when the stopped intent cannot be persisted", async () => {
+  const { provisioner, state } = makeProvisioner();
+  state.attached = [{ id: "x", udid: "UDID-00000001", label: "Phone" }];
+  await provisioner.pollOnce();
+  const logicalId = discoveredDeviceId("UDID-00000001");
+  state.attached = [];
+  await provisioner.pollOnce();
+  provisioner._saveRecord = () => { throw new Error("disk unavailable"); };
+
+  await assert.rejects(provisioner.stopDevice(logicalId), /disk unavailable/);
+  assert.equal(provisioner.getLifecycleState(logicalId).enabled, true,
+    "the lifecycle must not claim the stop was saved");
 });
 
 // ---- S15: typed lifecycle errors -----------------------------------------------------------

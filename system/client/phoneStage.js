@@ -209,6 +209,7 @@
       this.decodeFailures = 0;
       this.streamFrames = 0;  // video frames drawn for the current stream
       this.picture = false;   // something is on the canvas
+      this.pictureGeneration = 0;
       this.fpsWindow = { startedAt: now(), frames: 0 };
       this.fps = 0;
       this.holdTimer = null;
@@ -241,11 +242,10 @@
       this.fpsWindow = { startedAt: this.now(), frames: 0 };
     }
 
-    clear() {
+    clearPicture() {
       this._cancelGesture();
+      this.pictureGeneration += 1;
       this.pendingFrame = null;
-      this.streamId = null;
-      this.streamFrames = 0;
       this.picture = false;
       this.fps = 0;
       if (this.canvas) {
@@ -253,6 +253,12 @@
         context?.clearRect?.(0, 0, this.canvas.width, this.canvas.height);
       }
       this.frameEl?.classList?.remove("has-picture");
+    }
+
+    clear() {
+      this.clearPicture();
+      this.streamId = null;
+      this.streamFrames = 0;
     }
 
     get canInput() {
@@ -287,7 +293,7 @@
     }
 
     showFrame(bytes, kind) {
-      this.pendingFrame = { bytes, kind };
+      this.pendingFrame = { bytes, kind, generation: this.pictureGeneration };
       if (!this.decoding) void this._drain();
     }
 
@@ -295,10 +301,12 @@
       this.decoding = true;
       try {
         while (this.pendingFrame) {
-          const { bytes, kind } = this.pendingFrame;
+          const { bytes, kind, generation } = this.pendingFrame;
           this.pendingFrame = null; // frames that arrive while decoding replace this slot: newest wins
           try {
-            this._paint(await this.decode(bytes, kind));
+            const image = await this.decode(bytes, kind);
+            if (generation !== this.pictureGeneration) image.close?.();
+            else this._paint(image);
             this.decodeFailures = 0;
           } catch {
             // One undecodable frame is skipped and the next one repaints; a run of

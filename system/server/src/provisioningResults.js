@@ -35,6 +35,7 @@ const DEFINITIONS = {
       `${phoneLabel} is in use by ${operatorLabel}. Ask them to release it before stopping or restarting its control service.`,
   },
   wda_not_running: { status: 409, message: () => "Phone control is stopped. Use Start WDA instead." },
+  wda_not_ready: { status: 409, message: () => "The refreshed USB tunnel did not restore WDA control. Run Check control for details." },
   running_not_responding: { status: 409, message: () => "Control is running but not responding. Use Restart WDA." },
   provisioning_off: { status: 409, message: () => "Automatic phone setup is turned off on this Mac." },
   lifecycle_state_changed: { status: 409, message: () => "The phone control state changed. Review the current action and try again." },

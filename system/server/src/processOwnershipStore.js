@@ -110,10 +110,10 @@ export function createProcessOwnershipStore({
   function persist() {
     const snapshot = JSON.parse(JSON.stringify(load()));
     queue = queue.catch(() => {}).then(() => writeFile(fsImpl, filePath, snapshot));
-    return queue.catch(error => {
-      // A failed write must never break process supervision.
+    queue.catch(error => {
       log?.(`process-ownership file could not be written (${error?.code || error?.name})`);
     });
+    return queue;
   }
 
   async function lookUpStartTime(pid) {
@@ -129,19 +129,26 @@ export function createProcessOwnershipStore({
   return {
     filePath,
 
-    async record({ kind, udid, pid, bin, args = [], ports = [] }) {
+    async record({ kind, udid, pid, bin, args = [], ports = [], sanitizeCommand = value => value, metadata = {} }) {
       if (!kind || !udid || !Number.isSafeInteger(pid) || pid <= 0) return null;
       const key = keyOf(kind, udid);
       const generation = (generations.get(key) ?? 0) + 1;
       generations.set(key, generation);
       const description = await lookUpStartTime(pid);
       if (generations.get(key) !== generation) return null; // released or replaced meanwhile
+      const rawCommand = description?.command ?? [bin, ...args].join(" ");
+      const command = sanitizeCommand(rawCommand);
+      if (typeof command !== "string" || !command) throw new Error("a safe process command identity is required");
+      const safeMetadata = typeof metadata?.tunIface === "string" && /^utun\d{1,3}$/.test(metadata.tunIface)
+        ? { tunIface: metadata.tunIface } : {};
       const record = {
         kind, udid, pid,
         startTime: description?.startTime ?? null,
-        command: description?.command ?? [bin, ...args].join(" "),
+        command,
+        executableIdentity: description?.program ?? (path.basename(String(bin || "")) || null),
         unverified: !description?.startTime,
         ports: [...ports],
+        ...safeMetadata,
         ownerServerPid: owner?.pid ?? null,
         ownerServerStartTime: owner?.startTime ?? null,
         recordedAt: now(),
@@ -187,6 +194,36 @@ export function createProcessOwnershipStore({
       return Object.values(load()).map(record => ({ ...record }));
     },
 
+    // Describes whether the PID in a durable record is still the exact process
+    // Bodun recorded. Callers receive only a bounded status and the already-safe
+    // record; the live command line (which may contain credentials) is never
+    // returned or logged.
+    async inspectCurrent({ kind, udid, sanitizeCommand = value => value }) {
+      const record = load()[keyOf(kind, udid)];
+      if (!record) return { status: "gone", record: null };
+      if (record.unverified || !record.startTime || !inspector || inspector.supported === false) {
+        return { status: "unknown", record: { ...record } };
+      }
+      const description = await inspector.describe(record.pid).catch(() => undefined);
+      if (description === undefined) return { status: "unknown", record: { ...record } };
+      if (description === null) return { status: "gone", record: { ...record } };
+      if (description.startTime !== record.startTime) return { status: "reused", record: { ...record } };
+      const safeCurrentCommand = sanitizeCommand(description.command);
+      if (typeof safeCurrentCommand !== "string" || safeCurrentCommand !== record.command
+        || (record.executableIdentity && description.program !== record.executableIdentity)) {
+        return { status: "foreign", record: { ...record } };
+      }
+      if (record.ownerServerPid !== owner?.pid) {
+        if (!Number.isSafeInteger(record.ownerServerPid)) return { status: "unknown", record: { ...record } };
+        const currentOwner = await inspector.describe(record.ownerServerPid).catch(() => undefined);
+        if (currentOwner === undefined) return { status: "unknown", record: { ...record } };
+        if (currentOwner && (!record.ownerServerStartTime || currentOwner.startTime === record.ownerServerStartTime)) {
+          return { status: "foreign", record: { ...record } };
+        }
+      }
+      return { status: "owned", record: { ...record } };
+    },
+
     // Drops a record without touching any process (the sweep uses this for
     // records whose process is provably gone or provably somebody else's).
     async drop(kind, udid) {
@@ -211,7 +248,7 @@ export function createProcessOwnershipStore({
     },
 
     async flush() {
-      await queue.catch(() => {}); // a failed write was already reported by persist()
+      await queue;
     },
   };
 }

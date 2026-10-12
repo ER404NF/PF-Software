@@ -76,6 +76,32 @@ test("clearAnchor removes only this app's anchor rules, matching -a <anchor> -F 
   assert.deepEqual(calls[0].args, ["-n", "pfctl", "-a", "com.apple/phonefarm", "-F", "all"]);
 });
 
+test("quarantineBridge takes only a validated bridge down and verifies it is inactive", async () => {
+  const { execFile, calls } = fakeExecFile({ stdout: "bridge0: flags=0<>\n\tstatus: inactive\n" });
+  const ops = new PrivilegedOps({ execFile, ifconfigBin: "/sbin/ifconfig", anchor: "com.apple/phonefarm" });
+  await ops.quarantineBridge("bridge0");
+  assert.deepEqual(calls.map(call => call.args), [
+    ["-n", "/sbin/ifconfig", "bridge0", "down"],
+    ["-n", "/sbin/ifconfig", "bridge0"],
+  ]);
+  await assert.rejects(() => ops.quarantineBridge("bridge0; reboot"), /valid interface/);
+  assert.equal(calls.length, 2);
+});
+
+test("inspectBridge returns only bounded availability and link state", async () => {
+  const calls = [];
+  const ops = new PrivilegedOps({
+    anchor: "com.apple/phonefarm",
+    execFile: (_bin, args, _options, callback) => {
+      calls.push(args);
+      callback(null, "bridge0: flags=8863<UP,BROADCAST,RUNNING,SIMPLEX,MULTICAST>\nstatus: active\nprivate detail", "");
+    },
+  });
+  assert.deepEqual(await ops.inspectBridge("bridge0"), { available: true, up: true });
+  assert.match(calls[0].at(-2), /ifconfig$/);
+  assert.equal(calls[0].at(-1), "bridge0");
+});
+
 test("a failed privileged call surfaces stderr, truncated, never the raw Error stack", async () => {
   const { execFile } = fakeExecFile({ succeed: false, stderr: "pfctl: permission denied" });
   const ops = new PrivilegedOps({ execFile, anchor: "com.apple/phonefarm" });

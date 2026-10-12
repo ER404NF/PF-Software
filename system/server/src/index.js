@@ -103,6 +103,7 @@ import { OPERATOR_ROLES, normalizeRole } from "./roleCapabilities.js";
 import { monitorState } from "./monitorContract.js";
 import { createFileNotificationRepository } from "./persistence/fileNotificationRepository.js";
 import { createMailSender } from "./mailSender.js";
+import { secureRecoveryCapability } from "./secureRecoveryCapability.js";
 import { createNotificationOutbox } from "./notificationOutbox.js";
 import { createAuthenticationThrottle, createRecoveryThrottle } from "./recoveryThrottle.js";
 import { createSchedulerGuard } from "./schedulerGuard.js";
@@ -131,7 +132,9 @@ import { createCloudApi } from "./cloudApi/createCloudApi.js";
 import { discoverIosDevices, DiscoveredIosDevice } from "./deviceDiscovery.js";
 import { loadDeviceConfig } from "./deviceConfigLoader.js";
 import { loadDevices } from "./deviceRegistry.js";
-import { startAutoProvisioning } from "./provisioningBoot.js";
+import { startAutoProvisioning, resolveOwnershipStorePath } from "./provisioningBoot.js";
+import { createProcessInspector } from "./processInspector.js";
+import { createProcessOwnershipStore } from "./processOwnershipStore.js";
 import { LifecycleError, lifecycleErrorBody } from "./provisioningResults.js";
 import { buildSetupStatus, phoneReasonForStatus } from "./setupStatus.js";
 import { createShutdownHandler } from "./shutdown.js";
@@ -391,6 +394,15 @@ const mailSender = createMailSender({
 if (isMain && !mailSender.isConfigured()) {
   console.warn(`Account email delivery is not configured; missing ${mailSender.configurationStatus().missing.join(", ")}. Notifications will stay queued.`);
 }
+if (isMain) {
+  const recoveryStatus = secureRecoveryCapability({
+    smtpConfigured: mailSender.isConfigured(),
+    encryptionConfigured: accountNotificationStore.canSecureRecovery(),
+  });
+  if (!recoveryStatus.configured) {
+    console.warn(`Secure email recovery is disabled; missing ${recoveryStatus.missing.join(", ")}.`);
+  }
+}
 const accountNotificationOutbox = createNotificationOutbox({
   store: accountNotificationStore,
   mailSender,
@@ -430,6 +442,8 @@ let proxyPoolCache = proxyPoolRepository.publicList();
 function refreshProxyPoolCache() { proxyPoolCache = proxyPoolRepository.publicList(); }
 function poolProxyForDevice(deviceId) { return proxyPoolCache.find(p => p.leasedToDeviceId === deviceId) ?? null; }
 const usbNetworkStorePath = process.env.USB_NETWORK_STORE_PATH || path.join(__dirname, "../../storage/usb-network.json");
+const routingQuarantineStorePath = process.env.ROUTING_QUARANTINE_STORE_PATH
+  || path.join(__dirname, "../../storage/routing-quarantine.json");
 // Ephemeral, not persisted: the "before" bridge-member snapshot only needs
 // to survive the short window between an admin starting enrollment and
 // confirming it (after manually enabling Internet Sharing for that phone
@@ -897,7 +911,11 @@ app.post("/api/recovery/request", async (req, res, next) => {
   try {
     const identifier = req.body?.identifier;
     const allowed = recoveryThrottle.allow({ identifier, ip: req.ip });
-    const recovery = allowed && accountNotificationStore.canSecureRecovery()
+    const recoveryCapability = secureRecoveryCapability({
+      smtpConfigured: mailSender.isConfigured(),
+      encryptionConfigured: accountNotificationStore.canSecureRecovery(),
+    });
+    const recovery = allowed && recoveryCapability.configured
       ? await identityService.createEmailRecoveryToken(identifier)
       : null;
     if (recovery?.token) {
@@ -2343,7 +2361,10 @@ const summary = (d, viewer = null, viewerSocket = null) => {
     monitor: runtimeMonitorState(d.id),
     network: publicNetworkConfig(deviceNetwork.get(d.id)),
     poolProxy: hasCapability(viewer, CAPABILITIES.VIEW_PROXY_POOL) ? poolProxyForDevice(d.id) : null,
-    routingFeature: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? { ...networkRoutingSetupState } : null,
+    routingFeature: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? {
+      ...networkRoutingSetupState,
+      hostRouting: networkRoutingOrchestrator?.getHostRoutingStatus?.() ?? null,
+    } : null,
     routing: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? (networkRoutingOrchestrator?.getRoute(d.id) ?? null) : null,
     networkRouteHealth: (() => {
       const route = networkRoutingOrchestrator?.getRoute(d.id);
@@ -2351,6 +2372,8 @@ const summary = (d, viewer = null, viewerSocket = null) => {
         state: route.state,
         protected: route.protected === true,
         internetBlocked: route.internetBlocked === true,
+        protectionState: route.protectionState ?? null,
+        manualInterventionRequired: route.manualInterventionRequired === true,
       } : null;
     })(),
     usbNetwork: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? usbNetworkForDevice(d.id) : null,
@@ -2383,7 +2406,8 @@ app.get("/api/admin/devices/:deviceId/diagnostics", requireCapability(CAPABILITI
     deviceId: device.id,
     health: typeof device.healthSnapshot === "function" ? device.healthSnapshot() : null,
     routing: networkRoutingOrchestrator?.getRoute(device.id) ?? null,
-    routingFeature: { ...networkRoutingSetupState },
+    routingFeature: { ...networkRoutingSetupState,
+      hostRouting: networkRoutingOrchestrator?.getHostRoutingStatus?.() ?? null },
     network: networkVerifier.getStatus(device.id),
   });
 });
@@ -2576,55 +2600,118 @@ registerNetworkCheckRoutes({
 // trust/developer-certificate prompt was just resolved on the phone) or
 // `provisioning_error` (WDA/iproxy exhausted its restart budget). No-op
 // route (409) when automatic provisioning isn't enabled on this relay.
-app.post("/api/admin/devices/:deviceId/retry-provisioning", requireCapability(CAPABILITIES.MANAGE_DEVICES), async (req, res, next) => {
+async function runProvisioningRetry(req, res, next, { tunnelOnly = false } = {}) {
   if (!deviceProvisioner) return res.status(409).json({ error: "Automatic phone setup is turned off on this Mac." });
   if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
-  if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
-    return res.status(403).json({ error: "not authorized for this device" });
-  }
+  let currentAtCommit = null;
+  const authorizeRetry = async () => {
+    const current = await authorizeWdaLifecycle(req);
+    const ownerSocket = humanOwners.get(req.params.deviceId);
+    if (ownerSocket) {
+      const ownerUsername = ownerSocket.operatorUsername;
+      const ownerAccount = ownerUsername ? operators.get(ownerUsername) : null;
+      throw new LifecycleError("phone_in_use", {
+        phoneLabel: devices.get(req.params.deviceId)?.label?.trim() || "This phone",
+        operatorLabel: ownerAccount?.fullName?.trim() || ownerUsername || "another operator",
+      });
+    }
+    currentAtCommit = current;
+    return current;
+  };
   try {
-    const result = await deviceProvisioner.retryDevice(req.params.deviceId);
+    await authorizeRetry();
+    const result = tunnelOnly
+      ? await deviceProvisioner.retryTunnelDevice(req.params.deviceId, { authorize: authorizeRetry })
+      : await deviceProvisioner.retryDevice(req.params.deviceId, { authorize: authorizeRetry });
+    const current = await authorizeRetry();
     logAuditBestEffort({
-      operator: req.currentOperator.username,
-      type: "provisioning_retry",
+      operator: current.username,
+      type: tunnelOnly ? "iproxy_retry" : "provisioning_retry",
       deviceId: req.params.deviceId,
       detail: { code: result.code },
     }, "Provisioning retry audit write");
     res.json({ ok: true, code: result.code });
   } catch (error) {
+    if ([401, 403].includes(error?.status)) {
+      logAuditBestEffort({
+        operator: currentAtCommit?.username ?? "revoked-operator",
+        type: tunnelOnly ? "iproxy_retry_denied" : "provisioning_retry_denied",
+        deviceId: req.params.deviceId,
+        detail: { code: error.code === "AUTHENTICATION_REQUIRED" ? "authentication_revoked" : "authorization_revoked" },
+      }, "Provisioning retry denial audit write");
+      return res.status(error.status).json({
+        error: error.status === 401 ? "authentication required" : "not authorized for this device",
+      });
+    }
     // Each way a retry can fail has its own plain message, machine code and status.
     if (error instanceof LifecycleError) {
       logAuditBestEffort({
-        operator: req.currentOperator.username, type: "provisioning_retry_failed",
+        operator: currentAtCommit?.username ?? "revoked-operator",
+        type: tunnelOnly ? "iproxy_retry_failed" : "provisioning_retry_failed",
         deviceId: req.params.deviceId, detail: { code: error.code },
       }, "Provisioning retry audit write");
       return res.status(error.status).json(lifecycleErrorBody(error));
     }
     next(error);
   }
-});
+}
+
+app.post("/api/admin/devices/:deviceId/retry-provisioning",
+  requireCapability(CAPABILITIES.MANAGE_WDA_LIFECYCLE),
+  (req, res, next) => runProvisioningRetry(req, res, next));
+app.post("/api/admin/devices/:deviceId/retry-tunnel",
+  requireCapability(CAPABILITIES.MANAGE_WDA_LIFECYCLE),
+  (req, res, next) => runProvisioningRetry(req, res, next, { tunnelOnly: true }));
 
 // "Check again": look once more at Bodun's earlier phone connections when automatic phone setup is paused. The check only
 // looks and reclaims under the same exact-match rules as at start-up. Pressing twice shares one check (the provisioner
 // guarantees it); while Bodun is shutting down it is refused.
-app.post("/api/admin/automatic-setup/check", requireCapability(CAPABILITIES.MANAGE_DEVICES), async (req, res, next) => {
+app.post("/api/admin/automatic-setup/check", requireCapability(CAPABILITIES.MANAGE_WDA_LIFECYCLE), async (req, res, next) => {
   if (!deviceProvisioner?.recheckNow) return res.status(409).json(lifecycleErrorBody(new LifecycleError("provisioning_off")));
+  let currentAtCheck = null;
   try {
+    currentAtCheck = await authorizeCurrentOperator(req, [CAPABILITIES.MANAGE_WDA_LIFECYCLE]);
     const status = await deviceProvisioner.recheckNow();
+    currentAtCheck = await authorizeCurrentOperator(req, [CAPABILITIES.MANAGE_WDA_LIFECYCLE]);
     logAuditBestEffort({
-      operator: req.currentOperator.username, type: "automatic_setup_check", detail: { code: status.code },
+      operator: currentAtCheck.username, type: "automatic_setup_check", detail: { code: status.code },
     }, "Automatic setup check audit write");
-    res.json({ ok: true, status: automaticSetupFor(req.currentOperator) });
+    res.json({ ok: true, status: automaticSetupFor(currentAtCheck) });
   } catch (error) {
     if (error instanceof LifecycleError) {
       logAuditBestEffort({
-        operator: req.currentOperator.username, type: "automatic_setup_check_refused", detail: { code: error.code },
+        operator: currentAtCheck?.username ?? "revoked-operator", type: "automatic_setup_check_refused", detail: { code: error.code },
       }, "Automatic setup check audit write");
       return res.status(error.status).json(lifecycleErrorBody(error));
     }
     next(error);
   }
 });
+
+app.post("/api/admin/automatic-setup/repair-provisioning-state",
+  requireCapability(CAPABILITIES.MANAGE_WDA_LIFECYCLE), async (req, res, next) => {
+    if (!deviceProvisioner?.repairProvisioningState) {
+      return res.status(409).json(lifecycleErrorBody(new LifecycleError("provisioning_off")));
+    }
+    try {
+      let current = await authorizeCurrentOperator(req, [CAPABILITIES.MANAGE_WDA_LIFECYCLE]);
+      const result = await deviceProvisioner.repairProvisioningState({
+        destructiveReset: req.body?.confirmDestructiveReset === true,
+        authorize: async () => {
+          current = await authorizeCurrentOperator(req, [CAPABILITIES.MANAGE_WDA_LIFECYCLE]);
+          return true;
+        },
+      });
+      logAuditBestEffort({ operator: current.username, type: "provisioning_state_repaired",
+        detail: { repaired: result.repaired, reason: result.reason, repairId: result.repairId,
+          preservedCount: result.preservedCount, quarantinedCount: result.quarantinedCount,
+          unrecoverableCount: result.unrecoverableCount } }, "Phone setup repair record write");
+      res.json({ ok: true, ...result });
+    } catch (error) {
+      if (error?.status) return res.status(error.status).json({ error: error.message, code: error.code });
+      next(error);
+    }
+  });
 
 // Shared proxy pool (Phase B, Phone_Farm_Automation_Architecture.md §4.6):
 // an Admin enters provider credentials once; assigning a pool entry to a
@@ -2702,8 +2789,15 @@ app.post("/api/admin/devices/:deviceId/network-enrollment/start", requireCapabil
   if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
     return res.status(403).json({ error: "not authorized for this device" });
   }
+  let currentAtStart;
+  try {
+    currentAtStart = await authorizeRoutingMutation(req, req.params.deviceId);
+    networkRoutingOrchestrator.assertRoutingAvailable?.();
+  } catch (error) {
+    return sendRoutingHttpFailure(res, error, { code: "N201" });
+  }
   const reservation = networkEnrollmentLock.tryStart(req.params.deviceId, {
-    before: null, ready: false, operatorUsername: req.currentOperator.username, sessionId: req.sessionID, generation: null,
+    before: null, ready: false, operatorUsername: currentAtStart.username, sessionId: req.sessionID, generation: null,
   });
   if (!reservation) {
     const active = networkEnrollmentLock.active();
@@ -2717,6 +2811,7 @@ app.post("/api/admin/devices/:deviceId/network-enrollment/start", requireCapabil
   try {
     const before = await enrollmentTools.listBridgeMembers({ bridgeIface: networkRoutingOrchestrator.bridgeIface });
     const current = await authorizeNetworkIdentityCommit(req, req.params.deviceId, generation, reservation);
+    networkRoutingOrchestrator.assertRoutingAvailable?.();
     const committed = networkEnrollmentLock.update(req.params.deviceId, reservation, {
       before, ready: true, operatorUsername: current.username,
     });
@@ -2788,6 +2883,8 @@ app.post("/api/admin/devices/:deviceId/network-enrollment/confirm", requireCapab
     return enrollmentFailure(res, "ENROLLMENT_STARTING", "Bodun is still reading this Mac's network connections. Wait a moment, then confirm again.");
   }
   try {
+    await authorizeRoutingMutation(req, req.params.deviceId);
+    networkRoutingOrchestrator.assertRoutingAvailable?.();
     const after = await enrollmentTools.listBridgeMembers({ bridgeIface: networkRoutingOrchestrator.bridgeIface });
     const diff = diffBridgeMembers(pending.before, after);
     if (diff.state !== "assigned") {
@@ -2795,6 +2892,7 @@ app.post("/api/admin/devices/:deviceId/network-enrollment/confirm", requireCapab
       return enrollmentFailure(res, code, diff.reason, { newMemberCount: diff.newMembers?.length ?? 0 });
     }
     const currentAtCommit = await authorizeNetworkIdentityCommit(req, req.params.deviceId, pending.generation, pending);
+    networkRoutingOrchestrator.assertRoutingAvailable?.();
     // No await is allowed between this final route/generation check and the
     // synchronous atomic store mutation.
     if (networkRoutingOrchestrator.getRoute(req.params.deviceId)) throw networkIdentityConflict();
@@ -2828,13 +2926,16 @@ app.post("/api/admin/devices/:deviceId/discover-ip", requireCapability(CAPABILIT
   }
   const enrolled = getUsbNetworkRecord(usbNetworkStorePath, req.params.deviceId);
   if (!enrolled) return res.status(409).json({ error: "complete network enrollment for this device first" });
-  const generation = advanceNetworkIdentityGeneration(req.params.deviceId);
   try {
+    await authorizeRoutingMutation(req, req.params.deviceId);
+    networkRoutingOrchestrator.assertRoutingAvailable?.();
+    const generation = advanceNetworkIdentityGeneration(req.params.deviceId);
     const ownIp = await enrollmentTools.discoverBridgeOwnIp({ bridgeIface: networkRoutingOrchestrator.bridgeIface });
     const capture = await enrollmentTools.captureDeviceTraffic({ iface: enrolled.usbIface });
     const result = discoverDeviceIp(capture, { excludeIps: [ownIp] });
     if (result.state !== "resolved") return res.status(409).json({ error: result.reason, state: result.state, candidates: result.candidates });
     const currentAtCommit = await authorizeNetworkIdentityCommit(req, req.params.deviceId, generation);
+    networkRoutingOrchestrator.assertRoutingAvailable?.();
     if (networkRoutingOrchestrator.getRoute(req.params.deviceId)) throw networkIdentityConflict();
     const record = setUsbIp(usbNetworkStorePath, req.params.deviceId, result.ip);
     refreshUsbNetworkCache(req.params.deviceId);
@@ -2866,6 +2967,7 @@ app.post("/api/admin/devices/:deviceId/start-routing", requireCapability(CAPABIL
     return res.status(400).json({ error: "usbIp is required (supply it, or run network enrollment + IP discovery for this device first)" });
   }
   try {
+    await authorizeRoutingMutation(req, req.params.deviceId);
     advanceNetworkIdentityGeneration(req.params.deviceId);
     let currentAtCommit = null;
     const route = await networkRoutingOrchestrator.startRouting(req.params.deviceId, {
@@ -2902,18 +3004,81 @@ app.post("/api/admin/devices/:deviceId/stop-routing", requireCapability(CAPABILI
     return res.status(403).json({ error: "not authorized for this device" });
   }
   try {
+    const currentAtStart = await authorizeRoutingMutation(req, req.params.deviceId);
     advanceNetworkIdentityGeneration(req.params.deviceId);
     // Once teardown has begun it is a fail-closed safety operation. Finish it
     // even if the initiating session is revoked while PF/tunnel cleanup waits.
     await networkRoutingOrchestrator.stopRouting(req.params.deviceId);
     logAuditBestEffort(
-      { operator: req.currentOperator.username, type: "routing_stopped", deviceId: req.params.deviceId },
+      { operator: currentAtStart.username, type: "routing_stopped", deviceId: req.params.deviceId },
       "Routing-stop audit write",
     );
     broadcastDeviceList();
     res.json({ ok: true });
   } catch (error) {
     sendRoutingHttpFailure(res, error, { code: "F202" });
+  }
+});
+
+app.post("/api/admin/routing/recover", requireCapability(CAPABILITIES.MANAGE_ROUTING), async (req, res) => {
+  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "Automatic network setup is turned off on this Mac." });
+  try {
+    let currentAtCommit = null;
+    const hostRouting = await networkRoutingOrchestrator.recoverHostRouting({
+      authorize: async () => {
+        currentAtCommit = await authorizeCurrentOperator(req, [CAPABILITIES.MANAGE_ROUTING]);
+        return currentAtCommit;
+      },
+    });
+    if (!currentAtCommit) throw httpAuthorizationError("not logged in", 401);
+    networkRoutingSetupState = { state: "enabled", message: "Proxy routing is enabled and the Internet Sharing bridge is configured." };
+    logAuditBestEffort({
+      operator: currentAtCommit.username,
+      type: "routing_host_recovered",
+      detail: { state: hostRouting.state },
+    }, "Routing recovery audit write");
+    broadcastDeviceList();
+    res.json({ ok: true, hostRouting });
+  } catch (error) {
+    logAuditBestEffort({
+      operator: req.currentOperator?.username,
+      type: "routing_host_recovery_failed",
+      detail: { code: error?.code || "ROUTING_RECOVERY_FAILED" },
+    }, "Routing recovery-failure audit write");
+    sendRoutingHttpFailure(res, error, { code: "F208" });
+  }
+});
+
+app.post("/api/admin/routing/repair", requireCapability(CAPABILITIES.MANAGE_ROUTING), async (req, res) => {
+  if (!networkRoutingOrchestrator) return res.status(409).json({ error: "Automatic network setup is turned off on this Mac." });
+  try {
+    let currentAtCommit = null;
+    const hostRouting = await networkRoutingOrchestrator.repairHostRoutingState({
+      confirmed: req.body?.confirm === true,
+      authorize: async () => {
+        currentAtCommit = await authorizeCurrentOperator(req, [CAPABILITIES.MANAGE_ROUTING]);
+        return currentAtCommit;
+      },
+    });
+    if (!currentAtCommit) throw httpAuthorizationError("not logged in", 401);
+    networkRoutingSetupState = {
+      state: "recovery_required",
+      message: "Host routing state was preserved and repaired. Run host recovery checks before routing any phone.",
+    };
+    logAuditBestEffort({
+      operator: currentAtCommit.username,
+      type: "routing_host_state_repaired",
+      detail: { state: hostRouting.state, originalPreserved: hostRouting.originalPreserved === true },
+    }, "Routing state-repair audit write");
+    broadcastDeviceList();
+    res.json({ ok: true, hostRouting });
+  } catch (error) {
+    logAuditBestEffort({
+      operator: req.currentOperator?.username,
+      type: "routing_host_state_repair_failed",
+      detail: { code: error?.code || "ROUTING_REPAIR_FAILED" },
+    }, "Routing state-repair failure audit write");
+    sendRoutingHttpFailure(res, error, { code: "F208" });
   }
 });
 
@@ -3559,9 +3724,13 @@ function sendWebSocketJsonBestEffort(client, message, context) {
 // people who hold the device provisioning capability, and only while setup is paused.
 function automaticSetupFor(viewer) {
   const status = deviceProvisioner?.getSetupStatus?.() ?? buildSetupStatus("setup_off");
+  const canRepair = Boolean(deviceProvisioner?.repairProvisioningState)
+    && deviceProvisioner?.hasCorruptProvisioningState?.() === true
+    && hasCapability(viewer, CAPABILITIES.MANAGE_WDA_LIFECYCLE);
   return {
     state: status.state, code: status.code, message: status.message,
-    canCheckAgain: Boolean(deviceProvisioner?.recheckNow) && status.state === "paused" && hasCapability(viewer, CAPABILITIES.MANAGE_DEVICES),
+    canCheckAgain: Boolean(deviceProvisioner?.recheckNow) && status.state === "paused" && hasCapability(viewer, CAPABILITIES.MANAGE_WDA_LIFECYCLE),
+    canRepairProvisioning: canRepair,
   };
 }
 
@@ -4749,13 +4918,6 @@ if (isMain) {
   schedulerGuard.run(new Date());
   void refreshWdaReadiness().catch(error => logOperationalFailure("Initial WDA readiness refresh failed", error));
   const PORT = process.env.PORT || 4173;
-  server.listen(PORT, deployment.host, () => {
-    // server.address().port (not the raw PORT var) so this is still correct
-    // when PORT=0 asks the OS for an ephemeral port.
-    const displayHost = deployment.host.includes(":") ? `[${deployment.host}]` : deployment.host;
-    console.log(`Phone Farm control server running at http://${displayHost}:${server.address().port}`);
-    console.log(`Scheduling timezone for /time: ${schedulingTimeZone} (set PHONE_FARM_TIMEZONE to change)`);
-  });
   // Only when actually running as the server, not on import — tests drive
   // taskQueue.tick() explicitly with controlled timestamps, and a real
   // wall-clock timer running in the background during those tests would
@@ -4778,10 +4940,25 @@ if (isMain) {
   // Opt-in (AUTO_PROVISION_WDA=true): find USB iPhones and set up WebDriverAgent on
   // each. Manually pinned devices.config.json WDA entries are left untouched. Shared
   // with the site agent; see provisioningBoot.js.
+  let processOwnership = null;
+  if (process.env.AUTO_PROVISION_WDA === "true" || process.env.AUTO_ROUTE_PROXY_TUNNELS === "true") {
+    const inspector = createProcessInspector();
+    const ownerDescription = await inspector.describe(process.pid).catch(() => null);
+    const owner = { pid: process.pid, startTime: ownerDescription?.startTime ?? null };
+    processOwnership = {
+      inspector,
+      owner,
+      store: createProcessOwnershipStore({
+        filePath: resolveOwnershipStorePath(process.env), inspector, owner,
+        log: line => console.warn(`[ownership] ${line}`),
+      }),
+    };
+  }
   deviceProvisioner = startAutoProvisioning({
     devices,
     manualUdids: manualWdaUdids,
     onDeviceListChanged: broadcastDeviceList,
+    processOwnership,
     onAudit: event => logAuditBestEffort({
       operator: "bodun", type: event.type, deviceId: event.deviceId ?? undefined,
       detail: { port: event.port, program: event.program, pid: event.pid, outcome: event.outcome },
@@ -4804,12 +4981,15 @@ if (isMain) {
       console.error("Automatic proxy tunnel routing is disabled — TWO_FACTOR_MASTER_KEY (or PROXY_CREDENTIAL_ENCRYPTION_KEY) is not configured.");
     } else {
       try {
-        networkRoutingOrchestrator = new NetworkRoutingOrchestrator({
+        const tunManager = new TunManager({ ownershipStore: processOwnership?.store ?? null });
+        await tunManager.recoverPersistedOwnership();
+        const routingCandidate = new NetworkRoutingOrchestrator({
           proxyPoolStorePath,
           proxyCredentialEncryptionKey,
-          tunManager: new TunManager(),
+          tunManager,
           privilegedOps: new PrivilegedOps({ anchor: process.env.PF_ANCHOR || "com.apple/phonefarm" }),
           bridgeIface,
+          quarantineStorePath: routingQuarantineStorePath,
           onStateChanged: (deviceId, route) => {
             const state = route?.state ?? null;
             if (knownRouteStates.get(deviceId) !== state) {
@@ -4818,8 +4998,19 @@ if (isMain) {
             }
             broadcastDeviceList();
           },
+          onHostStateChanged: () => broadcastDeviceList(),
         });
-        networkRoutingSetupState = { state: "enabled", message: "Proxy routing is enabled and the Internet Sharing bridge is configured." };
+        networkRoutingSetupState = { state: "checking", message: "Proxy routing is checking the previous firewall state." };
+        // Reconcile before the HTTP listener exists. Until this completes there is
+        // deliberately no routable orchestrator reachable by an API request.
+        await routingCandidate.reconcileStartup();
+        networkRoutingOrchestrator = routingCandidate;
+        const hostRouting = routingCandidate.getHostRoutingStatus();
+        networkRoutingSetupState = hostRouting.state === "healthy"
+          ? { state: "enabled", message: "Proxy routing is enabled and the Internet Sharing bridge is configured." }
+          : hostRouting.repairRequired
+            ? { state: hostRouting.state, message: "Proxy routing state is invalid. An administrator must preserve and repair it before recovery checks can run." }
+            : { state: hostRouting.state, message: "Proxy routing is quarantined. An administrator must complete host recovery checks." };
         networkRoutingOrchestrator.startHealthChecks({
           intervalMs: Number(process.env.ROUTING_HEALTH_CHECK_INTERVAL_MS) || undefined,
         });
@@ -4834,8 +5025,12 @@ if (isMain) {
         if (process.env.AUTO_ENABLE_INTERNET_SHARING === "true") {
           void (async () => {
             try {
-              const primaryInterface = process.env.INTERNET_SHARING_PRIMARY_INTERFACE || await detectPrimaryInterface();
-              await enableInternetSharing({ primaryInterface });
+              const primaryInterface = await networkRoutingOrchestrator.runHostRoutingSetup(async () => {
+                const resolved = process.env.INTERNET_SHARING_PRIMARY_INTERFACE || await detectPrimaryInterface();
+                networkRoutingOrchestrator.assertRoutingAvailable();
+                await enableInternetSharing({ primaryInterface: resolved });
+                return resolved;
+              });
               console.log(`Internet Sharing enabled automatically (${primaryInterface} -> USB). This uses an undocumented macOS mechanism — verify it actually worked via the fleet UI's network enrollment status.`);
             } catch (error) {
               logOperationalFailure(
@@ -4853,6 +5048,7 @@ if (isMain) {
             proxyPoolStorePath,
             manualUdids: manualWdaUdids,
             startRouting: (deviceId, opts) => networkRoutingOrchestrator.startRouting(deviceId, opts),
+            assertRoutingAvailable: () => networkRoutingOrchestrator.assertRoutingAvailable(),
             pollIntervalMs: Number(process.env.NETWORK_ENROLLMENT_POLL_INTERVAL_MS) || undefined,
             onStatusChanged: () => broadcastDeviceList(),
           });
@@ -4864,6 +5060,14 @@ if (isMain) {
       }
     }
   }
+
+  server.listen(PORT, deployment.host, () => {
+    // server.address().port (not the raw PORT var) so this is still correct
+    // when PORT=0 asks the OS for an ephemeral port.
+    const displayHost = deployment.host.includes(":") ? `[${deployment.host}]` : deployment.host;
+    console.log(`Bodun control server running at http://${displayHost}:${server.address().port}`);
+    console.log(`Scheduling timezone for /time: ${schedulingTimeZone} (set PHONE_FARM_TIMEZONE to change)`);
+  });
 }
 
 let runtimeCleanupPromise = null;

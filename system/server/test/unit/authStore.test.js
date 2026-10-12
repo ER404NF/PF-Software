@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { hashPassword, verifyPassword, authenticate, canAccessDevice, operators, normalizeRole, publicOperator, hasRole, filterValidResearchGrants, capabilitiesForRole, hasCapability, validateOperatorConfig } from "../../src/authStore.js";
+import { hashPassword, verifyPassword, authenticate, canAccessDevice, operators, normalizeRole, publicOperator, publicOperatorAccount, hasRole, filterValidResearchGrants, capabilitiesForRole, hasCapability, validateOperatorConfig } from "../../src/authStore.js";
 import { CAPABILITIES, OPERATOR_ROLES, ROLE_CAPABILITIES } from "../../src/roleCapabilities.js";
 
 test("only host, admin and special manager receive physical WDA lifecycle control", () => {
@@ -108,6 +108,37 @@ test("operator config rejects malformed authorization state instead of applying 
     assert.throws(() => validateOperatorConfig({ operators: [{ ...base, ...patch }] }), /invalid/);
   }
   assert.doesNotThrow(() => validateOperatorConfig({ operators: [{ ...base, accountStatus: "banned" }] }));
+});
+
+test("operator config validates persisted identity fields before publishing accounts", () => {
+  const base = { username: "identity-user", passwordHash: hashPassword("identity-test-password"), role: "va", allowedDevices: [] };
+  assert.throws(() => validateOperatorConfig({ operators: [{ ...base, email: "not-an-email" }] }), /invalid email/);
+  assert.throws(() => validateOperatorConfig({ operators: [{ ...base, fullName: "!" }] }), /invalid fullName/);
+  assert.throws(() => validateOperatorConfig({ operators: [{ ...base, teamId: "Bad Team" }] }), /invalid teamId/);
+  const raw = { operators: [{ ...base, email: "Valid.User+tag@gmail.com", fullName: " Valid User ", teamId: "team_one" }] };
+  assert.doesNotThrow(() => validateOperatorConfig(raw));
+  assert.equal(raw.operators[0].email, "validuser@gmail.com");
+  assert.equal(raw.operators[0].fullName, "Valid User");
+});
+
+test("public recovery methods advertise only configured, usable mechanisms", () => {
+  const names = ["SMTP_HOST", "SMTP_PORT", "SMTP_USER", "SMTP_PASS", "COMPANY_FROM_EMAIL", "ACCOUNT_NOTIFICATION_ENCRYPTION_KEY"];
+  const previous = Object.fromEntries(names.map(name => [name, process.env[name]]));
+  try {
+    for (const name of names) delete process.env[name];
+    const base = { username: "recovery-user", role: "va", allowedDevices: [], allowedResearchWorkspaces: [],
+      active: true, twoFactorRequired: true };
+    assert.deepEqual(publicOperatorAccount(base).recoveryMethods, ["admin_assisted"]);
+    assert.deepEqual(publicOperatorAccount({ ...base, twoFactorSecret: "encrypted" }).recoveryMethods,
+      ["authenticator", "admin_assisted"]);
+    assert.deepEqual(publicOperatorAccount({ ...base, recoveryCodeDigests: ["digest"] }).recoveryMethods,
+      ["recovery_codes", "admin_assisted"]);
+    for (const name of names) process.env[name] = name === "SMTP_PORT" ? "2525" : "configured";
+    assert.deepEqual(publicOperatorAccount({ ...base, email: "valid@gmail.com" }).recoveryMethods,
+      ["email", "admin_assisted"]);
+  } finally {
+    for (const name of names) previous[name] === undefined ? delete process.env[name] : process.env[name] = previous[name];
+  }
 });
 
 test("canAccessDevice: no operator at all is never allowed", () => {

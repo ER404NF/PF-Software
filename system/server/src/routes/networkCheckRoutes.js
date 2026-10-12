@@ -149,7 +149,12 @@ export function registerNetworkCheckRoutes({
       return;
     }
 
-    networkVerifier.checkDevice(req.params.deviceId, checkUrl, { authorize })
+    networkVerifier.checkDevice(req.params.deviceId, checkUrl, {
+      authorize,
+      proveCurrentRoute: isProxyEgress(configuredNetwork?.egress)
+        ? () => networkRoutingOrchestrator?.verifyCurrentRoute?.(req.params.deviceId) ?? false
+        : null,
+    })
       .then(async result => {
         await authorize();
         if (result.networkMismatch && isProxyEgress(configuredNetwork?.egress)) {

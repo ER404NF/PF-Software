@@ -1,13 +1,25 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "events";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { TunManager, buildProxyUrl, redactProxyCredentials, parseTunPeer, discoverTunPeer, listAllInterfaces, allocateTunIface } from "../../src/tunManager.js";
+import { createProcessOwnershipStore } from "../../src/processOwnershipStore.js";
 
 function fakeChild() {
   const child = new EventEmitter();
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
   child.kill = () => {};
+  return child;
+}
+
+function ownedChild(pid = 4100) {
+  const child = fakeChild();
+  child.pid = pid;
+  child.signals = [];
+  child.kill = signal => { child.signals.push(signal || "SIGTERM"); };
   return child;
 }
 
@@ -145,4 +157,113 @@ test("getLog() also returns redacted lines", () => {
   manager.start({ deviceId: "mock-1", tunIface: "utun7", proxy: SAMPLE_PROXY });
   child.stdout.emit("data", Buffer.from(buildProxyUrl(SAMPLE_PROXY)));
   assert.equal(manager.getLog("mock-1")[0].includes("user1"), false);
+});
+
+test("stop() returns the supervisor result and managed IDs remain enumerable", async () => {
+  const manager = new TunManager({ spawn: () => fakeChild() });
+  manager.start({ deviceId: "mock-1", tunIface: "utun7", proxy: SAMPLE_PROXY });
+  assert.deepEqual(manager.listManagedDeviceIds(), ["mock-1"]);
+  manager.group.stop = () => Promise.resolve({ ok: false, error: "unconfirmed exit" });
+  assert.deepEqual(await manager.stop("mock-1"), { ok: false, error: "unconfirmed exit" });
+});
+
+test("stopAll waits for durable ownership cleanup before shutdown completes", async () => {
+  const order = [];
+  const ownershipStore = {
+    list: () => [],
+    flush: async () => { order.push("flushed"); },
+  };
+  const manager = new TunManager({ spawn: () => fakeChild(), ownershipStore });
+  manager.group.stopAll = async () => { order.push("stopped"); return [{ ok: true }]; };
+
+  assert.deepEqual(await manager.stopAll(), [{ ok: true }]);
+  assert.deepEqual(order, ["stopped", "flushed"]);
+});
+
+test("tun2proxy ownership is durable and never persists proxy credentials", async () => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "tun-owner-"));
+  const file = path.join(folder, "processes.json");
+  const command = `sudo -n tun2proxy --tun utun7 --proxy ${buildProxyUrl(SAMPLE_PROXY)} --dns virtual --verbosity info`;
+  const inspector = { supported: true, describe: async pid => ({
+    pid, ppid: 1, startTime: "start-a", program: "sudo", command,
+  }) };
+  const store = createProcessOwnershipStore({ filePath: file, inspector, owner: { pid: 22, startTime: "server-a" }, sleep: async () => {} });
+  const child = ownedChild();
+  const manager = new TunManager({ spawn: () => child, ownershipStore: store });
+
+  manager.start({ deviceId: "phone-a", tunIface: "utun7", proxy: SAMPLE_PROXY });
+  assert.equal(await manager.waitForOwnership("phone-a"), true);
+  await store.flush();
+  const raw = fs.readFileSync(file, "utf8");
+  assert.doesNotMatch(raw, /user1|p%40ss|p@ss|proxy\.example\.com|socks5:\/\//);
+  const record = store.get("tun2proxy", "phone-a");
+  assert.equal(record.tunIface, "utun7");
+  assert.equal(record.executableIdentity, "sudo");
+  assert.equal(record.command.includes("--proxy <redacted>"), true);
+  fs.rmSync(folder, { recursive: true, force: true });
+});
+
+test("ownership registration failure kills tun2proxy and blocks replacement", async () => {
+  const child = ownedChild();
+  const ownershipStore = {
+    record: async () => { throw new Error("disk unavailable"); },
+    release: async () => false,
+    confirmGone: async () => false,
+    list: () => [],
+  };
+  const manager = new TunManager({ spawn: () => child, ownershipStore });
+  manager.start({ deviceId: "phone-a", tunIface: "utun7", proxy: SAMPLE_PROXY });
+  assert.equal(await manager.waitForOwnership("phone-a"), false);
+  assert.deepEqual(child.signals, ["SIGTERM"]);
+  assert.equal(manager.getStatus("phone-a").state, "stop_failed");
+  assert.equal(manager.start({ deviceId: "phone-a", tunIface: "utun7", proxy: SAMPLE_PROXY }), "blocked");
+});
+
+test("restart recovery stops only the exact persisted tun2proxy process", async () => {
+  const records = [{
+    kind: "tun2proxy", udid: "phone-a", pid: 5100, startTime: "start-a",
+    command: "sudo -n tun2proxy --tun utun9 --proxy socks5://***@proxy.example.com:7000 --dns virtual --verbosity info",
+    executableIdentity: "sudo", tunIface: "utun9", unverified: false,
+    ownerServerPid: 20, ownerServerStartTime: "old-server",
+  }];
+  let processDescription = {
+    pid: 5100, ppid: 1, startTime: "start-a", program: "sudo",
+    command: `sudo -n tun2proxy --tun utun9 --proxy ${buildProxyUrl(SAMPLE_PROXY)} --dns virtual --verbosity info`,
+  };
+  const dropped = [];
+  const store = {
+    list: () => records,
+    inspectCurrent: async () => processDescription ? { status: "owned", record: records[0] } : { status: "gone", record: records[0] },
+    drop: async (kind, id) => { dropped.push([kind, id]); },
+  };
+  const signals = [];
+  const manager = new TunManager({ ownershipStore: store, spawn: () => ownedChild(),
+    killProcess: (pid, signal) => { signals.push([pid, signal]); processDescription = null; }, sleep: async () => {} });
+  assert.deepEqual(manager.listManagedDeviceIds(), ["phone-a"]);
+  assert.deepEqual(await manager.recoverPersistedOwnership(), { recovered: 1 });
+  assert.deepEqual(signals, [[5100, "SIGTERM"]]);
+  assert.deepEqual(dropped, [["tun2proxy", "phone-a"]]);
+});
+
+test("restart recovery preserves a reused or unverifiable foreign pid", async () => {
+  for (const status of ["reused", "foreign", "unknown"]) {
+    const record = { kind: "tun2proxy", udid: `phone-${status}`, pid: 6100, startTime: "old", unverified: false };
+    const signals = [];
+    const dropped = [];
+    const store = {
+      list: () => [record],
+      inspectCurrent: async () => ({ status, record }),
+      drop: async (...args) => { dropped.push(args); },
+    };
+    const manager = new TunManager({ ownershipStore: store, spawn: () => ownedChild(),
+      killProcess: (...args) => signals.push(args), sleep: async () => {} });
+    if (status === "reused") {
+      assert.deepEqual(await manager.recoverPersistedOwnership(), { recovered: 0 });
+      assert.deepEqual(dropped, [["tun2proxy", `phone-${status}`]]);
+    } else {
+      await assert.rejects(manager.recoverPersistedOwnership(), /cannot prove ownership/);
+      assert.deepEqual(dropped, []);
+    }
+    assert.deepEqual(signals, []);
+  }
 });

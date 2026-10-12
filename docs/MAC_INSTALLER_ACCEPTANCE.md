@@ -32,11 +32,11 @@ Do **not** mark the steps below as passed until they have been executed on macOS
 4. Double-click it in Finder.
 5. macOS **Installer.app** opens.
 6. Continue through the wizard (Introduction → Read Me → Install → Summary).
-7. `Phone Farm.app` appears in `/Applications`.
+7. `Bodun.app` appears in `/Applications`.
 8. Close Terminal.
 9. Close Xcode.
 10. Connect two already-trusted iPhones.
-11. Launch **Phone Farm** from Applications.
+11. Launch **Bodun** from Applications.
 12. Choose **Set up a new host**; host startup happens inside the app (preflight rows, first-admin form).
     Click **Fix it** on any row that needs attention, then **Check again** if it does not re-check itself.
     On first run, enter the Apple Team ID if asked. Leave "Start Phone Farm automatically when this Mac starts" ticked.
@@ -126,7 +126,7 @@ rollback procedure in `docs/RELIABILITY_NETWORK_FINAL_REPORT.md` sections 16-17.
 39. Unplug Phone A. Phone B must remain controllable and routed. Reconnect Phone A and require stable logical identity,
     preferred-port reuse when safe, WDA/iproxy recovery, fresh interface discovery, route rebuild, and a new passing
     device-originated check.
-40. Quit Phone Farm completely and relaunch it from Applications. Require both phones to recover independently; no
+40. Quit Bodun completely and relaunch it from Applications. Require both phones to recover independently; no
     stale route may be reported `PROTECTED` before current device-originated evidence exists.
 41. Run the healthy two-phone case for 30 minutes. Record disconnects, frame stalls, process restarts, CPU/energy
     observations, phone heat, and final network checks. Then use **Stop routing** for each phone and confirm the private
@@ -136,7 +136,7 @@ rollback procedure in `docs/RELIABILITY_NETWORK_FINAL_REPORT.md` sections 16-17.
 
 42. **No** "unidentified developer"/"cannot be opened" Gatekeeper warning when opening the downloaded `.pkg`.
 43. `pkgutil --check-signature Phone-Farm-<version>-arm64.pkg` reports a valid **Developer ID Installer** signature.
-44. `spctl --assess --type install -vv <pkg>` accepts the package, and `spctl --assess --type execute -vv "/Applications/Phone Farm.app"` accepts the installed app.
+44. `spctl --assess --type install -vv <pkg>` accepts the package, and `spctl --assess --type execute -vv "/Applications/Bodun.app"` accepts the installed app.
 45. `xcrun stapler validate <pkg>` (and the app) reports the notarization ticket is valid.
 
 `npm run verify:pkg -- <pkg> --expect notarized` in `desktop/` automates the signature, ticket, Gatekeeper,

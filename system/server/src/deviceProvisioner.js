@@ -2,7 +2,8 @@ import path from "path";
 import { WdaDevice } from "./wdaDevice.js";
 import { discoveredDeviceId } from "./deviceDiscovery.js";
 import { isLocalPortAvailable, reserveAvailablePortPair, resolveMjpegPortRange, resolvePortRange } from "./portAllocator.js";
-import { upsertProvisioningRecord, loadProvisioningRecords } from "./deviceProvisioningStore.js";
+import { upsertProvisioningRecord, loadProvisioningRecords, planProvisioningStoreRepair,
+  applyProvisioningStoreRepair } from "./deviceProvisioningStore.js";
 import { diagnosticError } from "./errorCatalog.js";
 import { LifecycleError, lifecycleSuccess } from "./provisioningResults.js";
 import { ownerStatus } from "./portReclaimer.js";
@@ -256,6 +257,7 @@ export class DeviceProvisioner {
     this.recheckTimer = null;
     this.checkOperation = null;
     this.reclaimAttempts = new Map(); // "kind:udid" -> how many times a leftover was asked to stop this session
+    this.corruptStateDevices = new Map(); // udid -> logical id; never contains a runnable entry
     this.waiters = new Set(); // functions that end a start-up wait early (shutdown)
 
     this.wdaProcessManager.on("exit", ({ key, log }) => this._onProcessExit("WDA", key, log));
@@ -436,6 +438,10 @@ export class DeviceProvisioner {
     const summary = { dropped: 0, reclaimed: 0, skipped: 0, cannotLook: 0, ownerAlive: 0, reclaimFailed: 0, unverifiedAlive: 0 };
     for (const record of store.list()) {
       if (this.stopping) break;
+      // The shared store also contains tun2proxy records. Routing owns their
+      // redacted command identity and restart cleanup; this WDA/iproxy sweep
+      // must never drop or signal a process kind it cannot verify itself.
+      if (!new Set(["wda", "iproxy"]).has(record?.kind)) continue;
       const attemptKey = `${record.kind}:${record.udid}`;
       const forget = async () => { await store.drop(record.kind, record.udid); this.reclaimAttempts.delete(attemptKey); summary.dropped += 1; };
       if (record.unverified || !record.startTime) {
@@ -549,8 +555,25 @@ export class DeviceProvisioner {
     try {
       existingRecord = this._loadRecord(udid);
     } catch {
-      // An unreadable lifecycle record is never permission to launch WDA.
-      existingRecord = { lifecycleIntent: "stopped", wdaEnabled: false };
+      // Preserve the damaged file and expose a non-runnable fleet entry. Only
+      // repairProvisioningState(), invoked by an authorized route, may reset it.
+      let blocked = this.devices.get(logicalId);
+      if (!(blocked instanceof WdaDevice)) {
+        blocked = new WdaDevice(logicalId, discovered.label, { host: "127.0.0.1", port: 0 });
+        this.devices.set(logicalId, blocked);
+      }
+      const stateError = diagnosticError("D103");
+      blocked.status = "offline";
+      blocked.discoveryState = "provisioning_state_corrupt";
+      blocked.discoveryStateMessage = `${stateError.name}. ${stateError.operatorAction}`;
+      blocked.setComponentError("wdaProcess", stateError);
+      blocked.setComponentHealth({ deviceAttachment: "CONNECTED", wdaProcess: "BLOCKED", iproxy: "BLOCKED",
+        wdaEndpoint: "UNKNOWN", control: "UNAVAILABLE", recovery: "USER_ACTION_REQUIRED" });
+      blocked.recordDiagnosticEvent("PROVISIONING_STATE_CORRUPT", { error: stateError });
+      this.corruptStateDevices.set(udid, logicalId);
+      this.udidByLogicalId.set(logicalId, udid);
+      this.onDeviceListChanged();
+      return;
     }
     let reservation;
     let adoptOwnedTunnel = false;
@@ -1052,13 +1075,14 @@ export class DeviceProvisioner {
     return error;
   }
 
-  _markIproxyStopFailed(entry) {
+  _markIproxyStopFailed(entry, { preserveWdaProcess = false } = {}) {
     const error = diagnosticError("I210");
     entry.wdaDevice.discoveryState = "provisioning_error";
     entry.wdaDevice.discoveryStateMessage = `${error.name}. ${error.operatorAction}`;
     entry.wdaDevice.setComponentError("iproxy", error);
     entry.wdaDevice.setComponentHealth({
-      wdaProcess: "STOPPED", iproxy: "FAILED", control: "UNAVAILABLE", recovery: "STOP_FAILED",
+      ...(preserveWdaProcess ? {} : { wdaProcess: "STOPPED" }),
+      iproxy: "FAILED", control: "UNAVAILABLE", recovery: "STOP_FAILED",
     });
     entry.wdaDevice.recordDiagnosticEvent("IPROXY_STOP_FAILED", { error });
     this.onDeviceListChanged();
@@ -1152,24 +1176,37 @@ export class DeviceProvisioner {
   // Public entry point for the admin route/fleet UI, which only ever knows
   // a device's logical id (never its raw UDID — CLAUDE.md §14.8, and the
   // Automation Architecture guide's own "redact UDIDs" logging rule).
-  retryDevice(logicalId) {
+  retryDevice(logicalId, { authorize = null } = {}) {
     return this._serializeLifecycle(logicalId, async () => {
+      await authorize?.();
       if (this.stopping) throw new LifecycleError("shutting_down");
       const udid = this.udidByLogicalId.get(logicalId);
       if (!udid) throw new LifecycleError("device_unknown");
-      return this.retry(udid);
+      return this.retry(udid, { authorize });
+    });
+  }
+
+  retryTunnelDevice(logicalId, { authorize = null } = {}) {
+    return this._serializeLifecycle(logicalId, async () => {
+      await authorize?.();
+      if (this.stopping) throw new LifecycleError("shutting_down");
+      const udid = this.udidByLogicalId.get(logicalId);
+      if (!udid) throw new LifecycleError("device_unknown");
+      return this.retryTunnel(udid, { authorize });
     });
   }
 
   // Internal — keyed by UDID because that's what the runtime map and the
   // process managers use as their identity. Every failure is a thrown LifecycleError (a distinct,
   // plain-language reason); only success returns a value: { ok: true, code: "started" }.
-  async retry(udid) {
+  async retry(udid, { authorize = null } = {}) {
     const entry = this.runtime.get(udid);
     if (!entry) throw new LifecycleError("device_not_attached");
     if (this.stopping) throw new LifecycleError("shutting_down");
+    await authorize?.();
     await this._assertNoForeignWda(udid, entry.derivedDataPath, { allowManaged: true });
     const adoptOwnedTunnel = this._ownsIproxyMapping(udid, entry);
+    await authorize?.();
     const stopped = await Promise.all([
       this.wdaProcessManager.stop(udid),
       ...(adoptOwnedTunnel ? [] : [this.iproxyManager.stop(udid)]),
@@ -1182,6 +1219,7 @@ export class DeviceProvisioner {
     }
     if (this.stopping) throw new LifecycleError("shutting_down");
     if (this.runtime.get(udid) !== entry) throw new LifecycleError("device_not_attached");
+    await authorize?.();
     let reservation = null;
     if (!adoptOwnedTunnel) {
       const conflict = await this._resolvePortConflict(entry);
@@ -1211,10 +1249,13 @@ export class DeviceProvisioner {
         wdaEndpoint: "UNKNOWN", control: "UNAVAILABLE", recovery: "MANUAL_RETRY",
       });
       entry.wdaDevice.recordDiagnosticEvent("WDA_RETRY_REQUESTED");
+      await authorize?.();
       assertStartResult(this.wdaProcessManager.start({ udid, derivedDataPath: entry.derivedDataPath }));
       if (!adoptOwnedTunnel) {
+        await authorize?.();
         assertStartResult(this.iproxyManager.start({ udid, localPort: entry.port, mjpegLocalPort: entry.mjpegPort }));
       }
+      await authorize?.();
       this.onDeviceListChanged();
       return lifecycleSuccess();
     } catch (error) {
@@ -1226,6 +1267,60 @@ export class DeviceProvisioner {
         ? error.message : "WDA control could not start safely. Review diagnostics before retrying.";
       entry.wdaDevice.setComponentHealth({ wdaProcess: "FAILED", control: "UNAVAILABLE", recovery: "FAILED" });
       this.onDeviceListChanged();
+      throw error;
+    } finally {
+      reservation?.release();
+    }
+  }
+
+  async retryTunnel(udid, { authorize = null } = {}) {
+    const entry = this.runtime.get(udid);
+    if (!entry) throw new LifecycleError("device_not_attached");
+    if (!entry.wdaEnabled || this._managerState(this.wdaProcessManager, udid) !== "running") {
+      throw new LifecycleError("wda_not_running");
+    }
+    let tunnelStarted = false;
+    let reservation = null;
+    try {
+      await authorize?.();
+      const stopped = await this.iproxyManager.stop(udid);
+      if (stopped?.ok === false || this.iproxyManager.getStatus?.(udid)?.state === "stop_failed") {
+        this._markIproxyStopFailed(entry);
+        throw new LifecycleError("old_process_would_not_stop");
+      }
+      entry.wdaDevice.invalidateReadiness("IPROXY_RETRY");
+      entry.wdaDevice.setComponentHealth({ iproxy: "STARTING", control: "UNAVAILABLE", recovery: "IPROXY_RESTART" });
+      await authorize?.();
+      const conflict = await this._resolvePortConflict(entry);
+      if (conflict.status !== "free") throw this._markPortConflict(entry, this._conflictError(conflict));
+      reservation = await this._reserveDevicePorts(entry);
+      await authorize?.();
+      assertStartResult(this.iproxyManager.start({ udid, localPort: entry.port, mjpegLocalPort: entry.mjpegPort }));
+      tunnelStarted = true;
+      await authorize?.();
+      const ready = await this._checkControlReadiness(udid, entry);
+      await authorize?.();
+      if (!ready) throw new LifecycleError("wda_not_ready");
+      entry.wdaDevice.setComponentError("iproxy", null);
+      this.onDeviceListChanged();
+      return lifecycleSuccess();
+    } catch (error) {
+      let cleanupFailed = false;
+      if (tunnelStarted) {
+        try {
+          const stopped = await this.iproxyManager.stop(udid);
+          cleanupFailed = stopped?.ok === false
+            || this.iproxyManager.getStatus?.(udid)?.state === "stop_failed";
+        } catch {
+          cleanupFailed = true;
+        }
+      }
+      if (cleanupFailed) {
+        this._markIproxyStopFailed(entry, { preserveWdaProcess: true });
+      } else {
+        entry.wdaDevice.setComponentHealth({ iproxy: "FAILED", control: "UNAVAILABLE", recovery: "FAILED" });
+        this.onDeviceListChanged();
+      }
       throw error;
     } finally {
       reservation?.release();
@@ -1315,9 +1410,18 @@ export class DeviceProvisioner {
   async _assertNoForeignWda(udid, derivedDataPath, { allowManaged = true } = {}) {
     if (allowManaged && this.wdaProcessManager.ownsProcess?.(udid, { derivedDataPath })) return "owned";
     const inspector = this.portReclaimer?.inspector;
-    if (!inspector?.findProcesses) return "not-supported";
-    const found = await inspector.findProcesses("xcodebuild");
-    if (!found?.supported) throw new LifecycleError("wda_ownership_unavailable");
+    if (!inspector?.findProcesses) throw new LifecycleError("wda_ownership_unavailable");
+    let found;
+    try {
+      found = await inspector.findProcesses("xcodebuild");
+    } catch {
+      throw new LifecycleError("wda_ownership_unavailable");
+    }
+    if (found?.supported !== true || !Array.isArray(found.processes)
+      || found.processes.some(process => !process || !Number.isSafeInteger(process.pid)
+        || process.pid < 1 || typeof process.command !== "string")) {
+      throw new LifecycleError("wda_ownership_unavailable");
+    }
     const matches = found.processes.filter(process => {
       const command = String(process.command || "");
       return command.includes("WebDriverAgentRunner") && command.includes(`id=${udid}`);
@@ -1403,6 +1507,7 @@ export class DeviceProvisioner {
           reservation.release();
         }
         const ready = await this._checkControlReadiness(udid, entry);
+        if (authorize) await authorize();
         if (!ready) {
           entry.wdaDevice.discoveryState = "provisioning";
           entry.wdaDevice.discoveryStateMessage = "WDA restarted, but control is not ready yet. Use Check control for the failing layer.";
@@ -1442,7 +1547,9 @@ export class DeviceProvisioner {
       if (!entry) {
         // Unplugged in this session: there is no running process to stop, but the operator's choice
         // is still recorded, so the phone comes back stopped when it is plugged in again.
-        try { this._saveRecord(udid, { wdaEnabled: false }); } catch { /* the in-memory state below still reports it */ }
+        // Persistence is authoritative here: reporting success after a failed write would let the
+        // phone auto-start on reconnect despite the operator's explicit Stop request.
+        this._saveRecord(udid, { wdaEnabled: false });
         await Promise.allSettled([this.wdaProcessManager.stop(udid), this.iproxyManager.stop(udid)]);
         const wdaDevice = this.devices.get(logicalId);
         if (wdaDevice) {
@@ -1576,6 +1683,7 @@ export class DeviceProvisioner {
   }
 
   async diagnoseDevice(logicalId, { authorize = null } = {}) {
+    await authorize?.();
     const udid = this.udidByLogicalId.get(logicalId);
     const entry = udid ? this.runtime.get(udid) : null;
     if (!entry) return null;
@@ -1586,6 +1694,7 @@ export class DeviceProvisioner {
     const checked = readinessChecked
       ? await this._checkControlReadiness(udid, entry)
       : false;
+    await authorize?.();
     const probes = { sessionProbe: null, windowProbe: null, screenshotProbe: null };
     if (checked) {
       const runProbe = async (key, id, label, work, describe) => {
@@ -1593,10 +1702,13 @@ export class DeviceProvisioner {
         const startedAt = this.now();
         try {
           const value = await work();
-          if (authorize) await authorize();
+          await authorize?.();
           probes[key] = successfulProbe(id, label, describe(value), Math.max(0, this.now() - startedAt));
           return true;
         } catch (error) {
+          // Authorization failures are not device-probe failures and must remain
+          // fail-closed all the way to the route error middleware.
+          await authorize?.();
           probes[key] = failedProbe(id, label, error);
           return false;
         }
@@ -1672,6 +1784,32 @@ export class DeviceProvisioner {
 
   _loadRecord(udid) {
     return loadProvisioningRecords(this.provisioningStorePath)[udid] ?? null;
+  }
+
+  hasCorruptProvisioningState() {
+    return this.corruptStateDevices.size > 0;
+  }
+
+  async repairProvisioningState({ authorize, destructiveReset = false } = {}) {
+    if (authorize) await authorize();
+    const plan = planProvisioningStoreRepair(this.provisioningStorePath);
+    if (authorize) await authorize();
+    const result = applyProvisioningStoreRepair(this.provisioningStorePath, plan, { destructiveReset });
+    if (!result.repaired) return result;
+    for (const [udid, logicalId] of this.corruptStateDevices) {
+      if (this.udidByLogicalId.get(logicalId) === udid) this.udidByLogicalId.delete(logicalId);
+      if (!this.runtime.has(udid)) this.devices.delete(logicalId);
+    }
+    this.corruptStateDevices.clear();
+    try {
+      await this.pollOnce();
+      return { ...result, refreshPending: false };
+    } catch {
+      // The repair is already durably committed. A discovery/refresh failure
+      // must not tell the operator that the repair itself failed or invite a
+      // second destructive attempt.
+      return { ...result, refreshPending: true };
+    }
   }
 
   _saveRecord(udid, patch) {

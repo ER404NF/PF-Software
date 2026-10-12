@@ -22,6 +22,13 @@ export function redactProxyCredentials(text) {
   return typeof text === "string" ? text.replace(CREDENTIAL_URL_RE, "$1***@") : text;
 }
 
+// Durable ownership needs a stable command shape but never the proxy endpoint
+// or credential-bearing URL. PID + start time + executable + this normalized
+// shape are sufficient to reject PID reuse and foreign processes safely.
+export function redactTunOwnershipCommand(text) {
+  return redactProxyCredentials(text).replace(/(--proxy\s+)\S+/gi, "$1<redacted>");
+}
+
 // Percent-encodes username/password as tun2proxy's URL parsing requires
 // (guide §4.7). Built once here rather than left to each caller, so every
 // tunnel launch encodes consistently.
@@ -42,10 +49,20 @@ export function buildProxyUrl({ protocol, host, port, username, password }) {
 // while this architecture relies on PfManager's per-device `route-to` rules
 // for selective routing (guide §4.7's explicit guardrail).
 export class TunManager {
-  constructor({ spawn = nodeSpawn, sudoBin = "sudo", tun2proxyBin = process.env.TUN2PROXY_BIN || "tun2proxy", restartBackoffMs } = {}) {
+  constructor({ spawn = nodeSpawn, sudoBin = "sudo", tun2proxyBin = process.env.TUN2PROXY_BIN || "tun2proxy", restartBackoffMs,
+    ownershipStore = null, killProcess = (pid, signal) => process.kill(pid, signal), sleep = ms => new Promise(resolve => setTimeout(resolve, ms)),
+    recoveryPollMs = 100, recoveryWaitMs = 3000 } = {}) {
     this.sudoBin = sudoBin;
     this.tun2proxyBin = tun2proxyBin;
-    this.group = new SupervisedProcessGroup({ spawn, restartBackoffMs, logRingSize: 100 });
+    this.ownershipStore = ownershipStore;
+    this.killProcess = killProcess;
+    this.sleep = sleep;
+    this.recoveryPollMs = recoveryPollMs;
+    this.recoveryWaitMs = recoveryWaitMs;
+    this.group = new SupervisedProcessGroup({
+      spawn, restartBackoffMs, logRingSize: 100,
+      ownership: ownershipStore ? tunOwnershipHooks(ownershipStore) : null,
+    });
     this.emitter = new EventEmitter();
     this.group.on("starting", (event) => this.emitter.emit("starting", event));
     this.group.on("log", (event) => this.emitter.emit("log", { ...event, line: redactProxyCredentials(event.line) }));
@@ -58,8 +75,70 @@ export class TunManager {
   isRunning(deviceId) { return this.group.isRunning(deviceId); }
   getStatus(deviceId) { return this.group.getStatus(deviceId); }
   getLog(deviceId) { return this.group.getLog(deviceId).map(redactProxyCredentials); }
-  stop(deviceId) { this.group.stop(deviceId); }
-  stopAll() { return this.group.stopAll(); }
+  listManagedDeviceIds() {
+    const persisted = this.ownershipStore?.list?.()
+      ?.filter(record => record?.kind === "tun2proxy" && typeof record.udid === "string")
+      .map(record => record.udid) ?? [];
+    return [...new Set([...this.group.listManagedKeys(), ...persisted])];
+  }
+  async stop(deviceId) {
+    const result = await this.group.stop(deviceId);
+    await this.ownershipStore?.flush?.();
+    return result;
+  }
+  async stopAll() {
+    const results = await this.group.stopAll();
+    await this.ownershipStore?.flush?.();
+    return results;
+  }
+  waitForOwnership(deviceId) { return this.group.waitForOwnership(deviceId); }
+  async hasCurrentOwnership(deviceId) {
+    if (!this.ownershipStore) return this.isRunning(deviceId);
+    const result = await this.ownershipStore.inspectCurrent({
+      kind: "tun2proxy", udid: deviceId, sanitizeCommand: redactTunOwnershipCommand,
+    });
+    return result.status === "owned";
+  }
+
+  async recoverPersistedOwnership() {
+    if (!this.ownershipStore) return { recovered: 0 };
+    const records = this.ownershipStore.list().filter(record => record?.kind === "tun2proxy");
+    let recovered = 0;
+    for (const record of records) {
+      const inspect = () => this.ownershipStore.inspectCurrent({
+        kind: "tun2proxy", udid: record.udid, sanitizeCommand: redactTunOwnershipCommand,
+      });
+      let state = await inspect();
+      if (["gone", "reused"].includes(state.status)) {
+        await this.ownershipStore.drop("tun2proxy", record.udid);
+        continue;
+      }
+      if (state.status !== "owned") throw new Error("tun2proxy recovery cannot prove ownership; routing remains blocked");
+      try { this.killProcess(record.pid, "SIGTERM"); }
+      catch (error) { if (error?.code !== "ESRCH") throw new Error("tun2proxy recovery could not stop an owned process"); }
+      const rounds = Math.max(1, Math.ceil(this.recoveryWaitMs / this.recoveryPollMs));
+      for (let round = 0; round < rounds; round += 1) {
+        state = await inspect();
+        if (["gone", "reused"].includes(state.status)) break;
+        if (state.status !== "owned") throw new Error("tun2proxy recovery lost exact process ownership; routing remains blocked");
+        if (round < rounds - 1) await this.sleep(this.recoveryPollMs);
+      }
+      if (state.status === "owned") {
+        try { this.killProcess(record.pid, "SIGKILL"); }
+        catch (error) { if (error?.code !== "ESRCH") throw new Error("tun2proxy recovery could not stop an owned process"); }
+        for (let round = 0; round < rounds; round += 1) {
+          state = await inspect();
+          if (["gone", "reused"].includes(state.status)) break;
+          if (state.status !== "owned") throw new Error("tun2proxy recovery lost exact process ownership; routing remains blocked");
+          if (round < rounds - 1) await this.sleep(this.recoveryPollMs);
+        }
+      }
+      if (!["gone", "reused"].includes(state.status)) throw new Error("tun2proxy recovery could not confirm process exit; routing remains blocked");
+      await this.ownershipStore.drop("tun2proxy", record.udid);
+      recovered += 1;
+    }
+    return { recovered };
+  }
 
   // `proxy` is the plaintext-decrypted credential object from
   // proxyPool.js's decryptProxyPassword — call sites must decrypt
@@ -68,7 +147,7 @@ export class TunManager {
     if (!deviceId) throw new Error("tunnel requires a deviceId");
     if (!tunIface) throw new Error("tunnel requires a tunIface");
     const url = buildProxyUrl(proxy);
-    this.group.start(deviceId, this.sudoBin, [
+    return this.group.start(deviceId, this.sudoBin, [
       "-n", this.tun2proxyBin,
       "--tun", tunIface,
       "--proxy", url,
@@ -76,6 +155,18 @@ export class TunManager {
       "--verbosity", "info",
     ]);
   }
+}
+
+export function tunOwnershipHooks(store) {
+  return {
+    onSpawn: ({ key, pid, bin, args }) => store.record({
+      kind: "tun2proxy", udid: key, pid, bin, args,
+      sanitizeCommand: redactTunOwnershipCommand,
+      metadata: { tunIface: args[args.indexOf("--tun") + 1] || null },
+    }),
+    onRelease: ({ key, pid }) => store.release({ kind: "tun2proxy", udid: key, pid }),
+    confirmGone: key => store.confirmGone({ kind: "tun2proxy", udid: key }),
+  };
 }
 
 // After tun2proxy brings the interface up, its point-to-point peer address

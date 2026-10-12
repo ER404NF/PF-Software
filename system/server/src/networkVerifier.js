@@ -29,6 +29,7 @@
 // exists to have a URL at all.
 
 import { egressIdentity } from "./deviceNetworkConfig.js";
+import { isProxyEgress } from "./deviceNetworkStore.js";
 import { diagnosticError } from "./errorCatalog.js";
 import { isPublicIpv4 } from "./publicIp.js";
 import { isIP } from "node:net";
@@ -112,7 +113,7 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS,
     return null;
   }
 
-  async function checkDevice(deviceId, checkUrl, { authorize = null } = {}) {
+  async function checkDevice(deviceId, checkUrl, { authorize = null, proveCurrentRoute = null } = {}) {
     const generation = generations.get(deviceId) ?? 0;
     await authorize?.();
     if (generation !== (generations.get(deviceId) ?? 0)) return getStatus(deviceId);
@@ -162,6 +163,14 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS,
     if (generation !== (generations.get(deviceId) ?? 0)) return getStatus(deviceId);
     const network = deviceNetwork.get(deviceId);
     const mismatches = [];
+    if (isProxyEgress(network?.egress)) {
+      let routeProven = false;
+      try { routeProven = typeof proveCurrentRoute === "function" && await proveCurrentRoute() === true; }
+      catch { routeProven = false; }
+      await authorize?.();
+      if (generation !== (generations.get(deviceId) ?? 0)) return getStatus(deviceId);
+      if (!routeProven) mismatches.push("current tunnel ownership, firewall rule, and bridge state could not be proven");
+    }
     if (collision) mismatches.push(`shares egress IP ${observedIp} with device "${collision}", which is on a different network assignment`);
     if (network?.expectedPublicIpv4 && network.expectedPublicIpv4 !== observedIp) {
       mismatches.push(`observed IPv4 ${observedIp} does not match configured IPv4 ${network.expectedPublicIpv4}`);

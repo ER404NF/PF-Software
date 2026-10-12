@@ -40,7 +40,11 @@ test("allocateAvailablePort skips a real operating-system listener", async () =>
   const occupied = blocker.address().port;
   try {
     assert.equal(await isLocalPortAvailable(occupied), false);
-    const selected = await allocateAvailablePort({ range: { start: occupied, end: occupied + 2 }, preferred: occupied });
+    // Do not assume the two numerically adjacent ports are bindable. Windows
+    // commonly reserves dynamic port blocks, and parallel suites may own
+    // neighbours even though this listener itself is valid evidence. Keep the
+    // occupied port preferred, then let the allocator find any real free port.
+    const selected = await allocateAvailablePort({ range: { start: 1024, end: 65535 }, preferred: occupied });
     assert.notEqual(selected, occupied);
   } finally {
     await new Promise(resolve => blocker.close(resolve));

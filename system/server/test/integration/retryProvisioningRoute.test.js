@@ -25,6 +25,7 @@ const { assertPlainOperatorText } = await import("../helpers/plainText.js");
 
 let httpUrl;
 let adminCookie;
+let managerCookie;
 
 async function loginCookie(username) {
   const res = await fetch(`${httpUrl}/api/login`, {
@@ -40,17 +41,23 @@ async function loginCookie(username) {
 const retry = () => fetch(`${httpUrl}/api/admin/devices/mock-1/retry-provisioning`, {
   method: "POST", headers: { "Content-Type": "application/json", Cookie: adminCookie }, body: "{}",
 });
+const retryAs = cookie => fetch(`${httpUrl}/api/admin/devices/mock-1/retry-provisioning`, {
+  method: "POST", headers: { "Content-Type": "application/json", Cookie: cookie }, body: "{}",
+});
 
 before(async () => {
   operators.set("retry-route-admin", { username: "retry-route-admin", passwordHash: hashPassword(TEST_PASSWORD), allowedDevices: null, role: "admin" });
+  operators.set("retry-route-manager", { username: "retry-route-manager", passwordHash: hashPassword(TEST_PASSWORD), allowedDevices: null, role: "manager", teamId: "retry-team" });
   await new Promise(resolve => server.listen(0, resolve));
   httpUrl = `http://127.0.0.1:${server.address().port}`;
   adminCookie = await loginCookie("retry-route-admin");
+  managerCookie = await loginCookie("retry-route-manager");
 });
 
 after(async () => {
   setDeviceProvisionerForTests(undefined);
   operators.delete("retry-route-admin");
+  operators.delete("retry-route-manager");
   await new Promise(resolve => wss.close(resolve));
   await new Promise(resolve => server.close(resolve));
   fs.rmSync(tmpStorageRoot, { recursive: true, force: true });
@@ -70,6 +77,25 @@ test("a started retry answers ok with its code", async () => {
   const res = await retry();
   assert.equal(res.status, 200);
   assert.deepEqual(await res.json(), { ok: true, code: "started" });
+});
+
+test("the USB-tunnel route calls only the tunnel recovery operation", async () => {
+  let fullRetries = 0;
+  let tunnelRetries = 0;
+  setDeviceProvisionerForTests({
+    retryDevice: async () => { fullRetries += 1; return { ok: true, code: "started" }; },
+    retryTunnelDevice: async (_deviceId, { authorize }) => {
+      await authorize();
+      tunnelRetries += 1;
+      return { ok: true, code: "started" };
+    },
+  });
+  const res = await fetch(`${httpUrl}/api/admin/devices/mock-1/retry-tunnel`, {
+    method: "POST", headers: { "Content-Type": "application/json", Cookie: adminCookie }, body: "{}",
+  });
+  assert.equal(res.status, 200);
+  assert.equal(tunnelRetries, 1);
+  assert.equal(fullRetries, 0);
 });
 
 test("each failure keeps its own status, code and plain message", async () => {
@@ -95,4 +121,49 @@ test("a port held by another program names the program, the process number and t
 test("an unexpected failure is still a server error", async () => {
   setDeviceProvisionerForTests({ retryDevice: async () => { throw new Error("boom"); } });
   assert.equal((await retry()).status, 500);
+});
+
+test("ordinary device-management capability cannot invoke WDA provisioning retry", async () => {
+  let calls = 0;
+  setDeviceProvisionerForTests({ retryDevice: async () => { calls += 1; return { ok: true, code: "started" }; } });
+  const res = await retryAs(managerCookie);
+  assert.equal(res.status, 403);
+  assert.equal(calls, 0);
+});
+
+for (const [name, expectedStatus, revoke, restore] of [
+  ["role", 403, () => { operators.get("retry-route-admin").role = "manager"; }, () => { operators.get("retry-route-admin").role = "admin"; }],
+  ["device grant", 403, () => { operators.get("retry-route-admin").allowedDevices = []; }, () => { operators.get("retry-route-admin").allowedDevices = null; }],
+  ["operator deletion", 401, () => { operators.delete("retry-route-admin"); }, () => {
+    operators.set("retry-route-admin", { username: "retry-route-admin", passwordHash: hashPassword(TEST_PASSWORD), allowedDevices: null, role: "admin" });
+  }],
+]) {
+  test(`${name} revocation while retry is pending fails before success`, async () => {
+    setDeviceProvisionerForTests({
+      retryDevice: async (_deviceId, { authorize }) => {
+        revoke();
+        await authorize();
+        return { ok: true, code: "started" };
+      },
+    });
+    try {
+      const res = await retry();
+      assert.equal(res.status, expectedStatus);
+    } finally {
+      restore();
+    }
+  });
+}
+
+test("session revocation while retry is pending fails before success", async () => {
+  setDeviceProvisionerForTests({
+    retryDevice: async (_deviceId, { authorize }) => {
+      await fetch(`${httpUrl}/api/logout`, { method: "POST", headers: { Cookie: adminCookie } });
+      await authorize();
+      return { ok: true, code: "started" };
+    },
+  });
+  const res = await retry();
+  assert.equal(res.status, 401);
+  adminCookie = await loginCookie("retry-route-admin");
 });

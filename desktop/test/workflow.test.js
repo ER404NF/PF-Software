@@ -146,6 +146,9 @@ test("the verified main-branch arm64 package is committed through an isolated LF
   assert.match(commit.run, /prebuilt\/mac\/Phone-Farm\.pkg/);
   assert.match(commit.run, /prebuilt\/mac\/Phone-Farm\.pkg\.sha256/);
   assert.match(commit.run, /prebuilt\/mac\/SIGNING_LEVEL\.txt/);
+  assert.match(commit.run, /prebuilt\/mac\/BUILD_INFO\.json/);
+  assert.match(commit.run, /GITHUB_SHA/, "the manifest must identify the source commit that produced the package");
+  assert.match(commit.run, /packageSha256/, "the manifest must bind the package digest");
   assert.match(commit.run, /\[skip ci\]/, "the generated commit must not trigger an Actions loop");
   assert.match(commit.run, /git lfs install --local/);
   assert.doesNotMatch(commit.run, /build-mac-pkg\.cjs/, "the verified package must be reused, not rebuilt");

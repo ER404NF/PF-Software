@@ -71,6 +71,24 @@ test("networkRoutingOrchestrator is not constructed without AUTO_ROUTE_PROXY_TUN
   assert.equal(networkRoutingOrchestrator, undefined);
 });
 
+test("stop-routing refreshes authorization immediately before beginning fail-closed teardown", () => {
+  const source = fs.readFileSync(new URL("../../src/index.js", import.meta.url), "utf8");
+  assert.match(source,
+    /const currentAtStart = await authorizeRoutingMutation\(req, req\.params\.deviceId\);\s*advanceNetworkIdentityGeneration\(req\.params\.deviceId\);\s*\/\/ Once teardown[\s\S]*?await networkRoutingOrchestrator\.stopRouting/);
+});
+
+test("network observation and generation changes begin only after fresh authorization", () => {
+  const source = fs.readFileSync(new URL("../../src/index.js", import.meta.url), "utf8");
+  assert.match(source,
+    /currentAtStart = await authorizeRoutingMutation[\s\S]*?const reservation = networkEnrollmentLock\.tryStart/);
+  assert.match(source,
+    /ENROLLMENT_STARTING[\s\S]*?await authorizeRoutingMutation\(req, req\.params\.deviceId\);\s*networkRoutingOrchestrator\.assertRoutingAvailable\?\.\(\);\s*const after = await enrollmentTools\.listBridgeMembers/);
+  assert.match(source,
+    /complete network enrollment[\s\S]*?await authorizeRoutingMutation\(req, req\.params\.deviceId\);\s*networkRoutingOrchestrator\.assertRoutingAvailable\?\.\(\);\s*const generation = advanceNetworkIdentityGeneration[\s\S]*?discoverBridgeOwnIp/);
+  assert.match(source,
+    /usbIp is required[\s\S]*?await authorizeRoutingMutation\(req, req\.params\.deviceId\);\s*advanceNetworkIdentityGeneration[\s\S]*?networkRoutingOrchestrator\.startRouting/);
+});
+
 test("autoNetworkEnrollment is not constructed without AUTO_NETWORK_ENROLLMENT (nested under AUTO_ROUTE_PROXY_TUNNELS, itself unset here)", () => {
   assert.equal(autoNetworkEnrollment, undefined);
 });
@@ -82,6 +100,10 @@ test("start-routing and stop-routing both require authentication", async () => {
   assert.equal(start.status, 401);
   const stop = await fetch(`${httpUrl}/api/admin/devices/mock-1/stop-routing`, { method: "POST" });
   assert.equal(stop.status, 401);
+  const recover = await fetch(`${httpUrl}/api/admin/routing/recover`, { method: "POST" });
+  assert.equal(recover.status, 401);
+  const repair = await fetch(`${httpUrl}/api/admin/routing/repair`, { method: "POST" });
+  assert.equal(repair.status, 401);
 });
 
 test("Manager (proxy:assign, but not routing:manage) is refused — routing stays Admin-only", async () => {
@@ -90,6 +112,15 @@ test("Manager (proxy:assign, but not routing:manage) is refused — routing stay
     body: JSON.stringify({ usbIp: "192.168.2.10" }),
   });
   assert.equal(res.status, 403);
+  const recover = await fetch(`${httpUrl}/api/admin/routing/recover`, {
+    method: "POST", headers: { Cookie: managerCookie },
+  });
+  assert.equal(recover.status, 403);
+  const repair = await fetch(`${httpUrl}/api/admin/routing/repair`, {
+    method: "POST", headers: { "Content-Type": "application/json", Cookie: managerCookie },
+    body: JSON.stringify({ confirm: true }),
+  });
+  assert.equal(repair.status, 403);
 });
 
 test("an authorized Admin gets a clear 409 rather than a silent no-op when routing is disabled", async () => {
@@ -107,6 +138,12 @@ test("an authorized Admin gets a clear 409 rather than a silent no-op when routi
   const stopMessage = (await stop.json()).error;
   assert.match(stopMessage, /Automatic network setup is turned off on this Mac\./);
   assertPlainOperatorText(stopMessage, "stop routing while routing is off");
+  const repair = await fetch(`${httpUrl}/api/admin/routing/repair`, {
+    method: "POST", headers: { "Content-Type": "application/json", Cookie: adminCookie },
+    body: JSON.stringify({ confirm: true }),
+  });
+  assert.equal(repair.status, 409);
+  assert.match((await repair.json()).error, /Automatic network setup is turned off on this Mac\./);
 });
 
 test("device_list never exposes a routing field to a viewer without routing:manage", async () => {
@@ -134,6 +171,7 @@ test("Admin device summaries distinguish a disabled routing feature from an unen
   assert.deepEqual(mock1.routingFeature, {
     state: "disabled",
     message: "Proxy routing is disabled on this host.",
+    hostRouting: null,
   });
   assert.equal(mock1.routing, null);
 });
