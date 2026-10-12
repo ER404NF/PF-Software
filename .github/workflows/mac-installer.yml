@@ -283,7 +283,7 @@ jobs:
           printf '%s\n' "${signing_level}" > prebuilt/mac/SIGNING_LEVEL.txt
           (cd prebuilt/mac && shasum -a 256 Phone-Farm.pkg > Phone-Farm.pkg.sha256)
           package_sha256="$(shasum -a 256 prebuilt/mac/Phone-Farm.pkg | awk '{print $1}')"
-          app_version="$(node -p \"require('./desktop/package.json').version\")"
+          app_version="$(node -p 'require("./desktop/package.json").version')"
           node - "${GITHUB_SHA}" "${app_version}" "${signing_level}" "${package_sha256}" <<'NODE'
           const fs = require("node:fs");
           const [sourceCommit, appVersion, signingLevel, packageSha256] = process.argv.slice(2);

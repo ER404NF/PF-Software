@@ -9,6 +9,14 @@ const workflowPath = path.join(repoRoot, ".github", "workflows", "mac-installer.
 const text = fs.readFileSync(workflowPath, "utf8");
 const workflow = yaml.load(text);
 const build = workflow.jobs.build;
+
+test("the prebuilt publisher uses shell-safe quoting for the app version", () => {
+  const prebuilt = workflow.jobs.prebuilt;
+  const publishStep = prebuilt.steps.find(step => step.name === "Commit verified arm64 installer through Git LFS");
+  assert.ok(publishStep, "the prebuilt publisher step must exist");
+  assert.match(publishStep.run, /node -p 'require\("\.\/desktop\/package\.json"\)\.version'/);
+  assert.doesNotMatch(publishStep.run, /node -p \\\"/);
+});
 const runs = build.steps.map(step => `${step.name || ""}\n${step.run || ""}\n${step.uses || ""}`);
 const indexOf = pattern => runs.findIndex(entry => pattern.test(entry));
 
