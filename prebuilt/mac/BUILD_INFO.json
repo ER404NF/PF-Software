@@ -1,8 +1,8 @@
 {
   "version": 1,
-  "sourceCommit": "fafe3abba1bfa33cb04de37a27c864a52c25c74c",
+  "sourceCommit": "fcac8a0867df9bb34fa0f41714ef15e1458e8090",
   "appVersion": "0.3.1",
   "arch": "arm64",
   "signingLevel": "unsigned",
-  "packageSha256": "3efe682e996648683eb5e0f82649dff16df055b529a5d6225e93aef81a86e17f"
+  "packageSha256": "15dded3985d61ef4fffb54849f6aaf7df7e6bba7650ac84d84f867e867c08cfa"
 }

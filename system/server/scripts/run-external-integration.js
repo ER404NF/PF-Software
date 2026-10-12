@@ -10,9 +10,8 @@ async function probePostgres(url) {
 }
 
 async function probeRedis(url) {
-  const client = createRedisClient({ url, connectTimeout: 2000, maxRetriesPerRequest: 0, lazyConnect: true });
+  const client = createRedisClient({ url, connectTimeout: 2000, maxRetriesPerRequest: 0 });
   try {
-    await client.connect();
     await client.ping();
   } finally {
     client.disconnect();
