@@ -726,6 +726,10 @@ test("explicit recovery refuses an unsafe bridge, then clears quarantine idempot
   privilegedOps.inspectBridge = async () => ({ available: true, up: false });
   await assert.rejects(() => orchestrator.recoverHostRouting(), error => error.code === "ROUTING_BRIDGE_UNAVAILABLE");
   assert.equal(fs.existsSync(quarantineStorePath), true);
+  assert.equal(orchestrator.getHostRoutingStatus().state, "recovery_required");
+  assert.equal(orchestrator.getHostRoutingStatus().reasonCode, "ROUTING_BRIDGE_UNAVAILABLE");
+  assert.equal(orchestrator.getHostRoutingStatus().bridgeAvailable, false);
+  assert.equal(JSON.parse(fs.readFileSync(quarantineStorePath, "utf8")).reasonCode, "ROUTING_BRIDGE_UNAVAILABLE");
 
   privilegedOps.inspectBridge = async () => ({ available: true, up: true });
   const recovered = await orchestrator.recoverHostRouting();
@@ -989,6 +993,10 @@ test("route loss blocks and rebuilds only the affected phone", async () => {
   assert.equal(orchestrator.getRoute("mock-1").state, ROUTING_STATES.ROUTE_LOST);
   assert.equal(orchestrator.getRoute("mock-1").internetBlocked, true);
   assert.equal(orchestrator.getRoute("mock-2").state, ROUTING_STATES.ROUTED);
+  assert.deepEqual(orchestrator.getRouteRecoveryStatus("mock-1"), {
+    automaticRecoveryPending: true,
+    automaticRecoveryExhausted: false,
+  });
   const blockedRules = privilegedOps.loadCalls.at(-1);
   assert.match(blockedRules, /block in quick on bridge0 inet from 192\.168\.2\.10 to any/);
   assert.match(blockedRules, /route-to .*from 192\.168\.2\.11/);
@@ -1034,6 +1042,10 @@ test("route recovery stops after the bounded retry budget and remains fail-close
   assert.equal(route.internetBlocked, true);
   assert.equal(route.protected, false);
   assert.equal(timers.length, 0, "no restart loop continues after the bounded attempts");
+  assert.deepEqual(orchestrator.getRouteRecoveryStatus("mock-1"), {
+    automaticRecoveryPending: false,
+    automaticRecoveryExhausted: true,
+  });
   assert.match(privilegedOps.loadCalls.at(-1), /block in quick on bridge0 inet from 192\.168\.2\.10 to any/);
 });
 

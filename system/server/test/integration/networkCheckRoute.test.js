@@ -196,7 +196,7 @@ test("revocation during a delayed network check returns no observed network data
   }
 });
 
-test("a successful check updates the device summary and is audited with the assigned network egress", async () => {
+test("a successful host check stays VERIFYING and is audited without claiming phone egress", async () => {
   await fetch(`${CHECK_URL.replace("/ip", "/debug/set-ip")}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -213,8 +213,11 @@ test("a successful check updates the device summary and is audited with the assi
   assert.equal(network.egress, "cellular-sim"); // mock-1's real devices.config.json assignment
   assert.equal(network.simIdentifierSuffix, "0001");
   assert.equal("simIccid" in network, false);
-  assert.equal(network.networkObservedIp, "64.6.64.6");
-  assert.equal(network.networkVerified, true);
+  assert.equal(network.networkObservedIp, null);
+  assert.equal(network.networkHostObservedIpv4, "64.6.64.6");
+  assert.equal(network.networkVerified, false);
+  assert.equal(network.networkProtectionState, "VERIFYING");
+  assert.match(network.networkVerificationMessage, /phone egress test required/);
 
   const meta = await fetch(`${httpUrl}/api/audit?deviceId=mock-1&limit=5`, { headers: { Cookie: cookie } }).then((r) =>
     r.json()
@@ -222,7 +225,7 @@ test("a successful check updates the device summary and is audited with the assi
   const checkEvent = meta.events.find((e) => e.type === "network_check");
   assert.ok(checkEvent, "expected a network_check audit event");
   assert.equal(checkEvent.detail.networkEgress, "cellular-sim");
-  assert.equal(checkEvent.detail.observedIp, "64.6.64.6");
+  assert.equal(checkEvent.detail.observedIp, null);
 });
 
 test("a completed network check remains successful when audit storage is unavailable", async () => {
@@ -241,8 +244,10 @@ test("a completed network check remains successful when audit storage is unavail
     });
     assert.equal(response.status, 200);
     const { network } = await response.json();
-    assert.equal(network.networkObservedIp, "64.6.64.6");
-    assert.equal(network.networkVerified, true);
+    assert.equal(network.networkObservedIp, null);
+    assert.equal(network.networkHostObservedIpv4, "64.6.64.6");
+    assert.equal(network.networkVerified, false);
+    assert.equal(network.networkProtectionState, "VERIFYING");
   } finally {
     auditLog.logEvent = originalAuditWrite;
   }
@@ -264,6 +269,8 @@ test("device_list over WebSocket carries the same network fields as the HTTP rou
   assert.equal("simIccid" in mock1.network, false);
   assert.ok("networkVerified" in mock1);
   assert.ok("networkMismatch" in mock1);
+  assert.equal(mock1.networkProtectionState, "VERIFYING");
+  assert.equal(mock1.networkVerificationMessage, "Host route verified — phone egress test required.");
 
   const mock2 = deviceListMsg.devices.find((d) => d.id === "mock-2");
   assert.equal(mock2.network.egress, "vlan-proxy");
@@ -315,22 +322,20 @@ test("only a proxy manager can persist and broadcast the safe proxy assignment s
   assert.ok(audit.events.every(event => !JSON.stringify(event).includes("vlan-bench-1")));
 });
 
-test("fail-closed mismatch blocks Human selection and AI dispatch until a fresh passing check", async () => {
+test("fail-closed phone remains blocked after repeated host-only checks", async () => {
   await fetch(`${CHECK_URL.replace("/ip", "/debug/set-ip")}`, {
     method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ip: "1.1.1.1" }),
   });
-  for (const deviceId of ["mock-2", "mock-1"]) {
-    const response = await fetch(`${httpUrl}/api/devices/${deviceId}/network-check`, {
-      method: "POST", headers: { "Content-Type": "application/json", Cookie: cookie },
-      body: JSON.stringify({ checkUrl: CHECK_URL }),
-    });
-    assert.equal(response.status, 200);
-  }
+  const initial = await fetch(`${httpUrl}/api/devices/mock-1/network-check`, {
+    method: "POST", headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ checkUrl: CHECK_URL }),
+  });
+  assert.equal(initial.status, 200);
 
   const blocked = (await fleetSnapshot(cookie)).find(device => device.id === "mock-1");
-  assert.equal(blocked.networkMismatch, true);
+  assert.equal(blocked.networkMismatch, false);
   assert.equal(blocked.canOpen, false);
-  assert.equal(blocked.accessState, "network_mismatch");
+  assert.equal(blocked.accessState, "network_verification_failed");
 
   const task = taskQueue.addTask({ goal: "must wait for safe network", createdBy: "netcheck-test-va",
     deviceSelector: { deviceId: "mock-1" } });
@@ -345,8 +350,11 @@ test("fail-closed mismatch blocks Human selection and AI dispatch until a fresh 
     body: JSON.stringify({ checkUrl: CHECK_URL }),
   });
   assert.equal(restored.status, 200);
-  assert.equal((await restored.json()).network.networkVerified, true);
-  assert.equal(taskQueue.getTask(task.id).state, "RUNNING");
+  const restoredNetwork = (await restored.json()).network;
+  assert.equal(restoredNetwork.networkVerified, false);
+  assert.equal(restoredNetwork.networkMismatch, false);
+  assert.equal(restoredNetwork.networkProtectionState, "VERIFYING");
+  assert.equal(taskQueue.getTask(task.id).state, "QUEUED");
 
   taskQueue.emergencyStopDevice("mock-1");
 });

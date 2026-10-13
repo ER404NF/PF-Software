@@ -524,9 +524,10 @@ real-provider adapter.
 A real provider adapter, durable provider lease authority, lease/rotation UI,
 and the independent infrastructure for regional exit servers/IP
 supply, provisioning, monitoring, metering, and abuse response are still
-required. The UI and documentation must not describe an inventory or lease as
-a working phone route; only device-originated egress verification can establish
-that result.
+required. The UI and documentation must not describe an inventory, lease, or
+server-side HTTP request as a working phone route. The current stack has no
+trusted way to originate the verification request from the iPhone, so it stays
+`VERIFYING` pending a physical phone egress test.
 
 ## Proxy tunnel routing (opt-in, `AUTO_ROUTE_PROXY_TUNNELS` — Phase B, part 2)
 
@@ -1368,8 +1369,10 @@ shutdowns wait for ownership persistence before completing.
 Emergency routing quarantine enumerates both live supervisor entries and
 persisted tunnel records. An incomplete inventory or an unconfirmed stop keeps
 the host in `RECOVERY_REQUIRED`; it can never publish a successful quarantine
-or protected-device result. A device-originated proxy check can report
-`PROTECTED` only after a fresh proof of the current owned tunnel, matching PF
-route, and active configured bridge. These are local safety contracts; their
-PF, tun2proxy, bridge, and two-phone behavior still requires the ordered Mac
-mini acceptance run.
+or protected-device result. Configured network-check URLs are fetched by the
+Bodun server and therefore record host evidence only; they cannot report
+`PROTECTED`. A genuine phone-originated check still requires a separate trusted
+transport plus a fresh proof of the current owned tunnel, matching PF route,
+and active configured bridge. These are local safety contracts; their PF,
+tun2proxy, bridge, and two-phone behavior still requires the ordered Mac mini
+acceptance run.

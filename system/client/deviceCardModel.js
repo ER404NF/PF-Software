@@ -56,7 +56,7 @@
 
   // One status chip: one word, one colour. green = healthy, amber = in progress / not checked yet,
   // red = failed or blocked, gray = stopped or not set up on purpose.
-  //   kind:  Device | Control | WDA | iproxy | Network | Proxy
+  //   kind:  Device | Control | WDA | iproxy | Network | Proxy endpoint
   //   state: the server's state word (WDA: the process state)
   //   ctx:   { endpoint, recovery }  WDA's reachability check and the recovery state, which refine the word
   const upper = value => String(value ?? "UNKNOWN").toUpperCase().trim().replace(/\s+/g, "_");
@@ -111,10 +111,13 @@
         if (value === "VERIFYING") return chip("Checking", "warning");
         if (value === "FAILED" || value === "MISMATCH") return chip("Failed", "error");
         return chip("Unchecked", "warning");
+      case "Proxy endpoint":
       case "Proxy":
-        if (value === "HEALTHY") return chip("Healthy", "healthy");
-        if (value === "FAILED") return chip("Failed", "error");
-        return chip("Unchecked", "warning");
+        if (value === "HEALTHY") return chip("Reachable", "healthy",
+          "The proxy provider answered a host-side connectivity test. This does not prove the iPhone route.");
+        if (value === "FAILED") return chip("Failed", "error",
+          "The host-side proxy endpoint test failed. The iPhone route remains unverified.");
+        return chip("Unchecked", "warning", "The proxy provider endpoint has not been checked from this host.");
       default:
         return chip(String(state ?? "Unknown"), "warning");
     }
@@ -128,8 +131,23 @@
     const recovery = upper(health.recovery);
     const attachment = upper(health.deviceAttachment);
     const access = device?.accessState;
+    const route = device?.networkRouteHealth || device?.routing || {};
+    const host = device?.routingFeature?.hostRouting || {};
+    const networkState = upper(device?.networkProtectionState);
     const summary = (headline, tone, attention = false) => ({ headline, tone, attention });
     if (access === "disconnected" || attachment === "DISCONNECTED") return summary("Unplugged", "error", true);
+    if (host.state === "recovery_required") return summary("Host recovery required", "error", true);
+    if (["quarantining", "quarantined"].includes(host.state)) return summary("Host routing blocked", "error", true);
+    if (route.protectionState === "quarantine_failed") return summary("Network block failed", "error", true);
+    if (route.state === "route_lost") return summary("Route lost", "error", true);
+    if (device?.networkMismatch === true || networkState === "FAILED" || networkState === "MISMATCH"
+      || ["network_mismatch", "network_verification_failed", "proxy_disabled"].includes(access)) {
+      return summary("Network blocked", "error", true);
+    }
+    if (["VERIFYING", "UNVERIFIED"].includes(networkState)
+      || ["network_not_verified", "network_verification_stale"].includes(access)) {
+      return summary("Network verification required", "warning", true);
+    }
     if (recovery === "OPERATOR_STOPPED" || access === "wda_stopped") return summary("Control stopped", "neutral");
     if (recovery === "BLOCKED_PORT" || recovery === "STOP_FAILED") return summary("Needs attention", "error", true);
     if (access === "wda_user_action_required" || access === "wda_provisioning_error") return summary("Needs attention", "error", true);
@@ -138,7 +156,53 @@
     if (device?.status === "offline") return summary("Not responding", "error", true);
     if (device?.status === "in-use") return summary("In use", "healthy");
     if (device?.consecutiveFailures > 0) return summary("Unstable", "warning");
+    if (device?.assignedToViewer === false) return summary("Not assigned", "neutral");
+    if (device?.canOpen === false) return summary("Unavailable", "warning", true);
     return summary("Ready", "healthy");
+  }
+
+  const HOST_ROUTING_GUIDANCE = Object.freeze({
+    F208: "Emergency bridge isolation failed. Disconnect affected phones or disable Internet Sharing, then repair the host firewall.",
+    T202: "A managed phone tunnel could not be stopped safely. Stop the stale tunnel, then run host recovery.",
+    ROUTING_TUNNEL_INVENTORY_INCOMPLETE: "Bodun could not account for every phone tunnel. Review host diagnostics and remove unknown tunnels before recovery.",
+    ROUTING_QUARANTINE_PERSIST_FAILED: "Bodun could not save the host safety state. Repair the saved routing state before recovery.",
+    ROUTING_QUARANTINE_STATE_INVALID: "The saved routing safety state is invalid or unreadable. Preserve and repair it before recovery.",
+    ROUTING_BRIDGE_UNAVAILABLE: "The Internet Sharing bridge is unavailable. Restore the configured bridge, then run host recovery again.",
+  });
+
+  function hostRoutingGuidance(host) {
+    if (!host || host.state === "healthy") return "";
+    if (host.repairRequired === true) return HOST_ROUTING_GUIDANCE.ROUTING_QUARANTINE_STATE_INVALID;
+    if (host.bridgeAvailable === false) return HOST_ROUTING_GUIDANCE.ROUTING_BRIDGE_UNAVAILABLE;
+    return HOST_ROUTING_GUIDANCE[host.reasonCode]
+      || (host.state === "quarantining"
+        ? "Host network quarantine is still in progress. Wait for it to finish before recovery."
+        : "Protected routing is blocked. Review host diagnostics and complete host recovery before routing a phone.");
+  }
+
+  function networkRecoveryGuidance(device) {
+    const hostMessage = hostRoutingGuidance(device?.routingFeature?.hostRouting);
+    if (hostMessage) return hostMessage;
+    const route = device?.networkRouteHealth || device?.routing || {};
+    if (route.protectionState === "quarantine_failed") {
+      return "Emergency network isolation failed. Disconnect the phone or disable Internet Sharing, then repair host routing.";
+    }
+    if (route.protectionState === "bridge_quarantined") {
+      return "The shared phone bridge is disabled. Repair the host firewall, restore Internet Sharing, then run host recovery.";
+    }
+    if (route.state === "route_lost" && route.internetBlocked === true) {
+      if (route.automaticRecoveryPending === true) {
+        return "A device-specific network block is active while Bodun retries this phone's protected route.";
+      }
+      if (route.automaticRecoveryExhausted === true) {
+        return "A device-specific network block is active. Automatic recovery is exhausted; repair the route, then retry routing.";
+      }
+      return "A device-specific network block is active. Repair the route, then retry routing.";
+    }
+    if (device?.networkProtectionState === "VERIFYING" || device?.networkVerified !== true) {
+      return "Host route verified — phone egress test required. Verify the assigned IP, DNS, WebRTC, and IPv6 policy from the iPhone before allowing control.";
+    }
+    return "Review the protected route and host-safety status before retrying network access.";
   }
 
   // Turns the diagnostics reply into plain lines an operator can read and paste. Internal details (file
@@ -326,7 +390,7 @@
     return network?.providerLabel || network?.gatewayLabel || network?.egress || "No egress assigned";
   }
 
-  const exported = { lifecycleButtons, describeLifecycle, chipFor, deviceStateSummary, formatDiagnostics, errorRows, asSentence, createCardMemory, captureFocus, restoreFocus, captureViewportAnchor, restoreViewportAnchor, egressLabel, fleetColumnCount, proxyName, providerName, providerKey, PROVISIONING_OFF, BUSY, LIFECYCLE_LABELS };
+  const exported = { lifecycleButtons, describeLifecycle, chipFor, deviceStateSummary, hostRoutingGuidance, networkRecoveryGuidance, formatDiagnostics, errorRows, asSentence, createCardMemory, captureFocus, restoreFocus, captureViewportAnchor, restoreViewportAnchor, egressLabel, fleetColumnCount, proxyName, providerName, providerKey, PROVISIONING_OFF, BUSY, LIFECYCLE_LABELS };
   if (typeof module !== "undefined" && module.exports) module.exports = exported;
   if (root) root.deviceCardModel = exported;
 })(typeof window !== "undefined" ? window : null);

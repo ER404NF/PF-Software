@@ -185,7 +185,7 @@ const NETWORK_ERRORS = [
   ["V201", "Network verification failed", "network-verification", "checkDevice", "Bodun will retry with another verification provider."],
   ["V202", "Unexpected proxy exit IP", "network-verification", "checkDevice", "Test the assigned proxy and verify its expected exit."],
   ["V203", "Unexpected IPv6 route", "network-verification", "checkDevice", "Restore the IPv6 block before allowing phone Internet."],
-  ["V204", "Protected network route lost", "network-verification", "reconcileRoute", "Bodun will block direct fallback and rebuild this phone's protected route."],
+  ["V204", "Protected network route lost", "network-verification", "reconcileRoute", "Review the route and host-safety status. Automatic recovery runs only while the host remains safe."],
 ];
 
 for (const [code, name, component, sourceFunction, operatorAction] of NETWORK_ERRORS) {

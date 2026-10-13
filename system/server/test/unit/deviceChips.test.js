@@ -8,6 +8,7 @@ vm.runInNewContext(fs.readFileSync(new URL("../../../client/deviceCardModel.js",
 const { chipFor } = context.window.deviceCardModel;
 const css = fs.readFileSync(new URL("../../../client/style.css", import.meta.url), "utf8");
 const app = fs.readFileSync(new URL("../../../client/app.js", import.meta.url), "utf8");
+const serverIndex = fs.readFileSync(new URL("../../src/index.js", import.meta.url), "utf8");
 
 // [kind, state, ctx, expected text, expected tone]
 const TABLE = [
@@ -48,9 +49,9 @@ const TABLE = [
   ["Network", "VERIFYING", {}, "Checking", "warning"],
   ["Network", "UNVERIFIED", {}, "Unchecked", "warning"],
   ["Network", "FAILED", {}, "Failed", "error"],
-  ["Proxy", "HEALTHY", {}, "Healthy", "healthy"],
-  ["Proxy", "FAILED", {}, "Failed", "error"],
-  ["Proxy", "NOT CHECKED", {}, "Unchecked", "warning"],
+  ["Proxy endpoint", "HEALTHY", {}, "Reachable", "healthy"],
+  ["Proxy endpoint", "FAILED", {}, "Failed", "error"],
+  ["Proxy endpoint", "NOT CHECKED", {}, "Unchecked", "warning"],
 ];
 
 for (const [kind, state, ctx, text, tone] of TABLE) {
@@ -82,7 +83,7 @@ test("the card renders its chips through the model", () => {
   assert.match(app, /value\.dataset\.state = chip\.tone;/);
 });
 
-const { deviceStateSummary } = context.window.deviceCardModel;
+const { deviceStateSummary, hostRoutingGuidance, networkRecoveryGuidance } = context.window.deviceCardModel;
 const phone = (extra = {}) => ({ status: "idle", accessState: "ready", componentHealth: {}, controllerMode: "HUMAN", consecutiveFailures: 0, ...extra });
 
 test("one state per phone: the header, access box and footer all read the same summary", () => {
@@ -97,6 +98,54 @@ test("one state per phone: the header, access box and footer all read the same s
   assert.equal(deviceStateSummary(phone({ accessState: "wda_stopped" })).tone, "neutral");
   assert.equal(deviceStateSummary(phone({ accessState: "wda_provisioning" })).tone, "warning");
   assert.equal(deviceStateSummary(phone({ consecutiveFailures: 2 })).headline, "Unstable");
+});
+
+test("network safety outranks an idle Ready headline", () => {
+  assert.equal(deviceStateSummary(phone({ networkProtectionState: "FAILED", networkMismatch: true,
+    canOpen: false })).headline, "Network blocked");
+  assert.equal(deviceStateSummary(phone({ networkProtectionState: "VERIFYING",
+    canOpen: false })).headline, "Network verification required");
+  assert.equal(deviceStateSummary(phone({ networkRouteHealth: { state: "route_lost" },
+    canOpen: false })).headline, "Route lost");
+  assert.equal(deviceStateSummary(phone({ routingFeature: { hostRouting: { state: "recovery_required" } },
+    canOpen: false })).headline, "Host recovery required");
+  assert.equal(deviceStateSummary(phone({ canOpen: false })).headline, "Unavailable");
+});
+
+test("host routing reason codes have short safe operator actions", () => {
+  assert.match(hostRoutingGuidance({ state: "recovery_required", reasonCode: "F208" }), /Disconnect affected phones/);
+  assert.match(hostRoutingGuidance({ state: "recovery_required", reasonCode: "T202" }), /stale tunnel/);
+  assert.match(hostRoutingGuidance({ state: "recovery_required", reasonCode: "ROUTING_TUNNEL_INVENTORY_INCOMPLETE" }), /account for every phone tunnel/);
+  assert.match(hostRoutingGuidance({ state: "recovery_required", reasonCode: "ROUTING_QUARANTINE_PERSIST_FAILED" }), /save the host safety state/);
+  assert.match(hostRoutingGuidance({ state: "recovery_required", repairRequired: true }), /invalid or unreadable/);
+  assert.match(hostRoutingGuidance({ state: "recovery_required", reasonCode: "ROUTING_BRIDGE_UNAVAILABLE" }), /Internet Sharing bridge is unavailable/);
+});
+
+test("V204 guidance reflects automatic recovery and manual safety states", () => {
+  assert.match(networkRecoveryGuidance({ networkRouteHealth: { state: "route_lost", internetBlocked: true,
+    automaticRecoveryPending: true } }), /while Bodun retries/);
+  assert.match(networkRecoveryGuidance({ networkRouteHealth: { state: "route_lost", internetBlocked: true,
+    automaticRecoveryExhausted: true } }), /recovery is exhausted/);
+  assert.match(networkRecoveryGuidance({ networkRouteHealth: { protectionState: "quarantine_failed" } }), /Disconnect the phone/);
+  assert.match(networkRecoveryGuidance({ networkProtectionState: "VERIFYING", networkVerified: false }), /phone egress test required/);
+});
+
+test("provider reachability is separate from phone route health", () => {
+  const endpoint = chipFor("Proxy endpoint", "HEALTHY");
+  assert.equal(endpoint.text, "Reachable");
+  assert.match(endpoint.title, /does not prove the iPhone route/);
+  assert.match(app, /\["Proxy endpoint", proxyHealth/);
+});
+
+test("network-policy revocation copy identifies route safety rather than WDA", () => {
+  assert.match(serverIndex, /Control paused because the protected network route failed/);
+  assert.doesNotMatch(serverIndex, /Control paused because WDA/);
+});
+
+test("live control and media-only buttons remain visually and semantically distinct", () => {
+  assert.match(app, /Open the live phone screen and request control/);
+  assert.match(app, /Open media files only\. This does not start live viewing or claim phone control/);
+  assert.match(css, /\.open-files-button\s*\{[^}]*border:\s*1px dashed/);
 });
 
 test("the card keeps setup errors out of the access box and gives them their own block", () => {

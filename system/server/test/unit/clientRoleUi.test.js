@@ -172,7 +172,7 @@ test("role and error-handling audit controls are explicit and recoverable", () =
   assert.match(app, /No tasks are currently in the queue\./);
   assert.match(app, /markPresenceUnavailable\(\)/);
   assert.match(app, /function deviceComponentRows\(device\)/);
-  for (const label of ["Device", "Control", "WDA", "iproxy", "Network", "Proxy"]) {
+  for (const label of ["Device", "Control", "WDA", "iproxy", "Network", "Proxy endpoint"]) {
     assert.match(app, new RegExp(`\\["${label}"`));
   }
   const model = fs.readFileSync(path.join(clientDir, "deviceCardModel.js"), "utf8");

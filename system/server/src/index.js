@@ -2295,7 +2295,11 @@ const summary = (d, viewer = null, viewerSocket = null) => {
     networkRouteMatch: networkDetails.networkRouteMatch,
     networkVerificationLevel: networkDetails.networkVerificationLevel,
     networkProtectionState: networkDetails.networkProtectionState,
-    networkVerificationMessage: networkDetails.networkVerified ? "Network verification passed." : "Network verification needs attention.",
+    networkVerificationMessage: networkDetails.networkVerified
+      ? "Network verification passed."
+      : networkDetails.networkProtectionState === "VERIFYING"
+        ? "Host route verified — phone egress test required."
+        : "Network verification needs attention.",
   };
   return {
     id: d.id,
@@ -2368,12 +2372,15 @@ const summary = (d, viewer = null, viewerSocket = null) => {
     routing: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? (networkRoutingOrchestrator?.getRoute(d.id) ?? null) : null,
     networkRouteHealth: (() => {
       const route = networkRoutingOrchestrator?.getRoute(d.id);
+      const recovery = networkRoutingOrchestrator?.getRouteRecoveryStatus?.(d.id);
       return route ? {
         state: route.state,
         protected: route.protected === true,
         internetBlocked: route.internetBlocked === true,
         protectionState: route.protectionState ?? null,
         manualInterventionRequired: route.manualInterventionRequired === true,
+        automaticRecoveryPending: recovery?.automaticRecoveryPending === true,
+        automaticRecoveryExhausted: recovery?.automaticRecoveryExhausted === true,
       } : null;
     })(),
     usbNetwork: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? usbNetworkForDevice(d.id) : null,
@@ -3990,6 +3997,7 @@ wss.on("connection", (ws, request) => {
   const revokeSelectedAccess = (action, target = selected, generation = selectionGeneration, broadcastChanges = true) => {
     if (!selected || selected !== target || selectionGeneration !== generation) return false;
     const revokedId = selected.id;
+    const networkRevoked = action === "network_policy" || networkDecision(revokedId).allowed === false;
     logAuditBestEffort({ operator: operator.username, type: "device_access_revoked", deviceId: revokedId,
       detail: { action } }, "WebSocket access-revocation audit write");
     releaseSelection();
@@ -3997,7 +4005,9 @@ wss.on("connection", (ws, request) => {
     broadcastPresence();
     if (ws.readyState === ws.OPEN) {
       ws.send(JSON.stringify({ type: "error", code: "device_access_revoked", deviceId: revokedId,
-        message: "Your access to this phone is no longer active. It has been released." }));
+        message: networkRevoked
+          ? "Control paused because the protected network route failed. Repair and verify the route before opening this phone again."
+          : "Your access to this phone is no longer active. It has been released." }));
     }
     return true;
   };

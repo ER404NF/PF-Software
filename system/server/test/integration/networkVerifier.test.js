@@ -60,15 +60,19 @@ function makeVerifier(devicesConfig) {
   return createNetworkVerifier({ deviceNetwork, timeoutMs: 500 });
 }
 
-test("checkDevice against a lone device on its own SIM is verified with no mismatch", async () => {
+test("a server-side check records host evidence but cannot prove phone egress", async () => {
   const verifier = makeVerifier([
     { id: "d1", network: { egress: "cellular-sim", simIccid: "111", controlIface: "usb" } },
   ]);
   const result = await verifier.checkDevice("d1", CHECK_URL);
-  assert.equal(result.networkObservedIp, "8.8.8.8");
-  assert.equal(result.networkVerified, true);
+  assert.equal(result.networkObservedIp, null);
+  assert.equal(result.networkHostObservedIpv4, "8.8.8.8");
+  assert.equal(result.networkVerified, false);
   assert.equal(result.networkMismatch, false);
   assert.equal(result.networkMismatchReason, null);
+  assert.equal(result.networkProtectionState, "VERIFYING");
+  assert.equal(result.networkVerificationLevel, "host-configured-egress-endpoint");
+  assert.match(result.networkVerificationMessage, /phone egress test required/);
   assert.ok(result.networkCheckedAt);
 });
 
@@ -77,7 +81,10 @@ test("getStatus for a never-checked device returns all-null defaults", () => {
   assert.deepEqual(verifier.getStatus("d1"), {
     networkObservedIp: null,
     networkHostObservedIpv4: null,
+    networkHostObservedIpv6: null,
     networkHostObservedRegion: null,
+    networkHostDnsStatus: null,
+    networkHostBandwidthMbps: null,
     networkCheckedAt: null,
     networkVerified: null,
     networkMismatch: null,
@@ -109,7 +116,7 @@ test("proxy and host-route checks remain VERIFYING until a device-originated egr
   assert.match(result.networkVerificationMessage, /device-originated/);
 });
 
-test("a proxy egress result cannot become protected without fresh tunnel, PF and bridge proof", async () => {
+test("fresh tunnel, PF and bridge proof still cannot turn a host request into phone proof", async () => {
   const verifier = makeVerifier([{ id: "d1", network: { egress: "commercial-proxy", profileId: "p1", controlIface: "usb" } }]);
   const unproven = await verifier.checkDevice("d1", CHECK_URL);
   assert.equal(unproven.networkVerified, false);
@@ -117,11 +124,13 @@ test("a proxy egress result cannot become protected without fresh tunnel, PF and
   assert.match(unproven.networkMismatchReason, /could not be proven/);
 
   const proven = await verifier.checkDevice("d1", CHECK_URL, { proveCurrentRoute: async () => true });
-  assert.equal(proven.networkVerified, true);
-  assert.equal(proven.networkProtectionState, "PROTECTED");
+  assert.equal(proven.networkVerified, false);
+  assert.equal(proven.networkMismatch, false);
+  assert.equal(proven.networkProtectionState, "VERIFYING");
+  assert.match(proven.networkVerificationMessage, /phone egress test required/);
 });
 
-test("two devices on different SIMs sharing an observed IP are both flagged as a mismatch", async () => {
+test("host observations are never used as evidence of cross-phone IP collision", async () => {
   const verifier = makeVerifier([
     { id: "d1", network: { egress: "cellular-sim", simIccid: "111", controlIface: "usb" } },
     { id: "d2", network: { egress: "cellular-sim", simIccid: "222", controlIface: "usb" } },
@@ -129,24 +138,15 @@ test("two devices on different SIMs sharing an observed IP are both flagged as a
 
   await setIp("1.1.1.1");
   const first = await verifier.checkDevice("d1", CHECK_URL);
-  assert.equal(first.networkVerified, true); // nothing to collide with yet
+  assert.equal(first.networkVerified, false);
 
   const second = await verifier.checkDevice("d2", CHECK_URL); // still the same IP
   assert.equal(second.networkVerified, false);
-  assert.equal(second.networkMismatch, true);
-  assert.match(second.networkMismatchReason, /shares egress IP 1\.1\.1\.1 with device "d1"/);
-
-  // d1's own record must be corrected retroactively too, not just d2's.
+  assert.equal(second.networkMismatch, false);
+  assert.equal(second.networkHostObservedIpv4, "1.1.1.1");
   const d1Status = verifier.getStatus("d1");
   assert.equal(d1Status.networkVerified, false);
-  assert.equal(d1Status.networkMismatch, true);
-  assert.match(d1Status.networkMismatchReason, /device "d2"/);
-  assert.equal(d1Status.networkLatestError.code, "V204");
-  assert.deepEqual(d1Status.networkDiagnosticEvents.at(-1), {
-    type: "NETWORK_DEGRADED",
-    at: d1Status.networkLatestError.at,
-    errorCode: "V204",
-  });
+  assert.equal(d1Status.networkMismatch, false);
 });
 
 test("two devices on the SAME vlanId sharing an observed IP is expected, not a mismatch", async () => {
@@ -159,24 +159,22 @@ test("two devices on the SAME vlanId sharing an observed IP is expected, not a m
   await verifier.checkDevice("d1", CHECK_URL, { proveCurrentRoute: async () => true });
   const second = await verifier.checkDevice("d2", CHECK_URL, { proveCurrentRoute: async () => true });
 
-  assert.equal(second.networkVerified, true);
+  assert.equal(second.networkVerified, false);
   assert.equal(second.networkMismatch, false);
-  assert.equal(verifier.getStatus("d1").networkVerified, true);
+  assert.equal(verifier.getStatus("d1").networkVerified, false);
 });
 
-test("a device with no network assignment yet still gets a real collision check (identity null vs null is still 'different' from any real identity, but two unassigned devices share the null identity)", async () => {
-  // Two genuinely unassigned devices share the same (null) identity, so
-  // sharing an IP between them is not flagged — there's no isolation claim
-  // to violate yet for either.
+test("unassigned devices also remain VERIFYING after a host-side request", async () => {
   const verifier = makeVerifier([{ id: "d1" }, { id: "d2" }]);
   await setIp("8.8.4.4");
   await verifier.checkDevice("d1", CHECK_URL);
   const second = await verifier.checkDevice("d2", CHECK_URL);
-  assert.equal(second.networkVerified, true);
+  assert.equal(second.networkVerified, false);
   assert.equal(second.networkMismatch, false);
+  assert.equal(second.networkProtectionState, "VERIFYING");
 });
 
-test("an unassigned device colliding with an assigned device IS flagged — unassigned is not a free pass", async () => {
+test("an assigned and unassigned device cannot be compared using host-side observations", async () => {
   const verifier = makeVerifier([
     { id: "d1", network: { egress: "cellular-sim", simIccid: "111", controlIface: "usb" } },
     { id: "d2" },
@@ -185,7 +183,7 @@ test("an unassigned device colliding with an assigned device IS flagged — unas
   await verifier.checkDevice("d1", CHECK_URL);
   const second = await verifier.checkDevice("d2", CHECK_URL);
   assert.equal(second.networkVerified, false);
-  assert.equal(second.networkMismatch, true);
+  assert.equal(second.networkMismatch, false);
 });
 
 test("an unreachable check endpoint is reported as unverified, not a false mismatch", async () => {
@@ -223,8 +221,9 @@ test("re-checking a device replaces its status rather than accumulating stale fi
   await setIp("4.2.2.2");
   const second = await verifier.checkDevice("d1", CHECK_URL);
 
-  assert.notEqual(first.networkObservedIp, second.networkObservedIp);
-  assert.equal(verifier.getStatus("d1").networkObservedIp, "4.2.2.2");
+  assert.notEqual(first.networkHostObservedIpv4, second.networkHostObservedIpv4);
+  assert.equal(verifier.getStatus("d1").networkHostObservedIpv4, "4.2.2.2");
+  assert.equal(verifier.getStatus("d1").networkObservedIp, null);
 });
 
 test("verification compares configured IPv4 and IPv6 policy and records safe health metadata", async () => {
@@ -241,8 +240,11 @@ test("verification compares configured IPv4 and IPv6 policy and records safe hea
   assert.equal(result.networkRouteMatch, false);
   assert.match(result.networkMismatchReason, /does not match configured IPv4/);
   assert.match(result.networkMismatchReason, /IPv6 was not observed/);
-  assert.equal(result.networkObservedRegion, "test-region");
-  assert.equal(result.networkDnsStatus, "ok");
+  assert.equal(result.networkObservedRegion, null);
+  assert.equal(result.networkDnsStatus, null);
+  assert.equal(result.networkHostObservedRegion, "test-region");
+  assert.equal(result.networkHostDnsStatus, "ok");
   assert.equal(result.networkProxyHealthy, true);
-  assert.equal(result.networkBandwidthMbps, 100);
+  assert.equal(result.networkBandwidthMbps, null);
+  assert.equal(result.networkHostBandwidthMbps, 100);
 });

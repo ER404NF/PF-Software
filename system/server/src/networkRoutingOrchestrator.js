@@ -239,6 +239,17 @@ export class NetworkRoutingOrchestrator {
     return this.routes.get(deviceId) ?? null;
   }
 
+  getRouteRecoveryStatus(deviceId) {
+    const route = this.routes.get(deviceId);
+    if (!route) return null;
+    const attempts = route.recoveryAttempts ?? 0;
+    return {
+      automaticRecoveryPending: this.recoveryTimers.has(deviceId) || this.startPromises.has(deviceId),
+      automaticRecoveryExhausted: route.state === ROUTING_STATES.ROUTE_LOST
+        && attempts >= MAX_AUTOMATIC_RECOVERIES,
+    };
+  }
+
   _setState(deviceId, state, patch = {}) {
     const current = this.routes.get(deviceId) ?? {};
     const next = { ...current, ...patch, state, lastError: null };
@@ -861,6 +872,22 @@ export class NetworkRoutingOrchestrator {
     await authorize?.();
     const bridge = await this.privilegedOps.inspectBridge(this.bridgeIface);
     if (!bridge?.available || !bridge?.up) {
+      const blocked = {
+        ...persisted,
+        state: ROUTING_HOST_STATES.RECOVERY_REQUIRED,
+        reasonCode: "ROUTING_BRIDGE_UNAVAILABLE",
+        manualInterventionRequired: true,
+        bridgeAvailable: false,
+      };
+      try {
+        const persistedBlocked = this._persistHostRoutingState(blocked);
+        this.hostRoutingState = { ...persistedBlocked, bridgeAvailable: false };
+        this.onHostStateChanged(this.getHostRoutingStatus());
+      }
+      catch {
+        this.hostRoutingState = { ...blocked, reasonCode: "ROUTING_QUARANTINE_PERSIST_FAILED" };
+        this.onHostStateChanged(this.getHostRoutingStatus());
+      }
       const error = new Error("routing recovery requires the configured Internet Sharing bridge to be available and active");
       error.status = 409; error.code = "ROUTING_BRIDGE_UNAVAILABLE"; error.expose = true;
       throw error;

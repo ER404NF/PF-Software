@@ -2068,6 +2068,18 @@ function buildProxyPoolPicker(device) {
 // rather than showing a stuck disabled button.
 const ROUTING_TERMINAL_ERROR_STATES = new Set(["tun_error", "pf_syntax_error", "route_lost"]);
 
+function routingHostGuidance(host) {
+  if (typeof deviceCardModel !== "undefined" && deviceCardModel.hostRoutingGuidance) {
+    return deviceCardModel.hostRoutingGuidance(host);
+  }
+  if (host?.repairRequired === true) {
+    return "Routing is blocked because its saved host-safety state is invalid. Preserve and repair it before recovery checks can run.";
+  }
+  return host?.state === "recovery_required"
+    ? "Routing is blocked because host cleanup could not be verified. Restore the bridge and remove stale routing state, then run host recovery."
+    : "Routing is blocked for every phone until an administrator completes host recovery checks.";
+}
+
 // How long is left, in words ("4 minutes"); at least one minute while there is any time at all.
 function enrollmentMinutes(ms) {
   const minutes = Math.max(1, Math.ceil((Number(ms) || 0) / 60_000));
@@ -2081,11 +2093,7 @@ function networkRoutingNextAction(device) {
       label: hostState === "quarantining" ? "Quarantine in progress" : "Host recovery required",
       action: null,
       disabled: true,
-      reason: device.routingFeature?.hostRouting?.repairRequired === true
-        ? "Routing is blocked because its saved host-safety state is invalid. An administrator must preserve and repair it before recovery checks can run."
-        : hostState === "recovery_required"
-        ? "Routing is blocked because host cleanup could not be verified. Restore the bridge and remove stale routing state, then run host recovery."
-        : "Routing is blocked for every phone until an administrator completes host recovery checks.",
+      reason: routingHostGuidance(device.routingFeature?.hostRouting),
       recoverHost: hostState !== "quarantining",
     };
   }
@@ -2132,6 +2140,10 @@ function networkRoutingStatusText(device) {
   if (device.routingFeature?.message) parts.push(device.routingFeature.message);
   const hostState = device.routingFeature?.hostRouting?.state;
   if (hostState && hostState !== "healthy") parts.push(`Host routing: ${hostState.replaceAll("_", " ")}`);
+  const hostReasonCode = device.routingFeature?.hostRouting?.reasonCode;
+  if (hostReasonCode) parts.push(`Host reason: ${hostReasonCode}`);
+  const hostGuidance = routingHostGuidance(device.routingFeature?.hostRouting);
+  if (hostGuidance) parts.push(hostGuidance);
   // Informational only — the auto-enrollment background loop (when
   // enabled) drives usbNetwork/routing on its own; the manual buttons
   // below remain available as a fallback/override regardless, e.g. if
@@ -2270,6 +2282,7 @@ function buildNetworkRoutingPanel(device) {
         : device.routingFeature?.state === "enabled" ? "Configured" : "Unavailable"],
     ["Host safety", device.routingFeature?.hostRouting?.state
       ? device.routingFeature.hostRouting.state.replaceAll("_", " ") : "Unavailable"],
+    ["Host reason", device.routingFeature?.hostRouting?.reasonCode || "None"],
     ["Enrollment", device.usbNetwork?.usbIface ? "Confirmed"
       : device.networkEnrollment?.state === "pending" ? "Pending"
         : device.networkEnrollment?.state === "owned_by_other_session" ? "In progress elsewhere" : "Required"],
@@ -2287,6 +2300,14 @@ function buildNetworkRoutingPanel(device) {
     statusGrid.append(dt, dd);
   }
   wrap.appendChild(statusGrid);
+  const next = networkRoutingNextAction(device);
+  const hostGuidance = hostRoutingBlocked ? next.reason : "";
+  if (hostGuidance) {
+    const guidance = document.createElement("p");
+    guidance.className = "network-routing-inline-error";
+    guidance.textContent = hostGuidance;
+    wrap.appendChild(guidance);
+  }
   const inlineError = device.routing?.lastError || device.autoEnrollment?.note;
   if (inlineError) {
     const error = document.createElement("p");
@@ -2295,7 +2316,6 @@ function buildNetworkRoutingPanel(device) {
     wrap.appendChild(error);
   }
 
-  const next = networkRoutingNextAction(device);
   if (next.pending) {
     // The manual step, in plain words, with the time that is left.
     const expires = Date.now() + (device.networkEnrollment?.expiresInMs ?? 0);
@@ -2503,6 +2523,17 @@ function phoneStatePresentation(device) {
         ? "This phone is not available to your account."
         : "This phone is outside your current device access. Review the user's grant before changing it.",
   };
+  if (["network_mismatch", "network_verification_failed", "proxy_disabled"].includes(device.accessState)
+    || device.networkProtectionState === "FAILED" || device.networkMismatch === true) return {
+    label: "Network blocked",
+    message: "Control paused because the protected network route failed. Repair and verify the phone's route before opening it again.",
+  };
+  if (["network_not_verified", "network_verification_stale"].includes(device.accessState)
+    || ["VERIFYING", "UNVERIFIED"].includes(device.networkProtectionState)) return {
+    label: "Network verification required",
+    message: device.networkVerificationMessage
+      || "Host route verified — phone egress test required before control can resume.",
+  };
   if (device.accessState === "wda_unconfigured") return {
     label: "Not ready",
     message: role === "va"
@@ -2590,7 +2621,7 @@ function deviceComponentRows(device) {
     ["WDA", health.wdaProcess || "UNKNOWN", { endpoint: health.wdaEndpoint }],
     ["iproxy", health.iproxy || "UNKNOWN", { recovery: health.recovery }],
     ["Network", networkState],
-    ["Proxy", proxyHealth === true ? "HEALTHY"
+    ["Proxy endpoint", proxyHealth === true ? "HEALTHY"
       : proxyHealth === false ? "FAILED"
         : device?.networkProxyHealthy === true ? "HEALTHY"
           : device?.networkProxyHealthy === false ? "FAILED" : "NOT CHECKED"],
@@ -2598,7 +2629,10 @@ function deviceComponentRows(device) {
 }
 
 function diagnosticForDevice(device) {
-  return device?.componentHealth?.latestError || device?.routing?.latestError || device?.networkLatestError || null;
+  const diagnostic = device?.componentHealth?.latestError || device?.routing?.latestError || device?.networkLatestError || null;
+  return diagnostic?.code === "V204"
+    ? { ...diagnostic, operatorAction: deviceCardModel.networkRecoveryGuidance(device) }
+    : diagnostic;
 }
 
 function diagnosticRetryKind(diagnostic) {
@@ -2870,7 +2904,7 @@ function renderDeviceCard(d, task, lastAction) {
     open.type = "button";
     open.className = "open-device-button";
     open.textContent = d.canOpen ? presentation.label : "Can't open yet";
-    if (!d.canOpen) open.title = presentation.message;
+    open.title = d.canOpen ? "Open the live phone screen and request control." : presentation.message;
     open.disabled = !d.canOpen;
     open.addEventListener("click", () => requestDeviceOpen(d));
     card.appendChild(open);
@@ -2890,6 +2924,7 @@ function renderDeviceCard(d, task, lastAction) {
     files.type = "button";
     files.className = "open-device-button open-files-button";
     files.textContent = "Open files";
+    files.title = "Open media files only. This does not start live viewing or claim phone control.";
     files.addEventListener("click", () => openMediaWorkspace(d));
     card.appendChild(files);
   }

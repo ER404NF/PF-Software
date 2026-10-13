@@ -1,34 +1,10 @@
-// Phase 0 network-isolation verification: given a device's assigned egress
-// (deviceNetworkConfig.js), determine its observed egress IP right now and
-// check it against every other device's most recently observed IP for an
-// isolation-boundary violation — source-material's Client Account Separation
-// reference §3.5: a stable, unusual IP shared across otherwise-unrelated
-// accounts is a real linkage risk, and that's exactly what two devices on
-// *different* assigned egress channels (different simIccid, or different
-// vlanId) sharing an observed IP would mean: the isolation this Phase 0 work
-// exists to enforce has silently failed — e.g. a cellular modem dropped and
-// the phone fell back to a shared network, the exact failure mode the iOS
-// Configuration Profile (a separate, out-of-band Phase 0 deliverable) is
-// meant to block at the OS level.
-//
-// This deliberately does NOT reach into WdaDevice/MockDevice's tap/swipe/
-// render contract (system/README.md "Current WebSocket protocol"/adapter
-// docs) — WDA's control channel runs over USB iproxy and has no concept of
-// the phone's own network egress, so there's nothing on that interface to
-// call. Instead this mirrors wdaDevice.js's OWN shape one level up: a small
-// fetch-based client, with a bounded timeout, pointed at whatever "what is
-// my IP" endpoint is reachable via the device's actual assigned egress path.
-// In Phase 1-3 (out of scope here — no real routers/SIMs exist yet) that's a
-// small status endpoint on each VLAN's dedicated LTE modem, or an
-// externally-reachable IP-echo service; here it's the fake fixture
-// (server/fixtures/fake-network-check-server.js) mirroring fake-wda-
-// server.js's own role for WdaDevice. The caller supplies the URL per check
-// (like WdaDevice's constructor takes host/port) rather than this module
-// reading it from devices.config.json — production wiring for "how do we
-// know each device's check URL" is a Phase 1-3 concern once real hardware
-// exists to have a URL at all.
+// Host-side network evidence for a phone's assigned egress. Node's fetch runs
+// in the Bodun server process; WDA has no API that originates arbitrary HTTP
+// traffic through the iPhone's Internet path. A successful request can prove
+// provider/host reachability and local route state, but it must remain
+// VERIFYING until a separate, genuine phone-originated probe exists. Negative
+// evidence remains fail closed.
 
-import { egressIdentity } from "./deviceNetworkConfig.js";
 import { isProxyEgress } from "./deviceNetworkStore.js";
 import { diagnosticError } from "./errorCatalog.js";
 import { isPublicIpv4 } from "./publicIp.js";
@@ -40,7 +16,10 @@ function emptyStatus() {
   return {
     networkObservedIp: null,
     networkHostObservedIpv4: null,
+    networkHostObservedIpv6: null,
     networkHostObservedRegion: null,
+    networkHostDnsStatus: null,
+    networkHostBandwidthMbps: null,
     networkCheckedAt: null,
     networkVerified: null,
     networkMismatch: null,
@@ -100,24 +79,10 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS,
     return status.get(deviceId) ?? emptyStatus();
   }
 
-  // Finds another already-checked device, on a *different* egress identity
-  // than `deviceId`, whose last observed IP matches `observedIp` — the
-  // concrete signal that isolation has failed for one or both of them.
-  function findCollision(deviceId, observedIp, identity) {
-    for (const [otherId, otherStatus] of status) {
-      if (otherId === deviceId) continue;
-      if (otherStatus.networkObservedIp !== observedIp) continue;
-      const otherIdentity = egressIdentity(deviceNetwork.get(otherId));
-      if (otherIdentity !== identity) return otherId;
-    }
-    return null;
-  }
-
   async function checkDevice(deviceId, checkUrl, { authorize = null, proveCurrentRoute = null } = {}) {
     const generation = generations.get(deviceId) ?? 0;
     await authorize?.();
     if (generation !== (generations.get(deviceId) ?? 0)) return getStatus(deviceId);
-    const identity = egressIdentity(deviceNetwork.get(deviceId));
     const checkedAt = () => new Date().toISOString();
 
     let observedIp;
@@ -145,7 +110,7 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS,
       if (generation !== (generations.get(deviceId) ?? 0)) return getStatus(deviceId);
       onError(err);
       const diagnostic = diagnosticError("V201", {
-        why: "Bodun could not complete the device egress request.",
+        why: "Bodun could not complete the host-side network endpoint request.",
         technical: { reason: err?.code || err?.name, timeoutMs },
       });
       const entry = { ...emptyStatus(), networkCheckedAt: checkedAt(), networkVerified: false,
@@ -158,7 +123,6 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS,
       return entry;
     }
 
-    const collision = findCollision(deviceId, observedIp, identity);
     await authorize?.();
     if (generation !== (generations.get(deviceId) ?? 0)) return getStatus(deviceId);
     const network = deviceNetwork.get(deviceId);
@@ -171,7 +135,6 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS,
       if (generation !== (generations.get(deviceId) ?? 0)) return getStatus(deviceId);
       if (!routeProven) mismatches.push("current tunnel ownership, firewall rule, and bridge state could not be proven");
     }
-    if (collision) mismatches.push(`shares egress IP ${observedIp} with device "${collision}", which is on a different network assignment`);
     if (network?.expectedPublicIpv4 && network.expectedPublicIpv4 !== observedIp) {
       mismatches.push(`observed IPv4 ${observedIp} does not match configured IPv4 ${network.expectedPublicIpv4}`);
     }
@@ -185,55 +148,35 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS,
       technical: { observedIpv6: Boolean(observedIpv6), mismatchCount: mismatches.length } }) : null;
     const eventAt = checkedAt();
     const entry = {
-      networkObservedIp: observedIp,
-      networkHostObservedIpv4: null,
-      networkHostObservedRegion: null,
+      networkObservedIp: null,
+      networkHostObservedIpv4: observedIp,
+      networkHostObservedIpv6: observedIpv6,
+      networkHostObservedRegion: observedRegion,
+      networkHostDnsStatus: dnsStatus,
+      networkHostBandwidthMbps: bandwidthMbps,
       networkCheckedAt: eventAt,
-      networkVerified: mismatches.length === 0,
+      networkVerified: false,
       networkMismatch: mismatches.length > 0,
       networkMismatchReason: mismatches.length ? mismatches.join("; ") : null,
-      networkObservedIpv6: observedIpv6,
-      networkObservedRegion: observedRegion,
-      networkDnsStatus: dnsStatus,
+      networkObservedIpv6: null,
+      networkObservedRegion: null,
+      networkDnsStatus: null,
       networkProxyHealthy: proxyHealthy,
-      networkBandwidthMbps: bandwidthMbps,
+      networkBandwidthMbps: null,
       networkRouteMatch: mismatches.length === 0,
-      networkVerificationLevel: "configured-egress-endpoint",
-      networkProtectionState: mismatches.length === 0 ? "PROTECTED" : "FAILED",
-      networkVerificationMessage: mismatches.length === 0 ? "End-to-end egress verification passed." : mismatches.join("; "),
+      networkVerificationLevel: "host-configured-egress-endpoint",
+      networkProtectionState: mismatches.length === 0 ? "VERIFYING" : "FAILED",
+      networkVerificationMessage: mismatches.length === 0
+        ? "Host route verified — phone egress test required."
+        : mismatches.join("; "),
       networkLatestError: latestError,
       networkDiagnosticEvents: [{ type: "NETWORK_VERIFY_STARTED", at: eventAt }, {
-        type: mismatches.length === 0 ? "NETWORK_PROTECTED" : "NETWORK_DEGRADED",
+        type: mismatches.length === 0 ? "HOST_ROUTE_VERIFIED" : "NETWORK_DEGRADED",
         at: eventAt,
         ...(latestError ? { errorCode: latestError.code } : {}),
       }],
     };
     status.set(deviceId, entry);
-
-    // The collision is evidence against BOTH devices, not just the one that
-    // happened to be checked second — the earlier device's own record must
-    // be corrected too, or it would keep reporting a stale "verified: true".
-    if (collision) {
-      const other = status.get(collision);
-      const collisionError = diagnosticError("V204", {
-        why: `The observed egress is shared with a differently assigned phone (${deviceId}).`,
-        technical: { collision: true },
-      });
-      status.set(collision, {
-        ...other,
-        networkVerified: false,
-        networkMismatch: true,
-        networkMismatchReason: `shares egress IP ${observedIp} with device "${deviceId}", which is on a different network assignment`,
-        networkRouteMatch: false,
-        networkProtectionState: "FAILED",
-        networkVerificationMessage: `shares egress IP ${observedIp} with device "${deviceId}", which is on a different network assignment`,
-        networkLatestError: collisionError,
-        networkDiagnosticEvents: [
-          ...(other?.networkDiagnosticEvents || []),
-          { type: "NETWORK_DEGRADED", at: collisionError.at, errorCode: collisionError.code },
-        ].slice(-20),
-      });
-    }
 
     return entry;
   }

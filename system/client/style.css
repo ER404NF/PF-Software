@@ -3241,7 +3241,12 @@ button:disabled { cursor: not-allowed; opacity: 0.5; }
 .device-attention strong { color: #ff8a80; }
 .device-attention[data-tone="warning"] strong { color: #ffd60a; }
 .device-attention span { color: #e5e5ea; overflow-wrap: anywhere; }
-.open-files-button { background: transparent; border: 1px solid #48484a; color: #d1d1d6; }
+.open-files-button {
+  background: transparent;
+  border: 1px dashed #636366;
+  color: #d1d1d6;
+  box-shadow: none;
+}
 
 /* Retry / Diagnostics under a phone's error use the same buttons as the rest of the card. */
 .device-error-actions button { border: 1px solid var(--line); border-radius: 8px; padding: 6px 12px; min-height: 32px; background: var(--surface); color: var(--ink); font-size: 12px; font-weight: 650; }
