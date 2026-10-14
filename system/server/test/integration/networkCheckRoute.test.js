@@ -24,12 +24,14 @@ const isolatedDeviceConfigPath = path.join(tmpStorageRoot, "devices.config.json"
 fs.copyFileSync(path.join(__dirname, "../../fixtures/network-devices.config.json"), isolatedDeviceConfigPath);
 const isolatedDeviceConfig = JSON.parse(fs.readFileSync(isolatedDeviceConfigPath, "utf8"));
 isolatedDeviceConfig.devices.find(device => device.id === "mock-1").network.failPolicy = "fail-closed";
+isolatedDeviceConfig.devices.push({ id: "pool-only", label: "Pool-assigned phone", type: "mock", hostLabel: "test-host" });
 fs.writeFileSync(isolatedDeviceConfigPath, `${JSON.stringify(isolatedDeviceConfig, null, 2)}\n`);
 process.env.DEVICE_CONFIG_PATH = isolatedDeviceConfigPath;
 process.env.SESSION_STORE_DIR = path.join(tmpStorageRoot, "sessions");
 process.env.AUDIT_LOG_PATH = path.join(tmpStorageRoot, "audit.log");
 process.env.QUEUE_STORE_PATH = path.join(tmpStorageRoot, "tasks.json");
 process.env.ALLOW_NETWORK_CHECK_URL_OVERRIDE = "true";
+process.env.TWO_FACTOR_MASTER_KEY = "a".repeat(32);
 process.env.NODE_ENV = "test";
 
 const { server, wss, deviceLease, taskQueue, auditLog } = await import("../../src/index.js");
@@ -274,6 +276,42 @@ test("device_list over WebSocket carries the same network fields as the HTTP rou
 
   const mock2 = deviceListMsg.devices.find((d) => d.id === "mock-2");
   assert.equal(mock2.network.egress, "vlan-proxy");
+});
+
+test("a pool-only proxy assignment immediately blocks Human and AI control until phone-originated verification", async () => {
+  const created = await fetch(`${httpUrl}/api/admin/proxies`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({
+      provider: "Provider A", protocol: "socks5", host: "proxy.example.test", port: 1080,
+      username: "account", password: "credential", country: "US", label: "Pool fallback",
+    }),
+  });
+  assert.equal(created.status, 201);
+  const proxyId = (await created.json()).proxy.id;
+  const assigned = await fetch(`${httpUrl}/api/admin/devices/pool-only/proxy-assignment`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ proxyId }),
+  });
+  assert.equal(assigned.status, 200);
+
+  const phone = (await fleetSnapshot(cookie)).find(device => device.id === "pool-only");
+  assert.equal(phone.network.egress, "commercial-proxy");
+  assert.equal(phone.network.failPolicy, "fail-closed");
+  assert.equal(phone.network.providerLabel, "Provider A");
+  assert.equal(phone.canOpen, false);
+  assert.equal(phone.accessState, "network_not_verified");
+  assert.match(phone.openReason, /blocked until.*network route passes verification/i);
+
+  const task = taskQueue.addTask({
+    goal: "must not acquire an unverified pool-assigned phone",
+    createdBy: "netcheck-test-va",
+    deviceSelector: { deviceId: "pool-only" },
+  });
+  assert.equal(task.state, "QUEUED");
+  assert.equal(deviceLease.getMode("pool-only"), "HUMAN");
+  taskQueue.emergencyStopDevice("pool-only");
 });
 
 test("only a proxy manager can persist and broadcast the safe proxy assignment switch", async () => {

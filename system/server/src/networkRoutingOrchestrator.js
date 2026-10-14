@@ -156,6 +156,12 @@ export class NetworkRoutingOrchestrator {
     if (isRoutingHostBlocked(this.hostRoutingState)) throw this._routingBlockedError();
   }
 
+  async _assertFreshRoutingPermissions({ allowBlockedHost = false } = {}) {
+    if (!allowBlockedHost) this._assertHostRoutingAllowed();
+    await this.privilegedOps.assertRoutingPermissions?.();
+    if (!allowBlockedHost) this._assertHostRoutingAllowed();
+  }
+
   assertRoutingAvailable() {
     this._assertHostRoutingAllowed();
     return true;
@@ -218,11 +224,16 @@ export class NetworkRoutingOrchestrator {
           this.reconciled = true;
           return { reconciled: true, routingBlocked: true, hostRouting: this.getHostRoutingStatus() };
         }
+        await this._assertFreshRoutingPermissions();
         const existingRules = await this.privilegedOps.inspectRules();
-        if (String(existingRules || "").trim()) await this.privilegedOps.clearAnchor();
+        if (String(existingRules || "").trim()) {
+          await this._assertFreshRoutingPermissions();
+          await this.privilegedOps.clearAnchor();
+        }
         this.reconciled = true;
         return { reconciled: true };
       } catch (error) {
+        if (error?.code === "ROUTING_SUDO_PERMISSION_MISSING") throw error;
         const failure = new Error("Bodun could not safely restore its network state; protected routing is unavailable", { cause: error });
         failure.status = 503;
         failure.code = "ROUTING_RECONCILIATION_REQUIRED";
@@ -314,6 +325,7 @@ export class NetworkRoutingOrchestrator {
   async _applyPfRuleset(devices, blockedIps = this._desiredBlockedIps()) {
     this._assertHostRoutingAllowed();
     const ruleset = generatePfRuleset({ bridgeIface: this.bridgeIface, devices, blockedIps });
+    await this._assertFreshRoutingPermissions();
     const test = await this.privilegedOps.testRuleset(ruleset);
     this._assertHostRoutingAllowed();
     if (!test.ok) {
@@ -321,6 +333,7 @@ export class NetworkRoutingOrchestrator {
       error.pfSyntaxError = true;
       throw error;
     }
+    await this._assertFreshRoutingPermissions();
     await this.privilegedOps.loadRuleset(ruleset);
     this._assertHostRoutingAllowed();
   }
@@ -331,6 +344,7 @@ export class NetworkRoutingOrchestrator {
     if (remaining.length > 0 || blocked.length > 0) {
       await this._applyPfRuleset(remaining, blocked);
     } else {
+      await this._assertFreshRoutingPermissions();
       await this.privilegedOps.clearAnchor();
     }
   }
@@ -407,6 +421,7 @@ export class NetworkRoutingOrchestrator {
     // PF_SYNTAX_ERROR rather than leaving the route stuck at PROXY_LEASED
     // with no recorded error — interface discovery/allocation included,
     // not just the tunnel/PF steps below.
+    let tunnelStarted = false;
     let pfLoaded = false;
     try {
       const existingIfaces = await this.listAllInterfaces();
@@ -427,11 +442,12 @@ export class NetworkRoutingOrchestrator {
         throw error;
       }
       const password = decryptProxyPassword(proxyRecord, this.proxyCredentialEncryptionKey);
-      this._assertHostRoutingAllowed();
+      await this._assertFreshRoutingPermissions();
       this.tunManager.start({
         deviceId, tunIface,
         proxy: { protocol: proxyRecord.protocol, host: proxyRecord.host, port: proxyRecord.port, username: proxyRecord.username, password },
       });
+      tunnelStarted = true;
       if (typeof this.tunManager.waitForOwnership === "function"
         && await this.tunManager.waitForOwnership(deviceId) !== true) {
         throw new Error("tunnel process ownership could not be recorded");
@@ -458,7 +474,7 @@ export class NetworkRoutingOrchestrator {
       pfLoaded = true;
       this._recordEvent(deviceId, "PF_APPLY_SUCCEEDED");
       await authorize?.();
-      this._assertHostRoutingAllowed();
+      await this._assertFreshRoutingPermissions();
       await this.privilegedOps.clearState(usbIp);
 
       this._assertHostRoutingAllowed();
@@ -470,6 +486,20 @@ export class NetworkRoutingOrchestrator {
         { verification: "device_egress_required" });
       return this.routes.get(deviceId) ?? routed;
     } catch (error) {
+      if (error?.code === "ROUTING_SUDO_PERMISSION_MISSING") {
+        if (tunnelStarted) {
+          try { await this.tunManager.stop(deviceId); }
+          catch (cleanupError) { this._recordCleanupFailure(deviceId, cleanupError); }
+        }
+        const detail = this._recordFailure(deviceId, ROUTING_STATES.TUN_ERROR, "F205", error);
+        this.routes.set(deviceId, {
+          ...this.routes.get(deviceId), latestError: detail, protected: false,
+          internetBlocked: false, protectionState: "permission_blocked", manualInterventionRequired: true,
+        });
+        this._recordEvent(deviceId, "ROUTING_PERMISSION_MISSING", { errorCode: detail.code });
+        this.onStateChanged(deviceId, this.routes.get(deviceId));
+        throw error;
+      }
       if (["ROUTING_HOST_QUARANTINED", "ROUTING_RECOVERY_REQUIRED"].includes(error?.code)) {
         try { await this.tunManager.stop(deviceId); }
         catch (cleanupError) { this._recordCleanupFailure(deviceId, cleanupError); }
@@ -549,7 +579,10 @@ export class NetworkRoutingOrchestrator {
     await this.tunManager.stop(deviceId);
     try {
       await this._removeDeviceFromPf(deviceId);
-      if (route.usbIp) await this.privilegedOps.clearState(route.usbIp);
+      if (route.usbIp) {
+        await this._assertFreshRoutingPermissions();
+        await this.privilegedOps.clearState(route.usbIp);
+      }
     } catch (error) {
       this._recordFailure(deviceId, ROUTING_STATES.STOP_ERROR, "F202", error);
       try { await this._applyFailClosed(deviceId); }
@@ -718,7 +751,10 @@ export class NetworkRoutingOrchestrator {
     let bridgeError = null;
     const cleanupFailures = [];
     if (this.hostSetupPromises.size) await Promise.allSettled([...this.hostSetupPromises]);
-    try { await this.privilegedOps.quarantineBridge(this.bridgeIface); }
+    try {
+      await this._assertFreshRoutingPermissions({ allowBlockedHost: true });
+      await this.privilegedOps.quarantineBridge(this.bridgeIface);
+    }
     catch (error) { bridgeError = error; }
 
     for (const affectedId of affectedIds) {
@@ -836,6 +872,7 @@ export class NetworkRoutingOrchestrator {
   }
 
   async _performHostRoutingRecovery({ authorize = null } = {}) {
+    await this._assertFreshRoutingPermissions({ allowBlockedHost: true });
     let persisted = this.hostRoutingState;
     if (this.quarantineStorePath) {
       persisted = readRoutingQuarantineState(this.quarantineStorePath, this.bridgeIface);
@@ -861,6 +898,7 @@ export class NetworkRoutingOrchestrator {
       await this._stopManagedTunnelAndVerify(affectedId);
     }
     await authorize?.();
+    await this._assertFreshRoutingPermissions({ allowBlockedHost: true });
     await this.privilegedOps.clearAnchor();
     await authorize?.();
     const rules = await this.privilegedOps.inspectRules();
@@ -950,6 +988,7 @@ export class NetworkRoutingOrchestrator {
   }
 
   async _performHostRoutingStateRepair({ authorize = null } = {}) {
+    await this._assertFreshRoutingPermissions({ allowBlockedHost: true });
     let managedIds = [];
     if (this.hostRoutingState.affectedDeviceInventoryComplete !== true) {
       if (this.hostRoutingState.failureMarkerInvalid === true
@@ -970,6 +1009,7 @@ export class NetworkRoutingOrchestrator {
       await this._stopManagedTunnelAndVerify(affectedId);
     }
     await authorize?.();
+    await this._assertFreshRoutingPermissions({ allowBlockedHost: true });
     await this.privilegedOps.clearAnchor();
     await authorize?.();
     const rules = await this.privilegedOps.inspectRules();
@@ -1106,6 +1146,10 @@ export class NetworkRoutingOrchestrator {
       try {
         await this.startRouting(deviceId, { usbIp: current.usbIp });
       } catch (error) {
+        if (error?.code === "ROUTING_SUDO_PERMISSION_MISSING") {
+          this.onStateChanged(deviceId, this.routes.get(deviceId));
+          return;
+        }
         const latest = this.routes.get(deviceId) ?? current;
         const detail = diagnosticError("T202", {
           technical: { errorKind: operationalErrorKind(error) },

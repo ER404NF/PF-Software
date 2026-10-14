@@ -155,6 +155,13 @@ test("when the usual port is taken by something else the host starts on the next
   }
 });
 
+test("the packaged host keeps routing quarantine authority in writable user data", () => {
+  const source = fs.readFileSync(path.join(app.desktopDir, "main.js"), "utf8");
+  assert.match(source,
+    /ROUTING_QUARANTINE_STORE_PATH:\s*path\.join\(storageRoot,\s*"routing-quarantine\.json"\)/,
+    "routing safety state must not fall back to the installed app's bundled system/storage directory");
+});
+
 test("a host that crashes comes back by itself, keeps the Mac awake meanwhile, and stays stopped when it is quit", { timeout: 90_000 }, async () => {
   const port = await freePort();
   // A configured host: the same secrets and port on every start.

@@ -177,7 +177,7 @@ const NETWORK_ERRORS = [
   ["F202", "PF rules could not be loaded", "pf", "_applyPfRuleset", "Check the scoped pfctl sudo permission."],
   ["F203", "Expected device route missing", "pf", "checkHealth", "Bodun will rebuild the private anchor for this device."],
   ["F204", "Traffic is not matching the device route", "pf", "checkHealth", "Generate phone traffic and inspect the device-specific PF counters."],
-  ["F205", "PF permission failure", "pf", "PrivilegedOps", "Install the documented scoped sudoers rule for pfctl."],
+  ["F205", "Protected routing permission failure", "routing", "PrivilegedOps", "Install the documented scoped sudoers rule for the required routing commands."],
   ["F206", "Stale PF state detected", "pf", "clearState", "Clear state for this phone's private USB IP and rebuild its route."],
   ["F207", "PF anchor unavailable", "pf", "inspectRules", "Check pfctl availability and the private Phone Farm anchor."],
   ["F208", "Emergency network quarantine failed", "pf", "quarantineBridge", "Disconnect affected phones or disable Internet Sharing until the host firewall can be repaired."],

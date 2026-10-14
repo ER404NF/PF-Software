@@ -135,6 +135,23 @@ function publicNetworkConfig(network) {
   };
 }
 
+// A pool assignment is also a network-safety assignment. Discovered phones
+// often have no static devices.config.json entry, so treating an assigned
+// pool proxy as "network unassigned" would let Human/AI input bypass the
+// fail-closed verification gate while the Fleet UI reports a failed route.
+function networkConfigForPoolProxy(proxy) {
+  if (!proxy || typeof proxy.id !== "string" || !proxy.id) return null;
+  return parseNetworkConfig({
+    egress: "commercial-proxy",
+    profileId: proxy.id,
+    controlIface: "usb",
+    enabled: true,
+    failPolicy: "fail-closed",
+    providerLabel: typeof proxy.provider === "string" && proxy.provider.trim() ? proxy.provider : null,
+    configuredRegion: typeof proxy.country === "string" && proxy.country.trim() ? proxy.country : null,
+  }, proxy.leasedToDeviceId || "pool-assigned-device");
+}
+
 // deviceId -> parsed network config, or null for a device with no `network`
 // block yet. Mirrors loadDevices()'s own raw-JSON-in, Map-out shape.
 function loadDeviceNetworkMap(raw) {
@@ -158,4 +175,7 @@ function egressIdentity(network) {
   return `gateway:${network.gatewayId}`;
 }
 
-export { EGRESS_TYPES, parseNetworkConfig, loadDeviceNetworkMap, egressIdentity, publicNetworkConfig };
+export {
+  EGRESS_TYPES, parseNetworkConfig, loadDeviceNetworkMap, egressIdentity, publicNetworkConfig,
+  networkConfigForPoolProxy,
+};

@@ -30,6 +30,13 @@ class FakePrivilegedOps {
     this.inspectCalls = 0;
     this.quarantineCalls = [];
     this.quarantineError = quarantineError;
+    this.permissionError = null;
+    this.permissionChecks = 0;
+  }
+  async assertRoutingPermissions() {
+    this.permissionChecks += 1;
+    if (this.permissionError) throw this.permissionError;
+    return { ok: true };
   }
   async testRuleset(text) { this.testCalls.push(text); return this.testResult; }
   async loadRuleset(text) { this.loadCalls.push(text); return { ok: true }; }
@@ -128,6 +135,81 @@ test("routing refuses to start when private-anchor reconciliation cannot be insp
   await assert.rejects(() => orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" }),
     error => error.code === "ROUTING_RECONCILIATION_REQUIRED" && error.status === 503);
   assert.equal(tunManager.starts.length, 0);
+});
+
+test("routing refuses to reconcile before any tunnel or PF mutation when sudo coverage is incomplete", async () => {
+  const storePath = tempStorePath();
+  const proxy = createProxy(storePath, samplePayload(), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxy.id });
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({ proxyPoolStorePath: storePath });
+  privilegedOps.permissionError = Object.assign(new Error("safe permission guidance"), {
+    code: "ROUTING_SUDO_PERMISSION_MISSING", status: 503, expose: true,
+  });
+
+  await assert.rejects(() => orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" }),
+    error => error.code === "ROUTING_SUDO_PERMISSION_MISSING" && error.status === 503);
+  assert.equal(tunManager.starts.length, 0);
+  assert.equal(privilegedOps.inspectCalls, 0);
+  assert.equal(privilegedOps.loadCalls.length, 0);
+});
+
+test("a reconciled host rechecks permissions and cannot start another route after permission revocation", async () => {
+  const storePath = tempStorePath();
+  const firstProxy = createProxy(storePath, samplePayload({ label: "First" }), MASTER_KEY);
+  const secondProxy = createProxy(storePath, samplePayload({ label: "Second" }), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: firstProxy.id });
+  assignProxyToDevice(storePath, { deviceId: "mock-2", proxyId: secondProxy.id });
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({ proxyPoolStorePath: storePath });
+  await orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" });
+  assert.equal(orchestrator.reconciled, true);
+
+  const startsBefore = tunManager.starts.length;
+  const testsBefore = privilegedOps.testCalls.length;
+  const loadsBefore = privilegedOps.loadCalls.length;
+  const clearsBefore = privilegedOps.clearStateCalls.length;
+  privilegedOps.permissionError = Object.assign(new Error("Protected routing permission is unavailable."), {
+    code: "ROUTING_SUDO_PERMISSION_MISSING", status: 503, expose: true,
+  });
+
+  await assert.rejects(() => orchestrator.startRouting("mock-2", { usbIp: "192.168.2.11" }), error => {
+    assert.equal(error.code, "ROUTING_SUDO_PERMISSION_MISSING");
+    assert.doesNotMatch(error.message, /s3cret|proxy\.example|\/sbin|private/i);
+    return true;
+  });
+  assert.equal(tunManager.starts.length, startsBefore, "no privileged tunnel launch occurs");
+  assert.equal(tunManager.stops.length, 0, "an unstarted tunnel is not mutated during rejection");
+  assert.equal(privilegedOps.testCalls.length, testsBefore, "no PF command is attempted");
+  assert.equal(privilegedOps.loadCalls.length, loadsBefore, "no PF mutation occurs");
+  assert.equal(privilegedOps.clearStateCalls.length, clearsBefore, "no PF state mutation occurs");
+  const failedRoute = orchestrator.getRoute("mock-2");
+  assert.equal(failedRoute.state, ROUTING_STATES.TUN_ERROR);
+  assert.equal(failedRoute.latestError.code, "F205");
+  assert.equal(failedRoute.protected, false);
+  assert.equal(failedRoute.protectionState, "permission_blocked");
+});
+
+test("permission revocation after tunnel startup blocks PF mutation and preserves the permission error", async () => {
+  const storePath = tempStorePath();
+  const proxy = createProxy(storePath, samplePayload(), MASTER_KEY);
+  assignProxyToDevice(storePath, { deviceId: "mock-1", proxyId: proxy.id });
+  const { orchestrator, tunManager, privilegedOps } = makeOrchestrator({ proxyPoolStorePath: storePath });
+  const originalTestRuleset = privilegedOps.testRuleset.bind(privilegedOps);
+  const permissionError = Object.assign(new Error("Protected routing permission is unavailable."), {
+    code: "ROUTING_SUDO_PERMISSION_MISSING", status: 503, expose: true,
+  });
+  privilegedOps.testRuleset = async text => {
+    const result = await originalTestRuleset(text);
+    privilegedOps.permissionError = permissionError;
+    return result;
+  };
+
+  await assert.rejects(() => orchestrator.startRouting("mock-1", { usbIp: "192.168.2.10" }), error => error === permissionError);
+  assert.equal(tunManager.starts.length, 1, "the permission was revoked only after tunnel startup");
+  assert.equal(tunManager.stops.includes("mock-1"), true, "the partial tunnel is cleaned up");
+  assert.equal(privilegedOps.testCalls.length, 1, "syntax validation completed before the revocation");
+  assert.equal(privilegedOps.loadCalls.length, 0, "the fresh pre-mutation check prevents PF loading");
+  assert.equal(privilegedOps.clearStateCalls.length, 0);
+  assert.equal(orchestrator.getRoute("mock-1").latestError.code, "F205");
 });
 
 test("authorization revoked during routing preparation prevents tunnel and PF mutations", async () => {
@@ -807,7 +889,7 @@ test("concurrent recovery calls perform only one destructive recovery sequence",
   let clearCalls = 0;
   privilegedOps.clearAnchor = () => { clearCalls += 1; return new Promise(resolve => { releaseClear = resolve; }); };
   const first = orchestrator.recoverHostRouting();
-  await Promise.resolve();
+  for (let turn = 0; turn < 10 && !releaseClear; turn += 1) await Promise.resolve();
   await assert.rejects(() => orchestrator.recoverHostRouting(), error => error.code === "ROUTING_RECOVERY_IN_PROGRESS");
   assert.equal(clearCalls, 1);
   releaseClear({ ok: true });
@@ -897,6 +979,7 @@ test("final quarantine persistence failure remains blocked after restart without
   let releaseBridge;
   first.privilegedOps.quarantineBridge = () => new Promise(resolve => { releaseBridge = resolve; });
   const quarantine = first.orchestrator._enforceEmergencyQuarantine("mock-1", new Error("pf failed secret=hidden"));
+  await new Promise(resolve => setImmediate(resolve));
   fs.rmSync(quarantineStorePath);
   fs.mkdirSync(quarantineStorePath);
   releaseBridge({ ok: true });

@@ -133,7 +133,9 @@ export function registerNetworkCheckRoutes({
           operator: requester.current.username,
           type: "network_check",
           deviceId: req.params.deviceId,
-          detail: { proxyId: record.id, level: result.networkVerificationLevel, protected: false },
+          detail: withNetworkEgress(req.params.deviceId, {
+            proxyId: record.id, level: result.networkVerificationLevel, protected: false,
+          }),
         });
         res.json({ network: { ...(publicNetworkConfig(configuredNetwork) ?? {}), ...result } });
       }).catch(error => {

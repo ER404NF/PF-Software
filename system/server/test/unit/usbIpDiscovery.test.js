@@ -49,10 +49,10 @@ test("captureDeviceTraffic runs tcpdump through sudo -n (packet capture requires
     calls.push({ bin, args });
     callback(null, CAPTURE_SAMPLE, "");
   };
-  const output = await captureDeviceTraffic({ iface: "en5", packetCount: 10, execFile });
+  const output = await captureDeviceTraffic({ iface: "en5", packetCount: 10, tcpdumpBin: "/usr/sbin/tcpdump", execFile });
   assert.equal(output, CAPTURE_SAMPLE);
   assert.equal(calls[0].bin, "sudo");
-  assert.deepEqual(calls[0].args, ["-n", "tcpdump", "-ni", "en5", "-c", "10", "-nn", "ip"]);
+  assert.deepEqual(calls[0].args, ["-n", "/usr/sbin/tcpdump", "-ni", "en5", "-c", "10", "-nn", "ip"]);
 });
 
 test("captureDeviceTraffic requires an iface", async () => {

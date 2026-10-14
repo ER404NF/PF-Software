@@ -71,7 +71,7 @@ import * as deviceLease from "./deviceLease.js";
 import { createTaskQueue } from "./taskQueue.js";
 import { parseCommand } from "./commandParser.js";
 import { resolveSchedulingTimeZone } from "./schedulingTimeZone.js";
-import { loadDeviceNetworkMap, publicNetworkConfig } from "./deviceNetworkConfig.js";
+import { loadDeviceNetworkMap, networkConfigForPoolProxy, publicNetworkConfig } from "./deviceNetworkConfig.js";
 import { isProxyEgress, setDeviceProxyEnabled } from "./deviceNetworkStore.js";
 import { publicProxy, decryptProxyPassword } from "./proxyPool.js";
 import { createFileProxyPoolRepository } from "./persistence/fileProxyPoolRepository.js";
@@ -1863,11 +1863,14 @@ app.post("/api/admin/users/:username/2fa/reset", requireCapability(CAPABILITIES.
 // the device adapter executes deterministic primitives and shouldn't also
 // carry control-plane bookkeeping about its own network assignment.
 const deviceNetwork = loadDeviceNetworkMap(rawDeviceConfig);
-const networkVerifier = createNetworkVerifier({ deviceNetwork });
+const networkForDevice = deviceId => deviceNetwork.get(deviceId)
+  ?? networkConfigForPoolProxy(poolProxyForDevice(deviceId));
+const effectiveDeviceNetwork = { get: networkForDevice };
+const networkVerifier = createNetworkVerifier({ deviceNetwork: effectiveDeviceNetwork });
 const networkMaxAgeMs = networkVerificationMaxAge();
 const knownRouteStates = new Map();
 const networkDecision = (deviceId, now = new Date()) => networkAccessDecision({
-  network: deviceNetwork.get(deviceId),
+  network: networkForDevice(deviceId),
   status: networkVerifier.getStatus(deviceId),
   now,
   maxAgeMs: networkMaxAgeMs,
@@ -2363,7 +2366,7 @@ const summary = (d, viewer = null, viewerSocket = null) => {
       .map(operator => ({ username: operator.username, role: operator.role }))
       .sort((a, b) => a.username.localeCompare(b.username)) : [],
     monitor: runtimeMonitorState(d.id),
-    network: publicNetworkConfig(deviceNetwork.get(d.id)),
+    network: publicNetworkConfig(networkForDevice(d.id)),
     poolProxy: hasCapability(viewer, CAPABILITIES.VIEW_PROXY_POOL) ? poolProxyForDevice(d.id) : null,
     routingFeature: hasCapability(viewer, CAPABILITIES.MANAGE_ROUTING) ? {
       ...networkRoutingSetupState,
@@ -2505,7 +2508,7 @@ app.post("/api/admin/devices/:deviceId/wda/:action",
 // than polluting every event with `networkEgress: null` before Phase 1-3
 // hardware exists to assign anything.
 function withNetworkEgress(deviceId, detail = {}) {
-  const network = deviceNetwork.get(deviceId);
+  const network = networkForDevice(deviceId);
   return network ? { ...detail, networkEgress: network.egress } : detail;
 }
 
@@ -2581,7 +2584,7 @@ registerNetworkCheckRoutes({
   runNetworkCheckCapability: CAPABILITIES.RUN_NETWORK_CHECK,
   knownDevice,
   canAccessDevice,
-  deviceNetwork,
+  deviceNetwork: effectiveDeviceNetwork,
   isProxyEgress,
   resolveNetworkCheckTarget,
   poolProxyForDevice,
@@ -5065,7 +5068,9 @@ if (isMain) {
           autoNetworkEnrollment.start();
         }
       } catch (error) {
-        networkRoutingSetupState = { state: "setup_failed", message: "Proxy routing could not be initialized. Review host diagnostics." };
+        networkRoutingSetupState = error?.code === "ROUTING_SUDO_PERMISSION_MISSING"
+          ? { state: "setup_failed", reasonCode: error.code, message: error.message }
+          : { state: "setup_failed", message: "Proxy routing could not be initialized. Review host diagnostics." };
         logOperationalFailure("Automatic proxy tunnel routing is disabled", error);
       }
     }

@@ -1,6 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseNetworkConfig, loadDeviceNetworkMap, egressIdentity, publicNetworkConfig } from "../../src/deviceNetworkConfig.js";
+import {
+  parseNetworkConfig, loadDeviceNetworkMap, egressIdentity, publicNetworkConfig, networkConfigForPoolProxy,
+} from "../../src/deviceNetworkConfig.js";
 
 test("parseNetworkConfig returns null for a device with no network block yet", () => {
   assert.equal(parseNetworkConfig(undefined, "mock-1"), null);
@@ -90,6 +92,20 @@ test("loadDeviceNetworkMap propagates a validation error with the offending devi
 test("loadDeviceNetworkMap treats a missing devices array as empty, matching loadDevices()'s own fallback", () => {
   const map = loadDeviceNetworkMap({});
   assert.equal(map.size, 0);
+});
+
+test("a saved pool assignment becomes a fail-closed network policy for discovered phones", () => {
+  const network = networkConfigForPoolProxy({
+    id: "px_saved", provider: "Oxylabs", country: "US", leasedToDeviceId: "ios-device",
+  });
+  assert.equal(network.egress, "commercial-proxy");
+  assert.equal(network.profileId, "px_saved");
+  assert.equal(network.controlIface, "usb");
+  assert.equal(network.enabled, true);
+  assert.equal(network.failPolicy, "fail-closed");
+  assert.equal(network.providerLabel, "Oxylabs");
+  assert.equal(network.configuredRegion, "US");
+  assert.equal(networkConfigForPoolProxy(null), null);
 });
 
 test("egressIdentity is null for an unassigned device", () => {

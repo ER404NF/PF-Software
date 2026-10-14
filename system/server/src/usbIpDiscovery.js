@@ -49,10 +49,12 @@ export function discoverDeviceIp(tcpdumpOutput, { excludeIps = [] } = {}) {
 // tunManager.js's tun2proxy launch — the host's sudoers rule needs a third
 // entry alongside pfctl/tun2proxy (see privilegedOps.js's module comment
 // for the exact line shape; add tcpdump's resolved path there too).
-export async function captureDeviceTraffic({ iface, packetCount = 10, sudoBin = "sudo", execFile = execFileCb, timeoutMs = 15_000 } = {}) {
+export async function captureDeviceTraffic({ iface, packetCount = 10, sudoBin = "sudo",
+  tcpdumpBin = process.env.TCPDUMP_BIN || (process.platform === "darwin" ? "/usr/sbin/tcpdump" : "tcpdump"),
+  execFile = execFileCb, timeoutMs = 15_000 } = {}) {
   if (typeof iface !== "string" || !iface) throw new Error("iface is required");
   const output = await new Promise((resolve, reject) => {
-    execFile(sudoBin, ["-n", "tcpdump", "-ni", iface, "-c", String(packetCount), "-nn", "ip"], { timeout: timeoutMs, windowsHide: true, encoding: "utf8" },
+    execFile(sudoBin, ["-n", tcpdumpBin, "-ni", iface, "-c", String(packetCount), "-nn", "ip"], { timeout: timeoutMs, windowsHide: true, encoding: "utf8" },
       (error, stdout, stderr) => {
         // tcpdump exits nonzero on a capture timeout with 0 packets seen —
         // that's a legitimate "no traffic yet" outcome, not a hard failure.

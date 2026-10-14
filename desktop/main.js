@@ -208,6 +208,10 @@ function hostStorageEnvironment(secrets) {
     ACCOUNT_NOTIFICATION_STORE_PATH: path.join(storageRoot, "notifications.json"),
     DEVICE_PROVISIONING_STORE_PATH: path.join(storageRoot, "device-provisioning.json"),
     PROCESS_OWNERSHIP_PATH: path.join(storageRoot, "process-ownership.json"),
+    // This is safety authority, not a bundled application asset. Keeping it
+    // beside the other mutable host records also lets an installed app
+    // preserve and explicitly repair a damaged record across upgrades.
+    ROUTING_QUARANTINE_STORE_PATH: path.join(storageRoot, "routing-quarantine.json"),
     WDA_DERIVED_DATA_ROOT: path.join(storageRoot, "wda-derived-data"),
     PROXY_POOL_STORE_PATH: path.join(storageRoot, "proxy-pool.json"),
     USB_NETWORK_STORE_PATH: path.join(storageRoot, "usb-network.json"),
