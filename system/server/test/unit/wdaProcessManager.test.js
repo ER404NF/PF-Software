@@ -38,7 +38,7 @@ test("start() passes WDA's MJPEG tuning env vars to the spawned xcodebuild proce
   const spawn = (bin, args, options) => { calls.push({ bin, args, options }); return fakeChild(); };
   const manager = new WdaProcessManager({ spawn, wdaRepoPath: "/repo" });
   manager.start({ udid: "00008110-ABCDEF1234567890", derivedDataPath: "/tmp/derived/ios-abc" });
-  assert.equal(calls[0].options.env.MJPEG_SERVER_FRAMERATE, "20");
+  assert.equal(calls[0].options.env.MJPEG_SERVER_FRAMERATE, "60");
   assert.equal(calls[0].options.env.MJPEG_SERVER_SCREENSHOT_QUALITY, "30");
   assert.equal(calls[0].options.env.MJPEG_SCALING_FACTOR, "50");
   // The spawned process must still inherit the rest of the parent's real

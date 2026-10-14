@@ -39,11 +39,12 @@ The existing pipeline is:
 5. The relay sends binary frames through the authenticated WebSocket.
 6. The browser discards superseded decode work and paints the newest frame.
 
-The 2026-09-21 low-latency pass changed the default WDA request from 15 fps,
-50% scale, quality 35 to 30 fps, 50% scale, quality 45. It also starts dropping
+The current low-latency profile requests WDA's documented maximum of 60 fps at
+50% scale and quality 30. It also starts dropping
 frames when 128 KiB is queued instead of allowing a 1 MB backlog. The normal
 phone view is larger and has a full-screen control mode. These changes improve
-WDA operation but do not change MJPEG's fundamental capture/encoding cost.
+WDA operation but do not guarantee 60 delivered fps or change MJPEG's
+fundamental screenshot-capture and JPEG-encoding cost.
 
 ## Candidate transports
 

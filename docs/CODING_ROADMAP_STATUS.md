@@ -632,7 +632,7 @@ Worked through `docs/productionization/PRODUCTION_READINESS_AUDIT.md`'s priority
 **§5 — WDA MJPEG tuning (`wdaProcessManager.js`, `processSupervisor.js`):** WDA's own MJPEG server was never
 configured — every session ran full-resolution, high-quality frames at WDA's conservative fixed rate, the
 likely actual cause of "the stream feels slow" rather than this app's own streaming pipeline (already good).
-Now sets `MJPEG_SERVER_FRAMERATE=20`, `MJPEG_SERVER_SCREENSHOT_QUALITY=30`, `MJPEG_SCALING_FACTOR=50` by
+Now sets `MJPEG_SERVER_FRAMERATE=60`, `MJPEG_SERVER_SCREENSHOT_QUALITY=30`, `MJPEG_SCALING_FACTOR=50` by
 default, each overridable per deployment via `WDA_MJPEG_*` env vars.
 `processSupervisor.js`'s `start()`/`_spawnNow()` gained an optional `env` parameter (merged over
 `process.env`, reused across restarts) to carry this through — a small, generically useful addition, not
@@ -1620,7 +1620,7 @@ acceptance is claimed here, and the macOS stable Release asset remains blocked o
 The desktop live phone was artificially capped at 320 px wide and 660 px high.
 It now uses up to 480 px / 860 px in the normal workspace, gets a larger desktop
 column, and has a full-screen phone mode that preserves canvas-based input
-coordinates. The WDA profile now asks for 30 fps at 50% scale and quality 45.
+coordinates. The WDA profile now asks for 60 fps at 50% scale and quality 30.
 The relay begins dropping video at a 128 KiB WebSocket backlog instead of 1 MB,
 so slow links keep the newest picture rather than displaying a queue of old
 frames.

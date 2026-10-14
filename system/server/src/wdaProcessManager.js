@@ -17,9 +17,11 @@ const BUNDLE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9.-]{0,199}$/;
 // most likely actual cause of "the stream feels slow" (the app's own
 // streaming pipeline — mjpegParser.js/streamHub.js — was never the
 // bottleneck). Each is independently overridable per deployment without a
-// code change; defaults are conservative starting points, not tuned/proven
-// against a real phone yet — see PRODUCTION_READINESS_AUDIT.md §5 step 2.
-const DEFAULT_MJPEG_SERVER_FRAMERATE = "20";
+// code change. Ask WDA for its documented maximum of 60 frames per second;
+// this is a target rather than a guarantee because each frame is still a
+// separately captured and encoded JPEG. The half-size, moderate-quality
+// defaults keep that target practical without allowing old frames to queue.
+const DEFAULT_MJPEG_SERVER_FRAMERATE = "60";
 const DEFAULT_MJPEG_SERVER_SCREENSHOT_QUALITY = "30";
 const DEFAULT_MJPEG_SCALING_FACTOR = "50";
 
