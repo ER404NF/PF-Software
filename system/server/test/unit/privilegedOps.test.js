@@ -123,7 +123,7 @@ test("testRuleset reports a syntax failure without throwing", async () => {
 
 test("loadRuleset targets -a <anchor> -f <file>, never the bare main ruleset", async () => {
   const { execFile, calls } = fakeExecFile();
-  const ops = new PrivilegedOps({ execFile, anchor: "com.apple/phonefarm" });
+  const ops = new PrivilegedOps({ execFile, pfctlBin: "pfctl", anchor: "com.apple/phonefarm" });
   await ops.loadRuleset("pass in quick on bridge0 ...\n");
   assert.deepEqual(calls[0].args.slice(0, 4), ["-n", "pfctl", "-a", "com.apple/phonefarm"]);
   assert.equal(calls[0].args[4], "-f");
@@ -131,7 +131,7 @@ test("loadRuleset targets -a <anchor> -f <file>, never the bare main ruleset", a
 
 test("inspectRules returns pfctl's stdout for this app's anchor only", async () => {
   const { execFile, calls } = fakeExecFile({ stdout: "pass in quick on bridge0 ...\n" });
-  const ops = new PrivilegedOps({ execFile, anchor: "com.apple/phonefarm" });
+  const ops = new PrivilegedOps({ execFile, pfctlBin: "pfctl", anchor: "com.apple/phonefarm" });
   const output = await ops.inspectRules();
   assert.equal(output, "pass in quick on bridge0 ...\n");
   assert.deepEqual(calls[0].args, ["-n", "pfctl", "-a", "com.apple/phonefarm", "-vvs", "rules"]);
@@ -139,7 +139,7 @@ test("inspectRules returns pfctl's stdout for this app's anchor only", async () 
 
 test("clearState validates the IPv4 before ever shelling out", async () => {
   const { execFile, calls } = fakeExecFile();
-  const ops = new PrivilegedOps({ execFile, anchor: "com.apple/phonefarm" });
+  const ops = new PrivilegedOps({ execFile, pfctlBin: "pfctl", anchor: "com.apple/phonefarm" });
   await ops.clearState("192.168.2.10");
   assert.deepEqual(calls[0].args, ["-n", "pfctl", "-k", "192.168.2.10"]);
 
@@ -150,7 +150,7 @@ test("clearState validates the IPv4 before ever shelling out", async () => {
 
 test("clearAnchor removes only this app's anchor rules, matching -a <anchor> -F all", async () => {
   const { execFile, calls } = fakeExecFile();
-  const ops = new PrivilegedOps({ execFile, anchor: "com.apple/phonefarm" });
+  const ops = new PrivilegedOps({ execFile, pfctlBin: "pfctl", anchor: "com.apple/phonefarm" });
   await ops.clearAnchor();
   assert.deepEqual(calls[0].args, ["-n", "pfctl", "-a", "com.apple/phonefarm", "-F", "all"]);
 });
