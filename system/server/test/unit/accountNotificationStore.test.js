@@ -79,3 +79,21 @@ test("account review notifications remain held until their account commit is rec
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("an aborted transition can reuse its idempotency key without losing the notification", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-notifications-"));
+  try {
+    const store = createAccountNotificationStore({ storePath: path.join(root, "accounts.json"), companyEmail: "sender@example.com" });
+    const input = { to: "person@gmail.com", fullName: "Person", username: "person", status: "approved",
+      holdForCommit: true, idempotencyKey: "account_approved:person:1" };
+    const first = store.queue(input);
+    store.markAborted(first.id);
+    const retry = store.queue(input);
+    assert.equal(retry.id, first.id);
+    assert.equal(retry.deliveryState, "pending_account_commit");
+    assert.equal(store.markCommitted(retry.id).deliveryState, "queued");
+    assert.equal(store.list().length, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

@@ -1,4 +1,4 @@
-export function registerHealthRoutes({ app, databasePool = null, checkDatabaseHealth }) {
+export function registerHealthRoutes({ app, databasePool = null, checkDatabaseHealth, databaseStartup = null }) {
   if (!app?.get) throw new TypeError("health routes require an Express app");
   if (databasePool && typeof checkDatabaseHealth !== "function") {
     throw new TypeError("database-backed readiness requires checkDatabaseHealth");
@@ -16,6 +16,13 @@ export function registerHealthRoutes({ app, databasePool = null, checkDatabaseHe
       return res.json({ ok: true, checks: { database: { status: "not_required" } } });
     }
     try {
+      const startup = databaseStartup?.status?.();
+      if (startup && startup.status !== "ready") {
+        return res.status(503).json({
+          ok: false,
+          checks: { database: { status: startup.status === "timeout" ? "startup_timeout" : "initializing", latencyMs: null } },
+        });
+      }
       const result = await checkDatabaseHealth(databasePool);
       const database = {
         status: result.healthy ? "ready" : "unavailable",

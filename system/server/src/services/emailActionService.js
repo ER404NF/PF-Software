@@ -27,15 +27,17 @@ export function createEmailActionService({
     if (!dep) throw new TypeError(`email action service requires ${name}`);
   }
 
-  async function issueToken({ userId, purpose, ttlMs }) {
-    return withTransaction(pool, async (client) => {
+  async function issueToken({ userId, purpose, ttlMs, onIssued = null, client: existingClient = null }) {
+    const operation = async (client) => {
       await emailActionTokenRepository.invalidateActiveForUser({ userId, purpose }, client);
       const token = newToken();
       const record = await emailActionTokenRepository.create({
         userId, purpose, tokenHash: hashToken(token), expiresAt: new Date(now().getTime() + ttlMs),
       }, client);
-      return { token, record };
-    });
+      const notification = onIssued ? await onIssued({ token, record, client }) : null;
+      return { token, record, notification };
+    };
+    return existingClient ? operation(existingClient) : withTransaction(pool, operation);
   }
 
   // Returns the token row when valid, unconsumed, and unexpired for the
@@ -51,8 +53,8 @@ export function createEmailActionService({
   }
 
   return {
-    async issueEmailVerificationToken(userId) {
-      return issueToken({ userId, purpose: "verify_email", ttlMs: VERIFY_EMAIL_TTL_MS });
+    async issueEmailVerificationToken(userId, onIssued = null, client = null) {
+      return issueToken({ userId, purpose: "verify_email", ttlMs: VERIFY_EMAIL_TTL_MS, onIssued, client });
     },
 
     async confirmEmailVerification(token) {
@@ -65,8 +67,8 @@ export function createEmailActionService({
       });
     },
 
-    async issuePasswordResetToken(userId) {
-      return issueToken({ userId, purpose: "password_reset", ttlMs: PASSWORD_RESET_TTL_MS });
+    async issuePasswordResetToken(userId, onIssued = null, client = null) {
+      return issueToken({ userId, purpose: "password_reset", ttlMs: PASSWORD_RESET_TTL_MS, onIssued, client });
     },
 
     // Resets the password and, when a session repository was provided,

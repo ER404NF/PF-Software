@@ -56,3 +56,16 @@ test("an unexpected readiness-check rejection is a bounded 503", async () => {
   assert.equal(res.statusCode, 503);
   assert.deepEqual(res.body, { ok: false, checks: { database: { status: "unavailable", latencyMs: null } } });
 });
+
+test("readiness stays unavailable until the shared startup coordinator is ready", async () => {
+  const res = responseRecorder();
+  let healthCalls = 0;
+  await routes({
+    databasePool: {},
+    databaseStartup: { status: () => ({ status: "retrying", code: "DATABASE_STARTUP_RETRY" }) },
+    checkDatabaseHealth: async () => { healthCalls += 1; return { healthy: true, latencyMs: 1 }; },
+  }).get("/readyz")({}, res);
+  assert.equal(res.statusCode, 503);
+  assert.deepEqual(res.body, { ok: false, checks: { database: { status: "initializing", latencyMs: null } } });
+  assert.equal(healthCalls, 0);
+});

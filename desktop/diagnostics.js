@@ -134,6 +134,10 @@ function buildDiagnosticsReport({
   automaticSetup = null, processRecords = null,
   platform = process.platform, arch = process.arch, osRelease = os.release(), now = new Date(),
 } = {}) {
+  const controlPlane = mode === "host" ? "Local host"
+    : mode === "client" ? `Hub origin: ${safeOrigin(config?.serverUrl)}`
+      : mode === "site" ? `Site agent linked to hub origin: ${safeOrigin(config?.hubUrl)}`
+        : "Not selected";
   const lines = [
     "Bodun diagnostics",
     `Created: ${now.toISOString()}`,
@@ -141,6 +145,7 @@ function buildDiagnosticsReport({
     `Build: ${describeBuild(build)}`,
     `System: ${platform} ${arch}, release ${osRelease}`,
     `Mode: ${mode ?? "not chosen yet"}`,
+    `Control plane: ${controlPlane}`,
     `Server: ${serverState ?? "not running"}`,
     ...(agentState ? [`Site agent: ${agentState}`] : []),
     ...describeAutomaticSetup(automaticSetup),
@@ -160,6 +165,13 @@ function buildDiagnosticsReport({
     "",
   ];
   return lines.join("\n");
+}
+
+function safeOrigin(value) {
+  try {
+    const url = new URL(String(value || ""));
+    return url.username || url.password || !["http:", "https:"].includes(url.protocol) ? "invalid" : url.origin;
+  } catch { return "not configured"; }
 }
 
 module.exports = { buildDiagnosticsReport, createLogger, describeAutomaticSetup, describeBuild, describeConfig, readBuildRecord, readSetupStatusFile, redact };

@@ -45,6 +45,16 @@ test("the report carries the status and the desktop record's health, and still h
   assert.doesNotMatch(report, /SHOULD-NOT-APPEAR/);
 });
 
+test("diagnostics identify the active control plane without URL credentials", () => {
+  const client = buildDiagnosticsReport({ mode: "client", config: { serverUrl: "https://hub.example.com/path" } });
+  assert.match(client, /Control plane: Hub origin: https:\/\/hub\.example\.com/);
+  assert.doesNotMatch(client, /\/path/);
+  const unsafe = buildDiagnosticsReport({ mode: "site", config: { hubUrl: "https://user:secret@hub.example.com/private", siteToken: "pfs_secret" } });
+  assert.match(unsafe, /Control plane: Site agent linked to hub origin: invalid/);
+  assert.doesNotMatch(unsafe, /user:secret|pfs_secret|\/private/);
+  assert.match(buildDiagnosticsReport({ mode: "host", config: {} }), /Control plane: Local host/);
+});
+
 test("the status file is read only for the fields that belong in a report, and a broken file is ignored", () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "setup-status-"));
   const file = path.join(dir, "automatic-setup-status.json");

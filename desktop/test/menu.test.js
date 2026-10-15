@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const { buildMenuTemplate } = require("../menu.js");
 
 const handlers = {
-  setLaunchAtLogin() {}, setProxyRouting() {}, setAutomation() {}, copyDiagnostics() {}, showLogFolder() {}, moveAsideDamagedRecords() {},
+  setLaunchAtLogin() {}, changeMode() {}, setProxyRouting() {}, setAutomation() {}, copyDiagnostics() {}, showLogFolder() {}, moveAsideDamagedRecords() {},
 };
 const build = overrides => buildMenuTemplate({ isMac: true, isPackaged: true, config: { mode: "host" }, launchAtLogin: true, handlers, ...overrides });
 const menuLabeled = (template, label) => template.find(item => item.label === label);
@@ -30,6 +30,7 @@ test("the settings are in the Bodun menu and none are left in Help", () => {
   const settings = menuLabeled(template, "Bodun").submenu.filter(item => item.label).map(item => item.label);
   assert.deepEqual(settings, [
     "Start Bodun When This Mac Starts",
+    "Change how this Mac is used…",
     "Enable Proxy Routing on This Mac (restart required)",
     "Automatic Network Enrollment (restart required)",
     "Automatic Internet Sharing (restart required)",
@@ -51,7 +52,7 @@ test("the automation switches start off, and need routing switched on before the
 
 test("a workstation that is not a host has no routing or automation switches", () => {
   const labels = menuLabeled(build({ config: { mode: "operator" } }), "Bodun").submenu.map(item => item.label).filter(Boolean);
-  assert.deepEqual(labels, ["Start Bodun When This Mac Starts"]);
+  assert.deepEqual(labels, ["Start Bodun When This Mac Starts", "Change how this Mac is used…"]);
 });
 
 test("start at login cannot be changed from a development run", () => {
@@ -66,16 +67,18 @@ test("each switch calls the matching handler with the new value", () => {
     handlers: {
       ...handlers,
       setLaunchAtLogin: value => calls.push(["login", value]),
+      changeMode: () => calls.push(["mode"]),
       setProxyRouting: value => calls.push(["routing", value]),
       setAutomation: (key, value) => calls.push([key, value]),
     },
   });
   const items = menuLabeled(template, "Bodun").submenu.filter(item => item.label);
   items[0].click({ checked: false });
-  items[1].click({ checked: false });
-  items[2].click({ checked: true });
+  items[1].click();
+  items[2].click({ checked: false });
   items[3].click({ checked: true });
-  assert.deepEqual(calls, [["login", false], ["routing", false], ["autoNetworkEnrollment", true], ["autoInternetSharing", true]]);
+  items[4].click({ checked: true });
+  assert.deepEqual(calls, [["login", false], ["mode"], ["routing", false], ["autoNetworkEnrollment", true], ["autoInternetSharing", true]]);
 });
 
 test("the menu labels are plain words, with no file names or code", () => {

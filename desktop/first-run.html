@@ -39,18 +39,18 @@
   <div class="card">
     <div id="choice-view">
       <h1>Set up Bodun</h1>
-      <p class="sub">Choose how this machine is being used.</p>
+      <p class="sub">Choose which control plane this machine uses. You can change this later without deleting local data.</p>
       <button class="choice" id="host-choice">
-        Set up a new host on this machine
-        <small>This machine will run the Bodun server and control the connected phones.</small>
+        Standalone host on this Mac
+        <small>This Mac stores accounts and settings locally. Railway accounts, database and email settings are not used. Intended for an isolated installation.</small>
       </button>
       <button class="choice" id="client-choice">
-        Connect to an existing Bodun host
-        <small>Sign in or apply for access on a host that's already running elsewhere. Use this for remote operators.</small>
+        Connect as an operator
+        <small>Opens the existing company hub. Accounts, approvals and email are managed by that hub.</small>
       </button>
       <button class="choice" id="site-choice">
-        This is a remote site's Mac mini
-        <small>Link this Mac's iPhones to your company's Bodun hub. Nobody operates the phones from this Mac; your team uses the hub.</small>
+        Link this Mac's phones to the company hub
+        <small>Runs the site agent. This Mac contributes connected iPhones; operators sign in through the hub and no local operator account is created.</small>
       </button>
     </div>
 
@@ -65,6 +65,7 @@
       <input id="site-id" placeholder="bucharest" autocomplete="off" spellcheck="false" />
       <label for="site-token">Site token</label>
       <input id="site-token" type="password" placeholder="pfs_..." autocomplete="off" spellcheck="false" />
+      <label class="check-row"><input type="checkbox" id="site-switch-confirm" /> I understand that local accounts stay on this Mac and will not automatically appear on the hub.</label>
       <label class="check-row"><input type="checkbox" id="site-launch-login" checked /> Start Bodun automatically when this Mac starts</label>
       <button class="primary" id="site-start">Save and link this site</button>
       <p class="error" id="site-error"></p>
@@ -111,6 +112,7 @@
       <p class="sub">Enter the address your host operator gave you.</p>
       <label>Host address</label>
       <input id="host-url" placeholder="https://phonefarm.example.com" />
+      <label class="check-row"><input type="checkbox" id="operator-switch-confirm" /> I understand that accounts stored on this Mac do not automatically move to the hub.</label>
       <button class="primary" id="connect-submit">Connect</button>
       <p class="error" id="connect-error"></p>
     </div>
@@ -274,6 +276,7 @@
       hubUrl: document.getElementById("site-hub-url").value,
       siteId: document.getElementById("site-id").value,
       siteToken: document.getElementById("site-token").value,
+      confirmSwitch: document.getElementById("site-switch-confirm").checked,
     });
     if (result.preflight) {
       const list = document.getElementById("site-status-list");
@@ -316,7 +319,8 @@
   document.getElementById("connect-submit").addEventListener("click", async () => {
     const errorEl = document.getElementById("connect-error");
     errorEl.textContent = "";
-    const result = await window.desktopApi.connectToHost(document.getElementById("host-url").value);
+    const result = await window.desktopApi.connectToHost(document.getElementById("host-url").value,
+      document.getElementById("operator-switch-confirm").checked);
     if (!result.ok) errorEl.textContent = result.error;
   });
 

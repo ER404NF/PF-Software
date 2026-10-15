@@ -111,6 +111,24 @@ test("signup/review notifications send when available and post-commit failures n
     assert.equal(acceptedMail.from, "noreply@example.com");
     assert.match(acceptedMail.text, /Real Delivery/);
 
+    const duplicateApproval = await request(baseUrl, "/api/admin/users/real-delivery/status", {
+      cookie: adminCookie, method: "PATCH", body: { status: "approved" },
+    });
+    assert.equal(duplicateApproval.status, 200);
+    assert.equal(sentMail.length, 2, "repeating the same approval must not enqueue or send a second acceptance email");
+
+    const laterRejection = await request(baseUrl, "/api/admin/users/real-delivery/status", {
+      cookie: adminCookie, method: "PATCH", body: { status: "rejected" },
+    });
+    assert.equal(laterRejection.status, 200);
+    const concurrentReapprovals = await Promise.all([1, 2].map(() => request(
+      baseUrl, "/api/admin/users/real-delivery/status",
+      { cookie: adminCookie, method: "PATCH", body: { status: "approved" } },
+    )));
+    assert.ok(concurrentReapprovals.every(response => response.status === 200));
+    assert.equal(sentMail.filter(mail => mail.subject === "Your Phone Farm account was accepted").length, 2,
+      "a later approval transition sends once while concurrent duplicates share its generation key");
+
     // A send failure must not break the approval itself — the account is
     // already approved either way; only the notification outcome differs.
     const secondSignup = await request(baseUrl, "/api/signup", {
@@ -138,7 +156,7 @@ test("signup/review notifications send when available and post-commit failures n
     }
     assert.equal(rejected.status, 200);
     assert.equal(rejected.body.operator.accountStatus, "rejected");
-    assert.equal(rejected.body.notification.deliveryState, "failed");
+    assert.equal(rejected.body.notification.deliveryState, "retry_scheduled");
     assert.ok(deliveryErrors.some(message => message.includes("Account notification email send failed")));
     assert.equal(deliveryErrors.some(message => /sensitive-password|outbox@example\.com|smtp\.example\.com/.test(message)), false,
       "SMTP credentials and endpoints must not be copied from transport errors into logs");

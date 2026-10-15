@@ -24,6 +24,7 @@
     <button type="submit">Sign in</button>
     <button type="button" id="logout-retry-button" class="secondary-auth-button" hidden>Retry session revocation</button>
     <div class="auth-links"><button type="button" id="show-signup-button">Create account</button><button type="button" id="show-recovery-button">Recover access</button><a href="/account-deletion.html">Request deletion</a></div>
+    <p id="login-status" class="auth-status" role="status" aria-live="polite"></p>
     <p id="login-error" role="alert"></p>
   </form>
 
@@ -81,6 +82,7 @@
       </div>
       <div id="top-bar-right">
         <span id="app-version" class="app-version" aria-label="Application version">Version…</span>
+        <span id="control-plane" class="app-version" aria-label="Active control plane">Control plane…</span>
         <p id="connection-status" class="connection-state loading" role="status">Connecting</p>
         <button type="button" id="theme-toggle" aria-label="Use dark mode" aria-pressed="false"><span aria-hidden="true">&#9680;</span><span id="theme-toggle-label">Dark</span></button>
         <span id="role-badge"></span>
@@ -358,6 +360,14 @@
             <button type="submit">Create user</button>
           </div>
         </form>
+        <section class="notification-status" aria-labelledby="notification-status-heading">
+          <div class="admin-panel-heading">
+            <div><h4 id="notification-status-heading">Email delivery</h4><span>Durable account-email queue; message bodies and credentials are never shown.</span></div>
+            <button type="button" id="notification-retry-button">Retry eligible</button>
+          </div>
+          <p id="notification-status-summary" role="status" aria-live="polite">Loading email delivery status…</p>
+          <div id="notification-status-list" class="users-list"></div>
+        </section>
         <p id="users-message" role="status" aria-live="polite"></p>
         <div id="users-list" class="users-list"></div>
         <p id="users-empty" class="admin-empty" hidden>No users configured.</p>

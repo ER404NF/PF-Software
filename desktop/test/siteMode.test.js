@@ -32,7 +32,7 @@ test("the site token is validated before use, never logged, and stored only in t
 
 test("stopping site mode forgets the token and the app quits cleanly with it", () => {
   assert.match(main, /siteToken: undefined/);
-  assert.match(main, /before-quit[\s\S]*stopSiteAgent\(\)/);
+  assert.match(main, /before-quit[\s\S]*topologyTransition\.stopAll\(\)/);
   assert.match(main, /function stopSiteAgent\(\) \{[\s\S]*agentWanted = null;[\s\S]*child\.intentionalStop = true;[\s\S]*shutdownChildren\(/, "stopping is deliberate, so the agent is not restarted, and it is stopped with the bounded wait");
 });
 
@@ -40,4 +40,25 @@ test("the setup page offers the third mode without weakening its Content-Securit
   assert.match(firstRun, /id="site-choice"/);
   assert.match(firstRun, /connect-src 'none'/);
   assert.doesNotMatch(firstRun, /https?:\/\/[^"'\s]*\.(js|css)/, "no remote scripts or styles");
+});
+
+test("first-run topology copy distinguishes local host, hub operator, and site agent authority", () => {
+  assert.match(firstRun, /Standalone host on this Mac/);
+  assert.match(firstRun, /Railway accounts, database and email settings are not used/);
+  assert.match(firstRun, /Connect as an operator/);
+  assert.match(firstRun, /Accounts, approvals and email are managed by that hub/);
+  assert.match(firstRun, /Link this Mac's phones to the company hub/);
+  assert.match(firstRun, /no local operator account is created/);
+});
+
+test("switching from a standalone host preserves local data and persists site mode only after hub acceptance", () => {
+  assert.match(firstRun, /local accounts stay on this Mac and will not automatically appear on the hub/);
+  assert.match(main, /previous\?\.mode === "host" && input\.confirmSwitch !== true/);
+  const handler = main.slice(main.indexOf('ipcMain.handle("desktop:start-site-agent"'), main.indexOf('ipcMain.handle("desktop:get-site-status"'));
+  assert.match(handler, /topologyTransition\.transitionTo\("site"/);
+  assert.ok(handler.indexOf("await waitForSiteAcceptance()") < handler.indexOf('writeConfig({ ...readConfig(), mode: "site"'));
+  assert.match(handler, /restore: mode => restoreTopology\(mode, readConfig\(\) \|\| previous\)/);
+  assert.doesNotMatch(handler, /rmSync|unlinkSync|OPERATORS_CONFIG_PATH/);
+  assert.match(main, /if \(existing\?\.sessionSecret && existing\.twoFactorMasterKey\) return existing/,
+    "returning to the preserved standalone host reuses its encryption keys");
 });

@@ -47,6 +47,7 @@
       "hostFixes.js",
       "serverSupervisor.js",
       "shutdown.js",
+      "topologyTransition.js",
       "menu.js",
       "processInfo.js",
       "childrenStore.js",

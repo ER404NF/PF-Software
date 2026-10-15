@@ -26,8 +26,30 @@ function runElectron({ url, profiles }) {
     let stdout = ""; let stderr = "";
     child.stdout.on("data", chunk => { stdout += chunk; });
     child.stderr.on("data", chunk => { stderr += chunk; });
+    let settled = false;
+    const cleanup = () => {
+      try { fs.rmSync(userData, { recursive: true, force: true }); } catch {}
+    };
+    const timeout = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill();
+      cleanup();
+      reject(new Error(`rendered harness did not exit within 45 seconds: ${stderr.slice(-1000)} ${stdout.slice(-1000)}`));
+    }, 45_000);
+    timeout.unref?.();
+    child.once("error", error => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      cleanup();
+      reject(error);
+    });
     child.once("exit", code => {
-      fs.rmSync(userData, { recursive: true, force: true });
+      if (settled) { cleanup(); return; }
+      settled = true;
+      clearTimeout(timeout);
+      cleanup();
       if (code !== 0) return reject(new Error(`rendered harness failed (${code}): ${stderr.slice(-1000)} ${stdout.slice(-1000)}`));
       const line = stdout.split(/\r?\n/).find(entry => entry.startsWith("PHONE_FARM_RENDER_RESULT="));
       if (!line) return reject(new Error("rendered harness returned no result"));

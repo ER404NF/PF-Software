@@ -118,6 +118,8 @@ function internalOperator(o) {
     allowedResearchWorkspaces: filterValidResearchGrants(o.username, o.allowedResearchWorkspaces),
     active: o.active !== false,
     authVersion: Number.isSafeInteger(o.authVersion) && o.authVersion >= 0 ? o.authVersion : 0,
+    accountStatusGeneration: Number.isSafeInteger(o.accountStatusGeneration) && o.accountStatusGeneration >= 0
+      ? o.accountStatusGeneration : 0,
     fullName: typeof o.fullName === "string" ? o.fullName : null,
     email: typeof o.email === "string" ? o.email : null,
     teamId: typeof o.teamId === "string" ? o.teamId : null,
@@ -296,6 +298,10 @@ export function validateOperatorConfig(raw) {
       && (!Number.isSafeInteger(operator.authVersion) || operator.authVersion < 0)) {
       throw new Error(`operators.config.json: operator "${username}" has an invalid authVersion`);
     }
+    if (Object.hasOwn(operator, "accountStatusGeneration")
+      && (!Number.isSafeInteger(operator.accountStatusGeneration) || operator.accountStatusGeneration < 0)) {
+      throw new Error(`operators.config.json: operator "${username}" has an invalid accountStatusGeneration`);
+    }
     if (Object.hasOwn(operator, "fullName") && operator.fullName !== null) {
       try { operator.fullName = validateFullName(operator.fullName); } catch {
         throw new Error(`operators.config.json: operator "${username}" has an invalid fullName`);
@@ -381,6 +387,7 @@ export function publicOperatorAccount(operator) {
     ...(operator.email ? { email: operator.email } : {}),
     ...(operator.teamId ? { teamId: operator.teamId } : {}),
     ...(operator.accountStatus !== "approved" ? { accountStatus: operator.accountStatus } : {}),
+    ...(operator.accountStatusGeneration ? { accountStatusGeneration: operator.accountStatusGeneration } : {}),
     ...(operator.twoFactorRequired ? {
       twoFactorRequired: true,
       twoFactorEnabled: Boolean(operator.twoFactorSecret),
@@ -517,6 +524,7 @@ export function createOperatorAccount(input) {
     allowedResearchWorkspaces,
     active,
     authVersion: 0,
+    accountStatusGeneration: 0,
     ...(fullName ? { fullName } : {}),
     ...(email ? { email } : {}),
     ...(teamId ? { teamId } : {}),
@@ -622,6 +630,7 @@ export function createSignupAccount(input) {
     allowedResearchWorkspaces: [],
     active: false,
     authVersion: 0,
+    accountStatusGeneration: 0,
     fullName,
     email,
     accountStatus: "pending",
@@ -700,6 +709,7 @@ export function setOperatorAccountStatus(username, status, metadata = {}) {
     accountStatus: status,
     active: status === "approved",
     authVersion: current.authVersion + 1,
+    accountStatusGeneration: current.accountStatusGeneration + (current.accountStatus === status ? 0 : 1),
     // Lifting a ban (moving away from "banned") clears the ban record along
     // with it — a fresh ban later gets its own reason/timestamp rather than
     // inheriting a stale one. A new ban's metadata is committed atomically

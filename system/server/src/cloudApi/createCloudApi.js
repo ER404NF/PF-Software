@@ -30,11 +30,10 @@ export function createCloudApi({
   pool, withTransaction, organizationRepository, userRepository, membershipRepository, roleRepository,
   organizationIdentityService, identitySessionService, invitationService, identityMfaService, emailActionService,
   verifyPassword, hashPassword, validatePassword,
-  // Optional: without these, every token-issuing flow still works exactly
-  // as before (a real token is created), it just isn't emailed anywhere —
-  // matching accountNotificationStore.js's own "unconfigured ⇒ no-op with
-  // a logged reason" convention rather than a hard failure.
-  mailSender = null, companyEmail = null,
+  // The Phase 1 mount supplies a durable repository. Token and invitation
+  // issuance fail before commit if their outbox row cannot be written; the
+  // callback only starts asynchronous delivery after that transaction commits.
+  notificationRepository = null, onNotificationQueued = () => {},
   // Phase 1 (docs/productionization/PHASE1_TEAM_ROLLOUT_HANDOUT.md §3): this
   // internal rollout has exactly one organization, created once at startup
   // (db/defaultOrganization.js), and "no public 'create an account' route
@@ -53,19 +52,26 @@ export function createCloudApi({
     if (!dep) throw new TypeError(`createCloudApi requires ${name}`);
   }
 
-  // No web portal exists yet to link to (M12), so the email body carries
-  // the raw token with instructions rather than a clickable link — a
-  // documented interim shape, not a finished user experience.
-  async function sendMail(to, subject, body) {
-    if (!mailSender?.isConfigured?.()) {
-      console.log("Cloud API: SMTP is not configured — notification not sent");
-      return;
+  // Token-bearing bodies are encrypted by the repository before the route
+  // returns. Delivery is kicked after persistence and never holds the HTTP
+  // request open for SMTP retries.
+  async function persistMail({ to, subject, body, kind, idempotencyKey, sensitive = true }, {
+    client = null, organizationId = null,
+  } = {}) {
+    if (!notificationRepository) throw new Error("durable cloud notification storage is unavailable");
+    const input = { to, subject, body, kind, idempotencyKey, sensitive };
+    if (client) {
+      if (typeof notificationRepository.queueInTransaction !== "function") {
+        throw new Error("durable cloud notification transactions are unavailable");
+      }
+      return notificationRepository.queueInTransaction(input, client, { organizationId });
     }
-    try {
-      await mailSender.send({ to, from: companyEmail, subject, body });
-    } catch (error) {
-      logOperationalFailure("Cloud API notification send failed", error);
-    }
+    return notificationRepository.queue(input);
+  }
+
+  function beginDelivery(notification) {
+    if (!notification?.id) return;
+    try { onNotificationQueued(notification.id, notification.workerOrganizationId); } catch { /* durable row remains queued */ }
   }
 
   const authenticate = createAuthenticate({ identitySessionService, userRepository });
@@ -84,13 +90,21 @@ export function createCloudApi({
       return res.status(400).json({ error: "slug, displayName, ownerEmail, and ownerPassword are required" });
     }
     validatePassword(ownerPassword);
-    const { organization, user, membership } = await organizationIdentityService.createOrganizationWithOwner({
+    const { organization, user, membership, completion } = await organizationIdentityService.createOrganizationWithOwner({
       slug, displayName, ownerEmail, ownerPassword, ownerDisplayName,
+      onCreated: async ({ organization: createdOrganization, user: createdUser, client }) => {
+        const issued = await emailActionService.issueEmailVerificationToken(createdUser.id, ({ token, record }) => persistMail({
+          to: ownerEmail, kind: "email_verification", idempotencyKey: `email_verification:${record.id}`,
+          subject: "Verify your Phone Farm account",
+          body: `Welcome to ${displayName}. Verify your email with this code: ${token}`,
+        }, { client, organizationId: createdOrganization.id }), client);
+        return { notification: issued.notification };
+      },
     });
-    const { token: verifyToken } = await emailActionService.issueEmailVerificationToken(user.id);
-    void sendMail(ownerEmail, "Verify your Phone Farm account",
-      `Welcome to ${displayName}. Verify your email with this code: ${verifyToken}`);
-    res.status(201).json({ organization, user: publicUser(user), membershipId: membership.id });
+    const notification = completion?.notification;
+    beginDelivery(notification);
+    res.status(201).json({ organization, user: publicUser(user), membershipId: membership.id,
+      notification: { deliveryState: notification?.deliveryState || "needs_reconciliation" } });
   }));
 
   // Completes an invitation for someone with no existing account —
@@ -113,7 +127,7 @@ export function createCloudApi({
       email: invitation.email_normalized, passwordHash: hashPassword(password), displayName: displayName ?? null,
     });
     // Completing an emailed invitation link already proves control of this
-    // address (once mailSender actually delivers the invitation below), so
+    // address (after the durable outbox delivers the invitation), so
     // this skips the separate email-verification round trip rather than
     // making a just-invited person prove the same thing twice.
     await userRepository.markPrimaryEmailVerified(user.id);
@@ -170,13 +184,18 @@ export function createCloudApi({
     asyncRoute(async (req, res) => {
       const { email, roleKey } = req.body ?? {};
       if (!email || !roleKey) return res.status(400).json({ error: "email and roleKey are required" });
-      const { token: inviteToken, invitation } = await invitationService.invite({
+      const { invitation, notification } = await invitationService.invite({
         organizationId: req.organization.id, email, roleKey, invitedByUserId: req.userId,
+        onCreated: ({ token, invitation: createdInvitation, client }) => persistMail({
+          to: email, kind: "invitation", idempotencyKey: `invitation:${createdInvitation.id}`,
+          subject: `You've been invited to ${req.organization.display_name}`,
+          body: `${req.user.display_name ?? "Someone"} invited you to join ${req.organization.display_name} on Phone Farm. `
+            + `Use this invitation code to join: ${token}`,
+        }, { client, organizationId: req.organization.id }),
       });
-      void sendMail(email, `You've been invited to ${req.organization.display_name}`,
-        `${req.user.display_name ?? "Someone"} invited you to join ${req.organization.display_name} on Phone Farm. `
-        + `Use this invitation code to join: ${inviteToken}`);
-      res.status(201).json({ invitationId: invitation.id, expiresAt: invitation.expires_at });
+      beginDelivery(notification);
+      res.status(201).json({ invitationId: invitation.id, expiresAt: invitation.expires_at,
+        notification: { deliveryState: notification.deliveryState } });
     }));
 
   app.post("/invitations/accept", authenticate, asyncRoute(async (req, res) => {
@@ -249,17 +268,19 @@ export function createCloudApi({
 
   // Uniform response regardless of whether the email exists — never
   // confirms account existence to an unauthenticated caller. The reset
-  // token itself is never in this HTTP response either way; it only ever
-  // reaches the requester through sendMail() below (a no-op, logged
-  // locally, when mailSender isn't configured).
+  // token itself is never in this HTTP response either way; it is persisted
+  // in the encrypted outbox payload and delivered asynchronously.
   app.post("/password-reset/request", asyncRoute(async (req, res) => {
     const { email } = req.body ?? {};
     if (typeof email === "string" && email) {
       const user = await userRepository.getByEmail(email);
       if (user) {
-        const { token: resetToken } = await emailActionService.issuePasswordResetToken(user.id);
-        void sendMail(email, "Reset your Phone Farm password",
-          `Use this code to reset your password (expires in 30 minutes): ${resetToken}`);
+        const issued = await emailActionService.issuePasswordResetToken(user.id, ({ token, record, client }) => persistMail({
+          to: email, kind: "password_reset", idempotencyKey: `password_reset:${record.id}`,
+          subject: "Reset your Phone Farm password",
+          body: `Use this code to reset your password (expires in 30 minutes): ${token}`,
+        }, { client }));
+        beginDelivery(issued.notification);
       }
     }
     res.status(202).json({ message: "if that email is registered, a reset link has been sent" });

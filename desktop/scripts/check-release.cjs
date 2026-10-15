@@ -18,7 +18,7 @@ const REPO = path.resolve(__dirname, "..", "..");
 const REQUIRED = [
   ".github/workflows/mac-installer.yml",
   "desktop/main.js", "desktop/preload.js", "desktop/first-run.html", "desktop/package.json", "desktop/package-lock.json",
-  "desktop/hostEnvironment.js", "desktop/hostFixes.js", "desktop/serverSupervisor.js", "desktop/shutdown.js", "desktop/menu.js", "desktop/processInfo.js", "desktop/childrenStore.js", "desktop/damagedRecords.js", "desktop/damagedRecordRecovery.js", "desktop/orphanRecovery.js", "desktop/diagnostics.js",
+  "desktop/hostEnvironment.js", "desktop/hostFixes.js", "desktop/serverSupervisor.js", "desktop/shutdown.js", "desktop/topologyTransition.js", "desktop/menu.js", "desktop/processInfo.js", "desktop/childrenStore.js", "desktop/damagedRecords.js", "desktop/damagedRecordRecovery.js", "desktop/orphanRecovery.js", "desktop/diagnostics.js",
   "desktop/wdaSource.js", "desktop/windowSecurity.js", "desktop/siteAgentConfig.js", "desktop/wda.lock.json",
   "desktop/build/entitlements.mac.plist", "desktop/build/icon.png", "desktop/build/pkg/components.plist",
   "desktop/build/pkg/resources/welcome.html", "desktop/build/pkg/resources/readme.html", "desktop/build/pkg/resources/conclusion.html",

@@ -82,12 +82,24 @@ test("cloud API authorization matrix (real PostgreSQL, real HTTP)", { skip }, as
     isConfigured: () => true,
     send: async ({ to, from, subject, body }) => { sentMail.push({ to, from, subject, body }); },
   };
+  const durableNotifications = new Map();
+  const notificationRepository = {
+    async queueInTransaction(input) {
+      const item = { ...input, id: crypto.randomUUID(), from: "no-reply@example.com", deliveryState: "queued" };
+      durableNotifications.set(item.id, item);
+      return item;
+    },
+  };
+  const onNotificationQueued = id => {
+    const item = durableNotifications.get(id);
+    if (item) void fakeMailSender.send(item);
+  };
 
   const app = createCloudApi({
     pool, withTransaction, organizationRepository, userRepository, membershipRepository, roleRepository,
     organizationIdentityService, identitySessionService, invitationService, identityMfaService, emailActionService,
     verifyPassword, hashPassword, validatePassword,
-    mailSender: fakeMailSender, companyEmail: "no-reply@example.com",
+    notificationRepository, onNotificationQueued,
   });
   const server = app.listen(0);
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
@@ -313,14 +325,13 @@ test("cloud API authorization matrix (real PostgreSQL, real HTTP)", { skip }, as
     assert.equal(valid.status, 201);
   });
 
-  async function flushFireAndForgetMail() {
-    // sendMail() inside createCloudApi.js is deliberately fire-and-forget
-    // (email delivery must never add latency to the HTTP response) — give
-    // its promise a turn to settle before asserting on sentMail.
+  async function flushOutboxDelivery() {
+    // Delivery begins after the authoritative transaction commits, so give
+    // the asynchronous outbox worker a turn before asserting on sentMail.
     await new Promise((resolve) => setImmediate(resolve));
   }
 
-  await t.test("a configured mailSender actually gets called for signup, invitations, and password reset", async () => {
+  await t.test("the durable outbox delivers signup, invitation, and password-reset notifications", async () => {
     sentMail.length = 0;
 
     const signupResponse = await fetch(`${baseUrl}/signup`, {
@@ -328,7 +339,7 @@ test("cloud API authorization matrix (real PostgreSQL, real HTTP)", { skip }, as
       body: JSON.stringify({ slug: `mail-test-${unique}`, displayName: "Mail Test Org", ownerEmail: `mail-owner-${unique}@example.com`, ownerPassword: "mail owner passphrase" }),
     });
     assert.equal(signupResponse.status, 201);
-    await flushFireAndForgetMail();
+    await flushOutboxDelivery();
     assert.ok(sentMail.some((m) => m.to === `mail-owner-${unique}@example.com` && /verify/i.test(m.subject)));
 
     const { token: managerToken2 } = await identitySessionService.issueSession({ userId: managerUser.id });
@@ -337,7 +348,7 @@ test("cloud API authorization matrix (real PostgreSQL, real HTTP)", { skip }, as
       body: JSON.stringify({ email: `mail-invitee-${unique}@example.com`, roleKey: "va_operator" }),
     });
     assert.equal(inviteResponse.status, 201);
-    await flushFireAndForgetMail();
+    await flushOutboxDelivery();
     const inviteMail = sentMail.find((m) => m.to === `mail-invitee-${unique}@example.com`);
     assert.ok(inviteMail, "expected an invitation email to have been sent");
     assert.match(inviteMail.body, /[a-zA-Z0-9_-]{20,}/, "the email body must contain the invitation code");
@@ -347,7 +358,7 @@ test("cloud API authorization matrix (real PostgreSQL, real HTTP)", { skip }, as
       body: JSON.stringify({ email: `mail-owner-${unique}@example.com` }),
     });
     assert.equal(resetResponse.status, 202);
-    await flushFireAndForgetMail();
+    await flushOutboxDelivery();
     assert.ok(sentMail.some((m) => m.to === `mail-owner-${unique}@example.com` && /reset/i.test(m.subject)));
   });
 
@@ -358,7 +369,7 @@ test("cloud API authorization matrix (real PostgreSQL, real HTTP)", { skip }, as
       body: JSON.stringify({ email: `definitely-not-registered-${unique}@example.com` }),
     });
     assert.equal(response.status, 202);
-    await flushFireAndForgetMail();
+    await flushOutboxDelivery();
     assert.equal(sentMail.length, 0);
   });
 
@@ -442,7 +453,7 @@ test("cloud API authorization matrix (real PostgreSQL, real HTTP)", { skip }, as
       pool, withTransaction, organizationRepository, userRepository, membershipRepository, roleRepository,
       organizationIdentityService, identitySessionService, invitationService, identityMfaService, emailActionService,
       verifyPassword, hashPassword, validatePassword,
-      mailSender: fakeMailSender, companyEmail: "no-reply@example.com",
+      notificationRepository, onNotificationQueued,
       allowOrganizationSignup: false,
     });
     const restrictedServer = restrictedApp.listen(0);

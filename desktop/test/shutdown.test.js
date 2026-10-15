@@ -92,12 +92,15 @@ test("main.js: quitting waits, relaunch handlers do nothing while shutting down,
   assert.match(main, /app\.on\("before-quit", event => \{[\s\S]*event\?\.preventDefault\?\.\(\)/);
   assert.match(main, /app\.on\("second-instance", \(\) => \{\s*[^\n]*\n\s*if \(shuttingDown\) return;/);
   assert.match(main, /app\.on\("activate", \(\) => \{ if \(shuttingDown\) return;/);
-  assert.equal((main.match(/await stopHostServer\(\);/g) || []).length, 2, "both mode switches wait for the old server to stop");
+  assert.match(main, /createTopologyTransition\([\s\S]*stopHost: stopHostServer,[\s\S]*stopSite: stopSiteAgent/,
+    "all mode switches use the centralized lifecycle controller");
   assert.match(main, /detached: CHILDREN_LEAD_GROUPS/);
 });
 
 test("the packaged app and the release check both include the shutdown module", () => {
   const pkg = require("../package.json");
   assert.ok(pkg.build.files.includes("shutdown.js"));
+  assert.ok(pkg.build.files.includes("topologyTransition.js"));
   assert.match(fs.readFileSync(path.join(__dirname, "..", "scripts", "check-release.cjs"), "utf8"), /desktop\/shutdown\.js/);
+  assert.match(fs.readFileSync(path.join(__dirname, "..", "scripts", "check-release.cjs"), "utf8"), /desktop\/topologyTransition\.js/);
 });

@@ -99,6 +99,17 @@ test("issueEmailVerificationToken invalidates a prior unconsumed token for the s
   assert.equal(emailActionTokenRepository.tokens.get(second.record.id).consumed_at, null);
 });
 
+test("token issuance persists its notification inside the same transaction", async () => {
+  const { service } = serviceWith();
+  let transactionClient = null;
+  const issued = await service.issueEmailVerificationToken("user-1", async ({ record, client }) => {
+    transactionClient = client;
+    return { id: `notification-for-${record.id}`, deliveryState: "queued" };
+  });
+  assert.equal(transactionClient?.calls instanceof Array, true);
+  assert.equal(issued.notification.id, `notification-for-${issued.record.id}`);
+});
+
 test("confirmEmailVerification marks the primary email verified exactly once", async () => {
   const { service, userRepository } = serviceWith();
   const { token } = await service.issueEmailVerificationToken("user-1");

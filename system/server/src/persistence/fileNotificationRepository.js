@@ -11,15 +11,16 @@ export function createFileNotificationRepository(storeOrOptions) {
     : createAccountNotificationStore(storeOrOptions);
 
   return assertNotificationRepository({
-    queue(input) { return store.queue(input); },
-    list() { return store.list(); },
-    deliveryContent(id) { return store.deliveryContent(id); },
-    markCommitted(id) { return store.markCommitted(id); },
-    markAborted(id) { return store.markAborted(id); },
-    markSent(id) { return store.markSent(id); },
-    markFailed(id) { return store.markFailed(id); },
-    claimNext(options) { return store.claimNext(options); },
-    completeClaim(id, claimToken, outcome) { return store.completeClaim(id, claimToken, outcome); },
+    async queue(input) { return store.queue(input); },
+    async list() { return store.list(); },
+    async deliveryContent(id) { return store.deliveryContent(id); },
+    async markCommitted(id) { return store.markCommitted(id); },
+    async markAborted(id) { return store.markAborted(id); },
+    async markSent(id) { return store.markSent(id); },
+    async markFailed(id) { return store.markFailed(id); },
+    async claimNext(options) { return store.claimNext(options); },
+    async completeClaim(id, claimToken, outcome) { return store.completeClaim(id, claimToken, outcome); },
+    async retryEligible(options) { return store.retryEligible(options); },
     canSecureRecovery() { return store.canSecureRecovery(); },
   });
 }

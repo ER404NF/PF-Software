@@ -5,7 +5,7 @@ contextBridge.exposeInMainWorld("desktopApi", {
   startHostSetup: () => ipcRenderer.invoke("desktop:start-host-setup"),
   saveHostSettings: (settings) => ipcRenderer.invoke("desktop:save-host-settings", settings),
   createAdmin: (payload) => ipcRenderer.invoke("desktop:create-admin", payload),
-  connectToHost: (url) => ipcRenderer.invoke("desktop:connect-to-host", { url }),
+  connectToHost: (url, confirmSwitch = false) => ipcRenderer.invoke("desktop:connect-to-host", { url, confirmSwitch }),
   startSiteAgent: (settings) => ipcRenderer.invoke("desktop:start-site-agent", settings),
   getSiteStatus: () => ipcRenderer.invoke("desktop:get-site-status"),
   stopSiteAgent: () => ipcRenderer.invoke("desktop:stop-site-agent"),

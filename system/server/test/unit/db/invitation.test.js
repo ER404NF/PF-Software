@@ -114,6 +114,20 @@ test("invite() normalizes the email and returns the raw token exactly once", asy
   assert.notEqual(invitation.token_hash, token);
 });
 
+test("invite() persists its notification inside the invitation transaction", async () => {
+  const { service } = serviceWith();
+  let transactionClient = null;
+  const result = await service.invite({
+    organizationId: "org-1", email: "va@example.com", roleKey: "va_operator",
+    onCreated: async ({ invitation, client }) => {
+      transactionClient = client;
+      return { id: `notification-for-${invitation.id}`, deliveryState: "queued" };
+    },
+  });
+  assert.equal(transactionClient?.calls instanceof Array, true);
+  assert.equal(result.notification.id, `notification-for-${result.invitation.id}`);
+});
+
 test("acceptInvitation() creates a membership with the invitation's role and marks it accepted", async () => {
   const { service, membershipRepository } = serviceWith();
   const { token } = await service.invite({ organizationId: "org-1", email: "va@example.com", roleKey: "va_operator" });

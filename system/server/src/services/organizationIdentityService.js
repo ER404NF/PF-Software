@@ -26,7 +26,7 @@ export function createOrganizationIdentityService({
     // Creates an organization, its first user, an active membership, and
     // assigns the 'owner' system-template role — all inside one
     // transaction, so a failure at any step leaves nothing behind.
-    async createOrganizationWithOwner({ slug, displayName, legalName, defaultTimezone, ownerEmail, ownerPassword, ownerDisplayName }) {
+    async createOrganizationWithOwner({ slug, displayName, legalName, defaultTimezone, ownerEmail, ownerPassword, ownerDisplayName, onCreated = null }) {
       return withTransaction(pool, async (client) => {
         const organization = await organizationRepository.create({ slug, displayName, legalName, defaultTimezone }, client);
         // The membership insert below is RLS-protected and needs the
@@ -49,7 +49,8 @@ export function createOrganizationIdentityService({
         }
         await roleRepository.assignToMembership({ membershipId: membership.id, roleId: ownerRole.id }, client);
 
-        return { organization, user, membership };
+        const completion = onCreated ? await onCreated({ organization, user, membership, client }) : null;
+        return { organization, user, membership, completion };
       });
     },
 

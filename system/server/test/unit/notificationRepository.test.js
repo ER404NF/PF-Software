@@ -12,25 +12,25 @@ test("notification repository contract rejects incomplete adapters", () => {
   assert.throws(
     () => assertNotificationRepository({ queue() {}, list() {}, deliveryContent() {}, markCommitted() {},
       markAborted() {}, markSent() {}, markFailed() {} }),
-    /requires canSecureRecovery/,
+    /requires claimNext/,
   );
 });
 
-test("file notification adapter satisfies the contract and preserves store behavior", (t) => {
+test("file notification adapter satisfies the async contract and preserves store behavior", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "phonefarm-notification-adapter-"));
   const storePath = path.join(directory, "notifications.json");
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const repository = createFileNotificationRepository({ storePath, companyEmail: "hello@example.com" });
   assertNotificationRepository(repository);
 
-  const queued = repository.queue({ to: "va@example.com", fullName: "VA One", username: "va1", status: "approved" });
+  const queued = await repository.queue({ to: "va@example.com", fullName: "VA One", username: "va1", status: "approved" });
   assert.equal(queued.deliveryState, "queued");
-  assert.equal(repository.list().length, 1);
+  assert.equal((await repository.list()).length, 1);
   assert.equal(repository.canSecureRecovery(), false);
 
-  const sent = repository.markSent(queued.id);
+  const sent = await repository.markSent(queued.id);
   assert.equal(sent.deliveryState, "sent");
-  const content = repository.deliveryContent(queued.id);
+  const content = await repository.deliveryContent(queued.id);
   assert.match(content.body, /VA One/);
 });
 
@@ -41,8 +41,8 @@ test("file notification adapter can wrap an already-constructed store for inject
     const store = createAccountNotificationStore({ storePath: path.join(directory, "notifications.json") });
     const repository = createFileNotificationRepository(store);
     assertNotificationRepository(repository);
-    repository.queue({ to: "va@example.com", fullName: "VA Two", username: "va2", status: "rejected" });
-    assert.equal(repository.list().length, 1);
+    await repository.queue({ to: "va@example.com", fullName: "VA Two", username: "va2", status: "rejected" });
+    assert.equal((await repository.list()).length, 1);
   } finally {
     fs.rmSync(directory, { recursive: true, force: true });
   }

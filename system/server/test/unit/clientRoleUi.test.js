@@ -36,6 +36,14 @@ test("navigation and privileged surfaces are hidden by default and capability-ga
   assert.match(app, /if \(!can\(UI_CAPABILITIES\.VIEW_ASSIGNMENTS\)\) return;[\s\S]*currentView = "assignments"/);
 });
 
+test("logout confirmation uses a polite success status while failures remain alerts", () => {
+  assert.match(html, /id="login-status"[^>]*role="status"[^>]*aria-live="polite"/);
+  assert.match(html, /id="login-error" role="alert"/);
+  assert.match(app, /loginStatusEl\.textContent = "Session revocation confirmed/);
+  assert.doesNotMatch(app, /loginErrorEl\.textContent = "Session revocation confirmed/);
+  assert.match(app, /loginErrorEl\.textContent = "You are signed out on this screen/);
+});
+
 test("the command console input has an accessible name", () => {
   assert.match(html, /<label class="visually-hidden" for="command-input">Command<\/label>/);
 });

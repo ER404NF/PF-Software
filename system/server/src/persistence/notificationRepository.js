@@ -9,6 +9,9 @@ export const NOTIFICATION_REPOSITORY_METHODS = Object.freeze([
   "markAborted",
   "markSent",
   "markFailed",
+  "claimNext",
+  "completeClaim",
+  "retryEligible",
   "canSecureRecovery",
 ]);
 

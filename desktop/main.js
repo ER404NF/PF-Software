@@ -32,6 +32,7 @@ const { createRestartPolicy, findFreePort } = require("./serverSupervisor");
 const { buildDiagnosticsReport, createLogger, readBuildRecord, readSetupStatusFile } = require("./diagnostics");
 const { enforceReleaseVersion } = require("./autoUpdate");
 const { shutdownChildren } = require("./shutdown");
+const { createTopologyTransition } = require("./topologyTransition");
 const { createProcessInfo } = require("./processInfo");
 const { createChildrenStore } = require("./childrenStore");
 const { recoverOrphans } = require("./orphanRecovery");
@@ -99,7 +100,10 @@ function defaultHostPort() {
 
 function hostSecrets() {
   const existing = readConfig();
-  if (existing?.mode === "host" && existing.sessionSecret && existing.twoFactorMasterKey) return existing;
+  // Switching away from standalone mode preserves its local data. Reuse the
+  // same encryption/session keys when that preserved host is started again;
+  // changing topology must never make its encrypted records unreadable.
+  if (existing?.sessionSecret && existing.twoFactorMasterKey) return existing;
   return {
     sessionSecret: crypto.randomBytes(32).toString("hex"),
     twoFactorMasterKey: crypto.randomBytes(32).toString("hex"),
@@ -665,6 +669,18 @@ function stopSiteAgent() {
   return stopped;
 }
 
+function waitForSiteAcceptance(timeoutMs = Number(process.env.SITE_LINK_CONFIRM_TIMEOUT_MS) || 20_000) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve, reject) => {
+    (function poll() {
+      if (agentStatus.state === "linked") return resolve(agentStatus);
+      if (["refused", "error", "stopped"].includes(agentStatus.state)) return reject(new Error(agentStatus.detail || "The hub did not accept this site."));
+      if (Date.now() >= deadline) return reject(new Error("The hub did not confirm this site before the safe setup deadline. Check the hub address and try again."));
+      setTimeout(poll, 100);
+    }());
+  });
+}
+
 function protectWindowNavigation(window, isAllowed) {
   const guard = (event, targetUrl) => {
     if (!isAllowed(targetUrl)) event.preventDefault();
@@ -712,6 +728,38 @@ async function openAppWindow(rawUrl) {
   if (setupWindow && !setupWindow.isDestroyed()) setupWindow.close();
   return window;
 }
+
+function stopClientWindow() {
+  if (appWindow && !appWindow.isDestroyed()) appWindow.close();
+  appWindow = null;
+}
+
+function activeTopologyMode() {
+  if (serverProcess || hostServerWanted) return "host";
+  if (agentProcess || agentWanted) return "site";
+  if (readConfig()?.mode === "client" && appWindow && !appWindow.isDestroyed()) return "client";
+  return null;
+}
+
+async function restoreTopology(mode, config) {
+  if (mode === "host") {
+    const { port } = await startHostServer();
+    await openAppWindow(`http://127.0.0.1:${port}`);
+  } else if (mode === "site") {
+    const checked = validateSiteSettings(config || {});
+    if (!checked.ok) throw new Error("previous site settings are unavailable");
+    startSiteAgent(checked.settings);
+  } else if (mode === "client" && config?.serverUrl) {
+    await openAppWindow(config.serverUrl);
+  }
+}
+
+const topologyTransition = createTopologyTransition({
+  activeMode: activeTopologyMode,
+  stopHost: stopHostServer,
+  stopSite: stopSiteAgent,
+  stopClient: async () => stopClientWindow(),
+});
 
 function authorizedSetupRequest(event) {
   return isTrustedSetupSender(event, setupWindow, setupFilePath);
@@ -763,8 +811,20 @@ ipcMain.handle("desktop:set-launch-at-login", (event, { enabled } = {}) => {
 ipcMain.handle("desktop:start-host-setup", async event => {
   if (!authorizedSetupRequest(event)) return unauthorizedResult();
   try {
-    const { port, preflight } = await startHostServer();
-    const alreadyConfigured = readConfig()?.mode === "host";
+    const previous = readConfig();
+    const { port, preflight } = await topologyTransition.transitionTo("host", {
+      start: startHostServer,
+      current: () => ({ port: activeHostSecrets.port, preflight: publicPreflight(activeHostResolution) }),
+      restore: mode => restoreTopology(mode, readConfig() || previous),
+    });
+    const alreadyConfigured = previous?.mode === "host"
+      || (Boolean(previous?.sessionSecret) && Boolean(previous?.twoFactorMasterKey));
+    if (alreadyConfigured && previous?.mode !== "host") {
+      writeConfig({ ...previous, mode: "host", port,
+        sessionSecret: activeHostSecrets.sessionSecret,
+        twoFactorMasterKey: activeHostSecrets.twoFactorMasterKey });
+      applyLaunchAtLogin();
+    }
     startupState = { mode: "host", preflight, error: null };
     if (alreadyConfigured) setImmediate(() => { void openAppWindow(`http://127.0.0.1:${port}`); });
     return { ok: true, port, alreadyConfigured, preflight };
@@ -823,15 +883,27 @@ ipcMain.handle("desktop:start-site-agent", async (event, input = {}) => {
   if (!authorizedSetupRequest(event)) return unauthorizedResult();
   const checked = validateSiteSettings(input);
   if (!checked.ok) return { ok: false, error: checked.error };
+  const previous = readConfig();
+  if (previous?.mode === "host" && input.confirmSwitch !== true) {
+    return { ok: false, error: "Confirm that local accounts stay on this Mac before switching it to site mode." };
+  }
   try {
-    await stopHostServer();
-    await ensureNoOrphans();
-    const started = startSiteAgent(checked.settings);
-    writeConfig({ ...readConfig(), mode: "site", ...checked.settings });
+    const started = await topologyTransition.transitionTo("site", {
+      current: () => ({ status: agentStatus, preflight: publicPreflight(activeHostResolution) }),
+      start: async () => {
+        await ensureNoOrphans();
+        const result = startSiteAgent(checked.settings);
+        await waitForSiteAcceptance();
+        writeConfig({ ...readConfig(), mode: "site", ...checked.settings });
+        return result;
+      },
+      restore: mode => restoreTopology(mode, readConfig() || previous),
+    });
     applyLaunchAtLogin();
     startupState = { mode: "site", preflight: started.preflight ?? null, error: null };
     return { ok: true, status: agentStatus, preflight: started.preflight ?? null };
   } catch (error) {
+    if (error.restoreError) logger.warn(`could not restore the previous topology after a failed site link: ${error.restoreError.message}`);
     startupState = { mode: "site", preflight: error.preflight || publicPreflight(activeHostResolution), error: error.message };
     return { ok: false, error: error.message, preflight: startupState.preflight };
   }
@@ -850,15 +922,29 @@ ipcMain.handle("desktop:stop-site-agent", async event => {
   return { ok: true };
 });
 
-ipcMain.handle("desktop:connect-to-host", async (event, { url } = {}) => {
+ipcMain.handle("desktop:connect-to-host", async (event, { url, confirmSwitch } = {}) => {
   if (!authorizedSetupRequest(event)) return unauthorizedResult();
   try {
     const parsed = new URL(url);
     if (!normalizedOrigin(parsed.toString())) throw new Error("host URL must be http or https and must not contain credentials");
-    await stopHostServer();
-    writeConfig({ mode: "client", serverUrl: parsed.toString() });
-    applyLaunchAtLogin();
-    await openAppWindow(parsed.toString());
+    const previous = readConfig();
+    if (previous?.mode === "host" && confirmSwitch !== true) {
+      throw new Error("Confirm that local accounts stay on this Mac before connecting to the hub.");
+    }
+    try {
+      await topologyTransition.transitionTo("client", {
+        current: async () => {},
+        start: async () => {
+          await openAppWindow(parsed.toString());
+          writeConfig({ ...previous, mode: "client", serverUrl: parsed.origin });
+          applyLaunchAtLogin();
+        },
+        restore: mode => restoreTopology(mode, readConfig() || previous),
+      });
+    } catch (error) {
+      if (error.restoreError) logger.warn(`could not restore the previous topology after a failed hub connection: ${error.restoreError.message}`);
+      throw error;
+    }
     return { ok: true };
   } catch (error) {
     return { ok: false, error: error.message };
@@ -948,6 +1034,7 @@ function buildMenu() {
       },
       showLogFolder: () => shell.showItemInFolder(logger.file),
       moveAsideDamagedRecords: () => { void moveAsideDamagedRecordsFromMenu(); },
+      changeMode: () => { void createSetupWindow(); },
     },
   });
   Menu.setApplicationMenu(Menu.buildFromTemplate(template));
@@ -995,7 +1082,7 @@ app.on("before-quit", event => {
   shuttingDown = true;
   hostServerWanted = false;
   logger.info("Bodun quitting");
-  Promise.all([stopHostServer(), stopSiteAgent()])
+  topologyTransition.stopAll()
     .catch(error => logger.warn(`shutdown: ${error?.message || error}`))
     .finally(() => {
       shutdownComplete = true;

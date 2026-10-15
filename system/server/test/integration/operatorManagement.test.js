@@ -216,8 +216,8 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
       body: { status: "approved" },
     });
     assert.equal(approved.status, 200);
-    assert.equal(approved.body.notification.deliveryState, "failed",
-      "the fixture configures delivery so secure recovery is usable, but its unreachable SMTP endpoint fails safely");
+    assert.equal(approved.body.notification.deliveryState, "retry_scheduled",
+      "the fixture configures delivery so secure recovery is usable, but its unreachable SMTP endpoint schedules a safe retry");
 
     const firstLogin = await fetch(`${baseUrl}/api/login`, {
       method: "POST",
@@ -318,7 +318,17 @@ test("admin user APIs persist safe accounts, enforce role/resource rules, and re
     const notificationList = await request(baseUrl, "/api/admin/account-notifications", { cookie: adminCookie });
     assert.equal(notificationList.status, 200);
     assert.equal(notificationList.body.notifications.some(item => "body" in item), false);
+    assert.equal(notificationList.body.notifications.some(item => "to" in item || "from" in item || "claimToken" in item), false);
+    assert.ok(notificationList.body.notifications.every(item => item.recipient === "redacted" || /\*\*\*@/.test(item.recipient)));
+    assert.equal(typeof notificationList.body.configuration.providerConfigured, "boolean");
+    assert.equal(typeof notificationList.body.configuration.senderConfigured, "boolean");
+    assert.equal(typeof notificationList.body.worker.running, "boolean");
     assert.equal(notificationList.body.notifications.some(item => item.kind === "account_recovery"), true);
+    const retry = await request(baseUrl, "/api/admin/account-notifications/retry", { cookie: adminCookie, method: "POST", body: {} });
+    assert.equal(retry.status, 200);
+    assert.equal(Number.isInteger(retry.body.retried), true);
+    assert.equal((await request(baseUrl, "/api/admin/account-notifications/retry", { method: "POST", body: {} })).status, 401,
+      "manual notification retry remains administrator-authorized");
     const notificationStore = JSON.parse(fs.readFileSync(process.env.ACCOUNT_NOTIFICATION_STORE_PATH, "utf8"));
     const persistedRecovery = notificationStore.notifications.find(item => item.kind === "account_recovery");
     assert.equal("body" in persistedRecovery, false);

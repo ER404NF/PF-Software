@@ -2,6 +2,7 @@ const loginFormEl = document.getElementById("login-form");
 const loginUsernameEl = document.getElementById("login-username");
 const loginPasswordEl = document.getElementById("login-password");
 const loginErrorEl = document.getElementById("login-error");
+const loginStatusEl = document.getElementById("login-status");
 const logoutRetryButtonEl = document.getElementById("logout-retry-button");
 const signupFormEl = document.getElementById("signup-form");
 const signupFullNameEl = document.getElementById("signup-full-name");
@@ -29,6 +30,7 @@ const logoutButtonEl = document.getElementById("logout-button");
 const whoamiEl = document.getElementById("whoami");
 const roleBadgeEl = document.getElementById("role-badge");
 const appVersionEl = document.getElementById("app-version");
+const controlPlaneEl = document.getElementById("control-plane");
 
 async function loadAppIdentity() {
   try {
@@ -38,6 +40,8 @@ async function loadAppIdentity() {
     const displayVersion = body.displayVersion || body.version;
     // The build id (short commit) tells two builds with the same version number apart.
     appVersionEl.textContent = `v${displayVersion}${body.buildId ? ` · ${body.buildId}` : ""}`;
+    controlPlaneEl.textContent = body.controlPlane?.mode === "hub"
+      ? `Hub · ${body.controlPlane.origin}` : "Local host";
     appVersionEl.title = body.buildId
       ? `${body.name} ${displayVersion}, build ${body.buildId}${body.builtAt ? `, built ${new Date(body.builtAt).toLocaleDateString()}` : ""}`
       : `${body.name} ${displayVersion} (development build)`;
@@ -188,6 +192,9 @@ const userCreateAllDevicesEl = document.getElementById("user-create-all-devices"
 const usersMessageEl = document.getElementById("users-message");
 const usersListEl = document.getElementById("users-list");
 const usersEmptyEl = document.getElementById("users-empty");
+const notificationRetryButtonEl = document.getElementById("notification-retry-button");
+const notificationStatusSummaryEl = document.getElementById("notification-status-summary");
+const notificationStatusListEl = document.getElementById("notification-status-list");
 const auditRefreshButtonEl = document.getElementById("audit-refresh-button");
 const auditBodyEl = document.getElementById("audit-body");
 const auditEmptyEl = document.getElementById("audit-empty");
@@ -839,11 +846,13 @@ async function confirmServerLogout() {
     await requestJson("/api/logout", { method: "POST" });
     rememberPendingLogout(false);
     logoutRetryButtonEl.hidden = true;
-    loginErrorEl.textContent = "Session revocation confirmed. Sign in when you are ready.";
+    loginErrorEl.textContent = "";
+    if (typeof loginStatusEl !== "undefined") loginStatusEl.textContent = "Session revocation confirmed. Sign in when you are ready.";
     return true;
   } catch {
     rememberPendingLogout(true);
     logoutRetryButtonEl.hidden = false;
+    if (typeof loginStatusEl !== "undefined") loginStatusEl.textContent = "";
     loginErrorEl.textContent = "You are signed out on this screen, but the server could not confirm session revocation. Close this browser and try again when Bodun is online.";
     return false;
   } finally {
@@ -1066,6 +1075,7 @@ function beginTwoFactorVerification() {
 loginFormEl.addEventListener("submit", async (e) => {
   e.preventDefault();
   loginErrorEl.textContent = "";
+  loginStatusEl.textContent = "";
   const username = loginUsernameEl.value;
   const submit = loginFormEl.querySelector('button[type="submit"]');
   submit.disabled = true;
@@ -4417,6 +4427,49 @@ function renderUsers(users) {
   }
 }
 
+async function refreshNotificationStatus() {
+  if (!can(UI_CAPABILITIES.MANAGE_USERS)) return;
+  try {
+    const { body } = await requestJson("/api/admin/account-notifications");
+    const counts = body.worker?.counts || {};
+    notificationStatusSummaryEl.textContent = [
+      `Provider configured: ${body.configuration?.providerConfigured ? "yes" : "no"}`,
+      `Sender configured: ${body.configuration?.senderConfigured ? "yes" : "no"}`,
+      `Worker running: ${body.worker?.running ? "yes" : "no"}`,
+      `Queued: ${counts.queued || 0}`,
+      `Sending: ${counts.sending || 0}`,
+      `Retry scheduled: ${counts.retry_scheduled || 0}`,
+      `Sent: ${counts.sent || 0}`,
+      `Permanently failed: ${counts.permanently_failed || 0}`,
+      `Needs reconciliation: ${counts.needs_reconciliation || 0}`,
+    ].join(" · ");
+    notificationStatusListEl.replaceChildren(...(body.notifications || []).map(item => {
+      const row = document.createElement("article");
+      row.className = "user-card";
+      const title = document.createElement("strong");
+      title.textContent = `${item.kind} · ${item.recipient}`;
+      const detail = document.createElement("p");
+      detail.textContent = `${item.deliveryState} · attempts ${item.attemptCount || 0}`
+        + (item.nextAttemptAt ? ` · next ${formatDate(item.nextAttemptAt)}` : "")
+        + (item.lastFailureCategory ? ` · ${item.lastFailureCategory}` : "");
+      row.append(title, detail);
+      return row;
+    }));
+  } catch (error) {
+    notificationStatusSummaryEl.textContent = error.message;
+  }
+}
+
+notificationRetryButtonEl.addEventListener("click", async () => {
+  notificationRetryButtonEl.disabled = true;
+  try {
+    await requestJson("/api/admin/account-notifications/retry", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+    await refreshNotificationStatus();
+  } catch (error) {
+    notificationStatusSummaryEl.textContent = error.message;
+  } finally { notificationRetryButtonEl.disabled = false; }
+});
+
 // ---- Sites: other locations that link their phones to this hub ---------------------
 function clearSitesView() {
   sitesListEl.replaceChildren();
@@ -4572,6 +4625,7 @@ async function refreshUsers() {
     const { body } = await requestJson("/api/admin/users");
     if (!profileRequestActive(generation, userCapabilities)) return;
     renderUsers(Array.isArray(body.users) ? body.users : []);
+    await refreshNotificationStatus();
   } catch (error) {
     if (!profileRequestActive(generation, userCapabilities)) return;
     usersListEl.replaceChildren();

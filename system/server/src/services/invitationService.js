@@ -31,19 +31,22 @@ export function createInvitationService({
   }
 
   return {
-    async invite({ organizationId, email, invitedByUserId = null, roleKey = "va_operator", ttlMs = DEFAULT_TTL_MS }) {
-      const role = await roleRepository.getByKey({ organizationId, key: roleKey });
-      if (!role) throw new Error(`unknown role key: ${roleKey}`);
-      const token = newToken();
-      const invitation = await invitationRepository.create({
-        organizationId,
-        emailNormalized: email.trim().toLowerCase(),
-        tokenHash: hashToken(token),
-        invitedByUserId,
-        expiresAt: new Date(now().getTime() + ttlMs),
-        roleKey,
-      });
-      return { token, invitation };
+    async invite({ organizationId, email, invitedByUserId = null, roleKey = "va_operator", ttlMs = DEFAULT_TTL_MS, onCreated = null }) {
+      return withTransaction(pool, async client => {
+        const role = await roleRepository.getByKey({ organizationId, key: roleKey }, client);
+        if (!role) throw new Error(`unknown role key: ${roleKey}`);
+        const token = newToken();
+        const invitation = await invitationRepository.create({
+          organizationId,
+          emailNormalized: email.trim().toLowerCase(),
+          tokenHash: hashToken(token),
+          invitedByUserId,
+          expiresAt: new Date(now().getTime() + ttlMs),
+          roleKey,
+        }, client);
+        const notification = onCreated ? await onCreated({ token, invitation, client }) : null;
+        return { token, invitation, notification };
+      }, { organizationId });
     },
 
     // Returns the invitation row when the token is valid and unexpired,

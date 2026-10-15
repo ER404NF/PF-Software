@@ -47,6 +47,7 @@ body {
 }
 
 #logout-button:hover { background: #3a3a3c; color: #f2f2f7; }
+.auth-status { color: #7bd88f; min-height: 1.25rem; }
 
 #connection-status {
   background: #3a1414;

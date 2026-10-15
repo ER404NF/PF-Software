@@ -21,6 +21,10 @@ function settingsItems({ config, isPackaged, launchAtLogin, handlers }) {
       enabled: isPackaged,
       click: item => handlers.setLaunchAtLogin(item.checked),
     },
+    {
+      label: "Change how this Mac is used…",
+      click: () => handlers.changeMode(),
+    },
   ];
   if (isHost) {
     items.push(

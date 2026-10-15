@@ -50,6 +50,7 @@ import { createFilePushLinkStore } from "./filePushLinkStore.js";
 import { registerFilePushRoutes } from "./routes/filePushRoutes.js";
 import { registerMediaRoutes } from "./routes/mediaRoutes.js";
 import { logOperationalFailure } from "./safeOperationalLog.js";
+import { createNotificationDrainLoop } from "./notificationDrainLoop.js";
 import { registerNetworkCheckRoutes } from "./routes/networkCheckRoutes.js";
 import { registerHealthRoutes } from "./routes/healthRoutes.js";
 import { registerMetricsRoutes } from "./routes/metricsRoutes.js";
@@ -113,6 +114,7 @@ import { decryptTotpSecret, encryptTotpSecret, generateRecoveryCodes, generateTo
 // CLOUD_API_ENABLED — additive, alongside the file-backed operator login
 // above, not a replacement for it.
 import { createPool } from "./db/pool.js";
+import { createDatabaseStartupCoordinator } from "./db/startupCoordinator.js";
 import { withTransaction } from "./db/transaction.js";
 import { ensureDefaultOrganization } from "./db/defaultOrganization.js";
 import { createOrganizationRepository } from "./db/repositories/organizationRepository.js";
@@ -129,6 +131,7 @@ import { createInvitationService } from "./services/invitationService.js";
 import { createIdentityMfaService } from "./services/identityMfaService.js";
 import { createEmailActionService } from "./services/emailActionService.js";
 import { createCloudApi } from "./cloudApi/createCloudApi.js";
+import { createPostgresNotificationRepository } from "./db/repositories/postgresNotificationRepository.js";
 import { discoverIosDevices, DiscoveredIosDevice } from "./deviceDiscovery.js";
 import { loadDeviceConfig } from "./deviceConfigLoader.js";
 import { loadDevices } from "./deviceRegistry.js";
@@ -176,6 +179,20 @@ const hubOrigin = req => deployment.publicUrl
   : `${req.protocol}://${req.get("host")}`;
 const durableRepositories = resolveDurableRepositoryConfig(process.env);
 const applicationDatabasePool = durableRepositories.requiresDatabase ? createPool() : null;
+const databaseStartup = applicationDatabasePool ? createDatabaseStartupCoordinator({
+  pool: applicationDatabasePool,
+  initialize: async pool => {
+    await ensureDefaultOrganization(pool);
+    const requiredRelations = [
+      "identity.organizations",
+      ...(durableRepositories.sites === "postgres" ? ["fleet.sites"] : []),
+      ...(process.env.CLOUD_API_ENABLED === "true" ? ["automation.account_notifications"] : []),
+    ];
+    const result = await pool.query("SELECT to_regclass(value) AS relation FROM unnest($1::text[]) AS value", [requiredRelations]);
+    if (result.rows.some(row => !row.relation)) throw new Error("required database migration is not present");
+  },
+  log: code => { if (isMain) console.log(code); },
+}) : null;
 
 // One explicit scheduling timezone for /time wall-clock input (PHONE_FARM_TIMEZONE,
 // default America/Los_Angeles) — never whatever zone the OS/process happens to be in.
@@ -228,18 +245,65 @@ app.use(helmet({
   crossOriginEmbedderPolicy: false,
   crossOriginResourcePolicy: false,
 }));
-app.get("/api/app-info", (_req, res) => res.json({
+app.get("/api/app-info", (req, res) => res.json({
   name: "Bodun",
   version: applicationVersion,
   channel: applicationChannel,
   displayVersion: `${applicationVersion}${applicationChannel ? ` (${applicationChannel})` : ""}`,
   buildId: applicationBuild.buildId,
   builtAt: applicationBuild.builtAt,
+  controlPlane: deployment.publicUrl
+    ? { mode: "hub", origin: new URL(hubOrigin(req)).origin }
+    : { mode: "local", origin: null },
 }));
 app.use(express.static(clientDir));
-registerHealthRoutes({ app, databasePool: applicationDatabasePool, checkDatabaseHealth });
+registerHealthRoutes({ app, databasePool: applicationDatabasePool, checkDatabaseHealth, databaseStartup });
 registerMetricsRoutes({ app, httpMetrics, bearerToken: process.env.METRICS_BEARER_TOKEN || null });
 app.use(express.json());
+
+// A direct production run starts database initialization without preventing
+// the HTTP listener from exposing /healthz and the initializing /readyz
+// response. Imported test servers still wait here so their first request sees
+// a fully initialized database. The guard below keeps every authoritative API
+// unavailable until the one shared coordinator has finished.
+const databaseStartupPromise = databaseStartup
+  ? (isMain ? databaseStartup.start() : await databaseStartup.start())
+  : null;
+if (databaseStartup) {
+  app.use((req, res, next) => {
+    const startup = databaseStartup.status();
+    if (startup.status === "ready") return next();
+    return res.status(503).json({
+      error: "service initialization is still in progress",
+      code: startup.status === "timeout" ? "DATABASE_STARTUP_TIMEOUT" : "DATABASE_STARTUP_WAITING",
+    });
+  });
+}
+
+// Open the liveness listener before waiting for PostgreSQL. Routes registered
+// after this point are still protected by the startup guard above until the
+// coordinator reports ready.
+const server = createServer(app);
+let startupSignalHandler = null;
+if (isMain) {
+  const port = process.env.PORT || 4173;
+  server.listen(port, deployment.host, () => {
+    const displayHost = deployment.host.includes(":") ? `[${deployment.host}]` : deployment.host;
+    console.log(`Bodun control server running at http://${displayHost}:${server.address().port}`);
+    console.log(`Scheduling timezone for /time: ${schedulingTimeZone} (set PHONE_FARM_TIMEZONE to change)`);
+  });
+  // Full runtime cleanup is installed after initialization. During this
+  // startup window there are no managed phone processes yet, so cancellation,
+  // listener close, and pool close are the complete safe shutdown sequence.
+  startupSignalHandler = () => {
+    databaseStartup?.cancel();
+    server.close();
+    void applicationDatabasePool?.end().finally(() => process.exit(0));
+    if (!applicationDatabasePool) process.exit(0);
+  };
+  process.once("SIGTERM", startupSignalHandler);
+  process.once("SIGINT", startupSignalHandler);
+}
 
 // The helmet() CSP's own reportUri target above. Browsers send these with
 // Content-Type: application/csp-report (or, for the newer Reporting API,
@@ -411,12 +475,13 @@ const accountNotificationOutbox = createNotificationOutbox({
   maxDelayMs: Number(process.env.ACCOUNT_EMAIL_RETRY_MAX_MS) || 15 * 60_000,
   onFailure: error => logOperationalFailure("Account notification email send failed", error),
 });
+const notificationDrainTargets = [{ name: "account", outbox: accountNotificationOutbox }];
 // Sends one already-queued notification and advances its deliveryState to
 // "sent"/"failed". A failed send is swallowed here (logged, not thrown) —
 // the account action that triggered the notification (approve/reject,
 // recovery request) must never fail because outbound mail did.
 async function deliverAccountNotification(id) {
-  if (!mailSender.isConfigured()) return accountNotificationStore.deliveryContent(id);
+  if (!mailSender.isConfigured()) return await accountNotificationStore.deliveryContent(id);
   try {
     return await accountNotificationOutbox.deliver(id);
   } catch (error) {
@@ -679,20 +744,27 @@ app.post("/api/signup", async (req, res, next) => {
     // signup itself. createSignupAccount() requires a real email, so this
     // is not conditional on one existing the way account review's queue()
     // call is (an operator created before email became mandatory).
+    let notificationState = null;
     if (operator.email) {
       try {
-        const notification = accountNotificationStore.queue({
+        const notification = await accountNotificationStore.queue({
           to: operator.email, fullName: operator.fullName || operator.username, username: operator.username, status: "received",
+          idempotencyKey: `account_received:${operator.username}`,
         });
-        deliverAccountNotification(notification.id);
+        notificationState = notification.deliveryState;
+        void deliverAccountNotification(notification.id);
       } catch (error) {
+        notificationState = "needs_reconciliation";
         logOperationalFailure("Signup notification queue failed", error);
       }
     }
     res.status(201).json({
       status: "pending",
-      message: "Application received. An administrator must accept it before sign-in.",
+      message: notificationState === "needs_reconciliation"
+        ? "Application saved. Email scheduling is temporarily degraded; an administrator can retry it without another application."
+        : "Application saved. An administrator must accept it before sign-in.",
       operator,
+      notification: { deliveryState: notificationState },
     });
   } catch (error) {
     if (error?.status) return res.status(error.status).json({ error: error.message });
@@ -920,7 +992,7 @@ app.post("/api/recovery/request", async (req, res, next) => {
       : null;
     if (recovery?.token) {
       try {
-        const item = accountNotificationStore.queue({
+        const item = await accountNotificationStore.queue({
           to: recovery.operator.email,
           fullName: recovery.operator.fullName || recovery.operator.username,
           username: recovery.operator.username,
@@ -1265,9 +1337,17 @@ const { authorizedAuditEvents, publicPeople } = registerAuditPeopleRoutes({
 // above) is unchanged either way; this only replaces account lifecycle
 // (invite/accept/login/logout/MFA) sitting in front of it, per the
 // handout's own recommended default (§4 task P2, step 6).
+if (isMain && databaseStartupPromise) {
+  try {
+    await databaseStartupPromise;
+  } catch (error) {
+    server.close();
+    await applicationDatabasePool?.end().catch(() => {});
+    throw error;
+  }
+}
 if (process.env.CLOUD_API_ENABLED === "true") {
   const cloudPool = applicationDatabasePool;
-  await ensureDefaultOrganization(cloudPool);
 
   const cloudOrganizationRepository = createOrganizationRepository(cloudPool);
   const cloudUserRepository = createUserRepository(cloudPool);
@@ -1277,6 +1357,18 @@ if (process.env.CLOUD_API_ENABLED === "true") {
   const cloudInvitationRepository = createInvitationRepository(cloudPool);
   const cloudMfaRepository = createIdentityMfaRepository(cloudPool);
   const cloudEmailActionTokenRepository = createEmailActionTokenRepository(cloudPool);
+  const cloudNotificationRepository = await createPostgresNotificationRepository(cloudPool, {
+    companyEmail: process.env.COMPANY_FROM_EMAIL || null,
+    encryptionKey: process.env.ACCOUNT_NOTIFICATION_ENCRYPTION_KEY || twoFactorMasterKey,
+  });
+  const cloudNotificationOutbox = createNotificationOutbox({
+    store: cloudNotificationRepository, mailSender,
+    maxAttempts: Number(process.env.ACCOUNT_EMAIL_MAX_ATTEMPTS) || 5,
+    baseDelayMs: Number(process.env.ACCOUNT_EMAIL_RETRY_BASE_MS) || 5_000,
+    maxDelayMs: Number(process.env.ACCOUNT_EMAIL_RETRY_MAX_MS) || 15 * 60_000,
+    onFailure: error => logOperationalFailure("Cloud notification email send failed", error),
+  });
+  notificationDrainTargets.push({ name: "cloud", outbox: cloudNotificationOutbox });
 
   const cloudOrganizationIdentityService = createOrganizationIdentityService({
     pool: cloudPool, withTransaction, organizationRepository: cloudOrganizationRepository,
@@ -1308,7 +1400,10 @@ if (process.env.CLOUD_API_ENABLED === "true") {
     identityMfaService: cloudIdentityMfaService,
     emailActionService: cloudEmailActionService,
     verifyPassword, hashPassword, validatePassword,
-    mailSender, companyEmail: process.env.COMPANY_FROM_EMAIL || null,
+    notificationRepository: cloudNotificationRepository,
+    onNotificationQueued: (id, organizationId) => {
+      void cloudNotificationOutbox.deliver(id, { organizationId }).catch(error => logOperationalFailure("Cloud notification delivery failed", error));
+    },
     // Phase 1: exactly one organization, invite-only — no public
     // organization-signup route (PHASE1_TEAM_ROLLOUT_HANDOUT.md §3/§4 P2.3).
     allowOrganizationSignup: false,
@@ -1317,7 +1412,6 @@ if (process.env.CLOUD_API_ENABLED === "true") {
   if (isMain) console.log("Cloud identity API mounted at /api/cloud (CLOUD_API_ENABLED=true)");
 }
 
-const server = createServer(app);
 // noServer: true — the upgrade is completed manually below, after checking
 // the session, instead of ws accepting every upgrade unconditionally.
 // Every legitimate message (a coordinate pair, a direction enum, ≤1000 chars
@@ -1580,11 +1674,14 @@ app.patch("/api/admin/users/:username/status", requireAnyCapability(CAPABILITIES
 
     let notification = null;
     if (sendsEmail) {
-      notification = accountNotificationStore.queue({
+      const transitionGeneration = (target.accountStatusGeneration ?? 0)
+        + ((target.accountStatus ?? "approved") === req.body.status ? 0 : 1);
+      notification = await accountNotificationStore.queue({
         to: target.email,
         fullName: target.fullName || target.username,
         username: target.username,
         status: req.body.status,
+        idempotencyKey: `account_${req.body.status}:${target.username}:${transitionGeneration}`,
         holdForCommit: true,
       });
     }
@@ -1612,14 +1709,14 @@ app.patch("/api/admin/users/:username/status", requireAnyCapability(CAPABILITIES
       }
     } catch (error) {
       if (notification) {
-        try { accountNotificationStore.markAborted(notification.id); }
+        try { await accountNotificationStore.markAborted(notification.id); }
         catch (abortError) { logOperationalFailure("Account review outbox abort failed", abortError); }
       }
       throw error;
     }
     let notificationState = null;
     if (notification) {
-      try { notificationState = accountNotificationStore.markCommitted(notification.id)?.deliveryState; }
+      try { notificationState = (await accountNotificationStore.markCommitted(notification.id))?.deliveryState; }
       catch (error) {
         notificationState = "pending_reconciliation";
         logOperationalFailure("Account review outbox commit failed", error);
@@ -1705,16 +1802,52 @@ app.patch("/api/admin/users/:username/rename", requireAnyCapability(CAPABILITIES
   }
 });
 
-app.get("/api/admin/account-notifications", requireCapability(CAPABILITIES.MANAGE_USERS), (req, res) => {
-  res.json({ configuration: mailSender.configurationStatus(), notifications: accountNotificationStore.list().map(item => ({
+function redactRecipient(value) {
+  const [local, domain] = String(value || "").split("@");
+  if (!local || !domain) return "redacted";
+  return `${local.slice(0, 1)}***@${domain}`;
+}
+
+app.get("/api/admin/account-notifications", requireCapability(CAPABILITIES.MANAGE_USERS), async (req, res, next) => {
+  try {
+  const notifications = await accountNotificationStore.list();
+  const counts = notifications.reduce((summary, item) => {
+    summary[item.deliveryState] = (summary[item.deliveryState] || 0) + 1;
+    return summary;
+  }, {});
+  const sent = notifications.filter(item => item.sentAt).sort((a, b) => String(b.sentAt).localeCompare(String(a.sentAt)))[0];
+  const queued = notifications.filter(item => ["queued", "awaiting_sender_configuration", "retry_scheduled"].includes(item.deliveryState));
+  const mailConfiguration = mailSender.configurationStatus();
+  res.json({
+    configuration: {
+      configured: mailConfiguration.configured,
+      providerConfigured: !mailConfiguration.missing.some(name => name !== "COMPANY_FROM_EMAIL"),
+      senderConfigured: !mailConfiguration.missing.includes("COMPANY_FROM_EMAIL"),
+      missing: mailConfiguration.missing,
+    },
+    worker: { running: Boolean(notificationDrainLoop?.running()), counts, oldestQueuedAt: queued.at(-1)?.createdAt ?? null,
+      lastSuccessfulDeliveryAt: sent?.sentAt ?? null,
+      lastFailureCategory: notifications.find(item => item.lastFailureCategory)?.lastFailureCategory ?? null },
+    notifications: notifications.map(item => ({
     id: item.id,
-    to: item.to,
-    from: item.from,
+    recipient: redactRecipient(item.to),
     subject: item.subject,
     kind: item.kind,
     deliveryState: item.deliveryState,
+    attemptCount: item.attemptCount,
+    nextAttemptAt: item.nextAttemptAt,
+    lastFailureCategory: item.lastFailureCategory,
     createdAt: item.createdAt,
   })) });
+  } catch (error) { next(error); }
+});
+
+app.post("/api/admin/account-notifications/retry", requireCapability(CAPABILITIES.MANAGE_USERS), async (req, res, next) => {
+  try {
+    const count = await accountNotificationStore.retryEligible({ id: req.body?.id || null });
+    void accountNotificationOutbox.drain().catch(error => logOperationalFailure("Account notification retry failed", error));
+    res.json({ retried: count });
+  } catch (error) { next(error); }
 });
 
 app.post("/api/admin/users", requireCapability(CAPABILITIES.MANAGE_USERS), async (req, res, next) => {
@@ -4922,15 +5055,24 @@ wss.on("connection", (ws, request) => {
 // default port — importing must be side-effect-free with respect to networking.
 let queueTickTimer;
 let wdaReadinessTimer;
-let accountNotificationTimer;
+let notificationDrainLoop;
 if (isMain) {
+  if (startupSignalHandler) {
+    process.removeListener("SIGTERM", startupSignalHandler);
+    process.removeListener("SIGINT", startupSignalHandler);
+    startupSignalHandler = null;
+  }
+  // The desktop app waits up to 10 s for this process; the hard stop here is 8 s.
+  const handleSignal = createShutdownHandler({ server, cleanupRuntime, hardStopMs: 8000, log: line => console.error(`[shutdown] ${line}`) });
+  process.once("SIGTERM", handleSignal);
+  process.once("SIGINT", handleSignal);
+
   researchTaskRunner.start();
   // Dispatch only after the worker and UI listeners exist. Dispatching from
   // createTaskQueue() would emit recovered work before either subscriber can
   // see it, leaving a restarted research task RUNNING with no consumer.
   schedulerGuard.run(new Date());
   void refreshWdaReadiness().catch(error => logOperationalFailure("Initial WDA readiness refresh failed", error));
-  const PORT = process.env.PORT || 4173;
   // Only when actually running as the server, not on import — tests drive
   // taskQueue.tick() explicitly with controlled timestamps, and a real
   // wall-clock timer running in the background during those tests would
@@ -4944,11 +5086,12 @@ if (isMain) {
     void refreshWdaReadiness().catch(error => logOperationalFailure("WDA readiness refresh failed", error));
   }, WDA_READINESS_INTERVAL_MS);
   const ACCOUNT_NOTIFICATION_INTERVAL_MS = Number(process.env.ACCOUNT_EMAIL_DRAIN_INTERVAL_MS) || 30_000;
-  void accountNotificationOutbox.drain().catch(error => logOperationalFailure("Account notification startup delivery retry failed", error));
-  accountNotificationTimer = setInterval(() => {
-    void accountNotificationOutbox.drain().catch(error => logOperationalFailure("Account notification delivery retry failed", error));
-  }, ACCOUNT_NOTIFICATION_INTERVAL_MS);
-  accountNotificationTimer.unref?.();
+  notificationDrainLoop = createNotificationDrainLoop({
+    targets: notificationDrainTargets,
+    intervalMs: ACCOUNT_NOTIFICATION_INTERVAL_MS,
+    onFailure: (name, error) => logOperationalFailure(`${name === "cloud" ? "Cloud" : "Account"} notification delivery retry failed`, error),
+  });
+  notificationDrainLoop.start();
 
   // Opt-in (AUTO_PROVISION_WDA=true): find USB iPhones and set up WebDriverAgent on
   // each. Manually pinned devices.config.json WDA entries are left untouched. Shared
@@ -5076,13 +5219,6 @@ if (isMain) {
     }
   }
 
-  server.listen(PORT, deployment.host, () => {
-    // server.address().port (not the raw PORT var) so this is still correct
-    // when PORT=0 asks the OS for an ephemeral port.
-    const displayHost = deployment.host.includes(":") ? `[${deployment.host}]` : deployment.host;
-    console.log(`Bodun control server running at http://${displayHost}:${server.address().port}`);
-    console.log(`Scheduling timezone for /time: ${schedulingTimeZone} (set PHONE_FARM_TIMEZONE to change)`);
-  });
 }
 
 let runtimeCleanupPromise = null;
@@ -5093,8 +5229,9 @@ function cleanupRuntime() {
   clearInterval(heartbeatTimer);
   if (queueTickTimer) clearInterval(queueTickTimer);
   if (wdaReadinessTimer) clearInterval(wdaReadinessTimer);
-  if (accountNotificationTimer) clearInterval(accountNotificationTimer);
+  const stoppingNotifications = notificationDrainLoop?.stop?.();
   runtimeCleanupPromise = (async () => {
+    databaseStartup?.cancel();
     // Stopping the phones' processes starts first and runs alongside the rest, so a slow research or
     // routing stop can never delay (or prevent) terminating iproxy and WebDriverAgent.
     const stoppingPhones = Promise.resolve(deviceProvisioner?.stop?.());
@@ -5107,7 +5244,7 @@ function cleanupRuntime() {
         catch (error) { logOperationalFailure("Proxy route shutdown cleanup failed", error); }
       }
     })();
-    await Promise.allSettled([stoppingPhones, stoppingTheRest]);
+    await Promise.allSettled([stoppingPhones, stoppingTheRest, stoppingNotifications]);
     await applicationDatabasePool?.end();
   })().catch(error => logOperationalFailure("Server shutdown cleanup failed", error));
   return runtimeCleanupPromise;
@@ -5116,13 +5253,6 @@ function cleanupRuntime() {
 server.on("close", () => {
   void cleanupRuntime();
 });
-
-if (isMain) {
-  // The desktop app waits up to 10 s for this process; the hard stop here is 8 s.
-  const handleSignal = createShutdownHandler({ server, cleanupRuntime, hardStopMs: 8000, log: line => console.error(`[shutdown] ${line}`) });
-  process.once("SIGTERM", handleSignal);
-  process.once("SIGINT", handleSignal);
-}
 
 // Test seam: lets an integration test drive the network-enrollment routes without a Mac (no real bridge,
 // no real `ifconfig`).
