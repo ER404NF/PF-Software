@@ -34,7 +34,7 @@ process.env.ALLOW_NETWORK_CHECK_URL_OVERRIDE = "true";
 process.env.TWO_FACTOR_MASTER_KEY = "a".repeat(32);
 process.env.NODE_ENV = "test";
 
-const { server, wss, deviceLease, taskQueue, auditLog } = await import("../../src/index.js");
+const { server, wss, deviceLease, taskQueue, auditLog, networkVerifier } = await import("../../src/index.js");
 const { operators, hashPassword } = await import("../../src/authStore.js");
 
 let httpUrl;
@@ -228,6 +228,74 @@ test("a successful host check stays VERIFYING and is audited without claiming ph
   assert.ok(checkEvent, "expected a network_check audit event");
   assert.equal(checkEvent.detail.networkEgress, "cellular-sim");
   assert.equal(checkEvent.detail.observedIp, null);
+});
+
+test("an admin can complete the explicit phone-originated verification gate", async () => {
+  networkVerifier.invalidate("mock-1", "Test requires a new host route check.");
+  const denied = await fetch(`${httpUrl}/api/devices/mock-2/network-attestation`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: restrictedCookie },
+    body: JSON.stringify({
+      observedIpv4: "8.8.8.8", dnsPassed: true, webrtcPassed: true, ipv6PolicyPassed: true,
+    }),
+  });
+  assert.equal(denied.status, 403);
+
+  const premature = await fetch(`${httpUrl}/api/devices/mock-1/network-attestation`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({
+      observedIpv4: "8.8.8.8", dnsPassed: true, webrtcPassed: true, ipv6PolicyPassed: true,
+    }),
+  });
+  assert.equal(premature.status, 409);
+  assert.match((await premature.json()).error, /host route check/i);
+
+  await fetch(`${CHECK_URL.replace("/ip", "/debug/set-ip")}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ip: "8.8.8.8" }),
+  });
+  const hostCheck = await fetch(`${httpUrl}/api/devices/mock-1/network-check`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({ checkUrl: CHECK_URL }),
+  });
+  assert.equal(hostCheck.status, 200);
+  assert.equal((await hostCheck.json()).network.networkProtectionState, "VERIFYING");
+
+  const queuedTask = taskQueue.addTask({
+    goal: "dispatch only after phone-originated network confirmation",
+    createdBy: "netcheck-test-va",
+    deviceSelector: { deviceId: "mock-1" },
+  });
+  assert.equal(queuedTask.state, "QUEUED");
+
+  const confirmed = await fetch(`${httpUrl}/api/devices/mock-1/network-attestation`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Cookie: cookie },
+    body: JSON.stringify({
+      observedIpv4: "8.8.8.8", dnsPassed: true, webrtcPassed: true, ipv6PolicyPassed: true,
+    }),
+  });
+  const confirmedBody = await confirmed.json();
+  assert.equal(confirmed.status, 200, JSON.stringify(confirmedBody));
+  const { network } = confirmedBody;
+  assert.equal(network.networkVerified, true);
+  assert.equal(network.networkProtectionState, "PROTECTED");
+  assert.equal(network.networkObservedIp, "8.8.8.8");
+
+  const phone = (await fleetSnapshot(cookie)).find(device => device.id === "mock-1");
+  assert.equal(phone.networkVerified, true);
+  assert.equal(phone.canOpen, false);
+  assert.equal(phone.accessState, "ai_controlled");
+  assert.equal(taskQueue.getTask(queuedTask.id).state, "RUNNING");
+  taskQueue.emergencyStopDevice("mock-1");
+  const releasedPhone = (await fleetSnapshot(cookie)).find(device => device.id === "mock-1");
+  assert.equal(releasedPhone.canOpen, true);
+  assert.equal(releasedPhone.accessState, "assigned_available");
+  const audit = await fetch(`${httpUrl}/api/audit?deviceId=mock-1&limit=20`, { headers: { Cookie: cookie } }).then(response => response.json());
+  assert.ok(audit.events.some(event => event.type === "phone_network_attested"));
 });
 
 test("a completed network check remains successful when audit storage is unavailable", async () => {

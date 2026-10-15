@@ -1806,11 +1806,68 @@ function buildNetworkCheckButton(device, statusEl = null) {
         headers: { "Content-Type": "application/json" },
         body: "{}",
       }, { timeoutMs: 30_000, uncertain: true });
-      if (body?.ok) say(`${device.label} network verified.`, "success");
-      else say(`${device.label} network check completed with a warning.`, "error");
+      if (body?.network?.networkVerified === true) {
+        say(`${device.label} network verified.`, "success");
+      } else if (body?.network?.networkProtectionState === "VERIFYING") {
+        say("Host route passed. Run the IP, DNS, WebRTC, and IPv6 checks on this iPhone, then confirm the phone test below.", "info");
+      } else {
+        say(body?.network?.networkVerificationMessage || `${device.label} network check needs attention.`, "error");
+      }
     } catch (error) {
       say(error.message, "error");
     } finally {
+      button.disabled = false;
+    }
+  });
+  return button;
+}
+
+function buildPhoneNetworkAttestationButton(device) {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "network-check-button secondary";
+  button.textContent = "Confirm phone egress test";
+  button.title = "Use this only after checking the public IP, DNS, WebRTC, and IPv6 result in Safari on this iPhone.";
+  const say = sayOnCard(device);
+  button.addEventListener("click", async () => {
+    const observedIpv4 = window.prompt(
+      `Enter the public IPv4 shown by the network test in Safari on ${device.label}.`,
+      device.networkObservedIp || "",
+    );
+    if (observedIpv4 === null) return;
+    let observedIpv6 = "";
+    if (device.network?.expectedIpv6Policy === "required") {
+      observedIpv6 = window.prompt("Enter the IPv6 address shown by the phone test.", "") ?? "";
+      if (!observedIpv6) return;
+    }
+    const confirmed = window.confirm(
+      `Confirm ${device.label} passed all checks in Safari:\n\n`
+      + "• the public IPv4 belongs to its assigned route\n"
+      + "• DNS did not leak outside the approved route\n"
+      + "• WebRTC did not expose another public or local route\n"
+      + `• IPv6 matches the ${device.network?.expectedIpv6Policy || "configured"} policy\n\n`
+      + "This audited confirmation will enable Human and AI control for the verification window.",
+    );
+    if (!confirmed) return;
+    button.disabled = true;
+    say(`Confirming the phone-originated network test for ${device.label}…`, "info");
+    try {
+      const { body } = await requestJson(`/api/devices/${encodeURIComponent(device.id)}/network-attestation`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          observedIpv4,
+          observedIpv6: observedIpv6 || null,
+          dnsPassed: true,
+          webrtcPassed: true,
+          ipv6PolicyPassed: true,
+        }),
+      });
+      if (body?.network?.networkVerified !== true) throw new Error("The phone network confirmation did not complete.");
+      say(`${device.label} network verified. Refreshing its current Human or AI control state…`, "success");
+      broadcastLocalFleetRefresh();
+    } catch (error) {
+      say(error.message, "error");
       button.disabled = false;
     }
   });
@@ -2108,7 +2165,7 @@ function networkRoutingNextAction(device) {
     };
   }
   const feature = device.routingFeature?.state;
-  if (feature === "disabled") return { label: "Routing disabled", action: null, disabled: true, reason: "Proxy routing is turned off on this Mac. Turn it on from the Bodun menu, then restart Bodun." };
+  if (feature === "disabled") return { label: "Routing disabled", action: null, disabled: true, reason: "Proxy routing is turned off on this Mac. From the Bodun menu, select ‘Enable Proxy Routing on This Mac (restart required)’, confirm the active Internet Sharing bridge, and restart Bodun." };
   if (feature === "bridge_missing") return { label: "Bridge required", action: null, disabled: true, reason: "Internet Sharing is not set up on this Mac yet." };
   if (feature === "setup_failed") return { label: "Setup failed", action: null, disabled: true, reason: "Proxy routing could not be set up on this Mac. Check Help > Copy Diagnostics." };
   if (feature === "starting") return { label: "Routing starting…", action: null, disabled: true, reason: "Proxy routing is starting. This takes a moment." };
@@ -2872,6 +2929,10 @@ function renderDeviceCard(d, task, lastAction) {
   if (can(UI_CAPABILITIES.MANAGE_PROXY) && isProxyEgress(d.network?.egress)) tools.appendChild(buildProxySwitch(d));
   if (can(UI_CAPABILITIES.RUN_NETWORK_CHECK) && d.assignedToViewer) {
     tools.appendChild(buildNetworkCheckButton(d));
+  }
+  if (can(UI_CAPABILITIES.MANAGE_ROUTING) && d.assignedToViewer
+    && d.networkProtectionState === "VERIFYING" && d.networkVerified !== true) {
+    tools.appendChild(buildPhoneNetworkAttestationButton(d));
   }
   // Shown for everyone who may manage the control service. When the server has no lifecycle for the phone
   // (automatic setup is off, or the phone is not managed) the panel is disabled and says why.

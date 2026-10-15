@@ -116,6 +116,143 @@ test("proxy and host-route checks remain VERIFYING until a device-originated egr
   assert.match(result.networkVerificationMessage, /device-originated/);
 });
 
+test("authorized phone evidence promotes a current protected route and detects cross-phone collisions", async () => {
+  const deviceNetwork = loadDeviceNetworkMap({ devices: [
+    { id: "d1", network: { egress: "commercial-proxy", profileId: "p1", controlIface: "usb", expectedIpv6Policy: "blocked" } },
+    { id: "d2", network: { egress: "commercial-proxy", profileId: "p2", controlIface: "usb", expectedIpv6Policy: "blocked" } },
+  ] });
+  const verifier = createNetworkVerifier({ deviceNetwork, timeoutMs: 500 });
+  const infrastructure = { status: "healthy", publicIpv4: "8.8.8.8", country: "US", checkedAt: new Date().toISOString() };
+  verifier.recordInfrastructureCheck("d1", { proxyResult: infrastructure, route: { state: "routed" } });
+  const protectedResult = await verifier.recordDeviceEvidence("d1", {
+    observedIpv4: "8.8.8.8", dnsPassed: true, webrtcPassed: true, ipv6PolicyPassed: true,
+  }, { authorize: async () => {}, proveCurrentRoute: async () => true });
+  assert.equal(protectedResult.networkVerified, true);
+  assert.equal(protectedResult.networkProtectionState, "PROTECTED");
+  assert.equal(protectedResult.networkVerificationLevel, "device-originated-manual-attestation");
+
+  verifier.recordInfrastructureCheck("d2", { proxyResult: infrastructure, route: { state: "routed" } });
+  await assert.rejects(() => verifier.recordDeviceEvidence("d2", {
+    observedIpv4: "8.8.8.8", dnsPassed: true, webrtcPassed: true, ipv6PolicyPassed: true,
+  }, { authorize: async () => {}, proveCurrentRoute: async () => true }), /shares a public IPv4/);
+});
+
+test("expired phone evidence does not reserve a rotating public IP forever", async () => {
+  const deviceNetwork = loadDeviceNetworkMap({ devices: [
+    { id: "d1", network: { egress: "commercial-proxy", profileId: "p1", controlIface: "usb" } },
+    { id: "d2", network: { egress: "commercial-proxy", profileId: "p2", controlIface: "usb" } },
+  ] });
+  const verifier = createNetworkVerifier({ deviceNetwork, timeoutMs: 500, maxHostEvidenceAgeMs: 5 });
+  const evidence = { observedIpv4: "8.8.8.8", dnsPassed: true, webrtcPassed: true, ipv6PolicyPassed: true };
+  const infrastructure = () => ({
+    proxyResult: { status: "healthy", publicIpv4: "8.8.8.8", checkedAt: new Date().toISOString() },
+    route: { state: "routed" },
+  });
+  verifier.recordInfrastructureCheck("d1", infrastructure());
+  await verifier.recordDeviceEvidence("d1", evidence,
+    { authorize: async () => {}, proveCurrentRoute: async () => true });
+  await new Promise(resolve => setTimeout(resolve, 15));
+  verifier.recordInfrastructureCheck("d2", infrastructure());
+  const result = await verifier.recordDeviceEvidence("d2", evidence,
+    { authorize: async () => {}, proveCurrentRoute: async () => true });
+  assert.equal(result.networkVerified, true);
+  assert.equal(result.networkObservedIp, "8.8.8.8");
+});
+
+test("phone evidence fails closed without complete leak checks or a current proxy route", async () => {
+  const verifier = makeVerifier([
+    { id: "d1", network: { egress: "commercial-proxy", profileId: "p1", controlIface: "usb", expectedIpv6Policy: "blocked" } },
+  ]);
+  verifier.recordInfrastructureCheck("d1", {
+    proxyResult: { status: "healthy", publicIpv4: "8.8.4.4", country: "US", checkedAt: new Date().toISOString() },
+    route: { state: "routed" },
+  });
+  await assert.rejects(() => verifier.recordDeviceEvidence("d1", {
+    observedIpv4: "8.8.4.4", dnsPassed: true, webrtcPassed: false, ipv6PolicyPassed: true,
+  }, { authorize: async () => {}, proveCurrentRoute: async () => true }), /DNS, WebRTC, and IPv6/);
+  await assert.rejects(() => verifier.recordDeviceEvidence("d1", {
+    observedIpv4: "8.8.4.4", dnsPassed: true, webrtcPassed: true, ipv6PolicyPassed: true,
+  }, { authorize: async () => {}, proveCurrentRoute: async () => false }), /no longer current/);
+  await assert.rejects(() => verifier.recordDeviceEvidence("d1", {
+    observedIpv4: "8.8.4.4", observedIpv6: "2001:4860:4860::8888",
+    dnsPassed: true, webrtcPassed: true, ipv6PolicyPassed: true,
+  }, { authorize: async () => {}, proveCurrentRoute: async () => true }), /requires IPv6 to be blocked/);
+  assert.equal(verifier.getStatus("d1").networkVerified, false);
+});
+
+test("phone evidence rejects missing authorization, invalid addresses, incomplete confirmations, and stale host checks", async () => {
+  const verifier = makeVerifier([{
+    id: "d1", network: {
+      egress: "cellular-sim", simIccid: "111", controlIface: "usb",
+      expectedPublicIpv4: "8.8.8.8", expectedIpv6Policy: "required",
+    },
+  }]);
+  const host = checkedAt => verifier.recordInfrastructureCheck("d1", {
+    proxyResult: { status: "healthy", publicIpv4: "8.8.8.8", country: "US", checkedAt },
+    route: { state: "routed" },
+  });
+  host(new Date().toISOString());
+  const complete = { observedIpv4: "8.8.8.8", observedIpv6: "2001:4860:4860::8888",
+    dnsPassed: true, webrtcPassed: true, ipv6PolicyPassed: true };
+  await assert.rejects(() => verifier.recordDeviceEvidence("d1", complete), /authorization is required/i);
+  await assert.rejects(() => verifier.recordDeviceEvidence("d1", { ...complete, observedIpv4: "127.0.0.1" },
+    { authorize: async () => {} }), /public IPv4/);
+  await assert.rejects(() => verifier.recordDeviceEvidence("d1", { ...complete, observedIpv4: "1.1.1.1" },
+    { authorize: async () => {} }), /does not match/);
+  await assert.rejects(() => verifier.recordDeviceEvidence("d1", { ...complete, observedIpv6: "not-ipv6" },
+    { authorize: async () => {} }), /valid IPv6/);
+  for (const field of ["dnsPassed", "webrtcPassed", "ipv6PolicyPassed"]) {
+    await assert.rejects(() => verifier.recordDeviceEvidence("d1", { ...complete, [field]: false },
+      { authorize: async () => {} }), /DNS, WebRTC, and IPv6/);
+  }
+  await assert.rejects(() => verifier.recordDeviceEvidence("d1", { ...complete, observedIpv6: null },
+    { authorize: async () => {} }), /requires an IPv6/);
+
+  host("2020-01-01T00:00:00.000Z");
+  await assert.rejects(() => verifier.recordDeviceEvidence("d1", complete,
+    { authorize: async () => {} }), /immediately before/);
+  assert.equal(verifier.getStatus("d1").networkVerified, false);
+});
+
+test("route invalidation or authorization revocation during proof cannot commit stale phone evidence", async () => {
+  const makeProxyVerifier = () => {
+    const verifier = makeVerifier([{
+      id: "d1", network: { egress: "commercial-proxy", profileId: "p1", controlIface: "usb" },
+    }]);
+    verifier.recordInfrastructureCheck("d1", {
+      proxyResult: { status: "healthy", publicIpv4: "8.8.8.8", country: "US", checkedAt: new Date().toISOString() },
+      route: { state: "routed" },
+    });
+    return verifier;
+  };
+  const evidence = { observedIpv4: "8.8.8.8", dnsPassed: true, webrtcPassed: true, ipv6PolicyPassed: true };
+
+  const invalidated = makeProxyVerifier();
+  let releaseProof;
+  let proofStarted;
+  const started = new Promise(resolve => { proofStarted = resolve; });
+  const proof = new Promise(resolve => { releaseProof = resolve; });
+  const pending = invalidated.recordDeviceEvidence("d1", evidence, {
+    authorize: async () => {},
+    proveCurrentRoute: async () => { proofStarted(); await proof; return true; },
+  });
+  await started;
+  invalidated.invalidate("d1");
+  releaseProof();
+  await assert.rejects(pending, /host route changed/);
+  assert.equal(invalidated.getStatus("d1").networkVerified, false);
+
+  const revoked = makeProxyVerifier();
+  let authorized = true;
+  await assert.rejects(() => revoked.recordDeviceEvidence("d1", evidence, {
+    authorize: async () => {
+      if (!authorized) throw Object.assign(new Error("authorization changed"), { status: 403 });
+    },
+    proveCurrentRoute: async () => { authorized = false; return true; },
+  }), /authorization changed/);
+  assert.equal(revoked.getStatus("d1").networkVerified, false);
+});
+
 test("fresh tunnel, PF and bridge proof still cannot turn a host request into phone proof", async () => {
   const verifier = makeVerifier([{ id: "d1", network: { egress: "commercial-proxy", profileId: "p1", controlIface: "usb" } }]);
   const unproven = await verifier.checkDevice("d1", CHECK_URL);

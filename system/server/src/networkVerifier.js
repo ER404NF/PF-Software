@@ -6,8 +6,10 @@
 // evidence remains fail closed.
 
 import { isProxyEgress } from "./deviceNetworkStore.js";
+import { egressIdentity } from "./deviceNetworkConfig.js";
 import { diagnosticError } from "./errorCatalog.js";
 import { isPublicIpv4 } from "./publicIp.js";
+import { DEFAULT_NETWORK_VERIFICATION_MAX_AGE_MS } from "./networkPolicy.js";
 import { isIP } from "node:net";
 
 const DEFAULT_TIMEOUT_MS = 5000;
@@ -71,6 +73,7 @@ async function readBoundedJson(response, maxBytes) {
 
 function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS,
   maxResponseBytes = 64 * 1024,
+  maxHostEvidenceAgeMs = DEFAULT_NETWORK_VERIFICATION_MAX_AGE_MS,
   onError = (error) => console.error("Network verification transport failed:", error?.code || error?.name || "Error") } = {}) {
   const status = new Map(); // deviceId -> status shape above
   const generations = new Map();
@@ -211,6 +214,127 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS,
     return entry;
   }
 
+  async function recordDeviceEvidence(deviceId, evidence = {}, { authorize = null, proveCurrentRoute = null } = {}) {
+    if (typeof authorize !== "function") {
+      const error = new Error("Current authorization is required to confirm a phone network test.");
+      error.status = 403;
+      throw error;
+    }
+    const staleEvidence = () => {
+      const error = new Error("The host route changed while the phone test was being confirmed. Run the host route check again.");
+      error.status = 409;
+      return error;
+    };
+    const generation = generations.get(deviceId) ?? 0;
+    await authorize();
+    if (generation !== (generations.get(deviceId) ?? 0)) throw staleEvidence();
+
+    const previous = getStatus(deviceId);
+    const network = deviceNetwork.get(deviceId);
+    const previousCheckedAt = Date.parse(previous.networkCheckedAt);
+    const previousAgeMs = Date.now() - previousCheckedAt;
+    if (!previous.networkCheckedAt || previous.networkProtectionState !== "VERIFYING"
+      || previous.networkRouteMatch !== true || previous.networkMismatch === true
+      || !Number.isFinite(previousCheckedAt) || previousAgeMs < 0 || previousAgeMs > maxHostEvidenceAgeMs) {
+      const error = new Error("Run a successful host route check immediately before confirming the phone egress test.");
+      error.status = 409;
+      throw error;
+    }
+
+    const observedIp = typeof evidence.observedIpv4 === "string" ? evidence.observedIpv4.trim() : "";
+    if (!isPublicIpv4(observedIp)) {
+      const error = new Error("Enter the public IPv4 address shown by the network test on this iPhone.");
+      error.status = 400;
+      throw error;
+    }
+    if (evidence.dnsPassed !== true || evidence.webrtcPassed !== true || evidence.ipv6PolicyPassed !== true) {
+      const error = new Error("Confirm the DNS, WebRTC, and IPv6 checks from this iPhone before allowing control.");
+      error.status = 400;
+      throw error;
+    }
+
+    const observedIpv6 = typeof evidence.observedIpv6 === "string" && evidence.observedIpv6.trim()
+      ? evidence.observedIpv6.trim() : null;
+    if (observedIpv6 && isIP(observedIpv6) !== 6) {
+      const error = new Error("The observed IPv6 value is not a valid IPv6 address.");
+      error.status = 400;
+      throw error;
+    }
+    if (network?.expectedPublicIpv4 && network.expectedPublicIpv4 !== observedIp) {
+      const error = new Error("The phone public IPv4 does not match the configured address for this route.");
+      error.status = 409;
+      throw error;
+    }
+    if (network?.expectedIpv6Policy === "blocked" && observedIpv6) {
+      const error = new Error("The phone exposed IPv6 even though this route requires IPv6 to be blocked.");
+      error.status = 409;
+      throw error;
+    }
+    if (network?.expectedIpv6Policy === "required" && !observedIpv6) {
+      const error = new Error("This route requires an IPv6 address from the phone test.");
+      error.status = 409;
+      throw error;
+    }
+
+    if (isProxyEgress(network?.egress)) {
+      let routeProven = false;
+      try { routeProven = typeof proveCurrentRoute === "function" && await proveCurrentRoute() === true; }
+      catch { routeProven = false; }
+      await authorize();
+      if (generation !== (generations.get(deviceId) ?? 0) || status.get(deviceId) !== previous) {
+        throw staleEvidence();
+      }
+      if (!routeProven) {
+        const error = new Error("The protected tunnel, firewall rule, and Internet Sharing bridge are no longer current. Run the host route check again.");
+        error.status = 409;
+        throw error;
+      }
+    }
+
+    if (generation !== (generations.get(deviceId) ?? 0) || status.get(deviceId) !== previous) {
+      throw staleEvidence();
+    }
+
+    const identity = egressIdentity(network);
+    const collisionCheckedAt = Date.now();
+    for (const [otherDeviceId, other] of status.entries()) {
+      if (otherDeviceId === deviceId || other.networkVerified !== true || other.networkObservedIp !== observedIp) continue;
+      const otherCheckedAt = Date.parse(other.networkCheckedAt);
+      const otherAgeMs = collisionCheckedAt - otherCheckedAt;
+      if (!Number.isFinite(otherCheckedAt) || otherAgeMs < 0 || otherAgeMs > maxHostEvidenceAgeMs) continue;
+      const otherIdentity = egressIdentity(deviceNetwork.get(otherDeviceId));
+      if (identity && otherIdentity && identity !== otherIdentity) {
+        const error = new Error("This phone shares a public IPv4 with a differently assigned phone. Keep both phones blocked and inspect their routes.");
+        error.status = 409;
+        throw error;
+      }
+    }
+
+    const checkedAt = new Date().toISOString();
+    const entry = {
+      ...previous,
+      networkObservedIp: observedIp,
+      networkObservedIpv6: observedIpv6,
+      networkObservedRegion: typeof evidence.observedRegion === "string"
+        ? evidence.observedRegion.trim().slice(0, 100) || null : null,
+      networkDnsStatus: "passed",
+      networkCheckedAt: checkedAt,
+      networkVerified: true,
+      networkMismatch: false,
+      networkMismatchReason: null,
+      networkRouteMatch: true,
+      networkVerificationLevel: "device-originated-manual-attestation",
+      networkProtectionState: "PROTECTED",
+      networkVerificationMessage: "Phone egress, DNS, WebRTC, and IPv6 policy were confirmed by an authorized operator.",
+      networkLatestError: null,
+      networkDiagnosticEvents: [...(previous.networkDiagnosticEvents ?? []).slice(-9), {
+        type: "DEVICE_EGRESS_ATTESTED", at: checkedAt,
+      }],
+    };
+    status.set(deviceId, entry);
+    return entry;
+  }
+
   function invalidate(deviceId, reason = "Network route or proxy assignment changed; run a new device network check.") {
     generations.set(deviceId, (generations.get(deviceId) ?? 0) + 1);
     const previous = getStatus(deviceId);
@@ -231,7 +355,7 @@ function createNetworkVerifier({ deviceNetwork, timeoutMs = DEFAULT_TIMEOUT_MS,
 
   function getGeneration(deviceId) { return generations.get(deviceId) ?? 0; }
 
-  return { checkDevice, getStatus, recordInfrastructureCheck, invalidate, getGeneration };
+  return { checkDevice, getStatus, recordInfrastructureCheck, recordDeviceEvidence, invalidate, getGeneration };
 }
 
 export { createNetworkVerifier };

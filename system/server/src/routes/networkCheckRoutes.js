@@ -6,6 +6,7 @@ export function registerNetworkCheckRoutes({
   app,
   hasCapability,
   runNetworkCheckCapability,
+  manageRoutingCapability,
   knownDevice,
   canAccessDevice,
   deviceNetwork,
@@ -17,7 +18,8 @@ export function registerNetworkCheckRoutes({
   testProxy,
   decryptProxyPassword,
   refreshProxyPoolCache,
-  networkRoutingOrchestrator,
+  networkRoutingOrchestrator = null,
+  getNetworkRoutingOrchestrator = () => networkRoutingOrchestrator,
   networkVerifier,
   networkDecision,
   taskQueue,
@@ -29,6 +31,7 @@ export function registerNetworkCheckRoutes({
   publicNetworkConfig,
   withNetworkEgress,
 }) {
+  const routingOrchestrator = () => getNetworkRoutingOrchestrator?.() ?? null;
   const stopUnauthorizedNetworkWork = deviceId => {
     taskQueue.stopDevice(deviceId, "network_policy");
     for (const client of wss.clients) client.releaseUnauthorizedSelection?.("network_policy");
@@ -115,11 +118,11 @@ export function registerNetworkCheckRoutes({
         await authorize();
         proxyPoolRepository.updateHealth(record.id, proxyResult);
         refreshProxyPoolCache();
-        await networkRoutingOrchestrator?.checkHealth();
+        await routingOrchestrator()?.checkHealth();
         await authorize();
         return networkVerifier.recordInfrastructureCheck(req.params.deviceId, {
           proxyResult,
-          route: networkRoutingOrchestrator?.getRoute(req.params.deviceId) ?? null,
+          route: routingOrchestrator()?.getRoute(req.params.deviceId) ?? null,
           generation: verificationGeneration,
         });
       })().then(async result => {
@@ -154,13 +157,13 @@ export function registerNetworkCheckRoutes({
     networkVerifier.checkDevice(req.params.deviceId, checkUrl, {
       authorize,
       proveCurrentRoute: isProxyEgress(configuredNetwork?.egress)
-        ? () => networkRoutingOrchestrator?.verifyCurrentRoute?.(req.params.deviceId) ?? false
+        ? () => routingOrchestrator()?.verifyCurrentRoute?.(req.params.deviceId) ?? false
         : null,
     })
       .then(async result => {
         await authorize();
         if (result.networkMismatch && isProxyEgress(configuredNetwork?.egress)) {
-          await networkRoutingOrchestrator?.quarantineRoute(req.params.deviceId, {
+          await routingOrchestrator()?.quarantineRoute(req.params.deviceId, {
             code: result.networkLatestError?.code || "V204",
             why: result.networkMismatchReason || "End-to-end verification detected an unexpected route.",
           });
@@ -190,5 +193,57 @@ export function registerNetworkCheckRoutes({
         console.error("Network verification failed:", error?.code || error?.name || "Error");
         res.status(502).json({ error: "network verification failed", code: "NETWORK_CHECK_FAILED" });
       });
+  });
+
+  app.post("/api/devices/:deviceId/network-attestation", async (req, res) => {
+    if (!hasCapability(req.currentOperator, manageRoutingCapability)) {
+      return res.status(403).json({ error: "phone network confirmation is not permitted for this role" });
+    }
+    if (!knownDevice(req.params.deviceId)) return res.status(404).json({ error: "unknown device" });
+    if (!canAccessDevice(req.currentOperator, req.params.deviceId)) {
+      return res.status(403).json({ error: "not authorized for this device" });
+    }
+    let currentAtCommit = null;
+    const authorize = async () => {
+      const current = await identityService.resolveSessionPrincipal(req.session?.operator);
+      if (!current || !hasCapability(current, manageRoutingCapability)
+        || !canAccessDevice(current, req.params.deviceId)) {
+        const error = new Error("authorization changed while confirming the phone network");
+        error.status = current ? 403 : 401;
+        throw error;
+      }
+      currentAtCommit = current;
+      return currentAtCommit;
+    };
+    try {
+      await authorize();
+      const configuredNetwork = deviceNetwork.get(req.params.deviceId);
+      const result = await networkVerifier.recordDeviceEvidence(req.params.deviceId, req.body, {
+        authorize,
+        proveCurrentRoute: isProxyEgress(configuredNetwork?.egress)
+          ? () => routingOrchestrator()?.verifyCurrentRoute?.(req.params.deviceId) ?? false
+          : null,
+      });
+      if (!currentAtCommit) throw new Error("phone network confirmation authorization was not checked");
+      taskQueue.tick(new Date());
+      broadcastDeviceList();
+      recordAudit({
+        operator: currentAtCommit.username,
+        type: "phone_network_attested",
+        deviceId: req.params.deviceId,
+        detail: withNetworkEgress(req.params.deviceId, {
+          observedIp: result.networkObservedIp,
+          ipv6Observed: Boolean(result.networkObservedIpv6),
+          level: result.networkVerificationLevel,
+        }),
+      });
+      res.json({ network: { ...(publicNetworkConfig(configuredNetwork) ?? {}), ...result } });
+    } catch (error) {
+      if ([400, 401, 403, 409].includes(error?.status)) {
+        return res.status(error.status).json({ error: error.message });
+      }
+      console.error("Phone network confirmation failed:", error?.code || error?.name || "Error");
+      res.status(500).json({ error: "phone network confirmation failed" });
+    }
   });
 }

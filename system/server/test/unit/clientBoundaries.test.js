@@ -510,6 +510,29 @@ test("routing host setup states are explicit and cannot send enrollment requests
     assert.equal(action.action, null);
     assert.equal(action.disabled, true);
   }
+  const disabled = vm.runInContext('networkRoutingNextAction({ routingFeature: { state: "disabled" } })', context);
+  assert.equal(disabled.reason, "Proxy routing is turned off on this Mac. From the Bodun menu, select ‘Enable Proxy Routing on This Mac (restart required)’, confirm the active Internet Sharing bridge, and restart Bodun.");
+});
+
+test("network-check UI reads the nested network result and explains the physical-phone gate", async () => {
+  const notices = [];
+  const context = vm.createContext({
+    document: { createElement: element },
+    sayOnCard: () => (message, tone) => notices.push({ message, tone }),
+    requestJson: async () => ({ body: { ok: false, network: {
+      networkVerified: false, networkProtectionState: "VERIFYING",
+    } } }),
+  });
+  vm.runInContext(section("function buildNetworkCheckButton(device", "function buildPhoneNetworkAttestationButton"), context);
+  const button = vm.runInContext('buildNetworkCheckButton({ id: "phone-1", label: "Phone 1" })', context);
+  await button.click();
+  assert.deepEqual(notices, [
+    { message: "Checking Phone 1 network…", tone: "info" },
+    {
+      message: "Host route passed. Run the IP, DNS, WebRTC, and IPv6 checks on this iPhone, then confirm the phone test below.",
+      tone: "info",
+    },
+  ]);
 });
 
 test("host quarantine overrides stale per-device routing success and offers explicit recovery", () => {
