@@ -53,66 +53,26 @@ function canonicalPrivilegePath(binary) {
   return normalized === binary ? normalized : null;
 }
 
-function listedCommandsByPasswordTag(output) {
-  const commands = { NOPASSWD: [], PASSWD: [] };
-  const text = typeof output === "string" && output.length <= 64 * 1024 ? output : "";
-  let continuation = null;
-  for (const line of text.split(/\r?\n/)) {
-    const tags = [...line.matchAll(/(?:^|[\s,)])(NOPASSWD|PASSWD):\s*/g)];
-    if (tags.length === 0) {
-      if (continuation && /^\s+\//.test(line)) {
-        for (const entry of line.trim().split(",")) {
-          const command = entry.trim();
-          if (command) commands[continuation.tag].push({ command, rootAllowed: continuation.rootAllowed });
-        }
-      } else {
-        continuation = null;
-      }
-      continue;
-    }
-    for (let index = 0; index < tags.length; index += 1) {
-      const match = tags[index];
-      const prefix = line.slice(0, match.index + 1);
-      const runAs = [...prefix.matchAll(/\(([^)]*)\)/g)].at(-1)?.[1] ?? "";
-      const runAsUsers = runAs.split(":", 1)[0].split(",").map(value => value.trim().toLowerCase());
-      const rootAllowed = runAsUsers.includes("root") || runAsUsers.includes("all");
-      const start = match.index + match[0].length;
-      const end = tags[index + 1]?.index ?? line.length;
-      for (const entry of line.slice(start, end).split(",")) {
-        const command = entry.trim();
-        if (command) commands[match[1]].push({ command, rootAllowed });
-      }
-      continuation = { tag: match[1], rootAllowed };
-    }
-  }
-  return commands;
-}
-
-function checkSudoPermission(execFile, sudoBin, binary, { timeout = 5_000 } = {}) {
+function checkSudoPermission(execFile, sudoBin, binary, probeArgs, { timeout = 5_000 } = {}) {
   return new Promise((resolve) => {
     const canonicalBinary = canonicalPrivilegePath(binary);
-    if (!canonicalBinary) {
+    if (!canonicalBinary || !Array.isArray(probeArgs)
+      || probeArgs.some(arg => typeof arg !== "string" || /[\u0000-\u001f\u007f]/.test(arg))) {
       resolve(false);
       return;
     }
-    // `sudo -n -l <command>` only asks sudo whether this exact executable is
-    // allowed without a password. It does not execute the privileged command.
-    // Exit status alone is insufficient: sudo may successfully print a PASSWD
-    // rule or a broader/different command. Accept exactly one bare canonical
-    // executable under NOPASSWD and reject missing, malformed or conflicting
-    // listings. Arguments are deliberately rejected because the production
-    // callers use several dynamic, validated argv shapes for these binaries.
-    execFile(sudoBin, ["-n", "-l", canonicalBinary],
-      { timeout, windowsHide: true, encoding: "utf8" }, (error, stdout) => {
-        if (error) {
-          resolve(false);
-          return;
-        }
-        const listed = listedCommandsByPasswordTag(stdout);
-        const allowed = listed.NOPASSWD.filter(entry => entry.command === canonicalBinary && entry.rootAllowed);
-        const passwordRequired = listed.PASSWD.some(entry => entry.command === canonicalBinary && entry.rootAllowed);
-        resolve(allowed.length === 1 && !passwordRequired);
-      });
+    // Do not use `sudo -n -l <command>` here. sudo's default `listpw=any`
+    // policy can require a password merely to list privileges when the same
+    // macOS administrator also has the normal password-authenticated `%admin`
+    // rule. That made every valid scoped NOPASSWD rule look absent after the
+    // terminal's credential timestamp expired.
+    //
+    // Instead, `-k` makes sudo ignore cached credentials for this invocation,
+    // while `-n` forbids a prompt. The command can therefore succeed only via
+    // a non-interactive rule such as the documented NOPASSWD entry. Every probe
+    // below is read-only, bounded, and supplied as a typed argv array.
+    execFile(sudoBin, ["-n", "-k", "--", canonicalBinary, ...probeArgs],
+      { timeout, windowsHide: true, encoding: "utf8" }, error => resolve(!error));
   });
 }
 
@@ -147,14 +107,14 @@ export class PrivilegedOps {
 
   async assertRoutingPermissions() {
     const required = [
-      ["tun2proxy", this.tun2proxyBin],
-      ["pfctl", this.pfctlBin],
-      ["tcpdump", this.tcpdumpBin],
-      ["ifconfig", this.ifconfigBin],
+      ["tun2proxy", this.tun2proxyBin, ["--version"]],
+      ["pfctl", this.pfctlBin, ["-s", "info"]],
+      ["tcpdump", this.tcpdumpBin, ["--version"]],
+      ["ifconfig", this.ifconfigBin, ["-l"]],
     ];
-    const checks = await Promise.all(required.map(async ([name, binary]) => ({
+    const checks = await Promise.all(required.map(async ([name, binary, probeArgs]) => ({
       name,
-      allowed: await checkSudoPermission(this.execFile, this.sudoBin, binary),
+      allowed: await checkSudoPermission(this.execFile, this.sudoBin, binary, probeArgs),
     })));
     const missing = checks.filter(check => !check.allowed).map(check => check.name);
     if (missing.length) {

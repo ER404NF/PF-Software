@@ -21,13 +21,13 @@ test("constructor requires a valid anchor path", () => {
   assert.doesNotThrow(() => new PrivilegedOps({ anchor: "com.apple/phonefarm" }));
 });
 
-test("routing permission preflight checks every exact privileged binary without executing it", async () => {
+test("routing permission preflight runs only bounded read-only probes for every exact privileged binary", async () => {
   const calls = [];
   const execFile = (bin, args, options, callback) => {
     calls.push({ bin, args, options });
-    const denied = args.at(-1) === "/sbin/ifconfig";
+    const denied = args.includes("/sbin/ifconfig");
     callback(denied ? new Error("not permitted") : null,
-      denied ? "" : `(root) NOPASSWD: ${args.at(-1)}\n`, "private host detail");
+      denied ? "" : "read-only probe output", "private host detail");
   };
   const ops = new PrivilegedOps({
     execFile,
@@ -47,52 +47,32 @@ test("routing permission preflight checks every exact privileged binary without 
     return true;
   });
   assert.deepEqual(calls.map(call => [call.bin, ...call.args]), [
-    ["/usr/bin/sudo", "-n", "-l", "/opt/homebrew/bin/tun2proxy-bin"],
-    ["/usr/bin/sudo", "-n", "-l", "/sbin/pfctl"],
-    ["/usr/bin/sudo", "-n", "-l", "/usr/sbin/tcpdump"],
-    ["/usr/bin/sudo", "-n", "-l", "/sbin/ifconfig"],
+    ["/usr/bin/sudo", "-n", "-k", "--", "/opt/homebrew/bin/tun2proxy-bin", "--version"],
+    ["/usr/bin/sudo", "-n", "-k", "--", "/sbin/pfctl", "-s", "info"],
+    ["/usr/bin/sudo", "-n", "-k", "--", "/usr/sbin/tcpdump", "--version"],
+    ["/usr/bin/sudo", "-n", "-k", "--", "/sbin/ifconfig", "-l"],
   ]);
 });
 
-test("routing permission preflight requires one exact bare NOPASSWD command", async () => {
+test("routing permission preflight ignores cached credentials and requires every read-only probe to succeed", async () => {
   const binaries = ["/opt/homebrew/bin/tun2proxy-bin", "/sbin/pfctl", "/usr/sbin/tcpdump", "/sbin/ifconfig"];
-  const makeOps = outputFor => new PrivilegedOps({
-    execFile: (_bin, args, _options, callback) => callback(null, outputFor(args.at(-1)), "private stderr"),
+  const makeOps = shouldFail => new PrivilegedOps({
+    execFile: (_bin, args, _options, callback) => callback(
+      shouldFail(args) ? new Error("a password is required") : null, "probe output", "private stderr"),
     sudoBin: "/usr/bin/sudo",
     tun2proxyBin: binaries[0], pfctlBin: binaries[1], tcpdumpBin: binaries[2], ifconfigBin: binaries[3],
     anchor: "com.apple/phonefarm",
   });
 
-  await assert.doesNotReject(() => makeOps(binary => [
-    "Matching Defaults entries for operator on host:",
-    "User operator may run the following commands on host:",
-    `    (root) NOPASSWD: ${binary}`,
-  ].join("\n")).assertRoutingPermissions());
+  await assert.doesNotReject(() => makeOps(() => false).assertRoutingPermissions());
+  await assert.rejects(() => makeOps(args => args.includes("/sbin/pfctl")).assertRoutingPermissions(), error => {
+    assert.equal(error.code, "ROUTING_SUDO_PERMISSION_MISSING");
+    assert.deepEqual(error.missingCapabilities, ["pfctl"]);
+    assert.doesNotMatch(error.message, /homebrew|\/sbin|private stderr|password/i);
+    return true;
+  });
 
-  const wrappedListing = [
-    `(root) NOPASSWD: ${binaries[0]}, ${binaries[1]},`,
-    `    ${binaries[2]}, ${binaries[3]}`,
-  ].join("\n");
-  await assert.doesNotReject(() => makeOps(() => wrappedListing).assertRoutingPermissions());
-
-  const cases = [
-    ["wrong executable", binary => `(root) NOPASSWD: ${binary}.other\n`],
-    ["password required", binary => `(root) PASSWD: ${binary}\n`],
-    ["wrong run-as user", binary => `(nobody) NOPASSWD: ${binary}\n`],
-    ["arguments restricted", binary => `(root) NOPASSWD: ${binary} --version\n`],
-    ["malformed output", () => "permission granted without a command listing\n"],
-    ["ambiguous output", binary => `(root) NOPASSWD: ${binary}\n(root) PASSWD: ${binary}\n`],
-    ["missing output", () => ""],
-  ];
-  for (const [label, outputFor] of cases) {
-    await assert.rejects(() => makeOps(outputFor).assertRoutingPermissions(), error => {
-      assert.equal(error.code, "ROUTING_SUDO_PERMISSION_MISSING", label);
-      assert.doesNotMatch(error.message, /homebrew|\/sbin|private stderr|operator|host/i, label);
-      return true;
-    });
-  }
-
-  const nonCanonical = makeOps(binary => `(root) NOPASSWD: ${binary}\n`);
+  const nonCanonical = makeOps(() => false);
   nonCanonical.pfctlBin = "/sbin/../sbin/pfctl";
   await assert.rejects(() => nonCanonical.assertRoutingPermissions(), error => {
     assert.ok(error.missingCapabilities.includes("pfctl"));
