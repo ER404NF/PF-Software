@@ -1791,6 +1791,24 @@ function buildProxySwitch(device) {
   return wrap;
 }
 
+function networkCheckResultPresentation(device, body) {
+  const network = body?.network;
+  if (network?.networkVerified === true) {
+    return { message: `${device.label} network verified.`, tone: "success" };
+  }
+  if (network?.networkProtectionState === "VERIFYING" && network?.networkRouteMatch === true
+    && network?.networkMismatch !== true) {
+    return {
+      message: "Host route passed. Run the IP, DNS, WebRTC, and IPv6 checks on this iPhone, then confirm the phone test below.",
+      tone: "info",
+    };
+  }
+  return {
+    message: network?.networkVerificationMessage || `${device.label} network check needs attention.`,
+    tone: "error",
+  };
+}
+
 function buildNetworkCheckButton(device, statusEl = null) {
   const button = document.createElement("button");
   button.type = "button";
@@ -1806,13 +1824,8 @@ function buildNetworkCheckButton(device, statusEl = null) {
         headers: { "Content-Type": "application/json" },
         body: "{}",
       }, { timeoutMs: 30_000, uncertain: true });
-      if (body?.network?.networkVerified === true) {
-        say(`${device.label} network verified.`, "success");
-      } else if (body?.network?.networkProtectionState === "VERIFYING") {
-        say("Host route passed. Run the IP, DNS, WebRTC, and IPv6 checks on this iPhone, then confirm the phone test below.", "info");
-      } else {
-        say(body?.network?.networkVerificationMessage || `${device.label} network check needs attention.`, "error");
-      }
+      const result = networkCheckResultPresentation(device, body);
+      say(result.message, result.tone);
     } catch (error) {
       say(error.message, "error");
     } finally {
@@ -2167,7 +2180,13 @@ function networkRoutingNextAction(device) {
   const feature = device.routingFeature?.state;
   if (feature === "disabled") return { label: "Routing disabled", action: null, disabled: true, reason: "Proxy routing is turned off on this Mac. From the Bodun menu, select ‘Enable Proxy Routing on This Mac (restart required)’, confirm the active Internet Sharing bridge, and restart Bodun." };
   if (feature === "bridge_missing") return { label: "Bridge required", action: null, disabled: true, reason: "Internet Sharing is not set up on this Mac yet." };
-  if (feature === "setup_failed") return { label: "Setup failed", action: null, disabled: true, reason: "Proxy routing could not be set up on this Mac. Check Help > Copy Diagnostics." };
+  if (feature === "setup_failed") return {
+    label: "Setup failed",
+    action: null,
+    disabled: true,
+    reason: device.routingFeature?.message
+      || "Proxy routing could not be set up on this Mac. Check Help > Copy Diagnostics.",
+  };
   if (feature === "starting") return { label: "Routing starting…", action: null, disabled: true, reason: "Proxy routing is starting. This takes a moment." };
   const routingState = device.routing?.state;
   if (device.routing?.manualInterventionRequired === true) {
@@ -2598,8 +2617,10 @@ function phoneStatePresentation(device) {
   if (["network_not_verified", "network_verification_stale"].includes(device.accessState)
     || ["VERIFYING", "UNVERIFIED"].includes(device.networkProtectionState)) return {
     label: "Network verification required",
-    message: device.networkVerificationMessage
-      || "Host route verified — phone egress test required before control can resume.",
+    message: deviceCardModel.hostRouteAwaitingPhoneEvidence(device)
+      ? (device.networkVerificationMessage || "Host route verified — phone egress test required before control can resume.")
+      : (device.routingFeature?.message || device.networkVerificationMessage
+        || "The protected route must be repaired and checked before phone egress can be confirmed."),
   };
   if (device.accessState === "wda_unconfigured") return {
     label: "Not ready",
@@ -2742,10 +2763,11 @@ async function retryDeviceDiagnostic(device, button, statusEl = null) {
       return;
     }
     if (retryKind === "network" && can(UI_CAPABILITIES.RUN_NETWORK_CHECK)) {
-      await requestJson(`/api/devices/${encodeURIComponent(device.id)}/network-check`, {
+      const { body } = await requestJson(`/api/devices/${encodeURIComponent(device.id)}/network-check`, {
         method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
       }, { timeoutMs: 30_000, uncertain: true });
-      say(`Network diagnostics completed for ${device.label}.`, "success");
+      const result = networkCheckResultPresentation(device, body);
+      say(result.message, result.tone);
       return;
     }
     say(diagnostic?.operatorAction || "Contact your manager for help with this phone.", "info");
@@ -2931,7 +2953,7 @@ function renderDeviceCard(d, task, lastAction) {
     tools.appendChild(buildNetworkCheckButton(d));
   }
   if (can(UI_CAPABILITIES.MANAGE_ROUTING) && d.assignedToViewer
-    && d.networkProtectionState === "VERIFYING" && d.networkVerified !== true) {
+    && deviceCardModel.hostRouteAwaitingPhoneEvidence(d)) {
     tools.appendChild(buildPhoneNetworkAttestationButton(d));
   }
   // Shown for everyone who may manage the control service. When the server has no lifecycle for the phone

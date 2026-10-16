@@ -512,6 +512,11 @@ test("routing host setup states are explicit and cannot send enrollment requests
   }
   const disabled = vm.runInContext('networkRoutingNextAction({ routingFeature: { state: "disabled" } })', context);
   assert.equal(disabled.reason, "Proxy routing is turned off on this Mac. From the Bodun menu, select ‘Enable Proxy Routing on This Mac (restart required)’, confirm the active Internet Sharing bridge, and restart Bodun.");
+  const setupFailed = vm.runInContext(`networkRoutingNextAction({ routingFeature: {
+    state: "setup_failed",
+    message: "Protected routing is blocked because macOS permission is missing for: ifconfig."
+  } })`, context);
+  assert.equal(setupFailed.reason, "Protected routing is blocked because macOS permission is missing for: ifconfig.");
 });
 
 test("network-check UI reads the nested network result and explains the physical-phone gate", async () => {
@@ -520,10 +525,10 @@ test("network-check UI reads the nested network result and explains the physical
     document: { createElement: element },
     sayOnCard: () => (message, tone) => notices.push({ message, tone }),
     requestJson: async () => ({ body: { ok: false, network: {
-      networkVerified: false, networkProtectionState: "VERIFYING",
+      networkVerified: false, networkProtectionState: "VERIFYING", networkRouteMatch: true,
     } } }),
   });
-  vm.runInContext(section("function buildNetworkCheckButton(device", "function buildPhoneNetworkAttestationButton"), context);
+  vm.runInContext(section("function networkCheckResultPresentation(device", "function buildPhoneNetworkAttestationButton"), context);
   const button = vm.runInContext('buildNetworkCheckButton({ id: "phone-1", label: "Phone 1" })', context);
   await button.click();
   assert.deepEqual(notices, [
@@ -533,6 +538,19 @@ test("network-check UI reads the nested network result and explains the physical
       tone: "info",
     },
   ]);
+});
+
+test("network-check UI keeps failed routing checks red instead of reporting completion", () => {
+  const context = vm.createContext({});
+  vm.runInContext(section("function networkCheckResultPresentation(device", "function buildNetworkCheckButton"), context);
+  const result = vm.runInContext(`networkCheckResultPresentation({ label: "Phone 1" }, { network: {
+    networkVerified: false,
+    networkProtectionState: "FAILED",
+    networkRouteMatch: false,
+    networkVerificationMessage: "Protected routing permission is missing."
+  } })`, context);
+  assert.equal(result.tone, "error");
+  assert.equal(result.message, "Protected routing permission is missing.");
 });
 
 test("host quarantine overrides stale per-device routing success and offers explicit recovery", () => {

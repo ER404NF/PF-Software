@@ -180,9 +180,21 @@
         : "Protected routing is blocked. Review host diagnostics and complete host recovery before routing a phone.");
   }
 
+  function hostRouteAwaitingPhoneEvidence(device) {
+    if (device?.networkProtectionState !== "VERIFYING" || device?.networkVerified === true
+      || device?.networkRouteMatch !== true || device?.networkMismatch === true) return false;
+    if (device?.routingFeature && device.routingFeature.state !== "enabled") return false;
+    const route = device?.networkRouteHealth || device?.routing;
+    return Boolean(route && route.state === "routed" && route.protected === true);
+  }
+
   function networkRecoveryGuidance(device) {
     const hostMessage = hostRoutingGuidance(device?.routingFeature?.hostRouting);
     if (hostMessage) return hostMessage;
+    if (device?.routingFeature && device.routingFeature.state !== "enabled") {
+      return device.routingFeature.message
+        || "Protected routing is unavailable on this Mac. Repair the host setup, restart Bodun, and run the network check again.";
+    }
     const route = device?.networkRouteHealth || device?.routing || {};
     if (route.protectionState === "quarantine_failed") {
       return "Emergency network isolation failed. Disconnect the phone or disable Internet Sharing, then repair host routing.";
@@ -199,10 +211,11 @@
       }
       return "A device-specific network block is active. Repair the route, then retry routing.";
     }
-    if (device?.networkProtectionState === "VERIFYING" || device?.networkVerified !== true) {
+    if (hostRouteAwaitingPhoneEvidence(device)) {
       return "Host route verified — phone egress test required. Verify the assigned IP, DNS, WebRTC, and IPv6 policy from the iPhone before allowing control.";
     }
-    return "Review the protected route and host-safety status before retrying network access.";
+    return device?.networkVerificationMessage
+      || "The protected route is not verified. Repair the Mac routing setup and rerun the host network check before testing phone egress.";
   }
 
   // Turns the diagnostics reply into plain lines an operator can read and paste. Internal details (file
@@ -390,7 +403,7 @@
     return network?.providerLabel || network?.gatewayLabel || network?.egress || "No egress assigned";
   }
 
-  const exported = { lifecycleButtons, describeLifecycle, chipFor, deviceStateSummary, hostRoutingGuidance, networkRecoveryGuidance, formatDiagnostics, errorRows, asSentence, createCardMemory, captureFocus, restoreFocus, captureViewportAnchor, restoreViewportAnchor, egressLabel, fleetColumnCount, proxyName, providerName, providerKey, PROVISIONING_OFF, BUSY, LIFECYCLE_LABELS };
+  const exported = { lifecycleButtons, describeLifecycle, chipFor, deviceStateSummary, hostRoutingGuidance, hostRouteAwaitingPhoneEvidence, networkRecoveryGuidance, formatDiagnostics, errorRows, asSentence, createCardMemory, captureFocus, restoreFocus, captureViewportAnchor, restoreViewportAnchor, egressLabel, fleetColumnCount, proxyName, providerName, providerKey, PROVISIONING_OFF, BUSY, LIFECYCLE_LABELS };
   if (typeof module !== "undefined" && module.exports) module.exports = exported;
   if (root) root.deviceCardModel = exported;
 })(typeof window !== "undefined" ? window : null);

@@ -2434,6 +2434,8 @@ const summary = (d, viewer = null, viewerSocket = null) => {
     networkVerificationMessage: networkDetails.networkVerified
       ? "Network verification passed."
       : networkDetails.networkProtectionState === "VERIFYING"
+          && networkDetails.networkRouteMatch === true
+          && networkDetails.networkMismatch !== true
         ? "Host route verified — phone egress test required."
         : "Network verification needs attention.",
   };
@@ -2728,6 +2730,10 @@ registerNetworkCheckRoutes({
   decryptProxyPassword,
   refreshProxyPoolCache,
   getNetworkRoutingOrchestrator: () => networkRoutingOrchestrator,
+  getRoutingFeatureStatus: () => ({
+    ...networkRoutingSetupState,
+    hostRouting: networkRoutingOrchestrator?.getHostRoutingStatus?.() ?? null,
+  }),
   networkVerifier,
   networkDecision,
   taskQueue,
@@ -5213,7 +5219,8 @@ if (isMain) {
         }
       } catch (error) {
         networkRoutingSetupState = error?.code === "ROUTING_SUDO_PERMISSION_MISSING"
-          ? { state: "setup_failed", reasonCode: error.code, message: error.message }
+          ? { state: "setup_failed", reasonCode: error.code, message: error.message,
+            missingCapabilities: Array.isArray(error.missingCapabilities) ? [...error.missingCapabilities] : [] }
           : { state: "setup_failed", message: "Proxy routing could not be initialized. Review host diagnostics." };
         logOperationalFailure("Automatic proxy tunnel routing is disabled", error);
       }

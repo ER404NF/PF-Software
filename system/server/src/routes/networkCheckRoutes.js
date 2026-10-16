@@ -20,6 +20,7 @@ export function registerNetworkCheckRoutes({
   refreshProxyPoolCache,
   networkRoutingOrchestrator = null,
   getNetworkRoutingOrchestrator = () => networkRoutingOrchestrator,
+  getRoutingFeatureStatus = () => null,
   networkVerifier,
   networkDecision,
   taskQueue,
@@ -75,6 +76,23 @@ export function registerNetworkCheckRoutes({
     const configuredNetwork = deviceNetwork.get(req.params.deviceId);
     if (isProxyEgress(configuredNetwork?.egress) && configuredNetwork?.enabled === false) {
       return res.status(409).json({ error: "network verification is unavailable while this proxy assignment is disabled" });
+    }
+    // The normal saved-proxy path cannot do useful work until host routing is
+    // available. An explicitly enabled diagnostic URL still runs below: its
+    // route proof remains mandatory, and RBAC can be revalidated mid-request.
+    if (isProxyEgress(configuredNetwork?.egress) && !req.body?.checkUrl) {
+      const feature = getRoutingFeatureStatus?.();
+      if (feature && feature.state !== "enabled") {
+        const missingCapabilities = Array.isArray(feature.missingCapabilities)
+          ? feature.missingCapabilities.filter(value => ["tun2proxy", "pfctl", "tcpdump", "ifconfig"].includes(value))
+          : [];
+        return res.status(feature.state === "setup_failed" ? 503 : 409).json({
+          error: feature.message || "protected routing is unavailable on this host",
+          code: feature.reasonCode || "ROUTING_UNAVAILABLE",
+          routingState: feature.state,
+          ...(missingCapabilities.length ? { missingCapabilities } : {}),
+        });
+      }
     }
 
     let checkUrl;

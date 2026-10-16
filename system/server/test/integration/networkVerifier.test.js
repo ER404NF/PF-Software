@@ -241,6 +241,8 @@ test("route invalidation or authorization revocation during proof cannot commit 
   releaseProof();
   await assert.rejects(pending, /host route changed/);
   assert.equal(invalidated.getStatus("d1").networkVerified, false);
+  assert.equal(invalidated.getStatus("d1").networkProtectionState, "UNVERIFIED");
+  assert.equal(invalidated.getStatus("d1").networkRouteMatch, false);
 
   const revoked = makeProxyVerifier();
   let authorized = true;

@@ -126,3 +126,51 @@ test("configured checks resolve late-bound route proof and quarantine from the l
   assert.equal(proofs, 1);
   assert.equal(quarantines, 1);
 });
+
+test("proxy network checks expose routing setup failure before testing the provider", async () => {
+  const handlers = new Map();
+  let proxyTests = 0;
+  registerNetworkCheckRoutes({
+    app: { post: (routePath, handler) => handlers.set(routePath, handler) },
+    hasCapability: () => true,
+    runNetworkCheckCapability: "run_network_check",
+    manageRoutingCapability: "manage_routing",
+    knownDevice: () => true,
+    canAccessDevice: () => true,
+    deviceNetwork: { get: () => ({ egress: "commercial-proxy", enabled: true }) },
+    isProxyEgress: egress => egress === "commercial-proxy",
+    resolveNetworkCheckTarget: () => null,
+    poolProxyForDevice: () => ({ id: "proxy-1" }),
+    proxyCredentialEncryptionKey: "configured",
+    proxyPoolRepository: { get: () => ({ id: "proxy-1" }) },
+    testProxy: async () => { proxyTests += 1; return { status: "healthy" }; },
+    getRoutingFeatureStatus: () => ({
+      state: "setup_failed",
+      reasonCode: "ROUTING_SUDO_PERMISSION_MISSING",
+      message: "Protected routing is blocked because macOS permission is missing for: ifconfig.",
+      missingCapabilities: ["ifconfig"],
+    }),
+    networkVerifier: {},
+    networkDecision: () => ({ allowed: false }),
+    taskQueue: { stopDevice() {}, tick() {} },
+    wss: { clients: [] },
+    broadcastDeviceList() {},
+    identityService: { resolveSessionPrincipal: async () => ({ username: "safe-operator" }) },
+    publicNetworkConfig: () => ({}),
+    withNetworkEgress: (_deviceId, detail) => detail,
+  });
+
+  const response = await new Promise((resolve, reject) => {
+    const res = { statusCode: 200, status(code) { this.statusCode = code; return this; },
+      json(body) { resolve({ status: this.statusCode, body }); } };
+    Promise.resolve(handlers.get("/api/devices/:deviceId/network-check")({
+      currentOperator: { username: "safe-operator" }, params: { deviceId: "phone-1" },
+      body: {}, session: { operator: "safe-operator" },
+    }, res)).catch(reject);
+  });
+
+  assert.equal(response.status, 503);
+  assert.equal(response.body.code, "ROUTING_SUDO_PERMISSION_MISSING");
+  assert.deepEqual(response.body.missingCapabilities, ["ifconfig"]);
+  assert.equal(proxyTests, 0);
+});

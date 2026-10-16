@@ -224,7 +224,7 @@ test("network verification is visible only through the server-issued capability"
   assert.match(app, /\/api\/devices\/\$\{encodeURIComponent\(device\.id\)\}\/network-check/);
   assert.match(app, /Confirm phone egress test/);
   assert.match(app, /\/api\/devices\/\$\{encodeURIComponent\(device\.id\)\}\/network-attestation/);
-  assert.match(app, /d\.networkProtectionState === "VERIFYING"/);
+  assert.match(app, /deviceCardModel\.hostRouteAwaitingPhoneEvidence\(d\)/);
 });
 
 test("WDA lifecycle and end-to-end control diagnostics are capability-gated", () => {

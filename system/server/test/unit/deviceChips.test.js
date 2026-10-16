@@ -127,7 +127,13 @@ test("V204 guidance reflects automatic recovery and manual safety states", () =>
   assert.match(networkRecoveryGuidance({ networkRouteHealth: { state: "route_lost", internetBlocked: true,
     automaticRecoveryExhausted: true } }), /recovery is exhausted/);
   assert.match(networkRecoveryGuidance({ networkRouteHealth: { protectionState: "quarantine_failed" } }), /Disconnect the phone/);
-  assert.match(networkRecoveryGuidance({ networkProtectionState: "VERIFYING", networkVerified: false }), /phone egress test required/);
+  assert.match(networkRecoveryGuidance({ networkProtectionState: "VERIFYING", networkVerified: false,
+    networkRouteMatch: true, routingFeature: { state: "enabled" }, networkRouteHealth: { state: "routed", protected: true } }), /phone egress test required/);
+  assert.match(networkRecoveryGuidance({ networkProtectionState: "FAILED", networkVerified: false,
+    routingFeature: { state: "setup_failed", reasonCode: "ROUTING_SUDO_PERMISSION_MISSING",
+      message: "Protected routing is blocked because macOS permission is missing for: ifconfig." } }), /macOS permission is missing for: ifconfig/);
+  assert.doesNotMatch(networkRecoveryGuidance({ networkProtectionState: "FAILED", networkVerified: false }), /Host route verified/);
+  assert.doesNotMatch(networkRecoveryGuidance({ networkProtectionState: "UNVERIFIED", networkVerified: false }), /Host route verified/);
 });
 
 test("provider reachability is separate from phone route health", () => {
